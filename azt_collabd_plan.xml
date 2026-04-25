@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plan name="azt_collabd" version="1">
+  <summary>
+    Extract collaboration logic from azt_recorder into a local sync server
+    (azt_collabd) plus a thin client library (azt_collab_client) used by every
+    app in the A-Z+T suite. The server owns credentials, project storage,
+    language-code selection, git operations, and network sync. Clients write
+    files into a working tree (or stream through the server) and call the
+    server to commit and sync. Auto-commit and auto-sync run on every relevant
+    state change, matching the recorder's current behavior.
+  </summary>
+
+  <goals>
+    <goal>One sync service per device, shared by all AZT suite apps.</goal>
+    <goal>Clients are thin: no dulwich, no git, no credentials, no langcode picker.</goal>
+    <goal>Server owns: credentials, project storage, langcode/template selection, git ops, push/pull scheduling, merge handling.</goal>
+    <goal>Auto-commit and auto-sync fire on every client state change (not timer-based).</goal>
+    <goal>Same public client API regardless of transport (ContentProvider on Android, loopback HTTP on desktop).</goal>
+  </goals>
+
+  <non_goals>
+    <non_goal>True background daemon / foreground service with periodic timers.</non_goal>
+    <non_goal>Client-side scratch store or offline buffer (working tree is the only durable store).</non_goal>
+    <non_goal>Multi-contributor switching UI in v1 (one contributor name per device).</non_goal>
+    <non_goal>Redesigning the recorder's edit flows.</non_goal>
+  </non_goals>
+
+  <architecture>
+    <package name="azt_collabd" role="server">
+      <module name="__main__.py">Entrypoint: desktop daemon or Android in-process host.</module>
+      <module name="server.py">Transport-agnostic RPC dispatch.</module>
+      <module name="auth.py">Device flow, token refresh, GitHub App install checks, GitLab PAT.</module>
+      <module name="repo.py">dulwich: init, clone, pull, fetch, commit, push; per-repo flock.</module>
+      <module name="lift_merge.py">LIFT-aware three-way merge driver (guid + field keyed).</module>
+      <module name="scheduler.py">Debounced job queue keyed by langcode; connectivity watcher.</module>
+      <module name="store.py">config.json, credentials.json, projects.json, per-project state.</module>
+      <module name="net.py">SSL patching for Android; is_online().</module>
+      <module name="ui/">Kivy UI: host toggle, GitHub connect, GitLab PAT form, projects screen, language picker (Start New only), per-project status screen.</module>
+    </package>
+    <package name="azt_collab_client" role="client_library">
+      <module name="__init__.py">Public API.</module>
+      <module name="rpc.py">Transport discovery: ContentProvider probe → loopback HTTP fallback → spawn server in-process. Retry on SERVICE_RESTARTED.</module>
+      <module name="types.py">Project, Status, Result, JobStatus dataclasses.</module>
+    </package>
+  </architecture>
+
+  <transport>
+    <android preferred="true">
+      <mechanism>ContentProvider</mechanism>
+      <authority_pattern>&lt;pkg&gt;.aztcollab</authority_pattern>
+      <discovery>Probe PackageManager.queryContentProviders for known AZT suite authorities; call ping() via ContentResolver.call to wake the hosting app's provider process.</discovery>
+      <auth>OS-level UID check (provider exported to suite apps only). No shared-secret token needed.</auth>
+      <files>File I/O via ContentResolver.openFileDescriptor (clients do not need shared storage permission).</files>
+      <streaming>Long-running job progress via openFileDescriptor + pipe.</streaming>
+    </android>
+    <fallback>
+      <mechanism>Loopback HTTP + JSON on 127.0.0.1</mechanism>
+      <when>Desktop; Android if no sibling suite app answers provider probe; provider crashed.</when>
+      <discovery>$AZT_HOME/server.json holds {port, token, pid, version}. Stale file triggers re-spawn.</discovery>
+      <auth>Bearer token from server.json.</auth>
+      <streaming>SSE on /v1/jobs/{id}/events, or polling GET /v1/jobs/{id}.</streaming>
+    </fallback>
+    <bundling>
+      Every client APK bundles azt_collabd code (~100-150 KB incremental over dulwich+certifi+urllib3 already shipped).
+      Whichever client starts first and wins the flock on $AZT_HOME/server.lock hosts the server; others discover and connect.
+    </bundling>
+  </transport>
+
+  <storage layout_root="$AZT_HOME">
+    <path type="dir" value="$XDG_DATA_HOME/azt" os="linux"/>
+    <path type="dir" value="~/Library/Application Support/azt" os="macos"/>
+    <path type="dir" value="server-APK private dir, or user-picked DocumentFile" os="android"/>
+    <file name="server.json">{port, token, pid, version} — loopback endpoint hint.</file>
+    <file name="server.lock">flock for single-instance guard.</file>
+    <file name="config.json">Host prefs, debounce_ms, merge_retry_max, contributor name.</file>
+    <file name="credentials.json">gh_* and gl_* tokens; chmod 600 on POSIX.</file>
+    <file name="projects.json">Index of langcode → {remote_url, path, created, last_sync}.</file>
+    <dir name="projects/&lt;langcode&gt;/">Git working trees.</dir>
+    <dir name="state/&lt;langcode&gt;.json">last_sync, last_pull_sha, pending_push flag, crash history.</dir>
+    <dir name="locks/&lt;langcode&gt;.lock">Per-project advisory lock.</dir>
+  </storage>
+
+  <data_model>
+    <mode>Clients write text/files; server commits.</mode>
+    <access>
+      <desktop>Clients receive Project.working_dir and write LIFT XML + audio directly.</desktop>
+      <android>Clients stream writes through the ContentProvider; server mediates every file op.</android>
+    </access>
+    <locking>
+      <edit_lock>Short, per-file. Server issues a lease on (langcode, file_path). Prevents two clients from racing the same file.</edit_lock>
+      <commit_lock>Coarse, per-repo flock. Held during git add + commit + fetch + merge + push. Clients attempting edits during this window get BUSY and retry.</commit_lock>
+    </locking>
+    <rationale>
+      One-device editing means distributed-commit (per-client git repos) would produce constant three-way merges on the same LIFT file. Shared working tree + central committer avoids that. Clients never run dulwich.
+    </rationale>
+  </data_model>
+
+  <client_api>
+    <function signature="configure(app_id: str) -> None">Once at startup.</function>
+    <function signature="list_projects() -> list[ProjectInfo]"/>
+    <function signature="open_project(langcode: str) -> Project"/>
+    <function signature="pick_or_create_project() -> Project">Opens server UI.</function>
+    <function signature="project_status(langcode) -> Status">branch, n_changes, last_sync, online_ok.</function>
+    <function signature="commit_local(langcode, contributor, kinds=('audio','lift'))"/>
+    <function signature="request_sync(langcode, contributor) -> JobId">Fire-and-forget; server debounces.</function>
+    <function signature="poll_job(job_id) -> JobStatus"/>
+    <function signature="stream_job(job_id) -> Iterator[JobStatus]"/>
+    <function signature="get_contributor() -> str"/>
+    <function signature="is_online() -> bool"/>
+    <function signature="open_server_settings()">Deeplink to server UI.</function>
+  </client_api>
+
+  <server_rpc_surface note="Same methods, two wire formats: HTTP/JSON on loopback, Bundle on ContentProvider.call.">
+    <endpoint method="GET" path="/v1/projects"/>
+    <endpoint method="POST" path="/v1/projects" action="create|clone"/>
+    <endpoint method="GET" path="/v1/projects/{code}/status"/>
+    <endpoint method="POST" path="/v1/projects/{code}/commit"/>
+    <endpoint method="POST" path="/v1/projects/{code}/sync">
+      <param name="contributor" type="string"/>
+      <param name="merge_retry_max" type="int" optional="true" clamp="[1,10]"/>
+      <returns>job_id</returns>
+    </endpoint>
+    <endpoint method="GET" path="/v1/jobs/{id}"/>
+    <endpoint method="GET" path="/v1/jobs/{id}/events" transport="SSE"/>
+    <endpoint method="GET" path="/v1/auth/github/status"/>
+    <endpoint method="POST" path="/v1/auth/github/device-flow"/>
+    <endpoint method="POST" path="/v1/auth/github/device-flow/poll"/>
+    <endpoint method="POST" path="/v1/auth/gitlab"/>
+    <endpoint method="GET" path="/v1/online"/>
+  </server_rpc_surface>
+
+  <status_codes>
+    <code>OK</code>
+    <code>NOT_A_REPO</code>
+    <code>NO_REMOTE</code>
+    <code>AUTH_REQUIRED</code>
+    <code>APP_NOT_INSTALLED</code>
+    <code>REPO_NOT_AUTHORIZED</code>
+    <code>PUSHED</code>
+    <code>PULLED</code>
+    <code>NOTHING_TO_COMMIT</code>
+    <code>OFFLINE</code>
+    <code>LOCAL_ONLY</code>
+    <code>NETWORK_ERROR</code>
+    <code>BUSY</code>
+    <code>CONFLICTS</code>
+    <code>RACE</code>
+    <code>FETCHING</code>
+    <code>MERGING</code>
+    <code>PUSHING</code>
+    <code>SERVICE_RESTARTED</code>
+  </status_codes>
+
+  <recorder_changes>
+    <keeps>
+      <item>Sync-status indicator in the recorder top bar (reads project_status on timer / after each sync event).</item>
+      <item>Manual "Sync now" button → request_sync + toast on result.</item>
+      <item>"Start new wordlist" / "Clone URL" entrypoints — dispatch to server UI or call server RPC with progress overlay.</item>
+      <item>Auto-sync triggers on go_welcome / go_config / go_collab / after recording / after LIFT edit (same triggers as today's _auto_commit_sync / commit_audio_and_sync).</item>
+      <item>Per-app prefs: theme, ui_language, last_lift (becomes (langcode,) reference), collab_name (read from server, displayed read-only).</item>
+    </keeps>
+    <deletes>
+      <item>CollabScreen class (~500 LOC) and its KV.</item>
+      <item>Direct dulwich imports anywhere in main.py.</item>
+      <item>Host-toggle state, GitLab PAT form, GitHub device-flow UI, langcode input (all move into server UI).</item>
+      <item>LangPickerScreen — moves into server UI behind "Start New".</item>
+      <item>Prefs keys: collab_host, collab_username, collab_token, collab_langcode, gh_* (all), gl_* (all).</item>
+      <item>_get_gh_credentials, _get_sync_credentials, _mark_gh_app_installed, _try_auto_publish (replaced by backend).</item>
+    </deletes>
+  </recorder_changes>
+
+  <auto_sync_model>
+    <trigger_points>
+      <trigger>go_welcome(), go_config(), go_collab() screen transitions.</trigger>
+      <trigger>After each recording save.</trigger>
+      <trigger>After each LIFT edit (entry add/modify).</trigger>
+      <trigger>Any other mutating flow currently calling _auto_commit_sync or commit_audio_and_sync.</trigger>
+      <trigger>Offline → online transition (server-side connectivity watcher drains pending_push flags).</trigger>
+    </trigger_points>
+    <debounce>
+      <mode>Trailing-edge debounce of both commit and push within debounce window.</mode>
+      <config_key>sync.debounce_ms</config_key>
+      <default>500</default>
+      <clamp>[0, 5000]</clamp>
+      <ui_label>Group rapid edits within (ms)</ui_label>
+      <semantics>request_sync schedules a job debounce_ms in the future; subsequent calls within the window reset the timer. All files written before the timer fires land in one commit and one push.</semantics>
+      <rationale>Single user actions (record audio = .wav + .lift update; pick image = image + .lift update) fire multiple request_sync calls. Without debouncing that's N commits + N push cycles per user-visible action. 500 ms groups same-action writes into one commit.</rationale>
+    </debounce>
+    <offline>
+      Server commits locally, sets state/&lt;code&gt;.json pending_push=True, returns LOCAL_ONLY. No retry loop while offline. On online transition, connectivity watcher iterates projects with pending_push=True and runs one sync each.
+    </offline>
+    <no_periodic_polling>When online and no pending pushes, server does not poll. Network activity only on client trigger or offline→online edge.</no_periodic_polling>
+  </auto_sync_model>
+
+  <merge_model>
+    <scope>All merging is server-side. Clients never see conflicts directly — they see OK or CONFLICTS(paths=[...]).</scope>
+    <algorithm>
+      <step n="1">Fetch only (updates refs/remotes/origin/&lt;branch&gt;, no working tree change).</step>
+      <step n="2">Fast-forward if local is ancestor of remote; done.</step>
+      <step n="3">Remote has nothing new; push local; done.</step>
+      <step n="4">Diverged → classify paths:
+        <classification>
+          <type name="audio/images">Distinct filenames per entry/contributor. Union merge, always clean.</type>
+          <type name="non-overlapping files">Three-way merge via dulwich porcelain.merge.</type>
+          <type name="lift_xml">Use lift_merge driver (guid + field keyed, not line-based).</type>
+          <type name="other_conflicts">Surface as CONFLICTS.</type>
+        </classification>
+      </step>
+      <step n="5">Commit the merge with merge commit format (see below).</step>
+      <step n="6">Push. If rejected (race), loop back to step 1 up to merge_retry_max times.</step>
+    </algorithm>
+    <retry>
+      <config_key>sync.merge_retry_max</config_key>
+      <default>3</default>
+      <clamp>[1, 10]</clamp>
+      <override>request_sync RPC accepts optional merge_retry_max param.</override>
+      <ui_label>Merge retry attempts</ui_label>
+      <on_exhaustion>Return RACE status; leave local commits in working tree; user can trigger manual sync later.</on_exhaustion>
+    </retry>
+    <lift_merge_rules>
+      <rule>Parse base, ours, theirs as LIFT trees keyed by entry guid (and sense-id within entry).</rule>
+      <rule>Entry present only in ours or only in theirs → keep.</rule>
+      <rule>Field changed only on one side → take that side.</rule>
+      <rule>Field changed to the same value on both sides → take it.</rule>
+      <rule>List-valued fields (senses, examples, audio forms) → union by inner id.</rule>
+      <rule>Audio href set on one side, unset on base → take it.</rule>
+      <rule>Audio href set to different files on both sides → keep both as additional &lt;form&gt; entries with contributor suffix.</rule>
+      <conflict_surface>
+        <case>Same field set to two different non-empty values on both sides.</case>
+        <case>Entry deleted on one side, modified on the other.</case>
+      </conflict_surface>
+      <conflict_marker>
+        <xml_element>&lt;annotation name="azt-lift-conflict" value="ours|theirs"&gt;</xml_element>
+        <placement>Inside the conflicted entry/field; both versions preserved side-by-side.</placement>
+        <resolution>Normal follow-up edit by user in the recorder UI; recorder draws conflict banner on flagged entries.</resolution>
+      </conflict_marker>
+    </lift_merge_rules>
+    <merge_commit_format>
+      <author>A-Z+T Collab[bot] &lt;azt-collab[bot]@users.noreply.github.com&gt;</author>
+      <committer>A-Z+T Collab[bot] &lt;azt-collab[bot]@users.noreply.github.com&gt;</committer>
+      <message_template><![CDATA[
+Merge origin/<branch> into <branch>
+
+Local commits:
+  <sha> <subject>  (<contributor>)
+  ...
+Remote commits:
+  <sha> <subject>  (<author>)
+  ...
+Conflicts (azt-lift-conflict markers added):
+  <lift-path>: <guid> <field>
+  ...
+
+Co-authored-by: <Local Contributor> <local@device>
+Co-authored-by: <Remote Author> <remote@email>
+]]></message_template>
+      <notes>
+        <note>Co-author trailers deduplicated.</note>
+        <note>Conflicts section omitted when merge is clean.</note>
+      </notes>
+    </merge_commit_format>
+    <pull_while_editing>
+      <rule>Pull runs under commit_lock; edits serialize behind it.</rule>
+      <rule>If pull changes files a client has open, server emits PROJECT_UPDATED(langcode, changed_files) event on the transport stream channel.</rule>
+      <rule>Recorder reuses existing _reload_and_restore path to refresh UI; prompts user if the open entry is among changed_files.</rule>
+    </pull_while_editing>
+  </merge_model>
+
+  <crash_handling>
+    <client_startup>
+      <step>Probe ContentProvider.</step>
+      <step>Fall back to spawning azt_collabd (loopback + flock).</step>
+      <step>If spawn fails, retry twice.</step>
+      <step>On persistent failure: blocking dialog "Sync service could not start. The app cannot continue. [Retry] [Quit]".</step>
+      <step>No degraded read-only mode.</step>
+    </client_startup>
+    <mid_session_crash>
+      <step>Transport detects dropped connection (RPC fails / provider gone / loopback refused).</step>
+      <step>Non-blocking toast: "Sync service stopped — restarting…"</step>
+      <step>Re-run discovery (provider probe → spawn).</step>
+      <step>Boot-time sync does not re-run; just reconnect.</step>
+      <step>In-flight RPC returns SERVICE_RESTARTED; client retries once.</step>
+      <step>If reconnect fails after 3 attempts: same blocking dialog as startup.</step>
+    </mid_session_crash>
+    <no_client_scratch>
+      Clients do not buffer writes locally. Working tree is the only durable store. During the ~5 s restart window, writes return BUSY/SERVICE_RESTARTED and the client retries; no dual-source-of-truth reconciliation.
+    </no_client_scratch>
+    <telemetry>
+      Server writes state/crash.log on crash+restart; surfaces in server settings UI ("Last crash: &lt;timestamp&gt; — &lt;reason&gt;").
+    </telemetry>
+  </crash_handling>
+
+  <credentials_and_identity>
+    <network_account>
+      One GitHub device-flow token + one GitLab PAT per suite install. Server holds the set; all projects use them. No per-app credentials.
+    </network_account>
+    <contributor_name>
+      Device-level, set once in server UI. Read by clients via get_contributor() and shown read-only in their UIs. Used in git author field, LIFT &lt;form&gt; attribution, audio filenames.
+    </contributor_name>
+    <switch_contributor>
+      Deferred. Add a control in server UI later if needed; no schema change required (already per-commit).
+    </switch_contributor>
+  </credentials_and_identity>
+
+  <langcode_and_template>
+    <owns>Server UI.</owns>
+    <location>Inside "Start New" flow only.</location>
+    <picker>Move recorder's LangPickerScreen into server UI.</picker>
+    <other_entrypoints>
+      <entry>clone_project(url) — derives langcode from repo name or .lift file; no picker.</entry>
+      <entry>open_project(path_or_langcode) — just opens; no picker.</entry>
+    </other_entrypoints>
+    <rationale>Any preexisting .lift file already carries its langcode. Only "Start New" needs the picker + template choice.</rationale>
+  </langcode_and_template>
+
+  <migration_steps>
+    <step n="1" name="skeleton">Create azt_collabd/ and azt_collab_client/ packages. Copy collab.py functions verbatim into azt_collabd submodules. collab.py remains as a shim re-exporting from the new package. Recorder untouched. Verify build + one end-to-end sync.</step>
+    <step n="2" name="loopback_rpc">Add stdlib http.server front-end in azt_collabd. Trivial azt_collab_client that calls it. Route one op (do_sync) end-to-end through client. Verify with server launched manually.</step>
+    <step n="3" name="strip_kivy">Remove Clock import from run_async; callers wrap result. Move or delete run_async from backend.</step>
+    <step n="4" name="strip_i18n">Replace every _tr() in backend with Status(code, params). Update recorder call sites to translate at UI layer.</step>
+    <step n="5" name="inject_github_app_config">Replace from appinfo import APP_SLUG with configure() call made once at startup.</step>
+    <step n="6" name="move_credentials">Introduce azt_collabd.store.Credentials. One-shot migration: read legacy keys from prefs.json, copy to credentials.json, strip from prefs. Keep UI-only keys in recorder prefs.</step>
+    <step n="7" name="project_handle">Introduce Project handle + project store. One-time migration moves existing projects from user_data_dir/projects/&lt;code&gt; into $AZT_HOME/projects/&lt;code&gt;. Recorder's last_lift becomes (langcode,).</step>
+    <step n="8" name="file_locking">Add flock around staging, commit, pull, fetch, push, clone, init. BUSY return on timeout.</step>
+    <step n="9" name="contentprovider_transport">Add ContentProvider transport on Android; client discovery prefers provider, falls back to loopback. Bundle server code in each client APK with flock-based single-instance guard.</step>
+    <step n="10" name="server_ui">Build server's own Kivy UI reusing CollabScreen + LangPickerScreen widgets. Recorder deletes its CollabScreen.</step>
+    <step n="11" name="scheduler">Add debounced job queue (debounce_ms default 500) and connectivity watcher (drain pending_push on online transition).</step>
+    <step n="12" name="lift_merge">Implement lift_merge.py with guid+field keyed three-way merge and azt-lift-conflict markers. Integrate into sync loop.</step>
+    <step n="13" name="merge_commit_format">Implement merge commit message template with local/remote commit lists + co-author trailers.</step>
+    <step n="14" name="crash_recovery">Implement SERVICE_RESTARTED detection in client rpc.py; spawn retry logic; blocking dialog on persistent failure. crash.log on server side.</step>
+    <step n="15" name="retire_shim">Delete collab.py. Tighten client API.</step>
+    <step n="16" name="second_app_docs">Minimal example in docs showing another suite app registering itself, reading a project, committing.</step>
+  </migration_steps>
+
+  <config_keys file="$AZT_HOME/config.json">
+    <key name="sync.debounce_ms" type="int" default="500" clamp="[0,5000]" ui_label="Group rapid edits within (ms)"/>
+    <key name="sync.merge_retry_max" type="int" default="3" clamp="[1,10]" ui_label="Merge retry attempts"/>
+    <key name="collab_host" type="enum" values="github|gitlab" default="github"/>
+    <key name="contributor_name" type="string" default=""/>
+    <key name="default_branch" type="string" default="main"/>
+  </config_keys>
+
+  <open_questions>
+    <question id="packaging_android">Separate APK for azt_collabd vs. every client APK bundling the server code? Current decision: bundle in each APK, single-instance via flock + ContentProvider probe.</question>
+    <question id="shared_storage_android">If ContentProvider route covers all file I/O, we can skip MANAGE_EXTERNAL_STORAGE. Confirm all writes go through provider on Android.</question>
+    <question id="service_apk_signing">For ContentProvider to be accessed cross-APK, all AZT suite apps should either share signing or export the provider with a suite-specific permission. Lock this down before step 9.</question>
+  </open_questions>
+
+  <decisions_locked_in>
+    <decision>Conflict marker: &lt;annotation name="azt-lift-conflict" value="ours|theirs"&gt;</decision>
+    <decision>Merge retry default: 3; configurable via sync.merge_retry_max; per-call override on request_sync.</decision>
+    <decision>Merge commit author/committer: A-Z+T Collab[bot]; Co-authored-by trailers for every distinct author on both sides; conflicts section only when present.</decision>
+    <decision>Auto-sync: trigger-based (every state change + offline→online edge), not timer-based.</decision>
+    <decision>Debounce: 500 ms default, both commit and push; sync.debounce_ms configurable.</decision>
+    <decision>Language-code and template selection live in server UI, Start New flow only.</decision>
+    <decision>One network account + one contributor name per device; switch-contributor deferred.</decision>
+    <decision>No client-side scratch store; blocking dialog if server can't start.</decision>
+    <decision>Every client APK bundles the server; flock + ContentProvider probe for single-instance.</decision>
+    <decision>Clients write text/files; server commits. (Not: clients commit and share commits.)</decision>
+    <decision>Transport: ContentProvider preferred on Android; loopback HTTP+JSON fallback on desktop / when no provider answers.</decision>
+  </decisions_locked_in>
+</plan>

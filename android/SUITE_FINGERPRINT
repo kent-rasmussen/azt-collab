@@ -1,0 +1,18 @@
+SHA256:4F:D7:7D:16:B7:D5:79:BC:5D:C6:C0:C6:13:66:99:4E:93:11:93:54:D0:13:7A:D4:2C:CF:F8:4A:90:4C:67:DE
+
+# This is the SHA-256 fingerprint of the A-Z+T suite signing key.
+# Every APK in the suite (azt_recorder + future sister apps) MUST be
+# signed with the keystore that produces this fingerprint. The Android
+# signature-level <permission> on the AZTCollabProvider check enforces
+# this at install time; mismatched signatures simply can't call into
+# the provider.
+#
+# Verify any built APK against this value:
+#   keytool -printcert -jarfile bin/azt_recorder-*.apk | grep SHA256
+#
+# Or against the keystore directly:
+#   keytool -list -v -keystore /path/to/azt-suite.keystore -alias <alias>
+#
+# If you ever need to rotate the key, all suite APKs must rotate
+# together; users will have to uninstall + reinstall (their
+# $AZT_HOME data survives, but Android-private app data is wiped).
