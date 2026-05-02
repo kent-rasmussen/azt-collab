@@ -69,8 +69,11 @@ android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
 android.add_src = ../android/src/main/java
 
 # Sign with the suite keystore — same key as every peer APK.
+#This avoids creating an aab, but also turns off signing (you need to self-sign)
+android.release_artifact = apk
 android.signing.keystore = /home/kentr/bin/azt-suite.keystore                                                     
 android.signing.key_alias = azt                                              
+p4a.sign = True
 
 [buildozer]
 
