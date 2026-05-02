@@ -52,6 +52,8 @@ azt-collab/
       langpicker.py             #     LangPickerScreen (BCP-47 picker)
       picker.py                 #     ProjectPickerScreen
       popups.py                 #     clone-from-URL prompt, etc.
+    test_peer.sh                #   peer-side manifest plumbing check
+                                #     (run after installing a peer APK)
   android/
     SUITE_FINGERPRINT           # SHA-256 of the suite signing key
     manifest_extras_peer.xml    # canonical peer <queries> block
@@ -68,6 +70,8 @@ azt-collab/
     setup.sh                    #   idempotent: creates the
                                 #     azt_collabd/ + azt_collab_client/
                                 #     symlinks needed for packaging
+    test_install.sh             #   on-device server APK verification
+                                #     (run after install + adb deploy)
     README_NewClient.txt        #   peer-app integration guide
   examples/sister_app.py        # runnable demo for a new suite app
   CHANGELOG.md                  # versioned change history (client + daemon)
@@ -241,6 +245,20 @@ Workflow when shipping to Android:
    top-level injection).
 5. Build each peer APK separately; peers symlink only
    `azt_collab_client` plus `manifest_extras.xml`.
+6. After install, verify the round-trip:
+
+   ```bash
+   adb install -r server_apk/bin/aztcollab-*-debug.apk
+   bash server_apk/test_install.sh        # server-side: 15 checks
+   bash azt_collab_client/test_peer.sh    # peer-side: per-peer checks
+   ```
+
+   `test_install.sh` covers manifest integrity, provider registration,
+   bundled modules, icon, activity startup, dist consistency, and
+   installed-vs-bin APK match. `test_peer.sh` walks every installed
+   peer under `org.atoznback.*`, confirming each declares
+   `AZT_COLLAB_ACCESS`, was granted (signature match), declares the
+   `<queries>` block, and matches `android/SUITE_FINGERPRINT`.
 
 The server APK is allowed to be transient: there's no persistent
 foreground-service notification by default. When peers go idle, Android

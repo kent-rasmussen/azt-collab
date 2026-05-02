@@ -96,6 +96,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
   (`icon.filename`, `icon.adaptive_*`) so the launcher icon isn't
   the default Kivy logo.
 
+### azt_collabd 0.10.3 — manifest dual-patch + on-device verification
+
+- `_inject_aztcollab_provider` and `_inject_aztcollab_pick_intent`
+  in `buildozer_tweaks/p4a_hook.py` now patch BOTH
+  `AndroidManifest.xml` (the dist root) AND
+  `src/main/AndroidManifest.xml` (the file gradle's default
+  sourceSets actually reads). Previously patched only the dist
+  root, so gradle ran against the unpatched copy and the resulting
+  APK had no `<provider>` despite the dist-root manifest on disk
+  looking correct. Symptom: dumpsys showed no provider yet
+  `aapt dump xmltree` of the *dist root* manifest confirmed it —
+  diverging because gradle's input was a different file.
+- New `server_apk/test_install.sh` — 15-check on-device
+  verification of the server APK: install, `<permission>`
+  declaration, signature self-grant, `<provider>` registration
+  (multi-source: per-package dumpsys, system-wide provider table,
+  `pm dump`), direct `content query`, bundled
+  `azt_collabd`/`azt_collab_client` Python modules, launcher icon
+  vs. default Kivy logo, activity launches without crash, source
+  symlinks, dist manifest sentinel, hook traces, installed-vs-bin
+  APK md5 match, APK's own manifest, all dist manifests' patch
+  status, gradle manifest config.
+- New `azt_collab_client/test_peer.sh` — peer-side verification:
+  walks each `org.atoznback.*` package on the device, confirms
+  each requests `AZT_COLLAB_ACCESS`, was granted (signature match),
+  declares the suite `<queries>` block, and signs against the
+  fingerprint in `android/SUITE_FINGERPRINT`.
+
 ### azt_collabd 0.10.1 — naming default + build/manifest plumbing
 - Default `_SLUG_DEFAULT` in `config.py` flipped from `'azt-recorder'`
   to `'azt-collaboration'` to match the renamed GitHub App slug.

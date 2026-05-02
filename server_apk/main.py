@@ -36,7 +36,6 @@ for _candidate in (_HERE, _PARENT):
         sys.path.insert(0, _candidate)
 
 import azt_collabd
-__version__ = azt_collabd.__version__
 
 _PICK_ACTION = 'org.atoznback.aztcollab.PICK_PROJECT'
 

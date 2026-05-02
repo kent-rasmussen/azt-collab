@@ -64,16 +64,73 @@ else
     bad "$PERMISSION not granted to itself — signing problem"
 fi
 
-section "4. <provider> at authority=$AUTHORITY"
-if echo "$DUMP" | grep "authority=" | grep -q "$AUTHORITY"; then
-    ok "<provider authority=$AUTHORITY> registered"
-    if echo "$DUMP" | grep -q AZTCollabProvider; then
-        ok "  provider class is AZTCollabProvider"
-    else
-        hmm "provider registered but class name unexpected — manifest hook may have rendered differently"
-    fi
+section "4. <provider> at authority=$AUTHORITY (system view)"
+# Three independent sources, in preference order. PASS if any shows
+# the authority. Android 14's per-package dumpsys formatting can
+# differ from older versions; the system-wide provider table and
+# `pm dump` are reliable backups.
+found_via=""
+
+# A: per-package dumpsys. Match any registration signature:
+#    1. authority=<auth>            (older Android format)
+#    2. authorities=<auth>          (some variants)
+#    3. [<auth>]:                   (Android 14 "ContentProvider Authorities" section)
+#    4. <pkg>/.<X>Provider          (Android 14 "Registered ContentProviders" section)
+if echo "$DUMP" | grep -E "(authority=|authorities=)$AUTHORITY|\[$AUTHORITY\]:|$PKG/\.[A-Za-z]+Provider" >/dev/null; then
+    found_via="dumpsys package $PKG"
+fi
+
+# B: system-wide provider table — check for the bracketed-authority
+#    form OR the Provider{...$pkg/.<X>Provider} pattern, both of which
+#    only appear when the system has registered our provider.
+sys_prov=$(adb shell dumpsys package providers 2>/dev/null | tr -d '\r')
+if [ -z "$found_via" ] && echo "$sys_prov" \
+        | grep -E "\[$AUTHORITY\]:|$PKG/\.[A-Za-z]+Provider" >/dev/null; then
+    found_via="dumpsys package providers"
+fi
+
+# C: pm dump fallback (sometimes carries provider info even when the
+#    sectioned dumpsys output omits it).
+pm_dump=$(adb shell pm dump "$PKG" 2>/dev/null | tr -d '\r')
+if [ -z "$found_via" ] && echo "$pm_dump" \
+        | grep -E "\[$AUTHORITY\]:|$PKG/\.[A-Za-z]+Provider|authority=$AUTHORITY" >/dev/null; then
+    found_via="pm dump $PKG"
+fi
+
+if [ -n "$found_via" ]; then
+    ok "<provider authority=$AUTHORITY> registered (visible via $found_via)"
+    # Class-name verification lives in §13 (aapt dump xmltree of the
+    # APK's actual manifest). Don't re-check here — dumpsys formats the
+    # class field inconsistently across Android versions, leading to
+    # noisy false-warns when §13 already confirms the manifest is right.
 else
-    bad "no provider with authority=$AUTHORITY — _inject_aztcollab_provider hook didn't fire"
+    bad "no provider with authority=$AUTHORITY in any system view"
+    echo "    Tried: dumpsys package $PKG, dumpsys package providers, pm dump $PKG"
+    # Dump diagnostic context so we can see WHAT the system thinks of
+    # this package's providers (if anything).
+    echo "    --- dumpsys package $PKG: any 'provider' or 'authority' lines ---"
+    matches=$(echo "$DUMP" | grep -iE 'provider|authorit|aztcollab' | head -20)
+    if [ -n "$matches" ]; then
+        printf '%s\n' "$matches" | sed 's/^/      /'
+    else
+        echo "      (none)"
+    fi
+    echo "    --- dumpsys package providers grep aztcollab ---"
+    aztcollab_in_sys=$(echo "$sys_prov" | grep -i aztcollab | head -10)
+    if [ -n "$aztcollab_in_sys" ]; then
+        printf '%s\n' "$aztcollab_in_sys" | sed 's/^/      /'
+    else
+        echo "      (none — system-wide table doesn't know about this package's providers)"
+    fi
+    echo "    --- last 50 logcat lines mentioning PackageManager + $PKG ---"
+    pm_log=$(adb logcat -d 2>/dev/null \
+        | grep -iE "PackageManager|PackageParser|PackageInstaller|aztcollab" \
+        | tail -50)
+    if [ -n "$pm_log" ]; then
+        printf '%s\n' "$pm_log" | sed 's/^/      /'
+    else
+        echo "      (logcat buffer empty for these tags — try uninstall + install + this script in sequence)"
+    fi
 fi
 
 section "5. direct ContentResolver call"
@@ -169,15 +226,63 @@ section "8. Activity launches"
 adb shell am force-stop $PKG >/dev/null 2>&1 || true
 adb logcat -c >/dev/null 2>&1 || true
 adb shell am start -n $PKG/org.kivy.android.PythonActivity >/dev/null 2>&1
-sleep 3
-crash=$(adb logcat -d 2>&1 | grep -E "FATAL EXCEPTION|$PKG.*has died|Process.*$PKG.*killed" | head -3)
-if [ -n "$crash" ]; then
-    bad "activity crashed:"
-    printf '%s\n' "$crash" | sed 's/^/    /'
-elif adb shell "pidof $PKG || ps -A 2>/dev/null | grep -F $PKG" 2>/dev/null | grep -q .; then
-    ok "process running"
+sleep 4
+log=$(adb logcat -d 2>&1)
+
+# Three independent crash signatures, gathered together so we can show
+# whichever one is actually present (Java stacktrace / Python traceback /
+# bare process-death).
+fatal=$(printf '%s\n' "$log" | grep -A 30 'FATAL EXCEPTION' | head -50)
+# Python tracebacks: capture LOTS of trailing context so we see the
+# actual crash, not just the first non-fatal warning. Kivy logs many
+# benign tracebacks (e.g., logo-copy permission denied) before the
+# real one.
+py_err=$(printf '%s\n' "$log" \
+    | grep -B 1 -A 30 -E 'ModuleNotFoundError|ImportError|AttributeError|RuntimeError|Traceback \(most recent' \
+    | tail -60)
+death=$(printf '%s\n' "$log" | grep -E "$PKG.*has died|Process.*$PKG.*killed|signal.*$PKG" | head -3)
+
+# Last 30 python-tag lines — usually the most diagnostic snapshot of
+# what was happening right before the process died.
+py_tail=$(printf '%s\n' "$log" \
+    | grep -E "^.*[[:space:]][IEDWFV][[:space:]]+python[[:space:]]" \
+    | tail -30)
+
+# python tag at E severity specifically.
+py_log=$(printf '%s\n' "$log" \
+    | grep -E "^.*[[:space:]]E[[:space:]]+python" \
+    | head -10)
+
+# Process dead AND no recognized error pattern? Show the python tail
+# so the user sees the last thing that happened before the process died.
+proc_alive=$(adb shell "pidof $PKG" 2>/dev/null | tr -d '\r')
+
+if [ -n "$fatal" ] || [ -n "$death" ] || [ -z "$proc_alive" ]; then
+    bad "activity didn't reach a running steady state"
+    if [ -n "$fatal" ]; then
+        echo "    --- Java FATAL EXCEPTION ---"
+        printf '%s\n' "$fatal" | sed 's/^/    /'
+    fi
+    if [ -n "$py_err" ]; then
+        echo "    --- Python error(s) (last in window) ---"
+        printf '%s\n' "$py_err" | sed 's/^/    /'
+    fi
+    if [ -n "$py_tail" ]; then
+        echo "    --- last 30 python-tagged log lines ---"
+        printf '%s\n' "$py_tail" | sed 's/^/    /'
+    fi
+    if [ -n "$death" ]; then
+        echo "    --- process death ---"
+        printf '%s\n' "$death" | sed 's/^/    /'
+    fi
+    if [ -z "$fatal" ] && [ -z "$py_err" ] && [ -z "$py_tail" ] && [ -z "$death" ]; then
+        echo "    No diagnostic markers caught. Manual capture:"
+        echo "      adb logcat -c"
+        echo "      adb shell am start -n $PKG/org.kivy.android.PythonActivity"
+        echo "      adb logcat AndroidRuntime:E python:* '*:S'"
+    fi
 else
-    hmm "process not running but no crash logged — may have exited cleanly"
+    ok "process running (pid $proc_alive)"
 fi
 
 section "9. Source-tree symlinks (only meaningful from a source checkout)"
@@ -221,28 +326,123 @@ else
     fi
 fi
 
-section "11. Build hook traces (last buildlog at /tmp/buildlog.txt)"
+section "11. Build hook traces (informational — supplements §10)"
+# §10 is the authoritative answer for whether the hook ran. §11 only adds
+# context if /tmp/buildlog.txt happens to be a fresh tee of the last build.
+# Always informational (never FAIL); section 10's verdict is what counts.
 BUILDLOG=/tmp/buildlog.txt
 if [ ! -f "$BUILDLOG" ]; then
-    hmm "no $BUILDLOG. Re-run with: 'buildozer android debug 2>&1 | tee /tmp/buildlog.txt'"
+    echo "  no $BUILDLOG — re-run with 'buildozer android debug 2>&1 | tee /tmp/buildlog.txt' if you want hook traces here"
 else
-    hook_lines=$(grep -E "Hook: (execute|ignore) (before_apk_build|before_apk_assemble|after_apk_build|before_apk_assemble|after_apk_assemble)|inject_aztcollab|aztcollab-provider-injection|^\[hook\]" "$BUILDLOG" 2>/dev/null)
-    if [ -z "$hook_lines" ]; then
-        bad "no hook traces in $BUILDLOG — p4a's --hook= arg may not be reaching the apk() phase"
+    # Compare buildlog age vs. dist manifest age. If the buildlog is older
+    # than the manifest, the buildlog is from a previous build and any
+    # absence of hook traces is meaningless.
+    if [ -n "$DIST_MANIFEST" ] && [ -f "$DIST_MANIFEST" ] \
+            && [ "$BUILDLOG" -ot "$DIST_MANIFEST" ]; then
+        echo "  $BUILDLOG is older than the dist manifest — likely stale from an earlier build; skipping"
     else
-        # Just count what we found; print the unique kinds.
-        echo "$hook_lines" | sed 's/^/    /' | head -20
-        if echo "$hook_lines" | grep -q "Hook: execute before_apk_assemble"; then
-            ok "before_apk_assemble fired"
+        hook_lines=$(grep -E "Hook: (execute|ignore) (before_apk_build|before_apk_assemble|after_apk_build|after_apk_assemble)|inject_aztcollab|aztcollab-provider-injection|^\[hook\]" "$BUILDLOG" 2>/dev/null)
+        if [ -z "$hook_lines" ]; then
+            echo "  no hook traces in $BUILDLOG — odd if §10 passed; otherwise expected"
         else
-            bad "before_apk_assemble never fired — _inject_aztcollab_provider couldn't run"
+            echo "$hook_lines" | sed 's/^/    /' | head -20
         fi
-        if echo "$hook_lines" | grep -q "injected AZTCollabProvider"; then
-            ok "provider injection ran successfully"
-        elif echo "$hook_lines" | grep -q "already has aztcollab provider"; then
-            ok "provider already injected (re-run skip)"
-        elif echo "$hook_lines" | grep -q "skipping aztcollab provider"; then
-            bad "provider injection skipped — see preceding line for reason"
+    fi
+fi
+
+section "12. Installed APK matches the freshest build artifact"
+# Compares the installed APK's hash to the newest debug APK in bin/.
+# Catches "I rebuilt but forgot to adb install" — the most common
+# silent regression after a manifest/hook fix.
+fresh_apk=$(ls -t "$SCRIPT_DIR"/bin/aztcollab-*-debug.apk 2>/dev/null | head -1)
+if [ -z "$fresh_apk" ] || [ ! -f "$fresh_apk" ]; then
+    hmm "no APK in $SCRIPT_DIR/bin/aztcollab-*-debug.apk — can't compare"
+else
+    installed_md5=$(adb shell md5sum "$apk_path" 2>/dev/null | awk '{print $1}' | tr -d '\r')
+    fresh_md5=$(md5sum "$fresh_apk" 2>/dev/null | awk '{print $1}')
+    if [ -z "$installed_md5" ] || [ -z "$fresh_md5" ]; then
+        hmm "couldn't compute md5 of one or both APKs"
+    elif [ "$installed_md5" = "$fresh_md5" ]; then
+        ok "installed APK matches $(basename "$fresh_apk")"
+    else
+        bad "installed APK is STALE — does not match $(basename "$fresh_apk")"
+        echo "        adb install -r '$fresh_apk'"
+        echo "        bash $0   # then re-run"
+    fi
+fi
+
+section "13. Installed APK's actual manifest (authoritative)"
+# Pulls the live APK and uses aapt to inspect its embedded manifest.
+# Resolves the disagreement when §10 says "dist manifest patched"
+# but §4 says "no provider visible to dumpsys". If the APK manifest
+# itself lacks the provider, gradle is reading a different manifest
+# than the one our hook patches (see §14, §15).
+aapt_bin=$(command -v aapt 2>/dev/null || command -v aapt2 2>/dev/null || true)
+if [ -z "$aapt_bin" ]; then
+    hmm "neither aapt nor aapt2 on PATH — can't introspect APK manifest"
+elif [ -z "${tmp:-}" ] || [ ! -s "$tmp" ]; then
+    hmm "APK not pulled (§6 may have failed); skipping"
+else
+    if [ "$(basename "$aapt_bin")" = "aapt2" ]; then
+        manifest_text=$("$aapt_bin" dump xmltree --file AndroidManifest.xml "$tmp" 2>/dev/null)
+    else
+        manifest_text=$("$aapt_bin" dump xmltree "$tmp" AndroidManifest.xml 2>/dev/null)
+    fi
+    if [ -z "$manifest_text" ]; then
+        hmm "$aapt_bin produced no output — manifest unreadable"
+    elif printf '%s' "$manifest_text" \
+            | awk '/E: provider/{p=1} p{print} p && /^[[:space:]]*E:/ && !/E: provider/{exit}' \
+            | grep -q "$AUTHORITY"; then
+        ok "<provider authorities=\"$AUTHORITY\"> is in the APK's own manifest"
+        echo "    (so §4's dumpsys FAIL is misleading — provider IS in the APK)"
+    else
+        bad "no <provider> for $AUTHORITY in the APK's manifest"
+        echo "    The dist manifest had it (§10) but gradle didn't bundle it."
+        echo "    See §14 and §15 for which manifest gradle is actually reading."
+    fi
+fi
+
+section "14. All AndroidManifest*.xml in the dist (which carry the patch?)"
+if [ -z "${DIST_MANIFEST:-}" ]; then
+    hmm "no dist dir resolved earlier; skipping"
+else
+    DIST_DIR=$(dirname "$DIST_MANIFEST")
+    found=0
+    while IFS= read -r m; do
+        found=1
+        if grep -q 'aztcollab-provider-injection' "$m" 2>/dev/null; then
+            mark="patched"
+        else
+            mark="UNPATCHED"
+        fi
+        if grep -q '<provider' "$m" 2>/dev/null; then
+            prov="<provider>"
+        else
+            prov="no <provider>"
+        fi
+        echo "    [$mark / $prov] $m"
+    done < <(find "$DIST_DIR" -name "AndroidManifest*.xml" 2>/dev/null)
+    [ "$found" -eq 0 ] && hmm "no AndroidManifest*.xml found under $DIST_DIR"
+    echo "    A row marked UNPATCHED is a candidate for the file gradle reads instead."
+fi
+
+section "15. Gradle manifest source (where gradle is configured to read)"
+if [ -z "${DIST_MANIFEST:-}" ]; then
+    hmm "no dist dir resolved earlier; skipping"
+else
+    DIST_DIR=$(dirname "$DIST_MANIFEST")
+    GRADLE="$DIST_DIR/build.gradle"
+    if [ ! -f "$GRADLE" ]; then
+        hmm "no build.gradle at $GRADLE"
+    else
+        echo "    $GRADLE:"
+        matches=$(grep -nE 'manifest|srcFile|sourceSets' "$GRADLE" 2>/dev/null)
+        if [ -n "$matches" ]; then
+            echo "$matches" | sed 's/^/      /'
+        else
+            echo "      (no explicit manifest/srcFile config — gradle uses default 'src/main/AndroidManifest.xml')"
+            echo "      That likely points at $DIST_DIR/src/main/AndroidManifest.xml,"
+            echo "      not $DIST_MANIFEST."
         fi
     fi
 fi
