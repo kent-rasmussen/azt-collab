@@ -18,6 +18,7 @@ daemon is auto-spawned on first call.
 """
 
 import datetime
+import os
 import threading
 import webbrowser
 
@@ -25,14 +26,17 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp, sp
+from kivy.properties import StringProperty
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+
+import azt_collab_client
+from azt_collab_client.ui import theme
 
 import azt_collabd
 from azt_collabd.status import AuthError
 from azt_collab_client import (
     get_credentials_status,
     is_online,
-    list_projects,
     mark_github_app_installed,
     save_github_tokens,
     save_gitlab_credentials,
@@ -41,22 +45,42 @@ from azt_collab_client import (
 )
 
 
+_AZT_ICON = os.path.join(
+    os.path.dirname(azt_collab_client.__file__), 'azt.png')
+
+
 KV = '''
+#:import T azt_collab_client.ui.theme
+
 <RootSM>:
-    transition: SlideTransition()
     SettingsScreen:
         name: 'settings'
     GitHubConnectScreen:
         name: 'github'
     GitLabFormScreen:
         name: 'gitlab'
-    ProjectsScreen:
-        name: 'projects'
 
 <NavBar@BoxLayout>:
     size_hint_y: None
     height: dp(48)
     spacing: dp(10)
+
+<RecBtn@Button>:
+    normal_color: T.ACCENT
+    size_hint_y: None
+    height: dp(52)
+    background_color: T.TRANSPARENT
+    background_normal: ''
+    canvas.before:
+        Color:
+            rgba: self.normal_color or T.ACCENT
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    color: 1, 1, 1, 1
+    font_size: sp(16)
+    bold: True
 
 <HeaderLabel@Label>:
     font_size: sp(20)
@@ -120,9 +144,6 @@ KV = '''
             Button:
                 text: 'Refresh'
                 on_release: root.refresh()
-            Button:
-                text: 'Projects'
-                on_release: app.go('projects')
 
 <GitHubConnectScreen>:
     BoxLayout:
@@ -202,23 +223,6 @@ KV = '''
                 text: 'Back'
                 on_release: app.go('settings')
 
-<ProjectsScreen>:
-    BoxLayout:
-        orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(10)
-        HeaderLabel:
-            text: 'Projects'
-        BodyLabel:
-            id: list_label
-            text: 'Loading...'
-        NavBar:
-            Button:
-                text: 'Refresh'
-                on_release: root.refresh()
-            Button:
-                text: 'Settings'
-                on_release: app.go('settings')
 '''
 
 
@@ -230,20 +234,31 @@ class RootSM(ScreenManager):
 
 class SettingsScreen(Screen):
     def on_enter(self):
-        self.refresh()
+        # Defer to next frame: on_enter can fire before the KV rule's
+        # nested BoxLayout children have all been added to ``self.ids``
+        # on Kivy >= 2.3, which raises a confusing
+        # "'super' object has no attribute '__getattr__'" from
+        # ObservableDict when a key is missing.
+        Clock.schedule_once(lambda *_: self.refresh(), 0)
 
     def refresh(self):
         try:
             status = get_credentials_status()
             online = is_online()
         except Exception as ex:
-            self.ids.status_label.text = f'Error: {ex}'
+            label = self.ids.get('status_label')
+            if label is not None:
+                label.text = f'Error: {ex}'
             return
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
         host = status.get('host', 'github')
-        self.ids.host_github_btn.disabled = (host == 'github')
-        self.ids.host_gitlab_btn.disabled = (host == 'gitlab')
+        gh_btn = self.ids.get('host_github_btn')
+        gl_btn = self.ids.get('host_gitlab_btn')
+        if gh_btn is not None:
+            gh_btn.disabled = (host == 'github')
+        if gl_btn is not None:
+            gl_btn.disabled = (host == 'gitlab')
         lines = [
             f"Online:   {'yes' if online else 'no'}",
             "",
@@ -395,42 +410,23 @@ class GitLabFormScreen(Screen):
         self.ids.gl_msg.text = f'Saved for {u}.'
 
 
-# ── Projects ────────────────────────────────────────────────────────────────
-
-class ProjectsScreen(Screen):
-    def on_enter(self):
-        self.refresh()
-
-    def refresh(self):
-        try:
-            projects = list_projects()
-        except Exception as ex:
-            self.ids.list_label.text = f'Error: {ex}'
-            return
-        if not projects:
-            self.ids.list_label.text = 'No projects registered yet.'
-            return
-        rows = []
-        for p in projects:
-            rows.append(f'{p.langcode}')
-            rows.append(f'  path:   {p.working_dir}')
-            if p.remote_url:
-                rows.append(f'  remote: {p.remote_url}')
-            if p.last_sync:
-                ts = datetime.datetime.fromtimestamp(p.last_sync)
-                rows.append(f'  last sync: {ts:%Y-%m-%d %H:%M}')
-            rows.append('')
-        self.ids.list_label.text = '\n'.join(rows).rstrip()
-
-
 # ── App ─────────────────────────────────────────────────────────────────────
 
 class CollabUIApp(App):
+    """Standalone collab settings UI. Credentials, host toggle, and
+    GitHub/GitLab connect screens. Project picking lives in its own
+    helper subprocess (`python -m azt_collabd projects`); see
+    azt_collabd/ui/picker_app.py."""
+
     title = 'A-Z+T Collab'
+    subtitle = StringProperty('Settings')
+    icon = StringProperty(_AZT_ICON)
+    version_string = StringProperty(f'collab {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}')
 
     def build(self):
+        theme.set_theme('Ocean')
         Builder.load_string(KV)
-        self.sm = RootSM()
+        self.sm = RootSM(transition=SlideTransition())
         return self.sm
 
     def go(self, name):

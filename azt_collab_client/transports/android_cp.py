@@ -1,18 +1,17 @@
 """
 Android ContentProvider transport.
 
-Discovery: enumerates installed ContentProviders, picks ones whose
-authority ends in ``.aztcollab``, and pings each via
-``ContentResolver.call(uri, "ping", null, null)`` until one responds.
-The first responder wins (multiple providers all read the same
-``$AZT_HOME``, so it doesn't matter which serves the call).
+Discovery: probes the single canonical server-APK authority
+``org.atoznback.aztcollab``. If the server APK is installed and
+responding to ``ping``, the transport binds to it. Otherwise
+``discover()`` returns None and the client surfaces an install
+prompt — there is no peer-hosted fallback (cleanup-draft #3).
 
 Auth: relies on Android signature-level <permission>. Anything that
 reaches this code already passed the install-time signature check;
 the transport just funnels JSON through ``call(method, arg, extras)``.
 
 This transport is only constructible on Android (pyjnius required).
-``pick_transport()`` falls back to LoopbackTransport everywhere else.
 """
 
 import json
@@ -20,12 +19,12 @@ import json
 from . import Transport, ServerUnavailable
 
 
-_AUTHORITY_SUFFIX = '.aztcollab'
+CANONICAL_AUTHORITY = 'org.atoznback.aztcollab'
 
 
 def discover():
-    """Return an AndroidContentProviderTransport bound to the first
-    matching authority, or None if nothing answers."""
+    """Return an AndroidContentProviderTransport bound to the canonical
+    server-APK authority if it answers ``ping``, else None."""
     try:
         from jnius import autoclass
     except ImportError:
@@ -36,27 +35,17 @@ def discover():
         activity = PythonActivity.mActivity
         if activity is None:
             return None
-        pm = activity.getPackageManager()
         resolver = activity.getContentResolver()
-        # 0 here = PackageManager.GET_META_DATA off; we just need authorities.
-        providers = pm.queryContentProviders(None, 0, 0)
-        if providers is None:
+        uri = Uri.parse(f'content://{CANONICAL_AUTHORITY}/v1/health')
+        try:
+            bundle = resolver.call(uri, 'ping', None, None)
+        except Exception:
             return None
-        for i in range(providers.size()):
-            info = providers.get(i)
-            authority = info.authority
-            if authority is None or not authority.endswith(_AUTHORITY_SUFFIX):
-                continue
-            uri = Uri.parse(f'content://{authority}/v1/health')
-            try:
-                bundle = resolver.call(uri, 'ping', None, None)
-                if bundle is not None:
-                    return AndroidContentProviderTransport(authority)
-            except Exception:
-                continue
+        if bundle is None:
+            return None
+        return AndroidContentProviderTransport(CANONICAL_AUTHORITY)
     except Exception:
         return None
-    return None
 
 
 class AndroidContentProviderTransport(Transport):

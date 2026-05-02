@@ -1,0 +1,23 @@
+<!--
+  Manifest extras for the AZT Collaboration service APK.
+
+  Content of this file is splice into the generated AndroidManifest.xml
+  at top-level under <manifest>, BEFORE <application> (per p4a's
+  AndroidManifest.tmpl.xml line 39). So only top-level elements are
+  legal here — no <application>, no <provider>, no <activity>.
+
+  The <provider> that this APK exports lives inside <application> and
+  is injected post-render by p4a_hook.py's
+  _inject_aztcollab_provider step (gated on dist_name == 'aztcollab',
+  so peer APKs don't accidentally inherit it).
+
+  The <permission> below defines the suite's signature-level
+  permission. Every peer APK <uses-permission>s it; only this APK
+  <permission>-defines it. Without this declaration, peers requesting
+  AZT_COLLAB_ACCESS get silently denied at install time and can never
+  reach the provider.
+-->
+
+<permission
+    android:name="org.atoznback.AZT_COLLAB_ACCESS"
+    android:protectionLevel="signature" />

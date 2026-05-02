@@ -29,6 +29,7 @@ import socketserver
 import sys
 import threading
 
+from . import config as _config
 from . import projects
 from . import scheduler
 from . import store
@@ -37,8 +38,7 @@ from .paths import azt_home, server_info_path
 from .repo import sync_repo as _sync_repo, repo_status_summary as _repo_status
 from .status import Result, Status
 from . import status as S
-
-_VERSION = "0.6.0"
+from . import __version__ as _VERSION
 
 # Kept alive for the server's lifetime so the flock on server.lock stays held.
 _server_lock_fd = None
@@ -176,6 +176,143 @@ def _h_credentials_status(_body):
     return 200, {"ok": True, **store.get_status()}
 
 
+def _h_github_install_url(_body):
+    """Return the configured GitHub App install URL (canonical source is
+    azt_collabd.config). Peers use this so they don't have to import
+    daemon internals just to send the user to install the App."""
+    from . import config as _config
+    try:
+        url = _config.install_url()
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "url": url}
+
+
+def _h_github_client_id(_body):
+    """Return the configured GitHub App client_id."""
+    from . import config as _config
+    try:
+        client_id = _config.get().get('client_id', '')
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "client_id": client_id}
+
+
+# ── GitHub App device flow (server-driven) ────────────────────────────
+#
+# Peers used to import ``device_flow_start`` / ``device_flow_poll`` from
+# ``azt_collabd.auth`` and run the whole flow in their own process. Now
+# the server owns the flow: the peer kicks it off, polls a job-style
+# status endpoint, and the server (a) hands back the user_code right
+# away, then (b) polls GitHub itself, and on success writes tokens
+# into the credentials store. The peer never touches a token.
+
+_device_flow_jobs = {}   # job_id -> dict
+_device_flow_lock = threading.Lock()
+
+
+def _device_flow_finalize(job_id, token_data):
+    """Save tokens to the store, look up the username, check whether
+    the GitHub App is installed, and mark the job DONE."""
+    from . import auth as _auth
+    access_token = token_data.get('access_token', '')
+    username = ''
+    app_installed = False
+    try:
+        username = _auth.get_github_username(access_token) or ''
+    except Exception:
+        username = ''
+    try:
+        store.set_github_tokens(
+            access_token=access_token,
+            refresh_token=token_data.get('refresh_token', ''),
+            username=username,
+        )
+    except Exception:
+        pass
+    try:
+        app_installed = bool(
+            _auth.check_app_installed(access_token).get('installed', False))
+        store.set_github_app_installed(app_installed)
+    except Exception:
+        app_installed = False
+    with _device_flow_lock:
+        job = _device_flow_jobs.get(job_id)
+        if job is not None:
+            job.update({
+                'state': 'DONE',
+                'username': username,
+                'app_installed': app_installed,
+            })
+
+
+def _device_flow_worker(job_id, device_code, interval, expires_in):
+    from . import auth as _auth
+    try:
+        token_data = _auth.device_flow_poll(
+            device_code, interval=interval, expires_in=expires_in)
+    except _auth.AuthError as ex:
+        with _device_flow_lock:
+            job = _device_flow_jobs.get(job_id)
+            if job is not None:
+                job.update({'state': 'FAILED',
+                            'error': ex.status.code,
+                            'error_params': ex.status.params})
+        return
+    except Exception as ex:
+        with _device_flow_lock:
+            job = _device_flow_jobs.get(job_id)
+            if job is not None:
+                job.update({'state': 'FAILED', 'error': str(ex)})
+        return
+    _device_flow_finalize(job_id, token_data)
+
+
+def _h_github_device_flow_start(_body):
+    """Begin device flow. Returns the user_code to display, the
+    verification URI to open, an expiry, and a job_id the peer should
+    poll."""
+    from . import auth as _auth
+    try:
+        resp = _auth.device_flow_start()
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    job_id = secrets.token_hex(8)
+    interval = int(resp.get('interval', 5))
+    expires_in = int(resp.get('expires_in', 900))
+    with _device_flow_lock:
+        _device_flow_jobs[job_id] = {
+            'state': 'POLLING',
+            'username': '',
+            'app_installed': False,
+            'error': '',
+            'error_params': {},
+        }
+    t = threading.Thread(
+        target=_device_flow_worker,
+        args=(job_id, resp.get('device_code', ''), interval, expires_in),
+        daemon=True,
+    )
+    t.start()
+    return 200, {
+        "ok": True,
+        "job_id": job_id,
+        "user_code": resp.get('user_code', ''),
+        "verification_uri": resp.get(
+            'verification_uri', 'https://github.com/login/device'),
+        "expires_in": expires_in,
+        "interval": interval,
+    }
+
+
+def _h_github_device_flow_status(job_id, _body):
+    with _device_flow_lock:
+        job = _device_flow_jobs.get(job_id)
+        if job is None:
+            return 404, {"ok": False, "error": "job_not_found"}
+        return 200, {"ok": True, **job}
+
+
 def _h_set_host(body):
     host = body.get('host', '')
     if host not in ('github', 'gitlab'):
@@ -229,6 +366,161 @@ def _h_get_project(langcode, _body):
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
     return 200, {"ok": True, "project": p.to_dict()}
+
+
+def _h_derive_langcode(body):
+    """Compute a langcode for a working dir / LIFT path. Pure function;
+    just exposes ``projects.derive_langcode`` to peers so they don't
+    have to import daemon internals to register a project."""
+    working_dir = body.get('working_dir', '')
+    lift_path = body.get('lift_path', '')
+    if not working_dir:
+        return 400, {"ok": False, "error": "missing_working_dir"}
+    return 200, {"ok": True,
+                 "langcode": projects.derive_langcode(
+                     working_dir, lift_path)}
+
+
+def _h_init_project(body):
+    """Initialize a git repo at *working_dir*, set the remote, and push.
+    Server uses store-resident credentials — peers do not pass tokens."""
+    from .repo import init_repo as _init_repo
+    working_dir = body.get('working_dir', '')
+    remote_url = body.get('remote_url', '')
+    branch = body.get('branch', 'main')
+    contributor = body.get('contributor', 'Recorder')
+    if not working_dir or not remote_url:
+        return 400, {"ok": False,
+                     "error": "missing_working_dir_or_remote_url"}
+    git_user, token = store.get_sync_credentials()
+    if not token:
+        return 200, {"ok": True,
+                     "result": Result().add(S.AUTH_REQUIRED).to_dict()}
+    try:
+        result = _init_repo(working_dir, remote_url, git_user, token,
+                            branch, contributor)
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+# Clone is run as a job so the peer can poll progress lines without the
+# HTTP request hanging for the whole download.
+_clone_jobs = {}
+_clone_lock = threading.Lock()
+
+
+def _clone_worker(job_id, remote_url, dest_dir, username, token,
+                  retry_anonymous_on_auth_fail=True):
+    from .repo import clone_repo as _clone_repo
+
+    def _on_progress(line):
+        with _clone_lock:
+            job = _clone_jobs.get(job_id)
+            if job is not None:
+                job['progress'].append(line)
+                # Cap history so a chatty repo doesn't grow unbounded.
+                if len(job['progress']) > 500:
+                    del job['progress'][:-500]
+
+    try:
+        lift_path, result = _clone_repo(
+            remote_url, dest_dir, username, token, on_progress=_on_progress)
+        if not lift_path and retry_anonymous_on_auth_fail:
+            looks_auth = False
+            for st in result.statuses:
+                msg = (st.params.get('error', '') or '').lower()
+                if st.code == 'CLONE_FAILED' and (
+                        'credential' in msg or 'auth' in msg):
+                    looks_auth = True
+                    break
+            if looks_auth:
+                lift_path, result = _clone_repo(
+                    remote_url, dest_dir, '', '',
+                    on_progress=_on_progress)
+        with _clone_lock:
+            job = _clone_jobs.get(job_id)
+            if job is not None:
+                job.update({
+                    'state': 'DONE',
+                    'lift_path': lift_path or '',
+                    'result': result.to_dict(),
+                })
+    except Exception as ex:
+        with _clone_lock:
+            job = _clone_jobs.get(job_id)
+            if job is not None:
+                job.update({'state': 'FAILED', 'error': str(ex)})
+
+
+def _h_create_project_from_template(body):
+    template_url = (body.get('template_url') or '').strip()
+    vernlang = (body.get('vernlang') or '').strip()
+    dest_dir = (body.get('dest_dir') or '').strip()
+    if not vernlang or not dest_dir:
+        return 400, {"ok": False,
+                     "error": "missing_vernlang_or_dest_dir"}
+    if not template_url:
+        template_url = _config.default_template_url()
+    try:
+        p = projects.create_from_template(
+            template_url, vernlang, dest_dir)
+    except (ValueError, RuntimeError) as ex:
+        return 400, {"ok": False, "error": str(ex)}
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "project": p.to_dict()}
+
+
+def _h_clone_project(body):
+    remote_url = body.get('remote_url', '')
+    dest_dir = body.get('dest_dir', '')
+    if not remote_url or not dest_dir:
+        return 400, {"ok": False,
+                     "error": "missing_remote_url_or_dest_dir"}
+    git_user, token = store.get_sync_credentials()
+    job_id = secrets.token_hex(8)
+    with _clone_lock:
+        _clone_jobs[job_id] = {
+            'state': 'CLONING',
+            'progress': [],
+            'lift_path': '',
+            'result': None,
+            'error': '',
+        }
+    t = threading.Thread(
+        target=_clone_worker,
+        args=(job_id, remote_url, dest_dir, git_user, token),
+        daemon=True,
+    )
+    t.start()
+    return 200, {"ok": True, "job_id": job_id}
+
+
+def _h_clone_status(job_id, body):
+    """Return the current state plus *new* progress lines since
+    ``last_index`` (caller-tracked). Defaults to all-so-far on first call."""
+    last_index = 0
+    try:
+        last_index = int(body.get('last_index', 0)) if body else 0
+    except (TypeError, ValueError):
+        last_index = 0
+    with _clone_lock:
+        job = _clone_jobs.get(job_id)
+        if job is None:
+            return 404, {"ok": False, "error": "job_not_found"}
+        progress = job['progress']
+        new_lines = progress[last_index:] if last_index < len(progress) \
+            else []
+        return 200, {
+            "ok": True,
+            "state": job.get('state', 'CLONING'),
+            "progress": new_lines,
+            "next_index": len(progress),
+            "lift_path": job.get('lift_path', ''),
+            "result": job.get('result'),
+            "error": job.get('error', ''),
+        }
 
 
 def _h_register_project(body):
@@ -325,6 +617,14 @@ def dispatch(method, path, body):
             return _h_online(body)
         if path == '/v1/credentials/status':
             return _h_credentials_status(body)
+        if path == '/v1/credentials/github/install_url':
+            return _h_github_install_url(body)
+        if path == '/v1/credentials/github/client_id':
+            return _h_github_client_id(body)
+        if path.startswith('/v1/credentials/github/device_flow/'):
+            parts = path.split('/')
+            if len(parts) == 6 and parts[5]:
+                return _h_github_device_flow_status(parts[5], body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -342,6 +642,8 @@ def dispatch(method, path, body):
     if method == 'POST':
         if path == '/v1/credentials/host':
             return _h_set_host(body)
+        if path == '/v1/credentials/github/device_flow/start':
+            return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':
             return _h_set_github_tokens(body)
         if path == '/v1/credentials/github/app_installed':
@@ -352,6 +654,18 @@ def dispatch(method, path, body):
             return _h_migrate_from_prefs(body)
         if path == '/v1/projects/register':
             return _h_register_project(body)
+        if path == '/v1/projects/derive_langcode':
+            return _h_derive_langcode(body)
+        if path == '/v1/projects/init':
+            return _h_init_project(body)
+        if path == '/v1/projects/from_template':
+            return _h_create_project_from_template(body)
+        if path == '/v1/projects/clone':
+            return _h_clone_project(body)
+        if path.startswith('/v1/projects/clone/'):
+            parts = path.split('/')
+            if len(parts) == 5 and parts[4]:
+                return _h_clone_status(parts[4], body)
         if path.startswith('/v1/projects/'):
             parts = path.split('/')
             if len(parts) == 5 and parts[4] == 'sync':

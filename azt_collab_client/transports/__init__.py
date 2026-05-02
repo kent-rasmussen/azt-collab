@@ -45,23 +45,24 @@ def _on_android():
 
 
 def pick_transport():
-    """Return the best transport for this platform. Cached after the
-    first call. Use ``reset()`` to force re-discovery."""
+    """Return the right transport for this platform. Cached after the
+    first call. Use ``reset()`` to force re-discovery.
+
+    On Android: bind to the standalone server APK's ContentProvider
+    or raise ``ServerUnavailable`` (no loopback fallback — there is
+    no Python interpreter to spawn).
+
+    Off Android: loopback HTTP, with auto-spawn of the daemon."""
     global _transport
     if _transport is not None:
         return _transport
     if _on_android():
-        # Probe sibling AZT suite apps' exported ContentProviders.
-        # Anything signed with the suite key qualifies; first responder
-        # wins. Falls back to loopback if no provider is reachable.
-        try:
-            from . import android_cp
-            cp = android_cp.discover()
-            if cp is not None:
-                _transport = cp
-                return _transport
-        except Exception:
-            pass
+        from . import android_cp
+        cp = android_cp.discover()
+        if cp is None:
+            raise ServerUnavailable('server_apk_not_installed')
+        _transport = cp
+        return _transport
     from .loopback import LoopbackTransport
     _transport = LoopbackTransport()
     return _transport
@@ -76,3 +77,9 @@ def reset():
         except Exception:
             pass
     _transport = None
+
+
+def current_transport_name():
+    """Name of whichever transport ``pick_transport`` last returned, or
+    ``''`` if no call has been made yet. Diagnostic only."""
+    return _transport.name if _transport is not None else ''

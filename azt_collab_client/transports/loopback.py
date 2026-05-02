@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 
 from . import Transport, ServerUnavailable
+from .._spawn import build_spawn_env
 from ..paths import server_info_path
 
 
@@ -137,6 +138,7 @@ class LoopbackTransport(Transport):
                     'stderr': subprocess.DEVNULL,
                     'stdin': subprocess.DEVNULL,
                     'close_fds': True,
+                    'env': build_spawn_env(),
                 }
                 if hasattr(os, 'setsid'):
                     kwargs['start_new_session'] = True

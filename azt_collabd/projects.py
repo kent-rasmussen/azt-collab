@@ -174,6 +174,55 @@ def derive_remote_url(working_dir):
         return ''
 
 
+def create_from_template(template_url, vernlang, dest_dir,
+                         timeout=60, size_cap=10 * 1024 * 1024):
+    """Download a LIFT template and register it as a project.
+
+    Returns the resulting Project. ``size_cap`` (default 10 MiB) defends
+    against accidentally pulling a giant repo via a misconfigured URL —
+    the SILCAWL template is ~200 KB, so this is plenty of head-room.
+
+    Raises ``ValueError`` for missing args, ``RuntimeError`` for download
+    failures.
+    """
+    import urllib.request
+
+    if not template_url:
+        raise ValueError('template_url required')
+    if not vernlang:
+        raise ValueError('vernlang required')
+    if not dest_dir:
+        raise ValueError('dest_dir required')
+
+    project_dir = os.path.abspath(dest_dir)
+    os.makedirs(project_dir, exist_ok=True)
+    lift_path = os.path.join(project_dir, f'{vernlang}.lift')
+
+    req = urllib.request.Request(template_url)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        content = resp.read(size_cap + 1)
+    if len(content) > size_cap:
+        raise RuntimeError(
+            f'template exceeds size cap ({size_cap} bytes)')
+    if len(content) < 50:
+        raise RuntimeError(
+            f'template download too small ({len(content)} bytes)')
+    fd, tmp = tempfile.mkstemp(prefix='.template.', suffix='.lift',
+                               dir=project_dir)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(content)
+        os.replace(tmp, lift_path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+    return register(vernlang, project_dir, lift_path=lift_path)
+
+
 def derive_langcode(working_dir, lift_path=''):
     """Pick a langcode for a working_dir by this priority:
         1. git remote repo name (last path segment, .git stripped)

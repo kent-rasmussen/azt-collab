@@ -1,0 +1,31 @@
+<!--
+  Canonical AndroidManifest extras for any AZT-suite PEER app.
+
+  Sister apps symlink this file in alongside their other shared bits
+  (azt_collab_client/, examples/, android/) and reference it from
+  buildozer.spec:
+
+      android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
+
+  where manifest_extras.xml is the symlink to this file.
+
+  Spliced at top-level under <manifest>, before <application>, by
+  p4a's extra-manifest-xml mechanism (buildozer key:
+  android.extra_manifest_xml). Only top-level elements belong here.
+
+  The <queries> block is required on Android 11+: without it,
+  PackageManager lookups can't see the standalone server APK
+  (org.atoznback.aztcollab) due to package-visibility restrictions,
+  so azt_collab_client.transports.android_cp.discover() reports the
+  server as unavailable even when it's installed.
+
+  Do NOT declare <permission> or <provider> here — both are owned by
+  the server APK (azt-collab/server_apk/manifest_extras.xml +
+  p4a_hook.py:_inject_aztcollab_provider). The <uses-permission> for
+  AZT_COLLAB_ACCESS comes from each peer's `android.permissions` line
+  in buildozer.spec, not from this file.
+-->
+
+<queries>
+    <package android:name="org.atoznback.aztcollab" />
+</queries>

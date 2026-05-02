@@ -17,6 +17,8 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
+__version__ = "0.10.2"
+
 from . import config
 from . import net
 from . import auth

@@ -23,6 +23,15 @@ def set_translator(fn):
     _tr = fn
 
 
+def tr(msg):
+    """Module-level wrapper that always delegates to the current ``_tr``.
+
+    Useful for KV ``#:import`` so subsequent ``set_translator`` calls
+    take effect (KV imports bind once; importing this wrapper instead
+    of ``_tr`` makes the indirection explicit)."""
+    return _tr(msg)
+
+
 def _fmt(template, params):
     try:
         return template.format(**params)
