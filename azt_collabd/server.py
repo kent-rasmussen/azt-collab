@@ -475,6 +475,22 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
             if (not had_token) or _clone_error_looks_like_auth(result):
                 result.add(S.CLONE_AUTH_REQUIRED, host=host)
 
+        # Auto-register on success so later list_projects /
+        # sync_project / project_status calls find this clone in the
+        # registry. Best-effort: a registry write failure shouldn't
+        # mark the whole clone as failed (the working tree is on
+        # disk; a future explicit register_project call recovers).
+        if lift_path:
+            try:
+                langcode = projects.derive_langcode(dest_dir, lift_path)
+                projects.register(langcode, dest_dir,
+                                  lift_path=lift_path,
+                                  remote_url=remote_url)
+            except Exception as ex:
+                print(f'[server] clone auto-register failed: '
+                      f'{type(ex).__name__}: {ex}',
+                      file=sys.stderr, flush=True)
+
         with _clone_lock:
             job = _clone_jobs.get(job_id)
             if job is not None:

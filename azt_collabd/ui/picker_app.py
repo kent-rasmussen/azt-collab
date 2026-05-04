@@ -65,6 +65,33 @@ _AZT_ICON = os.path.join(
     os.path.dirname(azt_collab_client.__file__), 'azt.png')
 
 
+# AZTCollabProvider authority — keep in sync with the value declared
+# in azt_collab_client/transports/android_cp.py and in
+# server_apk/manifest_extras.xml / p4a_hook.py.
+_PROVIDER_AUTHORITY = 'org.atoznback.aztcollab'
+
+
+def _to_content_uri(abs_path, home_dir):
+    """Translate an absolute lift-file path under
+    ``$AZT_HOME/projects/`` to a ``content://<authority>/<rel>`` URI
+    served by ``AZTCollabProvider.openFile`` (which routes back to
+    ``$AZT_HOME/projects/<rel>`` via ``_resolve_path``). Returns the
+    original path unchanged when it sits outside the ``projects/``
+    subtree — that path is for desktop / non-Android use, where peers
+    share the daemon's filesystem and ``open()`` works directly."""
+    projects_root = os.path.realpath(os.path.join(home_dir, 'projects'))
+    real_path = os.path.realpath(abs_path)
+    try:
+        # commonpath raises ValueError on cross-volume paths; treat
+        # any failure as "outside the projects subtree".
+        if os.path.commonpath([projects_root, real_path]) != projects_root:
+            return abs_path
+    except ValueError:
+        return abs_path
+    rel = os.path.relpath(real_path, projects_root)
+    return f'content://{_PROVIDER_AUTHORITY}/{rel}'
+
+
 _KV_TEMPLATE = '''
 #:import dp kivy.metrics.dp
 #:import sp kivy.metrics.sp
@@ -302,29 +329,43 @@ class PickerApp(App):
                 PythonActivity = autoclass(
                     'org.kivy.android.PythonActivity')
                 Intent = autoclass('android.content.Intent')
+                Uri = autoclass('android.net.Uri')
                 Bundle = autoclass('android.os.Bundle')
                 activity = PythonActivity.mActivity
-                # Build extras via Bundle.putString (typed) instead of
-                # Intent.putExtra (overloaded — jnius has been
-                # observed to silently pick a non-String overload,
-                # leaving getStringExtra returning null on the peer
-                # side and the recorder reporting "no_path"). Also
-                # give the result Intent the same action as the
-                # request so it isn't a bare "empty" Intent — some
-                # Android versions strip extras on cross-package
-                # delivery of action-less result Intents.
+                # Translate the daemon-private filesystem path to a
+                # content:// URI under our AZTCollabProvider. Peers
+                # must NOT open the absolute path directly: it lives
+                # in the server APK's sandbox
+                # (/data/user/0/org.atoznback.aztcollab/files/...),
+                # which other packages have no UID-level read on.
+                # Going through the URI uses the provider's openFile
+                # callback (resolveAbsPath) — single source of truth,
+                # serialized by the daemon, no peer-side caching.
+                import azt_collabd
+                emitted_path = _to_content_uri(
+                    str(path), azt_collabd.paths.azt_home())
                 extras = Bundle()
-                extras.putString('path', str(path))
+                extras.putString('path', emitted_path)
                 if langcode:
                     extras.putString('langcode', str(langcode))
                 data = Intent('org.atoznback.aztcollab.PICK_PROJECT')
                 data.putExtras(extras)
+                # If we produced a content URI, surface it on
+                # Intent.data and grant the recipient temporary
+                # read+write so its ContentResolver.openFileDescriptor
+                # call goes through. Without these flags the peer
+                # gets SecurityException despite holding the
+                # signature-level AZT_COLLAB_ACCESS permission for
+                # other provider operations.
+                if emitted_path.startswith('content://'):
+                    data.setData(Uri.parse(emitted_path))
+                    data.addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                 # Diagnostic round-trip: read the value back out
-                # before sending. If this prints empty / None, the
-                # putString itself silently failed and we know
-                # exactly where to look. If it prints the path but
-                # the recorder still sees no_path, the loss is in
-                # Android's IPC layer.
+                # before sending so a regression in Bundle/Intent
+                # plumbing is loud in logcat instead of surfacing as
+                # the peer reporting "no_path" with no clue why.
                 verify_path = data.getStringExtra('path')
                 print(f'[picker_app] result intent verify: '
                       f'path={verify_path!r}',

@@ -107,7 +107,12 @@ def install_callbacks():
 def _resolve_path(rel, mode):
     """Map a provider-supplied relative path to an absolute path under
     ``$AZT_HOME/projects/``. Returns None on path-traversal attempts so
-    the Java side raises FileNotFoundException."""
+    the Java side raises FileNotFoundException.
+
+    ``rel`` is expected as the URI's path component (Java-side
+    ``Uri.getPath()``), which always carries a leading slash. The
+    ``lstrip('/')`` below makes ``os.path.join(base, rel)`` compose
+    under ``base`` instead of treating ``rel`` as absolute."""
     if not rel:
         return None
     rel = rel.lstrip('/')

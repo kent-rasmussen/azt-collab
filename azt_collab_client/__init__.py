@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 MIN_SERVER_VERSION = "0.8.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
@@ -17,6 +17,7 @@ from .status import Status, Result
 from .projects import Project, ProjectStatus
 from .translate import translate_status, translate_result, set_translator
 from .rpc import call, health, ServerUnavailable
+from .lift_io import LiftHandle, is_content_uri
 
 
 def configure(app_id: str):
@@ -801,6 +802,7 @@ __all__ = [
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'request_sync', 'poll_job',
     'record_project_sync_time',
+    'LiftHandle', 'is_content_uri',
     'Status', 'Result', 'S', 'Project', 'ProjectStatus',
     'translate_status', 'translate_result', 'set_translator',
     'ServerUnavailable',

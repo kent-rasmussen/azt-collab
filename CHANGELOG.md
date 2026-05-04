@@ -11,6 +11,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.17.0 — LiftHandle: cross-package LIFT-file access for peer apps
+- New ``azt_collab_client.lift_io`` module exporting ``LiftHandle``
+  and ``is_content_uri``. ``LiftHandle(path_or_uri).open_read()`` /
+  ``.open_write()`` returns a binary file-like usable with
+  ``ElementTree.parse`` / ``ElementTree.write`` regardless of
+  whether the picker's emitted ``path`` is a filesystem path
+  (desktop) or a ``content://org.atoznback.aztcollab/<lang>/<file>.lift``
+  URI (Android, new model). On the URI branch, opens via
+  ``ContentResolver.openFileDescriptor`` and ``os.fdopen`` on the
+  detached FD; the file owns the FD lifetime (close-on-exit
+  through the context-manager protocol).
+- Re-exported from the package root: ``from azt_collab_client import
+  LiftHandle, is_content_uri``. Added to ``__all__``.
+- **No caching layer** — every read/write hits the daemon's
+  canonical copy through the provider. Lost-update protection
+  relies on the daemon's serialization. The new
+  ``azt_collab_client/CLAUDE.md`` "LIFT-file access" section
+  spells out the migration checklist for peers (recorder first,
+  viewer next): replace every ``open(lift_path)`` with
+  ``LiftHandle(p).open_read() / .open_write()``; do not introduce
+  a peer-side cache; do not compute sibling paths via
+  ``os.path.dirname`` on a URI. Also documents the patterns NOT
+  to use.
+
 ### azt_collab_client 0.16.0 — single source of truth for UI language; new public display_name + scan_catalog_languages
 - ``set_language(lang)`` no longer takes a ``persist`` keyword argument.
   There is no transient mode any more — one preference, one store
@@ -34,6 +58,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
   + mtime watcher) drop ``persist=False``; both calls just write the
   same value back, harmless because the mtime watcher's
   ``persisted == current_language()`` short-circuit prevents loops.
+
+### azt_collabd 0.14.0 — content:// URIs across the picker boundary; clone auto-registers; MIN_CLIENT_VERSION → 0.17.0
+- The picker (when running in the standalone server APK on Android)
+  now emits a ``content://org.atoznback.aztcollab/<lang>/<file>.lift``
+  URI from ``_emit_and_quit``, instead of an absolute filesystem
+  path inside the server APK's private ``filesDir``. The Intent
+  carries the URI on its ``data`` field and adds
+  ``FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION``
+  so the calling peer can open the URI via
+  ``ContentResolver.openFileDescriptor`` for the result delivery's
+  lifetime.
+- This removes a cross-package access bug (recorder's
+  ``ElementTree.parse(path)`` raised ``[Errno 2]`` on an absolute
+  path inside ``/data/user/0/org.atoznback.aztcollab/files/``,
+  which the recorder's UID can't read). The provider's existing
+  ``openFile`` callback (``_resolve_path`` under
+  ``$AZT_HOME/projects/``) handles the URIs without changes —
+  except for a leading-slash strip on ``Uri.getPath()`` so the
+  path composes correctly. The single canonical copy in the
+  daemon's ``$AZT_HOME`` stays the source of truth; peers don't
+  cache.
+- Successful clones now auto-register via
+  ``projects.register(langcode, dest_dir, lift_path, remote_url)``.
+  Previously a clone left the working tree on disk but no entry in
+  ``projects.json``, so subsequent ``list_projects()`` /
+  ``sync_project(langcode, …)`` calls couldn't find it. Failure
+  is logged but doesn't fail the clone job — caller can re-register
+  explicitly.
+- ``MIN_CLIENT_VERSION`` raised to ``0.17.0`` because the URI shape
+  is a hard contract: a peer bundling a pre-LiftHandle client would
+  try to ``open()`` the URI as a path and crash on the spot. Old
+  peers now get ``client_too_old`` from ``check_server_compat()``
+  at startup with a clear "update this app" prompt.
 
 ### azt_collabd 0.13.21 — Bundle-based result extras to fix cross-package no_path loss
 - Logcat showed the picker emitting a real lift_path

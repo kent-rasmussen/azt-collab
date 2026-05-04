@@ -317,6 +317,105 @@ at import.
 3. `available_languages()` discovers it on next call; the settings UI
    adds a button automatically.
 
+## LIFT-file access — peers MUST go through `LiftHandle`
+
+The daemon owns the canonical copy of every project's LIFT file
+under `$AZT_HOME/projects/<lang>/<file>.lift`. On the new Android
+model the daemon lives in the standalone server APK
+(`org.atoznback.aztcollab`) and that path is in the server APK's
+private `filesDir` — peer packages **cannot** `open()` it (sandbox
+denies; you'll see `[Errno 2] No such file or directory` even when
+the file exists, because the recorder process is `org.atoznback.<peer>`
+and has no UID-level read on `/data/user/0/org.atoznback.aztcollab/`).
+
+### Don't cache. Use `ContentResolver` every time.
+
+A peer-side cache (download to `<peer>/filesDir/lift_cache/...`,
+edit it, push back) breaks the architecture's promise of a single
+source of truth. Two peers (or the same peer across two sessions)
+that read at T0 and write at T1 / T2 will race; the later writer
+clobbers the earlier writer's edits and the daemon happily commits
++ pushes the corrupted state. **Read and write through the
+provider every time.**
+
+### `azt_collab_client.LiftHandle`
+
+The picker emits one of two shapes from `pick_project()['path']`:
+
+- **Filesystem path** (desktop, or any platform's open-file flow)
+  → peer uses regular `open(path, 'rb')`.
+- **`content://org.atoznback.aztcollab/<lang>/<file>.lift`** (Android
+  clone / template flow on the new model) → peer must use
+  `ContentResolver.openFileDescriptor(uri, 'r')` then
+  `os.fdopen(detached_fd, 'rb')`.
+
+`LiftHandle` papers over the difference so peer code stays uniform:
+
+```python
+from azt_collab_client import LiftHandle
+from xml.etree import ElementTree
+
+handle = LiftHandle(path_or_uri_from_picker)
+with handle.open_read() as f:
+    tree = ElementTree.parse(f)        # accepts file-like
+...
+with handle.open_write() as f:
+    tree.write(f, encoding='utf-8', xml_declaration=True)
+```
+
+Both `open_read()` and `open_write()` return binary file-likes
+usable as context managers. The picker side adds
+`FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION`
+to the result Intent so the URI grant is in place by the time
+`pick_project()` returns to the peer.
+
+### Recorder migration checklist
+
+When migrating a peer (the recorder is the first; viewer / future
+peers follow the same pattern):
+
+1. **Replace every `open(lift_path, ...)` site** with
+   ``with LiftHandle(p).open_read()/open_write() as f: ...``.
+   Particularly:
+   - `lift_api.LiftDoc.__init__` — `ElementTree.parse(path)` →
+     `with handle.open_read() as f: ElementTree.parse(f)`.
+   - The save / write-back path — `tree.write(path, ...)` →
+     `with handle.open_write() as f: tree.write(f, ...)`.
+   - Any `Path(lift_path).read_text()` etc.
+2. **Stop trying to compute auxiliary paths from the LIFT path.**
+   On a `content://` URI, ``os.path.dirname`` is meaningless.
+   Audio files / image references / any sibling resources should
+   also be resolved through the provider — either via their own
+   `content://` URIs or via the daemon's audio endpoints. If your
+   recorder branches on `os.path.exists(some_sibling)` keyed on
+   the LIFT path's directory, that branch goes wrong on Android.
+3. **Pass the original `path_or_uri` string to
+   `register_project(...)` / `derive_langcode(...)`** — the
+   daemon's wrappers already accept either shape (the daemon's
+   server-side `derive_langcode` handles relative-URI parsing too;
+   `register_project` stores it as-is in `projects.json`).
+4. **Don't introduce a `local_lift_cache_path` field.** If you find
+   yourself reaching for one, reread "Don't cache" above. The
+   write goes to the daemon's copy via `LiftHandle.open_write()`;
+   that *is* the canonical edit.
+5. **For binary auxiliary files (audio)** that the daemon also
+   serves through the same provider, mirror the same pattern with
+   a `LiftHandle`-equivalent (`LiftHandle` is named for the LIFT
+   case but doesn't validate file content; you can use it for any
+   provider-served file). A future helper `MediaHandle` may
+   formalize the audio case if it sprouts its own concerns.
+
+### What NOT to do
+
+- ❌ `shutil.copy(lift_path, local_cache)` followed by working from
+  the copy. Lost-update guaranteed.
+- ❌ `open(handle.path_or_uri, 'rb')` — the `content://` form is
+  not a filesystem path.
+- ❌ Treating the URI as a file via `pathlib.Path(uri)` then
+  calling its file methods. They'll silently produce nonsense.
+- ❌ Caching results of `LiftHandle(p).open_read()` past the
+  context-manager exit. The handle is cheap; reopen on each access.
+
 ## UI submodule (`azt_collab_client.ui`)
 
 Shared Kivy screens (`LangPickerScreen`, `ProjectPickerScreen`) and

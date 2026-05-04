@@ -17,13 +17,17 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.13.21"
+__version__ = "0.14.0"
 
 # Floor on the azt_collab_client version this daemon is willing to talk
-# to. Bump this when a daemon-side change relies on a status code or
-# wire-format addition that older clients can't decode/translate
-# usefully. Published on /v1/health so the client compares locally.
-MIN_CLIENT_VERSION = "0.14.0"
+# to. Published on /v1/health so the client compares locally and a peer
+# bundling an older client surfaces ``client_too_old`` from
+# ``check_server_compat()``. Bump in lockstep with wire-format / data-flow
+# changes older clients can't survive — for example the 0.16.0 cut moved
+# the picker to emit ``content://`` URIs, which a pre-LiftHandle client
+# would try to ``open()`` as a filesystem path (the recorder's
+# ``[Errno 2] No such file or directory`` symptom).
+MIN_CLIENT_VERSION = "0.17.0"
 
 from . import config
 from . import net
