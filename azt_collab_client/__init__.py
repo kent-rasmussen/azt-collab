@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 # 0.16.0 floor: the daemon now persists scheduler jobs across
 # kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
 # job_ids on respawn, so poll_job returns None and the peer can't
@@ -27,6 +27,7 @@ from .lift_io import (
     LiftHandle, MediaHandle, audio_uri_for, image_uri_for, is_content_uri,
 )
 from .recent import last_project, set_last_project
+from .peer_prefs import peer_pref, set_peer_pref
 
 
 def configure(app_id: str):
@@ -885,6 +886,7 @@ __all__ = [
     'LiftHandle', 'MediaHandle', 'audio_uri_for', 'image_uri_for',
     'is_content_uri',
     'last_project', 'set_last_project',
+    'peer_pref', 'set_peer_pref',
     'Status', 'Result', 'S', 'Project', 'ProjectStatus',
     'translate_status', 'translate_result', 'set_translator',
     'ServerUnavailable',

@@ -218,6 +218,7 @@ def create_from_template(template_url, vernlang, dest_dir,
     failures.
     """
     import urllib.request
+    from .net import _ensure_ssl
 
     if not template_url:
         raise ValueError('template_url required')
@@ -230,6 +231,11 @@ def create_from_template(template_url, vernlang, dest_dir,
     os.makedirs(project_dir, exist_ok=True)
     lift_path = os.path.join(project_dir, f'{vernlang}.lift')
 
+    # On Android p4a doesn't ship system CA certs; without this patch
+    # urlopen fails with SSL: CERTIFICATE_VERIFY_FAILED. Every other
+    # network-touching function in azt_collabd calls this first; this
+    # site was missed.
+    _ensure_ssl()
     req = urllib.request.Request(template_url)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         content = resp.read(size_cap + 1)

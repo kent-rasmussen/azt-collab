@@ -98,15 +98,13 @@ python examples/sister_app.py /path/to/some_lift_project
 
 ## Tests
 
-There is **no local test suite in this repo**. Canonical step-by-step verification scripts live at `../azt_recorder/tests/stepN.sh` and run with the recorder's venv:
+There is **no automated test suite anywhere in the suite**. The legacy `../azt_recorder/tests/stepN.sh` stack scripts were removed once their slices stabilised. Daemon-touching changes get a manual smoke against `examples/sister_app.py` from a sibling app's venv:
 
 ```bash
 cd ../azt_recorder
-bash tests/step12.sh   # LIFT merge driver
-bash tests/step16.sh   # sister-app example
+source env/bin/activate
+python ../azt-collab/examples/sister_app.py /tmp/some_lift_project
 ```
-
-When adding a feature here, validate it by running (or extending) the relevant `stepN.sh` over there.
 
 ## Runtime config
 
@@ -125,7 +123,7 @@ When adding a feature here, validate it by running (or extending) the relevant `
 - Suite signature permission is `org.atoznback.AZT_COLLAB_ACCESS` (`protectionLevel="signature"`). The standalone server APK (`org.atoznback.aztcollab`) is the **only** app that declares the `<permission>` (in `server_apk/manifest_extras.xml`) and exports the `<provider>` at authority `org.atoznback.aztcollab` (injected post-render by `p4a_hook.py:_inject_aztcollab_provider`, gated on `dist_name == 'aztcollab'`). Peer apps consume it via `<uses-permission>` (from `android.permissions` in their spec) plus a `<queries><package .../></queries>` block (from `android/manifest_extras_peer.xml`, symlinked into each peer as `manifest_extras.xml`).
 - Expected keystore SHA-256 is in `android/SUITE_FINGERPRINT`. Mismatched signing → install-time permission grant denied → ContentProvider transport silently falls back to loopback.
 - Suite apps must call `azt_collabd.android_cp.service.install_callbacks()` in their startup hook (no-op on desktop).
-- **Sticky-bound service.** The server APK declares `<service android:name="…AZTServiceProviderhost" android:exported="true" android:permission="org.atoznback.AZT_COLLAB_ACCESS" />`, injected post-render by `p4a_hook.py:_inject_aztcollab_service` (gated on `dist_name == 'aztcollab'` like the provider injection). The service body is `server_apk/service.py`; it shares a process with `AZTCollabProvider` (no `android:process` attribute on either) so the provider stays reachable across picker Activity teardowns. No foreground notification — the design is "transient when idle, pinned while in use" via bind-priority OOM hint + `START_STICKY` respawn, and the idle-stop policy in `service.py` (5 min default) keeps the process from running indefinitely. Peer apps do NOT declare the service; they may bind to it from the client transport (future work) but no peer code change is required for the lifetime fix to take effect.
+- **Sticky-bound service in a separate process.** The server APK declares `<service android:name="…AZTServiceProviderhost" android:exported="true" android:permission="org.atoznback.AZT_COLLAB_ACCESS" android:process=":provider" />` and the `<provider>` injection carries the same `android:process=":provider"`, so the daemon Python interpreter, the service, and the provider all live in **a different process from the picker Activity**. This isolation is load-bearing: p4a runs Python on the SDLThread inside PythonActivity, so the Activity's process already has one Python interpreter going. Putting Service+Provider in the same process would mean two Python interpreters fighting one GIL, which crashes (`PyImport_AddModule` SIGSEGV in `libpython3.11.so`) on Activity teardown — `dumpsys activity services` shows `crashCount` climbing. With `:provider`, the Activity's Kivy can finish however it wants (clean exit or Python teardown crash) and the daemon's process is unaffected; peer URI grants and openFileDescriptor calls keep working. Service body is `server_apk/service.py`; manifest entries injected post-render by `p4a_hook.py:_inject_aztcollab_service` and `_inject_aztcollab_provider` (both gated on `dist_name == 'aztcollab'`). No foreground notification — the design is "transient when idle, pinned while in use" via bind-priority OOM hint + `START_STICKY` respawn, and the idle-stop policy in `service.py` (5 min default) keeps the process from running indefinitely. Peer apps do NOT declare the service; they may bind to it from the client transport (future work) but no peer code change is required for the lifetime fix to take effect.
 - **Recovery semantics.** Under memory pressure the host process can still be killed; the next peer ContentResolver call lazy-spawns it via Android's unconditional ContentProvider contract. `Service.onCreate` re-runs `service.py` which calls `reconcile_on_startup()` to mark in-flight jobs `JOB_INTERRUPTED`. URI grants from the picker are scoped to the receiving Activity's lifetime (not the source process), so they survive source kills. Detached FDs are kernel-managed and survive too. The only ungraceful surface is the typed `JOB_INTERRUPTED` `Result` peers should treat as retryable.
 
 ## When adding a new client API call

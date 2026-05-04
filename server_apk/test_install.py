@@ -121,22 +121,44 @@ def section_2_translation_handler():
            f'handler returned unexpected value: {rendered!r}')
 
 
+def _vt(s):
+    """Best-effort 'X.Y.Z' → (X, Y, Z) tuple. Mirrors the client's
+    _version_tuple so the test compares the same way the client's
+    handshake does."""
+    out = []
+    for chunk in str(s or '').split('.'):
+        digits = ''
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        out.append(int(digits) if digits else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
 def section_3_version_floors():
-    section('3. Version floors are bumped to the new release line')
+    section('3. Versions and floors meet the JOB_INTERRUPTED release line')
     from azt_collabd import __version__ as srv_v, MIN_CLIENT_VERSION
     from azt_collab_client import __version__ as cli_v, MIN_SERVER_VERSION
-    expect(srv_v == '0.16.0',
-           f'azt_collabd.__version__ == 0.16.0 (got {srv_v})',
-           f'azt_collabd.__version__ should be 0.16.0, got {srv_v}')
-    expect(cli_v == '0.20.0',
-           f'azt_collab_client.__version__ == 0.20.0 (got {cli_v})',
-           f'azt_collab_client.__version__ should be 0.20.0, got {cli_v}')
-    expect(MIN_CLIENT_VERSION == '0.20.0',
-           f'azt_collabd.MIN_CLIENT_VERSION == 0.20.0',
-           f'MIN_CLIENT_VERSION should be 0.20.0, got {MIN_CLIENT_VERSION}')
-    expect(MIN_SERVER_VERSION == '0.16.0',
-           f'azt_collab_client.MIN_SERVER_VERSION == 0.16.0',
-           f'MIN_SERVER_VERSION should be 0.16.0, got {MIN_SERVER_VERSION}')
+    # Use >= comparisons rather than equality so a patch bump
+    # (0.20.0 → 0.20.1 etc.) doesn't fail the test — the contract is
+    # "at least the version that introduced JOB_INTERRUPTED."
+    expect(_vt(srv_v) >= _vt('0.16.0'),
+           f'azt_collabd.__version__ ({srv_v}) >= 0.16.0',
+           f'azt_collabd.__version__ ({srv_v}) is below 0.16.0')
+    expect(_vt(cli_v) >= _vt('0.20.0'),
+           f'azt_collab_client.__version__ ({cli_v}) >= 0.20.0',
+           f'azt_collab_client.__version__ ({cli_v}) is below 0.20.0')
+    expect(_vt(MIN_CLIENT_VERSION) >= _vt('0.20.0'),
+           f'azt_collabd.MIN_CLIENT_VERSION ({MIN_CLIENT_VERSION}) >= 0.20.0',
+           f'MIN_CLIENT_VERSION ({MIN_CLIENT_VERSION}) is below 0.20.0')
+    expect(_vt(MIN_SERVER_VERSION) >= _vt('0.16.0'),
+           f'azt_collab_client.MIN_SERVER_VERSION '
+           f'({MIN_SERVER_VERSION}) >= 0.16.0',
+           f'MIN_SERVER_VERSION ({MIN_SERVER_VERSION}) is below 0.16.0')
 
 
 def _ensure_git_repo(working_dir):

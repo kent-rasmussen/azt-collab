@@ -46,6 +46,47 @@ _server_lock_fd = None
 _started_at = 0.0
 
 
+_AZTCOLLAB_AUTHORITY = 'org.atoznback.aztcollab'
+
+
+def _on_android():
+    """Detect Android via jnius availability. Used by the API-response
+    URI conversion below — the daemon's projects.json stores
+    filesystem paths (the daemon needs them for dulwich), but peer
+    apps on Android can't open() those paths because they're inside
+    the server APK's private filesDir. So API responses convert
+    lift_path to a content:// URI on Android, which peers feed
+    directly to LiftHandle (which transparently handles both
+    filesystem paths and content URIs)."""
+    try:
+        import jnius  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _project_for_api(p):
+    """Convert a Project to its API-facing dict. On Android, replaces
+    ``lift_path`` (a filesystem path inside the server APK's
+    sandbox, useless to peer apps in other packages) with the
+    equivalent content URI under our ContentProvider authority. The
+    URI shape mirrors what the picker emits in its result Intent —
+    ``content://org.atoznback.aztcollab/<lang>/<basename>`` — so peers
+    that called LiftHandle on the picker URI can do the same with the
+    Project from list_projects / open_project on later runs without
+    knowing about the path-vs-URI distinction."""
+    d = p.to_dict()
+    if _on_android() and d.get('lift_path'):
+        # If lift_path is already a URI (e.g. registered by a future
+        # caller that did its own conversion), don't double-wrap.
+        if not d['lift_path'].startswith('content://'):
+            basename = os.path.basename(d['lift_path'])
+            d['lift_path'] = (
+                f'content://{_AZTCOLLAB_AUTHORITY}/'
+                f'{p.langcode}/{basename}')
+    return d
+
+
 def _state_dir():
     p = os.path.join(azt_home(), 'state')
     os.makedirs(p, exist_ok=True)
@@ -370,7 +411,7 @@ def _h_migrate_from_prefs(body):
 
 
 def _h_list_projects(_body):
-    items = [p.to_dict() for p in projects.list_all()]
+    items = [_project_for_api(p) for p in projects.list_all()]
     # Diagnostic: confirms the path the dispatcher reads from and
     # the resulting count. If the count is 0 here right after a
     # successful clone-register elsewhere in the same logcat, we
@@ -387,7 +428,7 @@ def _h_get_project(langcode, _body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
-    return 200, {"ok": True, "project": p.to_dict()}
+    return 200, {"ok": True, "project": _project_for_api(p)}
 
 
 def _h_derive_langcode(body):
@@ -569,7 +610,7 @@ def _h_create_project_from_template(body):
         return 500, {"ok": False,
                      "error": f'{type(ex).__name__}: {ex}',
                      "traceback": tb}
-    return 200, {"ok": True, "project": p.to_dict()}
+    return 200, {"ok": True, "project": _project_for_api(p)}
 
 
 def _h_clone_project(body):
@@ -614,13 +655,25 @@ def _h_clone_status(job_id, body):
         progress = job['progress']
         new_lines = progress[last_index:] if last_index < len(progress) \
             else []
+        # Convert lift_path to a content URI on Android so peers can
+        # feed it directly to LiftHandle (same logic as
+        # _project_for_api). Clone-job state stores filesystem paths
+        # because the daemon needs them for dulwich; the API boundary
+        # is where we adapt to peer-visibility rules.
+        lift_path = job.get('lift_path', '')
+        langcode = job.get('langcode', '')
+        if (lift_path and langcode and _on_android()
+                and not lift_path.startswith('content://')):
+            basename = os.path.basename(lift_path)
+            lift_path = (
+                f'content://{_AZTCOLLAB_AUTHORITY}/{langcode}/{basename}')
         return 200, {
             "ok": True,
             "state": job.get('state', 'CLONING'),
             "progress": new_lines,
             "next_index": len(progress),
-            "lift_path": job.get('lift_path', ''),
-            "langcode": job.get('langcode', ''),
+            "lift_path": lift_path,
+            "langcode": langcode,
             "result": job.get('result'),
             "error": job.get('error', ''),
         }
@@ -639,7 +692,7 @@ def _h_rename_project(langcode, body):
         return 400, {"ok": False, "error": str(ex)}
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
-    return 200, {"ok": True, "project": p.to_dict()}
+    return 200, {"ok": True, "project": _project_for_api(p)}
 
 
 def _h_register_project(body):
@@ -656,7 +709,7 @@ def _h_register_project(body):
     if not remote_url:
         remote_url = projects.derive_remote_url(working_dir)
     p = projects.register(langcode, working_dir, lift_path, remote_url)
-    return 200, {"ok": True, "project": p.to_dict()}
+    return 200, {"ok": True, "project": _project_for_api(p)}
 
 
 def _h_project_sync(langcode, body):
@@ -687,6 +740,7 @@ def _h_project_status(langcode, _body):
     branch, remote_url, n_changes = ('', '', 0)
     if summary is not None:
         branch, remote_url, n_changes = summary
+    api = _project_for_api(p)
     return 200, {
         "ok": True,
         "langcode": langcode,
@@ -695,7 +749,7 @@ def _h_project_status(langcode, _body):
         "n_changes": n_changes,
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
-        "lift_path": p.lift_path,
+        "lift_path": api['lift_path'],
     }
 
 

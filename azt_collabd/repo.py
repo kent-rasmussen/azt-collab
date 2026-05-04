@@ -331,6 +331,11 @@ def _ensure_remote_repo(remote_url, username, token):
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
 
+    # Idempotent — current callers already do this, but a future
+    # caller missing it would reproduce the SSL: CERTIFICATE_VERIFY_FAILED
+    # bug we just fixed in projects.create_from_template.
+    _ensure_ssl()
+
     from urllib.parse import urlparse
     parsed = urlparse(remote_url)
     host = parsed.hostname or ''
