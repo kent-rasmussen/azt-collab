@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.19.1"
+__version__ = "0.19.2"
 MIN_SERVER_VERSION = "0.8.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
@@ -212,6 +212,28 @@ def _pick_project_android(timeout_seconds):
 
     done = threading.Event()
     holder = {'result': None}
+    # Track whether ``android_activity.bind`` actually fired so the
+    # cleanup path doesn't try to unbind a handler that was never
+    # registered (early failure in ``_setup_on_ui``).
+    bind_state = {'bound': False}
+
+    def _unbind_handler():
+        """Drop ``_on_result`` from the global activity-result
+        dispatch list. Without this each ``pick_project()`` invocation
+        leaves a dangling handler bound for the lifetime of the host
+        process, so subsequent picks fire 2× / 3× / N×; each closure
+        writes to its own (long-since-stale) ``holder``, but the JNI
+        cost grows linearly with picks. Best-effort: a missing
+        ``unbind`` symbol on older Kivy/python-for-android builds
+        falls through silently."""
+        if not bind_state['bound']:
+            return
+        bind_state['bound'] = False
+        try:
+            android_activity.unbind(on_activity_result=_on_result)
+        except Exception:
+            # Old Kivy versions exposed bind without unbind; tolerate.
+            pass
 
     def _on_result(request_code, result_code, data):
         import sys as _sys
@@ -246,6 +268,10 @@ def _pick_project_android(timeout_seconds):
         else:
             holder['result'] = {'ok': False, 'error': 'cancelled'}
         done.set()
+        # Single-shot: drop ourselves from the global dispatch list so
+        # the next ``pick_project()`` doesn't fire two of us, three
+        # of us, etc.
+        _unbind_handler()
 
     # JNI proxy creation (android_activity.bind) needs the app
     # ClassLoader to resolve PythonActivity's inner-class interfaces
@@ -287,6 +313,7 @@ def _pick_project_android(timeout_seconds):
             except Exception:
                 pass
             android_activity.bind(on_activity_result=_on_result)
+            bind_state['bound'] = True
             activity.startActivityForResult(intent, _AZT_PICK_REQ_CODE)
         except Exception as ex:
             msg = str(ex)
@@ -314,6 +341,10 @@ def _pick_project_android(timeout_seconds):
     # for picking a project; callers can pass a smaller timeout.
     wait_for = timeout_seconds if timeout_seconds is not None else 600
     if not done.wait(timeout=wait_for):
+        # Timed out without an activity result. Drop the handler so
+        # a much-later result on the wrong code path doesn't write
+        # to a stale ``holder``.
+        _unbind_handler()
         return {'ok': False, 'error': 'timeout'}
     return holder['result'] or {'ok': False, 'error': 'cancelled'}
 

@@ -11,6 +11,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.19.2 — pick_project unbinds its activity-result handler after each call
+- ``pick_project()`` registered a closure on
+  ``android_activity.bind(on_activity_result=…)`` and never
+  unbound it, so each invocation in a host session left a dangling
+  handler that fired on every subsequent activity result. Logs
+  showed N copies of ``[pick_project] _on_result …`` after N
+  picks. Each closure wrote to its own long-since-stale
+  ``holder`` so behaviour was correct for the most recent caller,
+  but the JNI cost grew linearly with picks.
+- New ``_unbind_handler`` helper called from inside ``_on_result``
+  after ``done.set()`` (single-shot pattern) and from the timeout
+  path so a much-later activity result for our request code can't
+  write to a stale holder. Tracks ``bind_state['bound']`` to avoid
+  unbinding a never-bound handler when ``_setup_on_ui`` failed
+  early. Tolerates older Kivy / python-for-android versions that
+  exposed ``bind`` without ``unbind``.
+
 ### azt_collab_client 0.19.1 — fix vanishing project list: defer ProjectPickerScreen.on_enter populate by one frame
 - ``projects.json`` had the cloned project, the daemon's
   ``_h_list_projects`` would have returned it — but the picker
