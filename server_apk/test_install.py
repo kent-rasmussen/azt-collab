@@ -165,11 +165,38 @@ def _read_daemon_pid():
 
 
 def _wait_for_dead(pid, timeout=5.0):
+    """A process is 'dead' for our purposes if it's gone OR a zombie.
+
+    The loopback auto-spawn launches the daemon via
+    ``subprocess.Popen(start_new_session=True)``. ``start_new_session``
+    calls ``setsid`` (new session/process group) but does NOT change
+    parentage, so the daemon is still a child of this test process.
+    When we SIGKILL it, the kernel transitions it to zombie state and
+    waits for the parent (us) to ``waitpid`` it. ``os.kill(pid, 0)``
+    returns success for zombies — they still have a PID — so checking
+    PID existence alone reports the dead daemon as still alive.
+
+    Inspect ``/proc/<pid>/status`` to distinguish: ``Z`` (zombie) or
+    ``X`` (dying) are dead-for-our-purposes; anything else (R/S/D/T)
+    means it really is still running. Also call ``waitpid`` to reap
+    cleanly so the test process doesn't leak zombies."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+            with open(f'/proc/{pid}/status') as f:
+                state_char = ''
+                for line in f:
+                    if line.startswith('State:'):
+                        state_char = line.split(':', 1)[1].strip()[:1]
+                        break
+            if state_char in ('Z', 'X'):
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except OSError:
+                    pass  # not our child, or already reaped
+                return True
+        except FileNotFoundError:
+            # /proc entry gone — process is fully dead and reaped.
             return True
         time.sleep(0.05)
     return False
@@ -304,6 +331,21 @@ def _kill_lingering_daemons():
             pass
 
 
+def _reap_children():
+    """Reap any zombie children left behind by the auto-spawn path.
+    See _wait_for_dead for why these accumulate. Best-effort — ignore
+    ECHILD (no children) and any other races."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except OSError:
+            return
+        if pid == 0:
+            return  # no more zombies waiting
+
+
 def main(argv):
     workdir = argv[1] if len(argv) > 1 else None
 
@@ -342,6 +384,7 @@ def main(argv):
     finally:
         _kill_lingering_daemons()
         time.sleep(0.2)
+        _reap_children()
         shutil.rmtree(home_dir, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
 
