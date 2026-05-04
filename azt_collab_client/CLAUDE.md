@@ -416,6 +416,63 @@ peers follow the same pattern):
 - ❌ Caching results of `LiftHandle(p).open_read()` past the
   context-manager exit. The handle is cheap; reopen on each access.
 
+### Audio + image cross-package access — shipped
+
+**Daemon side:** `AZTCollabProvider` serves sibling files under the
+same authority as the LIFT URI:
+
+```
+content://org.atoznback.aztcollab/<lang>/audio/<basename>
+content://org.atoznback.aztcollab/<lang>/images/<basename>
+```
+
+Provider auto-creates `audio/` on first write (`openFile(mode='w')`
+mkdir-p's the parent). Image writes from peers are not supported —
+the daemon owns image additions; peers only read. The picker's
+result-Intent grant flags
+(`FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION`)
+cover same-authority sibling URIs without per-file grants.
+
+**Client side (`azt_collab_client.lift_io`):**
+
+- `MediaHandle(path_or_uri, kind='audio'|'image')` — `LiftHandle`
+  subclass with a `kind` field. `open_write()` raises
+  `PermissionError` for `kind='image'` (the architectural rule:
+  daemon owns image additions). Read-side identical to `LiftHandle`.
+- `audio_uri_for(lift_path_or_uri, basename)` /
+  `image_uri_for(lift_path_or_uri, basename)` — compose the sibling
+  URI / filesystem path so callers stay blind to the path-vs-URI
+  distinction.
+
+**Recorder side (1.32.0):**
+
+- `LIFTDatabase.audio_target(basename)` /
+  `LIFTDatabase.image_target(basename)` — thin wrappers over
+  `audio_uri_for` / `image_uri_for`.
+- `LIFTDatabase._resolve_uri_image(href)` pulls a sibling image
+  from the daemon's provider into the peer's image cache dir
+  (`<image_cache_dir>/_uri_images/<href>`) the first time it's
+  rendered, so `AsyncImage` can render by path. Memoised per
+  LIFTDatabase instance.
+- `_start_android_recording` opens an audio URI through
+  `ContentResolver.openFileDescriptor('w')` and hands the Java
+  `FileDescriptor` straight to `MediaRecorder.setOutputFile(fd)`.
+  The pfd is held on `self._record_pfd` until stop+release, then
+  closed (Java owns the FD lifetime — we do *not* `detachFd()`).
+- `play_audio` resolves to `audio_uri_for(...)` on URI projects and
+  uses `MediaPlayer.setDataSource(ctx, Uri.parse(uri))` instead of
+  the path string overload.
+- Image *additions* still gate off on URI projects — the URL/cache
+  fallback in `lift.py` keeps the displayed image rendering, only
+  the local-copy-into-`images/` step is skipped because the daemon
+  owns adds.
+
+**Discovery:** no `list_audio` / `list_images` RPCs needed — both
+sets of basenames are already encoded in the LIFT XML (audio in
+`<citation><form>` audiolang text, images in
+`<illustration href=…/>`). If a future admin UI wants directory
+listing, add `/v1/projects/<lang>/list_images` separately.
+
 ## UI submodule (`azt_collab_client.ui`)
 
 Shared Kivy screens (`LangPickerScreen`, `ProjectPickerScreen`) and
@@ -425,6 +482,32 @@ own `ScreenManager`. Translations route through
 startup if your host has its own i18n module (the recorder does).
 
 Don't add Kivy imports outside `ui/`; see hard rule #3.
+
+### Shared assets — client-first model
+
+Anything *shared in shape* across the suite (gear, sync, share, future
+back/close arrows) lives at
+`azt_collab_client/ui/assets/icons/<name>.png` so every sister app
+that imports the client gets it for free. Resolve via
+`from azt_collab_client.ui import icon_path; icon_path('gear')` — the
+helper returns an absolute path (or `''` if not bundled). Standalone
+subprocess (picker, settings UI) and sister apps cannot use relative
+paths; their cwd isn't the host's repo.
+
+Peer-specific icons stay in the peer (the recorder's
+`icons/microphone.png`, `icons/redo.png`, `icons/icon*.png` app-icon
+variants — these have no plausible second consumer and encode
+recorder-specific UX). Peers that want to override a shared icon with
+their own theming pass an explicit override path to whatever consumer
+takes one (e.g. `register_picker_kv(gear_icon=...)`); there is no
+implicit cwd-based search.
+
+When in doubt, **default to client-first**. It's easier to override
+locally later than to deduplicate parallel copies once they've drifted.
+The recorder's KV currently uses relative `'icons/<name>.png'` strings
+that resolve in its own cwd — that's fine, no migration required; the
+client-first rule applies to *new* shared-shape assets and to any
+asset whose move-to-shared is forced by a second consumer.
 
 ## Sister-app integration recap
 

@@ -24,15 +24,12 @@ to your ScreenManager:
         ... your other screens ...
 """
 
-import os
-
 from kivy.app import App
+from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.uix.screenmanager import Screen
 
-
-_BUNDLED_GEAR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'assets', 'gear.png')
+from .icons import icon_path
 
 
 _KV_TEMPLATE = '''
@@ -158,7 +155,7 @@ def register_kv(font_name='Roboto', hide_settings_gear=False,
     Builder.load_string(_KV_TEMPLATE.format(
         font_name=font_name,
         show_gear='True' if not hide_settings_gear else 'False',
-        gear_icon=(gear_icon or _BUNDLED_GEAR),
+        gear_icon=(gear_icon or icon_path('gear')),
     ))
 
 
@@ -167,17 +164,31 @@ class ProjectPickerScreen(Screen):
     host App methods (see module docstring for the contract)."""
 
     def on_enter(self):
-        self._populate_projects()
+        # Defer one frame: Kivy >= 2.3 fires on_enter before KV ids
+        # have attached on the first screen entry, so a synchronous
+        # ``self.ids.get('project_list')`` returns None and the
+        # populate path bails silently — the symptom user-visible
+        # was "previously cloned projects don't appear in the
+        # existing-projects list". Same fix the settings UI uses.
+        Clock.schedule_once(lambda *_: self._populate_projects(), 0)
 
     def _populate_projects(self):
         box = self.ids.get('project_list')
         if not box:
+            print('[picker] _populate_projects: project_list id '
+                  'still not attached after defer; bailing',
+                  flush=True)
             return
         box.clear_widgets()
         app = App.get_running_app()
         if not hasattr(app, 'list_projects'):
+            print('[picker] _populate_projects: app missing '
+                  'list_projects host method; bailing',
+                  flush=True)
             return
         projects = app.list_projects() or []
+        print(f'[picker] _populate_projects: rendering '
+              f'{len(projects)} button(s)', flush=True)
         if not projects:
             return
         for name, path in projects:
@@ -187,5 +198,13 @@ class ProjectPickerScreen(Screen):
                 '    normal_color: T.GREEN\n'
             )
             btn.lift_path = path
-            btn.bind(on_release=lambda b: app.load_lift(b.lift_path))
+            # ``name`` from ``app.list_projects()`` is the canonical
+            # langcode (the projects.json key — see the host
+            # contract in this module's docstring). Stash it on the
+            # button so the host's ``load_lift`` can stamp the
+            # result Intent's ``langcode`` extra without having to
+            # query the daemon a second time.
+            btn.langcode = name
+            btn.bind(on_release=lambda b: app.load_lift(
+                b.lift_path, getattr(b, 'langcode', '')))
             box.add_widget(btn)

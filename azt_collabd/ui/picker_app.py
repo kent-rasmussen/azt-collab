@@ -46,7 +46,7 @@ from azt_collab_client import i18n as _client_i18n
 from azt_collab_client.translate import tr as _tr
 from azt_collab_client.ui import (
     LangPickerScreen, ProjectPickerScreen,
-    clone_url_popup, register_charis,
+    clone_url_popup, confirm_langcode_popup, register_charis,
     register_langpicker_kv, register_picker_kv, theme,
 )
 # Settings live in azt_collabd.ui.app; host them in-process so the
@@ -69,6 +69,28 @@ _AZT_ICON = os.path.join(
 # in azt_collab_client/transports/android_cp.py and in
 # server_apk/manifest_extras.xml / p4a_hook.py.
 _PROVIDER_AUTHORITY = 'org.atoznback.aztcollab'
+
+
+def _tentative_langcode_from_url(url):
+    """Cheap derivation of the candidate langcode from a clone URL,
+    used to prefill the confirm-langcode popup before the clone
+    fetches anything. Mirrors the daemon-side
+    ``projects.derive_langcode`` priority order (URL repo basename
+    minus ``.git``); the user can override in the popup."""
+    name = (url or '').rstrip('/').split('/')[-1]
+    if name.endswith('.git'):
+        name = name[:-4]
+    return name or 'project'
+
+
+def _tentative_langcode_from_lift(path):
+    """Cheap derivation from a LIFT filename, used to prefill the
+    confirm-langcode popup for the open-file flow before
+    registration commits."""
+    base = os.path.basename(path or '')
+    if base.lower().endswith('.lift'):
+        base = base[:-5]
+    return base or 'project'
 
 
 def _to_content_uri(abs_path, home_dir):
@@ -289,24 +311,39 @@ class PickerApp(App):
             lambda dt: setattr(sm, 'transition', old_t), 0.1)
 
     # ── Result emission ───────────────────────────────────────────────
-    def load_lift(self, path):
+    def load_lift(self, path, langcode=''):
         """Existing-project tap. Routed here from the picker's project
-        list. Logs and refuses empty paths so a stale registration
-        with no lift_path can't silently land at the recorder as
-        ``no_path``."""
-        print(f'[picker_app] load_lift(path={path!r})',
+        list. The list builder stores the project's canonical
+        langcode on each button (the same value keying the
+        daemon's projects.json), so peers don't have to reverse
+        the URI. Logs and refuses empty paths so a stale
+        registration with no lift_path can't silently land at the
+        recorder as ``no_path``."""
+        print(f'[picker_app] load_lift(path={path!r} '
+              f'langcode={langcode!r})',
               file=sys.stderr, flush=True)
-        self._emit_and_quit(path)
+        self._emit_and_quit(path, langcode=langcode)
 
     def _emit_and_quit(self, path, langcode=''):
-        """Write the chosen path (and optionally a langcode for
-        from-template flows) and stop the app. On Android sets the
-        Activity result instead of writing stdout.
+        """Write the chosen path and the canonical langcode and stop
+        the app. On Android sets the Activity result instead of
+        writing stdout.
 
-        Protocol: ``AZT_PICK\\t<path>\\t<langcode>\\n``. langcode is
-        empty for existing / clone / open flows; populated only when
-        the project came from a fresh template download (the recorder
-        uses it to drive set_vernlang + clean_template on load).
+        Protocol: ``AZT_PICK\\t<path>\\t<langcode>\\n``. ``langcode``
+        is the daemon's ``projects.json`` key for the project — the
+        single source of truth across the suite. Every emit-path
+        threads it through:
+        - clone-flow: ``_after_clone_ok`` reads it from the daemon's
+          clone-job response (which was set on auto-register).
+        - open-file flow: derived by ``register_project`` (we capture
+          the returned ``Project.langcode``).
+        - existing-project tap: stored on the button at populate time.
+        - template-download flow: the user-typed BCP-47 tag.
+
+        Peers should prefer this extra over re-deriving from the
+        URI's first path segment — the URI form happens to use the
+        langcode as the directory name today, but nothing in the
+        contract says it must.
 
         Refuses to emit an empty path: on Android that lands at the
         peer's ``pick_project_android`` handler as ``RESULT_OK`` with
@@ -544,8 +581,19 @@ class PickerApp(App):
     def list_projects(self):
         try:
             ps = list_projects() or []
-        except Exception:
+        except Exception as ex:
+            print(f'[picker_app] list_projects RPC raised: '
+                  f'{type(ex).__name__}: {ex}',
+                  file=sys.stderr, flush=True)
             ps = []
+        # Diagnostic: confirm previously-cloned projects survive
+        # across picker launches. If this prints 0 right after a
+        # successful clone, the registry write didn't persist (bad
+        # AZT_HOME, write permission, etc.).
+        print(f'[picker_app] list_projects: {len(ps)} project(s) '
+              f'from registry: '
+              f'{[p.langcode for p in ps]!r}',
+              file=sys.stderr, flush=True)
         return [(p.langcode, p.lift_path or p.working_dir) for p in ps]
 
     # load_lift is defined earlier with a diagnostic print; the
@@ -575,21 +623,29 @@ class PickerApp(App):
                 return  # user cancelled chooser; stay on picker
             path = selection[0]
 
+            # No popup for the open-file flow — the auto-derived
+            # langcode (LIFT filename stem minus ``.lift``) is what
+            # the user picked when they named the file. They can
+            # rename later via the clone path or a future
+            # rename-project affordance.
+            derived_langcode = _tentative_langcode_from_lift(path)
+
             def _register_and_emit():
                 try:
-                    # working_dir = parent of the .lift; langcode is
-                    # left blank so the daemon derives it.
                     register_project(
-                        langcode='',
+                        langcode=derived_langcode,
                         working_dir=os.path.dirname(path),
                         lift_path=path,
                     )
                 except Exception:
                     # Registration is best-effort; the recorder can
-                    # still load the path.
+                    # still load the path. Derived langcode still
+                    # goes on the result Intent so peers stamp the
+                    # right value.
                     pass
                 Clock.schedule_once(
-                    lambda dt: self._emit_and_quit(path), 0)
+                    lambda dt: self._emit_and_quit(
+                        path, langcode=derived_langcode), 0)
 
             import threading
             threading.Thread(target=_register_and_emit,
@@ -607,55 +663,69 @@ class PickerApp(App):
 
     # ── Create flow: "Clone Internet Repository" ──────────────────────
     def clone_dialog(self):
-        """URL prompt → daemon clone → emit cloned path."""
-        def _on_submit(url):
-            self._show_loading_overlay(
-                _tr('Cloning {url}...').format(url=url))
-            import threading
-
-            def _worker():
-                print(f'[picker_app] clone worker starting url={url!r}',
-                      file=sys.stderr, flush=True)
-                try:
-                    import azt_collabd
-                    repo_name = (url.rstrip('/').split('/')[-1]
-                                 .replace('.git', ''))
-                    dest = os.path.join(
-                        azt_collabd.paths.azt_home(),
-                        'projects', repo_name)
-                    resp = clone_project(url, dest)
-                except Exception as ex:
-                    err_str = str(ex)
-                    print(f'[picker_app] clone exception: {err_str}',
-                          file=sys.stderr, flush=True)
-                    Clock.schedule_once(
-                        lambda dt: self._after_clone_fail(err_str, None), 0)
-                    return
-                # Sanitize for logging — resp['result'] can be a
-                # ``Result`` object that's noisy; just dump keys+ok.
-                print(f'[picker_app] clone returned: '
-                      f'ok={resp.get("ok")!r} '
-                      f'lift_path={resp.get("lift_path")!r} '
-                      f'error={resp.get("error")!r}',
-                      file=sys.stderr, flush=True)
-                if resp.get('ok') and resp.get('lift_path'):
-                    Clock.schedule_once(
-                        lambda dt: self._after_clone_ok(
-                            resp['lift_path']), 0)
-                else:
-                    Clock.schedule_once(
-                        lambda dt: self._after_clone_fail(
-                            resp.get('error', 'unknown'),
-                            resp.get('result')), 0)
-            threading.Thread(target=_worker, daemon=True).start()
+        """URL prompt → daemon clone → emit. The clone-url popup
+        already collects an explicit ``langcode`` (defaulting to the
+        URL-derived value, with an inline **change code** affordance
+        if the user wants to override). No separate confirmation
+        step — the picker just kicks the clone with whatever the
+        popup returned."""
+        def _on_submit(url, langcode):
+            self._start_clone(url, langcode)
 
         clone_url_popup(_on_submit)
 
-    def _after_clone_ok(self, lift_path):
-        print(f'[picker_app] _after_clone_ok lift_path={lift_path!r}',
+    def _start_clone(self, url, chosen_langcode):
+        """Kick the clone with the user-confirmed langcode. The
+        daemon's ``_clone_worker`` registers under this exact key;
+        ``_emit_and_quit`` later stamps the same value on the
+        result Intent's ``langcode`` extra."""
+        self._show_loading_overlay(
+            _tr('Cloning {url}...').format(url=url))
+        import threading
+
+        def _worker():
+            print(f'[picker_app] clone worker starting url={url!r} '
+                  f'langcode={chosen_langcode!r}',
+                  file=sys.stderr, flush=True)
+            try:
+                import azt_collabd
+                repo_name = (url.rstrip('/').split('/')[-1]
+                             .replace('.git', ''))
+                dest = os.path.join(
+                    azt_collabd.paths.azt_home(),
+                    'projects', repo_name)
+                resp = clone_project(url, dest, langcode=chosen_langcode)
+            except Exception as ex:
+                err_str = str(ex)
+                print(f'[picker_app] clone exception: {err_str}',
+                      file=sys.stderr, flush=True)
+                Clock.schedule_once(
+                    lambda dt: self._after_clone_fail(err_str, None), 0)
+                return
+            print(f'[picker_app] clone returned: '
+                  f'ok={resp.get("ok")!r} '
+                  f'lift_path={resp.get("lift_path")!r} '
+                  f'error={resp.get("error")!r}',
+                  file=sys.stderr, flush=True)
+            if resp.get('ok') and resp.get('lift_path'):
+                Clock.schedule_once(
+                    lambda dt: self._after_clone_ok(
+                        resp['lift_path'],
+                        resp.get('langcode', chosen_langcode)), 0)
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._after_clone_fail(
+                        resp.get('error', 'unknown'),
+                        resp.get('result')), 0)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _after_clone_ok(self, lift_path, langcode=''):
+        print(f'[picker_app] _after_clone_ok lift_path={lift_path!r} '
+              f'langcode={langcode!r}',
               file=sys.stderr, flush=True)
         self._dismiss_loading_overlay()
-        self._emit_and_quit(lift_path)
+        self._emit_and_quit(lift_path, langcode=langcode)
 
     def _after_clone_fail(self, err, result):
         print(f'[picker_app] _after_clone_fail err={err!r} '

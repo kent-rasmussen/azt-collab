@@ -95,6 +95,87 @@ class LiftHandle:
         return f'<LiftHandle {kind}={self.path_or_uri!r}>'
 
 
+def _sibling_uri_or_path(lift_path_or_uri, subdir, basename):
+    """Compose the URI / filesystem path for a sibling resource of
+    a project's LIFT file. ``subdir`` is one of ``'audio'`` or
+    ``'images'``; ``basename`` is the leaf filename only.
+
+    On a ``content://`` URI, returns a same-authority URI with the
+    project's ``<lang>`` segment preserved::
+
+        content://<auth>/<lang>/<file>.lift   →
+        content://<auth>/<lang>/<subdir>/<basename>
+
+    On a filesystem path, returns
+    ``<dirname-of-lift>/<subdir>/<basename>``. Mirrors what desktop
+    code does with ``os.path.join(os.path.dirname(lift_path), …)``,
+    so callers can stay agnostic about path vs URI."""
+    if not basename or '/' in basename or basename in ('..', '.'):
+        raise ValueError(f'invalid basename: {basename!r}')
+    if subdir not in ('audio', 'images'):
+        raise ValueError(f'subdir must be audio or images, got {subdir!r}')
+    if is_content_uri(lift_path_or_uri):
+        # Drop the scheme, split on '/', take authority + lang prefix
+        # before the .lift segment, swap subdir + basename in.
+        rest = lift_path_or_uri[len(_CONTENT_PREFIX):]
+        parts = rest.split('/')
+        # Expect [<authority>, <lang>, <file>.lift]; tolerate trailing
+        # slashes / empty terminal segments.
+        clean = [p for p in parts if p]
+        if len(clean) < 2:
+            raise ValueError(
+                f'malformed lift URI (need authority and at least '
+                f'<lang> segment): {lift_path_or_uri!r}')
+        authority, lang = clean[0], clean[1]
+        return f'{_CONTENT_PREFIX}{authority}/{lang}/{subdir}/{basename}'
+    return os.path.join(os.path.dirname(lift_path_or_uri),
+                        subdir, basename)
+
+
+def audio_uri_for(lift_path_or_uri, basename):
+    """Sibling audio URI / path. See ``_sibling_uri_or_path``."""
+    return _sibling_uri_or_path(lift_path_or_uri, 'audio', basename)
+
+
+def image_uri_for(lift_path_or_uri, basename):
+    """Sibling image URI / path. See ``_sibling_uri_or_path``."""
+    return _sibling_uri_or_path(lift_path_or_uri, 'images', basename)
+
+
+class MediaHandle(LiftHandle):
+    """Read/write wrapper for sibling audio / image files served by
+    the same provider that serves the LIFT file. Same shape as
+    ``LiftHandle`` plus a ``kind`` for log lines and a write-mode
+    gate (images are read-only from peers — the daemon owns image
+    additions; peers only display).
+
+    ``MediaHandle('content://.../audio/foo.wav', 'audio')`` →
+    read+write. ``MediaHandle('content://.../images/foo.png',
+    'image')`` → read-only.
+
+    Compose the path/URI with ``audio_uri_for`` / ``image_uri_for``
+    given the picker-emitted LIFT path/URI plus a basename."""
+
+    def __init__(self, path_or_uri, kind):
+        if kind not in ('audio', 'image'):
+            raise ValueError(f'kind must be audio or image, got {kind!r}')
+        super().__init__(path_or_uri)
+        self.kind = kind
+
+    def open_write(self):
+        if self.kind == 'image':
+            raise PermissionError(
+                'images are read-only from peers; the daemon owns '
+                'image additions. If you really need this, expose a '
+                'server endpoint.')
+        return super().open_write()
+
+    def __repr__(self):
+        kind = 'uri' if self.is_uri else 'path'
+        return (f'<MediaHandle kind={self.kind!r} {kind}='
+                f'{self.path_or_uri!r}>')
+
+
 def _open_content_uri(uri, mode):
     """Open a ``content://`` URI through the host Activity's
     ContentResolver. Detaches the underlying ``ParcelFileDescriptor``

@@ -11,6 +11,234 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.19.1 — fix vanishing project list: defer ProjectPickerScreen.on_enter populate by one frame
+- ``projects.json`` had the cloned project, the daemon's
+  ``_h_list_projects`` would have returned it — but the picker
+  never asked. ``ProjectPickerScreen.on_enter`` called
+  ``_populate_projects`` synchronously, and Kivy >= 2.3 fires
+  ``on_enter`` before KV-defined ids attach on the first screen
+  entry. So ``self.ids.get('project_list')`` returned None, the
+  populate function bailed silently, and the existing-projects
+  list rendered empty — "cloned projects don't show up on next
+  open". Same race the settings UI already worked around with
+  ``Clock.schedule_once``; applied the same fix here.
+- Added two diagnostic prints inside ``_populate_projects`` so
+  any future bail (still-no-id even after the defer, or missing
+  host ``list_projects`` method) surfaces in logcat instead of
+  manifesting as a silent empty list.
+
+### azt_collab_client 0.19.0 — suite-wide last-opened-project state (`recent.last_project`)
+- New ``azt_collab_client.recent`` module with ``last_project()`` and
+  ``set_last_project(langcode)``, persisted to
+  ``$AZT_HOME/config.json`` under ``recent.last_langcode``. Re-exported
+  from the package root.
+- Same store as ``i18n``'s ``ui.language`` — no daemon RPC, just a
+  file the client reads/writes; peers converge through the shared
+  config without an explicit coordination channel. Recorder writes
+  the langcode after every successful pick; the next peer launch
+  (recorder, viewer, future apps) reads it at startup and lands on
+  the same project.
+- Resolve langcode → current path/URI via the existing
+  ``open_project(langcode)`` (returns the daemon's authoritative
+  ``Project`` record). ``recent.last_project()`` deliberately returns
+  just the langcode, not a path — paths/URIs can shift across syncs;
+  the langcode is stable.
+- The "one store — suite-wide prefs AND state" rule generalises: the
+  recorder's ``prefs['last_lift']`` was the second peer-private
+  cache to fall under the rule (after ``prefs['ui_language']`` in
+  0.16.0). Future cross-peer signals (last entry within project,
+  contributor name) follow the same model.
+
+### azt_collabd 0.14.5 — list_projects path/count diagnostic
+- ``_h_list_projects`` now prints the resolved
+  ``projects.json`` path it just read from plus the count and
+  langcodes returned. Combined with the 0.14.4
+  ``clone registered langcode=… → <path>`` print on the write
+  side, the two log lines pin down whether the
+  vanishing-projects bug is a write-vs-read path mismatch
+  (different ``$AZT_HOME`` resolution between the two call
+  sites) or a write-failed-silently issue. The actual on-disk
+  content can be verified with ``adb shell run-as
+  org.atoznback.aztcollab cat files/azt/projects.json``.
+
+### azt_collabd 0.14.4 — inline langcode preview in clone popup; diagnostic prints for missing-after-relaunch projects
+- Clone-URL popup gained an inline ``code: <derived>`` readout
+  with an inline **change code** button right above the URL
+  field. The readout updates live as the user types the URL;
+  no separate confirmation step. Tapping **change code** swaps
+  the readout for a small editable field — once the user takes
+  control there's no auto-revert.
+- Open-file flow uses the LIFT-filename-stem-derived langcode
+  silently (no popup); user can rename later through whatever
+  rename affordance lands.
+- Diagnostic prints added in two spots so the user-reported
+  "previously cloned projects don't show up on next open"
+  actually points somewhere:
+  - ``_clone_worker`` after ``projects.register``, prints the
+    langcode and the resolved ``projects.json`` path. If the
+    print appears, the registry write thinks it succeeded.
+  - ``picker_app.list_projects`` (host method) prints how many
+    projects came back from the daemon and which langcodes.
+    If this prints 0 right after a successful clone, persistence
+    or path-resolution is the issue (likely an ``$AZT_HOME``
+    that differs between the clone-time process and the picker
+    relaunch).
+
+### azt_collabd 0.14.3 — clone accepts user-chosen langcode on input; rename_project endpoint
+- ``POST /v1/projects/clone`` body gains optional ``langcode``;
+  the picker collects an explicit value via the
+  ``confirm_langcode_popup`` (client 0.18.2) before kicking the
+  clone, so the project lands in ``projects.json`` keyed on the
+  user's choice from the moment the daemon first sees it. No
+  rename-after-the-fact in the registry. Empty ``langcode`` falls
+  back to the daemon's auto-derivation from the LIFT filename /
+  repo URL — matches the legacy desktop / scripted-call shape.
+- ``_clone_worker`` gained an ``override_langcode`` kwarg; the
+  registration step prefers it over ``derive_langcode``.
+- New ``POST /v1/projects/<langcode>/rename`` endpoint
+  (``_h_rename_project``) and ``projects.rename(old, new)``
+  helper. Not used by the picker (which sets-on-create instead),
+  but exposed for future flows that might let the user re-key a
+  project after the fact (e.g., a settings-screen "rename
+  project" affordance).
+
+### azt_collabd 0.14.2 — clone job response carries canonical langcode
+- Closes the azt-viewer 0.5.1 TODO ("picker should emit canonical
+  langcode, not just leave the URI to be parsed"). The clone job
+  response now includes ``langcode`` alongside ``lift_path`` —
+  the same value the daemon just keyed the projects.json entry
+  with on auto-register. ``_clone_worker`` captures it, the
+  ``DONE`` job-state stash records it, ``_h_clone_status``
+  passes it through.
+- Source-of-truth chain (none of these need to derive from the
+  URI on the peer side any more):
+  - clone → daemon ``projects.derive_langcode`` → clone job →
+    client ``clone_project`` returns ``langcode`` → picker stamps
+    Intent extra.
+  - open-file → ``register_project`` returns ``Project.langcode``
+    → picker stamps Intent extra.
+  - existing-project tap → ``picker.py`` populates the button
+    with ``btn.langcode = projects_list_entry.langcode`` →
+    ``load_lift(path, langcode)`` → picker stamps Intent extra.
+  - template flow → user-typed BCP-47 (``_pending_vernlang``)
+    already stamps the Intent extra.
+- Backward-compatible. Old clients ignore the extra ``langcode``
+  field on ``_h_clone_status`` responses; new clients hitting old
+  daemons see ``langcode == ''`` and the peer's URI-parse
+  fallback (defence-in-depth) still kicks in.
+
+### azt_collab_client 0.18.3 — clone popup: only one input field active at a time
+- ``clone_url_popup`` reworked so the URL field and the code field
+  are mutually exclusive — only one is enabled at any moment, so
+  the on-screen keyboard never argues with itself between two
+  text inputs.
+  - Mode A (default): code-preview row shows ``code: <derived> [change code]``;
+    URL field is the active input.
+  - Mode B (after tapping **change code**): code-preview row swaps
+    in an editable code field with an ``[OK]`` button; the URL
+    field is set to ``disabled=True`` (grays out, displays the
+    typed URL, no input focus).
+  - Tapping **OK** commits the typed code, re-enables the URL
+    field, and swaps Mode A back in. Empty typed code clears the
+    override so URL→code syncing resumes; non-empty pins the
+    user's value through subsequent URL edits.
+- Submit (Clone) works in either mode: takes the live code input
+  in Mode B, the saved override in Mode A (post-OK), or the
+  current URL-derived value otherwise. URL still required.
+
+### azt_collab_client 0.18.2 — confirm-langcode popup: set on creation, not afterwards
+- New ``ui.popups.confirm_langcode_popup(initial, on_submit)``:
+  shows the auto-derived langcode in an editable field, asks the
+  user to confirm or correct it. ``on_submit(chosen)`` fires on
+  Confirm (and on Cancel with the original ``initial``, so the
+  flow always resolves). Re-exported from ``azt_collab_client.ui``.
+- ``picker_app.clone_dialog`` now derives a tentative langcode
+  from the URL repo basename, runs ``confirm_langcode_popup``
+  immediately after the URL submit, and only kicks the clone
+  once the user confirms — passes the chosen value to
+  ``clone_project(url, dest, langcode=chosen)``. The daemon
+  registers under that exact key (no post-hoc rename). Helper
+  ``_tentative_langcode_from_url`` mirrors the daemon's
+  derivation order without requiring a filesystem path.
+- ``picker_app.open_file._on_chosen`` runs
+  ``confirm_langcode_popup`` after the file is picked but
+  before ``register_project``; the chosen value goes to the
+  registration call directly. Helper
+  ``_tentative_langcode_from_lift`` strips the ``.lift``
+  extension off the basename for the prefill.
+- ``clone_project()`` / ``clone_project_start()`` accept an
+  optional ``langcode=''`` kwarg routed into the request body;
+  empty preserves the legacy auto-derivation behaviour for
+  desktop scripted callers.
+- New ``rename_project(old_langcode, new_langcode)`` wrapper for
+  the daemon's ``/v1/projects/<langcode>/rename`` endpoint.
+  Currently unused by the picker (set-on-create supersedes it),
+  but exposed in ``__all__`` for peer apps that want to surface
+  a "rename this project" affordance later.
+
+### azt_collab_client 0.18.1 — clone_project carries langcode; project-list buttons stash langcode for load_lift
+- ``clone_project()`` now returns ``langcode`` alongside
+  ``lift_path`` / ``result`` / ``error`` on the success branch
+  (DONE state). Daemon-side companion in 0.14.2.
+- ``picker.py`` existing-project list now stores the project's
+  canonical langcode on each button at populate time (the
+  ``name`` half of the host's ``list_projects()`` tuple is already
+  the langcode by contract) and passes it through on tap:
+  ``app.load_lift(b.lift_path, getattr(b, 'langcode', ''))``. Host
+  ``load_lift`` signature gains an optional ``langcode``
+  parameter; default keeps existing single-arg callers working.
+
+### azt_collab_client 0.18.0 — MediaHandle + audio_uri_for / image_uri_for
+- New ``audio_uri_for(lift_path_or_uri, basename)`` and
+  ``image_uri_for(lift_path_or_uri, basename)`` composer helpers.
+  Given the picker-emitted LIFT path/URI plus a basename, return
+  the sibling resource's URI (on Android-content URIs) or
+  filesystem path (desktop) — so callers stay agnostic about the
+  path/URI distinction. URI form composes
+  ``content://<auth>/<lang>/{audio|images}/<basename>``, mirroring
+  the daemon's ``_resolve_path`` whitelist. Filesystem form is
+  ``os.path.join(os.path.dirname(lift_path), {audio|images}, basename)``.
+- New ``MediaHandle(path_or_uri, kind='audio'|'image')`` —
+  ``LiftHandle`` subclass with a ``kind`` for log lines / error
+  messages, and a write-mode gate: ``open_write()`` on
+  ``kind='image'`` raises ``PermissionError`` (images are
+  read-only from peers; the daemon owns image additions).
+- Re-exported from the package root: ``from azt_collab_client
+  import MediaHandle, audio_uri_for, image_uri_for``.
+- Together with ``LiftHandle`` (0.17.0), this is the full Tier 3
+  cross-package toolkit the recorder migration documented in
+  ``CLAUDE.md`` needs to land audio recording and image rendering
+  on the new Android server-APK model.
+
+### azt_collab_client 0.17.1 — client-first asset model: new icon_path helper, gear bundled
+- New ``azt_collab_client.ui.icons`` module with public
+  ``icon_path(name)`` — returns the absolute path to a bundled icon
+  under ``azt_collab_client/ui/assets/icons/<name>.png`` (canonical
+  location), falling back to ``assets/<name>.png`` for the legacy
+  flat layout where ``gear.png`` currently lives. Returns ``''`` if
+  the asset isn't bundled. Re-exported from
+  ``azt_collab_client.ui.icon_path``.
+- ``picker.py`` now resolves its default gear icon through
+  ``icon_path('gear')`` (was a private ``_BUNDLED_GEAR`` constant
+  with the same effect) so the discovery seam is reused for the
+  next batch of shared icons.
+- ``CLAUDE.md`` UI section documents the **client-first asset model**:
+  shared-shape assets (gear, sync, share, future back/close glyphs)
+  default to ``azt_collab_client/ui/assets/icons/`` so sister apps
+  inherit them for free; peer-specific icons (recorder microphone /
+  redo / app-icon variants) stay in the peer; existing recorder KV
+  references with relative ``icons/<name>.png`` paths still work in
+  the recorder's own cwd and don't need migrating.
+- **Asset migration done:** ``sync_dark`` / ``sync_light`` /
+  ``share_dark`` / ``share_light`` / ``gear_dark`` / ``gear_light``
+  copied from ``azt_recorder/icons/`` into
+  ``azt_collab_client/ui/assets/icons/``. ``icon_path('sync_dark')``
+  etc. now resolve to the bundled package paths; the next sister-app
+  peer (viewer, future clients) gets them with zero per-app work.
+  The recorder's existing relative ``icons/<name>.png`` references
+  still resolve in its own cwd, so this change is non-breaking;
+  recorder-side migration to ``icon_path()`` can be opportunistic.
+
 ### azt_collab_client 0.17.0 — LiftHandle: cross-package LIFT-file access for peer apps
 - New ``azt_collab_client.lift_io`` module exporting ``LiftHandle``
   and ``is_content_uri``. ``LiftHandle(path_or_uri).open_read()`` /

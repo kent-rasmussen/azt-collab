@@ -371,6 +371,15 @@ def _h_migrate_from_prefs(body):
 
 def _h_list_projects(_body):
     items = [p.to_dict() for p in projects.list_all()]
+    # Diagnostic: confirms the path the dispatcher reads from and
+    # the resulting count. If the count is 0 here right after a
+    # successful clone-register elsewhere in the same logcat, we
+    # have an AZT_HOME mismatch between the two call sites
+    # (different process? jnius Activity null at one point?).
+    print(f'[server] list_projects: {len(items)} entries from '
+          f'{projects.projects_path()!r} → '
+          f'{[i["langcode"] for i in items]!r}',
+          file=sys.stderr, flush=True)
     return 200, {"ok": True, "projects": items}
 
 
@@ -445,7 +454,8 @@ def _clone_error_looks_like_auth(result):
 
 
 def _clone_worker(job_id, remote_url, dest_dir, username, token,
-                  retry_anonymous_on_auth_fail=True):
+                  retry_anonymous_on_auth_fail=True,
+                  override_langcode=''):
     from .repo import clone_repo as _clone_repo
 
     def _on_progress(line):
@@ -480,12 +490,34 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
         # registry. Best-effort: a registry write failure shouldn't
         # mark the whole clone as failed (the working tree is on
         # disk; a future explicit register_project call recovers).
+        # Capture the canonical langcode for the job response so
+        # peers don't have to parse it back out of the LIFT URI
+        # (azt-viewer 0.5.1 filed the TODO; the URI parse worked
+        # only by coincidence — when working dir basename == langcode).
+        # Picker collects an explicit langcode from the user before
+        # kicking the clone (confirm-langcode popup); pass it through
+        # via ``override_langcode`` so the project is keyed on the
+        # user's choice from the moment ``projects.json`` first sees
+        # it. Empty override falls back to the filesystem-derived
+        # default — matches the desktop / scripted-call behaviour.
+        job_langcode = ''
         if lift_path:
             try:
-                langcode = projects.derive_langcode(dest_dir, lift_path)
-                projects.register(langcode, dest_dir,
+                job_langcode = (
+                    (override_langcode or '').strip()
+                    or projects.derive_langcode(dest_dir, lift_path))
+                projects.register(job_langcode, dest_dir,
                                   lift_path=lift_path,
                                   remote_url=remote_url)
+                # Confirm the registry write hit disk (the user
+                # reported previously-cloned projects not showing
+                # up on next open — most likely the auto-register
+                # is silently failing). projects_path() should be
+                # ``$AZT_HOME/projects.json`` — if it's missing
+                # after this print, persistence is the issue.
+                print(f'[server] clone registered langcode='
+                      f'{job_langcode!r} → {projects.projects_path()!r}',
+                      file=sys.stderr, flush=True)
             except Exception as ex:
                 print(f'[server] clone auto-register failed: '
                       f'{type(ex).__name__}: {ex}',
@@ -497,6 +529,7 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
                 job.update({
                     'state': 'DONE',
                     'lift_path': lift_path or '',
+                    'langcode': job_langcode,
                     'result': result.to_dict(),
                 })
     except Exception as ex:
@@ -542,6 +575,7 @@ def _h_create_project_from_template(body):
 def _h_clone_project(body):
     remote_url = body.get('remote_url', '')
     dest_dir = body.get('dest_dir', '')
+    override_langcode = (body.get('langcode') or '').strip()
     if not remote_url or not dest_dir:
         return 400, {"ok": False,
                      "error": "missing_remote_url_or_dest_dir"}
@@ -558,6 +592,7 @@ def _h_clone_project(body):
     t = threading.Thread(
         target=_clone_worker,
         args=(job_id, remote_url, dest_dir, git_user, token),
+        kwargs={'override_langcode': override_langcode},
         daemon=True,
     )
     t.start()
@@ -585,9 +620,26 @@ def _h_clone_status(job_id, body):
             "progress": new_lines,
             "next_index": len(progress),
             "lift_path": job.get('lift_path', ''),
+            "langcode": job.get('langcode', ''),
             "result": job.get('result'),
             "error": job.get('error', ''),
         }
+
+
+def _h_rename_project(langcode, body):
+    """Rename a project's langcode key in projects.json. Used by the
+    picker's confirm-langcode popup when the user overrides the
+    auto-derived value for a clone / open-file project."""
+    new_langcode = (body.get('new_langcode') or '').strip()
+    if not new_langcode:
+        return 400, {"ok": False, "error": "missing_new_langcode"}
+    try:
+        p = projects.rename(langcode, new_langcode)
+    except ValueError as ex:
+        return 400, {"ok": False, "error": str(ex)}
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    return 200, {"ok": True, "project": p.to_dict()}
 
 
 def _h_register_project(body):
@@ -725,6 +777,10 @@ def dispatch(method, path, body):
             return _h_migrate_from_prefs(body)
         if path == '/v1/projects/register':
             return _h_register_project(body)
+        if path.startswith('/v1/projects/'):
+            parts = path.split('/')
+            if len(parts) == 5 and parts[4] == 'rename':
+                return _h_rename_project(parts[3], body)
         if path == '/v1/projects/derive_langcode':
             return _h_derive_langcode(body)
         if path == '/v1/projects/init':

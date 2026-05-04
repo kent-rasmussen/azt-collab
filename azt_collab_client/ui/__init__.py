@@ -11,10 +11,14 @@ moves ``LangPickerScreen``; ``ProjectPickerScreen`` lands in step 5.
 
 from .langpicker import LangPickerScreen, register_kv as register_langpicker_kv
 from .picker import ProjectPickerScreen, register_kv as register_picker_kv
-from .popups import clone_url_popup, install_server_apk_popup
+from .popups import (
+    clone_url_popup, confirm_langcode_popup, install_server_apk_popup,
+)
 from .fonts import register_charis
+from .icons import icon_path
 
 __all__ = ['LangPickerScreen', 'register_langpicker_kv',
            'ProjectPickerScreen', 'register_picker_kv',
-           'clone_url_popup', 'install_server_apk_popup',
-           'register_charis']
+           'clone_url_popup', 'confirm_langcode_popup',
+           'install_server_apk_popup',
+           'register_charis', 'icon_path']

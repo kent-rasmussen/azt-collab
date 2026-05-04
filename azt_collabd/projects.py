@@ -130,6 +130,38 @@ def unregister(langcode):
     _update(mut)
 
 
+def rename(old_langcode, new_langcode):
+    """Rename a project's key in ``projects.json`` while preserving
+    its working_dir / lift_path / remote_url / created_at /
+    last_sync. Returns the resulting Project under the new key, or
+    None if ``old_langcode`` isn't registered. Raises ``ValueError``
+    if ``new_langcode`` is empty or already names a different
+    project.
+
+    Used by the picker's "confirm langcode" flow: the daemon
+    auto-derives a langcode from the LIFT filename / URL on clone
+    or open-file, but the user may want to override it before the
+    project is handed back to the recorder. Same-name rename is a
+    no-op."""
+    if not new_langcode:
+        raise ValueError('new_langcode required')
+    if old_langcode == new_langcode:
+        return get(old_langcode)
+    data = _load_raw()
+    entry = data.get(old_langcode)
+    if entry is None:
+        return None
+    if new_langcode in data:
+        raise ValueError(
+            f'{new_langcode!r} is already registered to a different '
+            f'working_dir; pick a different langcode')
+    def mut(d):
+        d[new_langcode] = dict(entry)
+        d.pop(old_langcode, None)
+    _update(mut)
+    return Project.from_entry(new_langcode, entry)
+
+
 def get(langcode):
     entry = _load_raw().get(langcode)
     if entry is None:

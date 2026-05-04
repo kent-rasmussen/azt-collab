@@ -17,7 +17,7 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.14.0"
+__version__ = "0.14.5"
 
 # Floor on the azt_collab_client version this daemon is willing to talk
 # to. Published on /v1/health so the client compares locally and a peer
@@ -27,7 +27,7 @@ __version__ = "0.14.0"
 # the picker to emit ``content://`` URIs, which a pre-LiftHandle client
 # would try to ``open()`` as a filesystem path (the recorder's
 # ``[Errno 2] No such file or directory`` symptom).
-MIN_CLIENT_VERSION = "0.17.0"
+MIN_CLIENT_VERSION = "0.18.0"
 
 from . import config
 from . import net

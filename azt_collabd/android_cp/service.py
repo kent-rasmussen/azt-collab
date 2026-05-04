@@ -104,28 +104,65 @@ def install_callbacks():
     _installed = True
 
 
+_ALLOWED_MEDIA_DIRS = ('audio', 'images')
+
+
 def _resolve_path(rel, mode):
     """Map a provider-supplied relative path to an absolute path under
-    ``$AZT_HOME/projects/``. Returns None on path-traversal attempts so
-    the Java side raises FileNotFoundException.
+    ``$AZT_HOME/projects/``. Returns None on path-traversal attempts or
+    structurally-disallowed shapes so the Java side raises
+    FileNotFoundException.
 
     ``rel`` is expected as the URI's path component (Java-side
     ``Uri.getPath()``), which always carries a leading slash. The
     ``lstrip('/')`` below makes ``os.path.join(base, rel)`` compose
-    under ``base`` instead of treating ``rel`` as absolute."""
+    under ``base`` instead of treating ``rel`` as absolute.
+
+    Allowed path shapes (defence-in-depth — even ``..`` would be
+    caught by ``commonpath``, but rejecting structurally lets us also
+    catch peer mistakes like asking for a sibling project's tree
+    through ``<lang>/../<other>/audio/foo.wav`` and surfaces them as
+    a clear FileNotFoundError instead of an opaque containment fail):
+
+    - ``<lang>/<file>.lift``     — top-level LIFT file
+    - ``<lang>/audio/<file>``    — sibling audio recording
+    - ``<lang>/images/<file>``   — sibling image asset
+
+    Anything else returns None. ``..`` and empty segments are
+    rejected explicitly; ``/`` inside a segment is impossible after
+    splitting."""
     if not rel:
         return None
     rel = rel.lstrip('/')
+    parts = rel.split('/')
+    # Reject empty segments and parent-traversal anywhere.
+    if any(p in ('', '..', '.') for p in parts):
+        return None
+    if len(parts) == 2:
+        # <lang>/<file>.lift — the only top-level file shape.
+        if not parts[1].lower().endswith('.lift'):
+            return None
+    elif len(parts) == 3:
+        # <lang>/{audio|images}/<file>.
+        if parts[1] not in _ALLOWED_MEDIA_DIRS:
+            return None
+    else:
+        return None
+
     base = os.path.realpath(os.path.join(azt_home(), 'projects'))
     target = os.path.realpath(os.path.join(base, rel))
-    # Containment check: target must live under base.
+    # Containment check: target must live under base. Belt-and-braces
+    # alongside the structural check above; if a future symlink trick
+    # bypasses the segment whitelist, this still 403s.
     try:
         if os.path.commonpath([base, target]) != base:
             return None
     except ValueError:
         return None
     if not os.path.exists(target):
-        # Allow creation in 'w' mode; deny otherwise.
+        # Allow creation in 'w'/'a' mode; mkdir -p the parent so the
+        # first audio recording for a freshly-cloned project doesn't
+        # need a separate mkdir RPC.
         if mode and ('w' in mode or 'a' in mode):
             os.makedirs(os.path.dirname(target), exist_ok=True)
             return target

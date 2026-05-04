@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.17.0"
+__version__ = "0.19.1"
 MIN_SERVER_VERSION = "0.8.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
@@ -17,7 +17,10 @@ from .status import Status, Result
 from .projects import Project, ProjectStatus
 from .translate import translate_status, translate_result, set_translator
 from .rpc import call, health, ServerUnavailable
-from .lift_io import LiftHandle, is_content_uri
+from .lift_io import (
+    LiftHandle, MediaHandle, audio_uri_for, image_uri_for, is_content_uri,
+)
+from .recent import last_project, set_last_project
 
 
 def configure(app_id: str):
@@ -562,6 +565,32 @@ def open_project(langcode):
     return Project.from_dict(resp.get('project', {}))
 
 
+def rename_project(old_langcode, new_langcode):
+    """Rename a project's langcode key in the daemon's
+    ``projects.json`` (preserving working_dir / lift_path /
+    remote_url / created_at / last_sync). Used by the picker's
+    confirm-langcode flow when the user overrides the
+    auto-derived value before the project is handed back to the
+    recorder. Same-name rename is a no-op.
+
+    Returns the resulting Project on success, or None if the
+    old langcode wasn't registered or the rename was rejected
+    (e.g. the new langcode is already in use). On transport
+    failure returns None and the caller should fall back to the
+    derived langcode."""
+    if not new_langcode or old_langcode == new_langcode:
+        return open_project(old_langcode)
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{old_langcode}/rename',
+                    {'new_langcode': new_langcode})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return Project.from_dict(resp.get('project', {}))
+
+
 def register_project(langcode, working_dir, lift_path='', remote_url=''):
     """Tell the server about an existing project. Returns the Project."""
     resp = call('POST', '/v1/projects/register', {
@@ -635,7 +664,7 @@ def create_project_from_template(vernlang, dest_dir, template_url=''):
 
 
 def clone_project(remote_url, dest_dir, on_progress=None,
-                  poll_interval=0.5):
+                  poll_interval=0.5, langcode=''):
     """Drive a server-side clone job to completion. Synchronous: blocks
     until the clone finishes (or fails). Returns
     ``{'ok': True, 'lift_path': str, 'result': Result}`` on success or
@@ -646,7 +675,7 @@ def clone_project(remote_url, dest_dir, on_progress=None,
     Clock-driven progress loop), call ``clone_project_start`` +
     ``clone_project_status`` directly."""
     import time as _time
-    kicked = clone_project_start(remote_url, dest_dir)
+    kicked = clone_project_start(remote_url, dest_dir, langcode=langcode)
     if not kicked.get('ok'):
         return {'ok': False,
                 'error': kicked.get('error', 'unknown'),
@@ -671,6 +700,12 @@ def clone_project(remote_url, dest_dir, on_progress=None,
         if state == 'DONE':
             return {'ok': bool(resp.get('lift_path')),
                     'lift_path': resp.get('lift_path', ''),
+                    # Canonical langcode from the daemon's
+                    # ``projects.json`` (set on auto-register after
+                    # clone). Pass-through so peers can stamp it on
+                    # the picker's result Intent without re-deriving
+                    # — see CHANGELOG TODO closed in 0.18.1.
+                    'langcode': resp.get('langcode', ''),
                     'result': resp.get('result'),
                     'error': '' if resp.get('lift_path') else 'no_lift_found'}
         if state == 'FAILED':
@@ -679,13 +714,21 @@ def clone_project(remote_url, dest_dir, on_progress=None,
                     'result': resp.get('result')}
 
 
-def clone_project_start(remote_url, dest_dir):
+def clone_project_start(remote_url, dest_dir, langcode=''):
     """Kick off a server-side clone job. Returns ``{ok, job_id}`` on
     success or ``{ok: False, error}`` on failure. Poll progress with
-    ``clone_project_status``."""
+    ``clone_project_status``.
+
+    ``langcode`` is the user-confirmed key the daemon will register
+    the project under (collected by the picker's confirm-langcode
+    popup before this call). Empty string falls back to the daemon's
+    auto-derivation from the LIFT filename / repo URL — matches the
+    legacy desktop / scripted-call shape."""
     try:
         resp = call('POST', '/v1/projects/clone', {
-            'remote_url': remote_url, 'dest_dir': dest_dir,
+            'remote_url': remote_url,
+            'dest_dir': dest_dir,
+            'langcode': langcode,
         })
     except ServerUnavailable as ex:
         return {'ok': False, 'error': f'server_unavailable: {ex}'}
@@ -795,14 +838,16 @@ __all__ = [
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',
     'save_gitlab_credentials', 'migrate_from_prefs',
-    'list_projects', 'open_project', 'register_project',
+    'list_projects', 'open_project', 'register_project', 'rename_project',
     'derive_langcode', 'init_project',
     'create_project_from_template',
     'clone_project',
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'request_sync', 'poll_job',
     'record_project_sync_time',
-    'LiftHandle', 'is_content_uri',
+    'LiftHandle', 'MediaHandle', 'audio_uri_for', 'image_uri_for',
+    'is_content_uri',
+    'last_project', 'set_last_project',
     'Status', 'Result', 'S', 'Project', 'ProjectStatus',
     'translate_status', 'translate_result', 'set_translator',
     'ServerUnavailable',
