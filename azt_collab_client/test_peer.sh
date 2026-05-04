@@ -67,7 +67,7 @@ else
         | grep -v "^$SERVER_PKG$" \
         | tr '\n' ' ')
 fi
-
+exclude woa, list?
 if [ -z "$peers" ]; then
     echo "no peer apps found under $SUITE_DOMAIN. Install one (e.g., the recorder)."
     echo "Or pass package names explicitly:"
@@ -80,6 +80,9 @@ echo "Peers to check: $peers"
 
 n_checked=0
 for peer in $peers; do
+    if [ "$peer" == "org.atoznback.woa" ] #Not a client app!
+    	then continue
+    fi
     n_checked=$((n_checked + 1))
     echo
     echo "── peer $n_checked: $peer ──"

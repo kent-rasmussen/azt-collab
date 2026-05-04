@@ -26,8 +26,8 @@ import org.kivy.android.PythonService;
  *      as JOB_INTERRUPTED to peers polling stale job_ids.
  *
  * The IBinder returned from onBind is a no-op stub. Peers don't need
- * to talk to it — bind exists purely for the OOM hint. RPC and file
- * I/O continue to flow through AZTCollabProvider.
+ * to talk to it — bind exists purely for the OOM hint. Real RPC and
+ * file I/O continue to flow through AZTCollabProvider.
  *
  * Manifest registration: injected post-render by p4a_hook.py's
  * _inject_aztcollab_service step (gated on dist_name == 'aztcollab',
@@ -35,6 +35,18 @@ import org.kivy.android.PythonService;
  *
  * Lives under the suite's signature-protected
  * org.atoznback.AZT_COLLAB_ACCESS so only suite-signed peers can bind.
+ *
+ * API note: this matches p4a's PythonService class as shipped in the
+ * SDL2 bootstrap (see PythonService.java in the same dist tree).
+ * That class exposes a {@code startType()} hook (not the typical
+ * {@code onStartCommand}) and uses Intent extras
+ * (androidPrivate / androidArgument / serviceEntrypoint /
+ * pythonName / pythonHome / pythonPath / pythonServiceArgument /
+ * serviceStartAsForeground) to pass configuration to the Python
+ * thread. We replicate p4a's auto-generated Service&lt;Name&gt;.start
+ * pattern (templates/Service.tmpl.java) here so we don't need
+ * {@code services = } in buildozer.spec, which would generate a
+ * parallel ServiceProviderhost we'd have to layer over.
  */
 public class AZTServiceProviderhost extends PythonService {
     private final IBinder binder = new Binder();
@@ -46,31 +58,83 @@ public class AZTServiceProviderhost extends PythonService {
         return sBoundCount;
     }
 
-    /** Build an Intent that starts THIS class with the right
-     *  PythonService extras (entrypoint, androidPrivate, etc.) and
-     *  start it. Use from Python via:
+    /** Build the Intent that points PythonService at service.py with
+     *  the right androidPrivate / androidArgument / pythonHome / etc.
+     *  Called by start() and by getThisDefaultIntent() (which Android
+     *  calls when recreating the service after a STICKY kill — the
+     *  delivered Intent is null in that case, and PythonService asks
+     *  us to rebuild it). */
+    public static Intent getDefaultIntent(Context ctx,
+                                          String pythonServiceArgument) {
+        Intent intent = new Intent(ctx, AZTServiceProviderhost.class);
+        String app_root = ctx.getFilesDir().getAbsolutePath() + "/app";
+        intent.putExtra("androidPrivate",
+                        ctx.getFilesDir().getAbsolutePath());
+        intent.putExtra("androidArgument", app_root);
+        intent.putExtra("serviceTitle", "AZT Collaboration");
+        intent.putExtra("serviceEntrypoint", "service.py");
+        intent.putExtra("pythonName", "providerhost");
+        // Sticky-bound, no foreground notification — we rely on bind
+        // priority + START_STICKY for kill-resistance, not on the
+        // notification-driven foreground status. Setting
+        // serviceStartAsForeground to "false" keeps PythonService from
+        // calling startForeground (which would require a notification
+        // and FOREGROUND_SERVICE permission).
+        intent.putExtra("serviceStartAsForeground", "false");
+        intent.putExtra("pythonHome", app_root);
+        intent.putExtra("pythonPath", app_root + ":" + app_root + "/lib");
+        intent.putExtra("pythonServiceArgument", pythonServiceArgument);
+        // smallIconName / contentTitle / contentText are only consumed
+        // when serviceStartAsForeground == "true"; pass empties to be
+        // safe under future PythonService changes that read them
+        // unconditionally.
+        intent.putExtra("smallIconName", "");
+        intent.putExtra("contentTitle", "");
+        intent.putExtra("contentText", "");
+        return intent;
+    }
+
+    /** Mirror of p4a's auto-generated Service&lt;Name&gt;.start, targeting
+     *  this concrete class. Use from Python:
      *      cls = autoclass('org.atoznback.aztcollab.AZTServiceProviderhost')
      *      cls.start(activity, '')
-     *  This is the same pattern p4a's auto-generated Service${Name}
-     *  classes use; we replicate it here so we don't need
-     *  `services = ` in buildozer.spec (which would generate a parallel
-     *  ServiceProviderhost class we'd have to layer over).
      */
     public static void start(Context ctx, String pythonServiceArgument) {
-        Intent intent = getDefaultIntent(ctx, "service.py",
-                                         pythonServiceArgument);
-        intent.setClassName(ctx, AZTServiceProviderhost.class.getName());
+        Intent intent = getDefaultIntent(ctx, pythonServiceArgument);
         ctx.startService(intent);
     }
 
+    /** Stop the service. Invokes onDestroy on the running instance,
+     *  which in PythonService also kills the host process via
+     *  Process.killProcess — that's the path we want at idle-stop. */
+    public static void stop(Context ctx) {
+        Intent intent = new Intent(ctx, AZTServiceProviderhost.class);
+        ctx.stopService(intent);
+    }
+
+    /** PythonService.onStartCommand calls startType() to decide what
+     *  to return. Override to ask Android to recreate us after a
+     *  memory-pressure kill (default in PythonService is
+     *  START_NOT_STICKY). */
     @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        // PythonService.onStartCommand spins up the Python thread that
-        // runs service.py. Force START_STICKY so Android recreates us
-        // after a memory-pressure kill (some p4a builds default to
-        // START_NOT_STICKY).
-        super.onStartCommand(intent, flags, startId);
+    public int startType() {
         return START_STICKY;
+    }
+
+    /** PythonService.onStartCommand calls getThisDefaultIntent when
+     *  Android recreates a STICKY service (the delivered Intent is
+     *  null in that case and PythonService needs the configuration
+     *  extras to know which Python to run). */
+    @Override
+    protected Intent getThisDefaultIntent(Context ctx,
+                                          String pythonServiceArgument) {
+        return AZTServiceProviderhost.getDefaultIntent(
+                ctx, pythonServiceArgument);
+    }
+
+    @Override
+    protected int getServiceId() {
+        return 1337;  // unique within this APK
     }
 
     @Override
@@ -87,14 +151,5 @@ public class AZTServiceProviderhost extends PythonService {
             if (sBoundCount > 0) sBoundCount--;
         }
         return false;
-    }
-
-    @Override
-    public boolean canDisplayNotification() {
-        return false;  // not a foreground service; sticky-bound only
-    }
-
-    public int getServiceId() {
-        return 1337;  // unique within this APK
     }
 }
