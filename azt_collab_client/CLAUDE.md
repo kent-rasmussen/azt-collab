@@ -328,6 +328,52 @@ denies; you'll see `[Errno 2] No such file or directory` even when
 the file exists, because the recorder process is `org.atoznback.<peer>`
 and has no UID-level read on `/data/user/0/org.atoznback.aztcollab/`).
 
+### URI grants and provider availability are stable across server kills
+
+From client 0.20.0 / server APK 0.16.0+, the server APK is pinned by
+a sticky-bound service (`AZTServiceProviderhost`). Picker dismissal
+no longer brings the process down, so the URI grant the picker emits
+in its result Intent is reachable for as long as the receiving
+Activity is alive (Android scopes the grant to the receiver, not to
+the source process). Under memory pressure Android may still kill
+the host; the next peer ContentResolver call (read **or** write)
+auto-spawns it via Android's unconditional ContentProvider contract.
+Detached FDs survive the source kill (kernel-managed inode).
+
+What this means in practice:
+
+- You may safely defer `LiftHandle(uri).open_read()` to a
+  `Clock.schedule_once` callback or any later user gesture. Pre-0.16
+  the source process exited synchronously with the picker, leaving a
+  ~600ms race window before Android cascade-SIGKILL'd the peer.
+- The "no caching" rule still stands. Reopen on every access not
+  because the URI expires (it doesn't, on 0.16+) but because the
+  daemon's copy is the single source of truth and another peer may
+  have written to it.
+- If a peer holds an audio FD across a long user interaction (60-s
+  recording), that's now safe. Pre-0.16 it depended on whether the
+  user re-opened the picker in the meantime.
+- If you observe a peer being SIGKILL'd by `appDiedLocked` and the
+  server APK is 0.16.0+, that's a regression — file it.
+
+### The one peer-visible recovery surface: `Result.has(S.JOB_INTERRUPTED)`
+
+If your peer uses `request_sync` + `poll_job` (the fire-and-forget
+path), you may receive a `JOB_INTERRUPTED` status if the daemon was
+killed mid-job (OOM, kill -9, container restart) and respawned.
+Treat it identically to `S.SERVER_UNAVAILABLE`: transient, retryable.
+Synchronous `sync_project` callers never see this code — a dead
+binder mid-call surfaces as `ServerUnavailable` and the client
+transport's existing retry loop handles it transparently.
+
+```python
+result = poll_job(job_id)['result']
+if result and result.has(S.JOB_INTERRUPTED):
+    # retry the underlying operation; the daemon respawned and
+    # forgot the worker thread that was running this job_id.
+    new_id = request_sync(langcode, contributor)
+```
+
 ### Don't cache. Use `ContentResolver` every time.
 
 A peer-side cache (download to `<peer>/filesDir/lift_cache/...`,

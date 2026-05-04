@@ -11,6 +11,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.16.0 + azt_collab_client 0.20.0 — sticky-bound server APK service + persistent scheduler jobs
+- **Server APK lifetime fix.** The picker Activity now leaves the
+  Python process running on Android instead of calling `App.stop()` /
+  `sys.exit()`. A new sticky-bound service
+  (`AZTServiceProviderhost`, `android/src/main/java/.../`) pins the
+  host so `AZTCollabProvider.openFileDescriptor` can still serve the
+  URI grant the picker just emitted. Pre-0.16.0 the server APK
+  process exited as soon as the picker Activity finished, taking the
+  provider with it and triggering Android's "depends on provider in
+  dying proc" cascade SIGKILL of any peer that had received a
+  `content://` URI from the picker.
+- Service is sticky-bound (no foreground notification): peers get
+  the bind-priority OOM hint while they're using the provider, and
+  `START_STICKY` asks Android to recreate the service after a
+  memory-pressure kill. Idle-stop policy (5 min of zero peers bound
+  + zero provider activity) tears the service down so the design's
+  "transient when idle, pinned while in use" intent is preserved.
+  Manifest entry injected by `_inject_aztcollab_service` in
+  `p4a_hook.py`, gated on `dist_name == 'aztcollab'`.
+- **Scheduler jobs persisted to `$AZT_HOME/jobs.json`** so peer
+  `poll_job(job_id)` calls survive a daemon respawn. `_store_job` and
+  `_fire` write atomically on every state transition. New
+  `scheduler.reconcile_on_startup()` runs from the loopback HTTP
+  daemon entry (`server.run`) and the Android service entry
+  (`server_apk/service.py`); marks any `PENDING` / `RUNNING` jobs
+  found at startup as `DONE` + `JOB_INTERRUPTED` because their
+  worker threads died with the previous process. Old `DONE`
+  entries are GC'd past 1h at the same pass.
+- New status code `JOB_INTERRUPTED` (`azt_collabd/status.py` and
+  `azt_collab_client/status.py`, mirror) plus translation in
+  `azt_collab_client/translate.py`. Peers should treat it identically
+  to `SERVER_UNAVAILABLE`: transient, retryable.
+- `MIN_CLIENT_VERSION` bumped to 0.20.0 — pre-0.20 clients don't have
+  the `JOB_INTERRUPTED` translation and would surface the raw
+  uppercase code in their UI.
+- `MIN_SERVER_VERSION` bumped to 0.16.0 — pre-0.16 daemons don't
+  persist jobs.json, so `poll_job` returns None for any job_id whose
+  daemon has been respawned, indistinguishable from "never existed."
+- Activity tracking added to `azt_collabd/android_cp/service.py`:
+  `touch()`, `seconds_since_last_touch()`, `bound_client_count()`
+  used by the service idle-stop loop. Every dispatch / openFile call
+  bumps the touch timestamp.
+- Picker app gains `on_pause` returning True so Kivy doesn't fight
+  the missing GL surface after the Activity finishes.
+- New `server_apk/test_install.py` (sibling of the existing adb-driven
+  `test_install.sh`): 8-section desktop integration test for the
+  kill-recovery flow — auto-spawn detection, jobs.json persistence,
+  reconcile_on_startup, JOB_INTERRUPTED end-to-end. Run from the
+  azt-collab repo root: `python server_apk/test_install.py`.
+
 ### azt_collab_client 0.19.2 — pick_project unbinds its activity-result handler after each call
 - ``pick_project()`` registered a closure on
   ``android_activity.bind(on_activity_result=…)`` and never

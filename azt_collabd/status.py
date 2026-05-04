@@ -49,6 +49,13 @@ REMOTE_CREATE_FAILED = 'REMOTE_CREATE_FAILED'
 BUSY = 'BUSY'
 CONFLICTS = 'CONFLICTS'
 SERVICE_RESTARTED = 'SERVICE_RESTARTED'
+# Scheduler job whose worker died with the previous daemon process
+# (e.g. OOM-kill on Android, kill -9 on desktop). The respawned
+# daemon's ``reconcile_on_startup`` flips PENDING/RUNNING jobs to
+# DONE+JOB_INTERRUPTED so peers polling on a stale job_id receive a
+# typed transient-failure result instead of silence. Treat as
+# retryable; the underlying operation is idempotent.
+JOB_INTERRUPTED = 'JOB_INTERRUPTED'
 
 # ── 403 diagnosis ──────────────────────────────────────────────────────────
 AUTH_REQUIRED = 'AUTH_REQUIRED'

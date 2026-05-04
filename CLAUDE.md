@@ -48,9 +48,27 @@ When adding a new suite component:
 
 ## Architecture invariants (read before changing things)
 
-1. **One daemon per device.** Auto-spawned by the client via `python -m azt_collabd` on first call. Disable with `AZT_CLIENT_AUTOSPAWN=0`. State lives at `$AZT_HOME` (Linux: `~/.local/share/azt/`; macOS: `~/Library/Application Support/azt/`).
+1. **One daemon per device, two transports, two lifetime models.**
+   *Desktop:* daemon auto-spawned via `python -m azt_collabd` on first
+   client call (disable with `AZT_CLIENT_AUTOSPAWN=0`); runs as a
+   detached child for the session. *Android:* daemon lives in the
+   standalone server APK (`org.atoznback.aztcollab`), reached via
+   `AZTCollabProvider`. The APK runs a sticky-bound service
+   (`AZTServiceProviderhost`) that pins the Python process so URI
+   grants survive picker dismissal and any peer that received a
+   `content://` URI can still call `openFileDescriptor` on it. The
+   service auto-stops after 5 min idle (no bound peers + no provider
+   activity); under memory pressure Android may kill earlier, in
+   which case the next peer ContentResolver call lazy-spawns the
+   host (Android's unconditional contract for ContentProvider
+   authorities) and `Service.onCreate` re-runs
+   `scheduler.reconcile_on_startup()` to flip in-flight jobs to
+   `JOB_INTERRUPTED` for peer-side retry. State at `$AZT_HOME`
+   (Linux: `~/.local/share/azt/`; macOS:
+   `~/Library/Application Support/azt/`; Android: the server APK's
+   private `filesDir`).
 
-2. **Discovery is `$AZT_HOME/server.json`** (`{port, token, pid, version}`). Every endpoint except `GET /v1/health` requires `Authorization: Bearer <token>`. The daemon holds a flock on `server.lock` for its lifetime; that's how a second daemon detects an existing one.
+2. **Discovery is `$AZT_HOME/server.json`** (`{port, token, pid, version}`). Every endpoint except `GET /v1/health` requires `Authorization: Bearer <token>`. The daemon holds a flock on `server.lock` for its lifetime; that's how a second daemon detects an existing one. (Loopback transport only — Android peers reach the daemon via ContentProvider, not via server.json.)
 
 3. **Daemon is the only thing that touches dulwich.** Clients write files into the working tree (or stream through the Android ContentProvider) and ask the daemon to commit. Don't add git operations to the client.
 
@@ -60,7 +78,7 @@ When adding a new suite component:
 
 6. **Per-project advisory locks.** `azt_collabd/locks.py` provides reentrant `flock`-backed locks keyed by working_dir. Re-entry within the same process is required so helpers like `commit_audio_and_sync` can call `sync_repo` without deadlocking.
 
-7. **Sync flow: commit-first → fetch → ff/merge → push,** with `merge_retry_max` race retries. Debounced (default 500 ms) when called via `request_sync` so bursts of edits collapse into one commit.
+7. **Sync flow: commit-first → fetch → ff/merge → push,** with `merge_retry_max` race retries. Debounced (default 500 ms) when called via `request_sync` so bursts of edits collapse into one commit. Async jobs are mirrored to `$AZT_HOME/jobs.json` on every state transition; `scheduler.reconcile_on_startup()` (called from `server.run` and the Android service entry) marks any `PENDING` / `RUNNING` jobs found there as `DONE` + `JOB_INTERRUPTED` because their worker thread died with the previous daemon process. Peers polling on a stale `job_id` after a daemon respawn receive a typed transient-failure result they can retry, instead of silence.
 
 8. **LIFT-aware merge by `<entry guid="...">`.** Per-entry, not per-field, in v1. Conflicts get `<annotation name="azt-lift-conflict" value="ours|theirs">`; both versions are kept side by side. The "theirs" copy gets a synthetic guid suffix to keep the document valid. See `azt_collabd/lift_merge.py`.
 
@@ -107,6 +125,8 @@ When adding a feature here, validate it by running (or extending) the relevant `
 - Suite signature permission is `org.atoznback.AZT_COLLAB_ACCESS` (`protectionLevel="signature"`). The standalone server APK (`org.atoznback.aztcollab`) is the **only** app that declares the `<permission>` (in `server_apk/manifest_extras.xml`) and exports the `<provider>` at authority `org.atoznback.aztcollab` (injected post-render by `p4a_hook.py:_inject_aztcollab_provider`, gated on `dist_name == 'aztcollab'`). Peer apps consume it via `<uses-permission>` (from `android.permissions` in their spec) plus a `<queries><package .../></queries>` block (from `android/manifest_extras_peer.xml`, symlinked into each peer as `manifest_extras.xml`).
 - Expected keystore SHA-256 is in `android/SUITE_FINGERPRINT`. Mismatched signing → install-time permission grant denied → ContentProvider transport silently falls back to loopback.
 - Suite apps must call `azt_collabd.android_cp.service.install_callbacks()` in their startup hook (no-op on desktop).
+- **Sticky-bound service.** The server APK declares `<service android:name="…AZTServiceProviderhost" android:exported="true" android:permission="org.atoznback.AZT_COLLAB_ACCESS" />`, injected post-render by `p4a_hook.py:_inject_aztcollab_service` (gated on `dist_name == 'aztcollab'` like the provider injection). The service body is `server_apk/service.py`; it shares a process with `AZTCollabProvider` (no `android:process` attribute on either) so the provider stays reachable across picker Activity teardowns. No foreground notification — the design is "transient when idle, pinned while in use" via bind-priority OOM hint + `START_STICKY` respawn, and the idle-stop policy in `service.py` (5 min default) keeps the process from running indefinitely. Peer apps do NOT declare the service; they may bind to it from the client transport (future work) but no peer code change is required for the lifetime fix to take effect.
+- **Recovery semantics.** Under memory pressure the host process can still be killed; the next peer ContentResolver call lazy-spawns it via Android's unconditional ContentProvider contract. `Service.onCreate` re-runs `service.py` which calls `reconcile_on_startup()` to mark in-flight jobs `JOB_INTERRUPTED`. URI grants from the picker are scoped to the receiving Activity's lifetime (not the source process), so they survive source kills. Detached FDs are kernel-managed and survive too. The only ungraceful surface is the typed `JOB_INTERRUPTED` `Result` peers should treat as retryable.
 
 ## When adding a new client API call
 

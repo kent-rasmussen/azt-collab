@@ -1,7 +1,7 @@
 """
 Async sync scheduler.
 
-Two responsibilities:
+Three responsibilities:
 
 1. **Debounced job queue.** ``request_sync(langcode, contributor)``
    schedules a sync to run after ``settings.debounce_ms``. Subsequent
@@ -14,10 +14,22 @@ Two responsibilities:
    the offline → online edge, projects flagged ``pending_push`` get
    re-synced.
 
+3. **Disk-persisted job table.** Jobs are mirrored to
+   ``$AZT_HOME/jobs.json`` at every state transition so ``poll_job``
+   from a peer still works after the daemon was killed (Android OOM,
+   ``kill -9``, container restart) and respawned by the next client
+   call. ``reconcile_on_startup`` is called from the daemon's startup
+   hook and flips any ``PENDING`` / ``RUNNING`` entries it finds to
+   ``DONE`` + ``JOB_INTERRUPTED`` — their worker threads died with
+   the previous process and will not be resumed. Old ``DONE`` entries
+   are GC'd past ``_GC_AGE_SECONDS`` at the same pass.
+
 Jobs are remembered in a process-local dict keyed by ``job_id`` so
 clients can poll status. Old jobs are pruned past _MAX_JOBS.
 """
 
+import json
+import os
 import threading
 import time
 import uuid
@@ -27,12 +39,14 @@ from . import projects
 from . import settings as _settings
 from . import status as S
 from .net import _has_internet
+from .paths import azt_home
 from .repo import sync_repo as _sync_repo
 from .status import Result, Status
 from .store import get_sync_credentials
 
 
 _MAX_JOBS = 100
+_GC_AGE_SECONDS = 3600
 
 
 # ── Job table ───────────────────────────────────────────────────────────────
@@ -61,12 +75,27 @@ class Job:
         return {
             'job_id': self.id,
             'langcode': self.langcode,
+            'contributor': self.contributor,
             'state': self.state,
             'result': self.result.to_dict() if self.result else None,
             'created_at': self.created_at,
             'started_at': self.started_at,
             'finished_at': self.finished_at,
         }
+
+    @classmethod
+    def from_dict(cls, d):
+        j = cls.__new__(cls)
+        j.id = d.get('job_id', '') or uuid.uuid4().hex[:12]
+        j.langcode = d.get('langcode', '')
+        j.contributor = d.get('contributor', '')
+        j.state = d.get('state', JobState.PENDING)
+        raw_result = d.get('result')
+        j.result = Result.from_dict(raw_result) if raw_result else None
+        j.created_at = float(d.get('created_at', 0.0) or 0.0)
+        j.started_at = float(d.get('started_at', 0.0) or 0.0)
+        j.finished_at = float(d.get('finished_at', 0.0) or 0.0)
+        return j
 
 
 # ── Scheduler state ─────────────────────────────────────────────────────────
@@ -89,6 +118,92 @@ def _store_job(job):
         # prune
         while len(_jobs) > _MAX_JOBS:
             _jobs.popitem(last=False)
+        _persist_locked()
+
+
+# ── Persistence ─────────────────────────────────────────────────────────────
+
+def _jobs_path():
+    return os.path.join(azt_home(), 'jobs.json')
+
+
+def _persist_locked():
+    """Caller must hold _lock. Atomically writes _jobs to
+    $AZT_HOME/jobs.json. Best-effort: an IO failure logs and falls
+    through, never raises into a worker thread."""
+    try:
+        path = _jobs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        payload = {'jobs': [j.to_dict() for j in _jobs.values()]}
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception as ex:
+        print(f'[scheduler] persist failed: {ex}')
+
+
+def _load_persisted_locked():
+    """Caller must hold _lock. Read jobs.json into an OrderedDict
+    keyed by job_id. Empty on missing/unreadable file."""
+    out = OrderedDict()
+    path = _jobs_path()
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return out
+    except Exception as ex:
+        print(f'[scheduler] load failed: {ex}')
+        return out
+    for raw in payload.get('jobs', []):
+        try:
+            j = Job.from_dict(raw)
+        except Exception as ex:
+            print(f'[scheduler] skipping malformed job entry: {ex}')
+            continue
+        if j.id:
+            out[j.id] = j
+    return out
+
+
+def reconcile_on_startup():
+    """Daemon-startup hook. Reads jobs.json, marks PENDING/RUNNING
+    entries as DONE + JOB_INTERRUPTED (their worker threads died with
+    the previous daemon process), and GC's DONE entries older than
+    _GC_AGE_SECONDS. Called from the loopback HTTP startup path
+    (azt_collabd.server.run) and the Android service entry
+    (server_apk/service.py). Idempotent — re-running on a daemon
+    that's already done one pass is a no-op (everything is already
+    DONE)."""
+    with _lock:
+        loaded = _load_persisted_locked()
+        now = time.time()
+        interrupted = 0
+        for job in loaded.values():
+            if job.state in (JobState.PENDING, JobState.RUNNING):
+                prev = job.state
+                job.state = JobState.DONE
+                job.result = Result(statuses=[Status(
+                    code=S.JOB_INTERRUPTED,
+                    params={'kind': 'sync',
+                            'langcode': job.langcode,
+                            'previous_state': prev})])
+                job.finished_at = now
+                interrupted += 1
+        # GC ancient DONE entries
+        stale = [k for k, v in loaded.items()
+                 if v.state == JobState.DONE
+                 and v.finished_at
+                 and (now - v.finished_at) > _GC_AGE_SECONDS]
+        for k in stale:
+            loaded.pop(k)
+        _jobs.clear()
+        _jobs.update(loaded)
+        _persist_locked()
+        if interrupted or stale:
+            print(f'[scheduler] reconcile_on_startup: '
+                  f'interrupted={interrupted} gc={len(stale)}', flush=True)
 
 
 def _set_pending_push(langcode, value):
@@ -147,16 +262,20 @@ def _fire(langcode):
         job = _pending_jobs.pop(langcode, None)
     if job is None:
         return
-    job.state = JobState.RUNNING
-    job.started_at = time.time()
+    with _lock:
+        job.state = JobState.RUNNING
+        job.started_at = time.time()
+        _persist_locked()
 
     try:
         result = _run_sync(job.langcode, job.contributor)
     except Exception as ex:
         result = Result().add(S.PUSH_FAILED, error=str(ex))
-    job.result = result
-    job.state = JobState.DONE
-    job.finished_at = time.time()
+    with _lock:
+        job.result = result
+        job.state = JobState.DONE
+        job.finished_at = time.time()
+        _persist_locked()
 
     codes = result.codes()
     if 'PUSHED' in codes or 'COMMITTED_AND_PUSHED' in codes:

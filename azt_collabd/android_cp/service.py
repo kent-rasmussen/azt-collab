@@ -13,16 +13,72 @@ the provider's ``call(method, arg, extras)`` and reach
 File reads (audio, images) come through ``openFile`` and route to
 ``_resolve_path`` below, which scopes paths to ``$AZT_HOME/projects/``
 to prevent path-traversal attacks from a malicious-but-signed sibling.
+
+Activity tracking: every dispatch / openFile call updates
+``_last_touch_monotonic`` and ``onBind`` / ``onUnbind`` adjust
+``_bound_count``. The sticky-bound service body
+(``server_apk/service.py``) reads these via ``seconds_since_last_touch``
+and ``bound_client_count`` to decide when the host process can
+``stopSelf``: idle = no bound clients AND no provider activity for
+``IDLE_TIMEOUT_SECONDS``. A subsequent peer ContentResolver call wakes
+the process again via Android's provider lazy-spawn contract.
 """
 
 import json
 import os
+import threading
+import time
 
 from .. import server as _server
 from ..paths import azt_home
 
 
 _installed = False
+
+# Activity tracking for idle-stop policy.
+_state_lock = threading.Lock()
+_last_touch_monotonic = time.monotonic()
+_bound_count = 0
+
+
+def touch():
+    """Mark a peer interaction. Called from the dispatch + openFile
+    callbacks below. Cheap (single monotonic clock + lock); safe from
+    any binder thread."""
+    global _last_touch_monotonic
+    with _state_lock:
+        _last_touch_monotonic = time.monotonic()
+
+
+def seconds_since_last_touch():
+    """How long since the last peer call into the provider. Returns a
+    large number on a freshly-started service that has never been
+    touched (initial value is process-start time, so this is the
+    seconds-since-startup until the first call)."""
+    with _state_lock:
+        return time.monotonic() - _last_touch_monotonic
+
+
+def bound_client_count():
+    """Current number of peers holding a bindService connection to the
+    sticky-bound service. Updated by _on_bind / _on_unbind callbacks
+    fired from the Java service class."""
+    with _state_lock:
+        return _bound_count
+
+
+def _on_bind():
+    global _bound_count
+    with _state_lock:
+        _bound_count += 1
+    touch()
+
+
+def _on_unbind():
+    global _bound_count
+    with _state_lock:
+        _bound_count = max(0, _bound_count - 1)
+    touch()
 
 # Strong refs to the PythonJavaClass proxy instances handed to
 # AZTCollabProvider.registerCallbacks. Java holds them for dispatch,
@@ -72,6 +128,7 @@ def install_callbacks():
 
         @java_method('(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/os/Bundle;')
         def dispatch(self, method, path, body_json):
+            touch()
             try:
                 body = json.loads(body_json) if body_json else None
             except Exception:
@@ -96,6 +153,7 @@ def install_callbacks():
 
         @java_method('(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;')
         def resolveAbsPath(self, rel, mode):
+            touch()
             return _resolve_path(rel, mode)
 
     _dispatch_cb = _Dispatch()

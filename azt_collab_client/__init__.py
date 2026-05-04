@@ -7,8 +7,14 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.19.2"
-MIN_SERVER_VERSION = "0.8.0"
+__version__ = "0.20.0"
+# 0.16.0 floor: the daemon now persists scheduler jobs across
+# kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
+# job_ids on respawn, so poll_job returns None and the peer can't
+# distinguish "never existed" from "interrupted." Bumping the floor
+# forces the user to update the server APK / azt_collabd if the
+# peer ships against 0.20+ client.
+MIN_SERVER_VERSION = "0.16.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
 )

@@ -919,6 +919,13 @@ def run(host='127.0.0.1', port=0):
             sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
+    # Mark any in-flight jobs left over from a previous daemon process
+    # (kill -9, OOM, container restart) as JOB_INTERRUPTED so peers
+    # polling on stale job_ids get a typed transient-failure result.
+    # Must run BEFORE start_watcher so the watcher sees a consistent
+    # job table.
+    scheduler.reconcile_on_startup()
+
     # Start the connectivity watcher so projects with pending_push get
     # drained on offline→online transitions.
     scheduler.start_watcher()

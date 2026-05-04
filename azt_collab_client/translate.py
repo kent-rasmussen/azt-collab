@@ -117,6 +117,8 @@ _HANDLERS = {
     S.CONFLICTS:              lambda p: (_fmt(_tr('Merge conflicts in {paths}'), p)
                                           if p.get('paths') else
                                           _tr('Merge conflicts; review the entries flagged azt-lift-conflict.')),
+    S.JOB_INTERRUPTED:        lambda p: _tr(
+        'Sync was interrupted; please retry.'),
 
     # Transport-layer synthetics from the client (not emitted by the backend)
     'SERVER_UNAVAILABLE':     lambda p: _fmt(_tr('Sync service unavailable: {error}'), p),

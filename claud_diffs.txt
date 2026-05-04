@@ -1,4 +1,272 @@
 ============================================================================
+2026-05-04 — sticky-bound server APK service + persistent scheduler jobs
+============================================================================
+
+Problem
+-------
+adb logcat showed peer (azt_viewer, PID 21100) being killed by Android
+ActivityManager immediately after the picker Activity in the server APK
+finished:
+
+  21133 21158 I python  : [INFO] [Base] Leaving application in progress...
+  ActivityManager: Process org.atoznback.aztcollab (pid 21133) has died
+  ActivityManager: Killing 21100:org.atoznback.azt_viewer ... depends on
+      provider org.atoznback.aztcollab/.AZTCollabProvider in dying proc
+
+Root cause: the server APK process hosts AZTCollabProvider, and the
+picker Activity called App.stop() + sys.exit() at picker_app.py:423,827.
+That tore down the entire Python process, taking the provider with it.
+Android then SIGKILL'd every peer that had registered a dependency on
+the dying provider — peer never got the chance to call openFileDescriptor
+on the URI it had just received from the picker's result Intent.
+
+Investigation
+-------------
+The placeholder server_apk/service.py:1-13 already documented the design
+intent: "the server APK is allowed to be transient. Android can stop the
+process when no peer is querying; the next peer call wakes it back up
+via ContentResolver.call." That holds for the RPC transport (each
+ContentResolver.call is short and self-contained) but breaks for the
+openFileDescriptor flow: the URI grant scoped to the peer Activity
+survives source kills, but openFileDescriptor itself must be called
+while the source is alive enough to dispatch it. The Activity teardown
+running synchronous sys.exit gave peers ~600ms — and Android's cascade
+SIGKILL didn't even leave that.
+
+ContentProvider lazy-spawn (Android's contract: any peer call lazy-
+spawns the provider host process before dispatching) does cover RPC
+recovery, but it requires the next call to actually go through; SIGKILL'd
+peers can't make that call. A foreground service was proposed but
+rejected for UX (no notification clutter for SIL field linguists).
+
+Final design: sticky-bound service. Peer bindService raises the host's
+OOM priority while peers are actively using the provider; START_STICKY
+asks Android to recreate the service after memory-pressure kills;
+ContentProvider lazy-spawn gives the unconditional second recovery
+path. Idle-stop policy (5 min of zero bind + zero provider activity)
+preserves the original "transient when idle" intent.
+
+Persistent scheduler jobs are the necessary companion: without them,
+poll_job(job_id) on a stale ID after a respawn returns None,
+indistinguishable from "never existed." With $AZT_HOME/jobs.json and
+reconcile_on_startup, peers get a typed Result(JOB_INTERRUPTED, ...)
+they can treat as a transient retryable failure.
+
+Changes
+-------
+
+1) azt_collabd/status.py — new code JOB_INTERRUPTED.
+
+   --- a/azt_collabd/status.py
+   +++ b/azt_collabd/status.py
+   @@
+    SERVICE_RESTARTED = 'SERVICE_RESTARTED'
+   +# Scheduler job whose worker died with the previous daemon process
+   +# (e.g. OOM-kill on Android, kill -9 on desktop). Treat as
+   +# retryable; the underlying operation is idempotent.
+   +JOB_INTERRUPTED = 'JOB_INTERRUPTED'
+
+   Why: structured signal so peers can detect "your job_id was inflight
+   when the daemon died" without inferring it from poll_job returning
+   None. Also: distinguishes from PUSH_FAILED so retry logic doesn't
+   bail on what is actually a transient infrastructure event.
+
+
+2) azt_collab_client/status.py — mirror.
+
+   --- a/azt_collab_client/status.py
+   +++ b/azt_collab_client/status.py
+   @@
+    SERVICE_RESTARTED = 'SERVICE_RESTARTED'
+   +JOB_INTERRUPTED = 'JOB_INTERRUPTED'
+
+   Why: client/status.py is a duplicate-on-purpose mirror per the
+   azt_collab_client/CLAUDE.md "Status codes & translation" rule.
+
+
+3) azt_collab_client/translate.py — translation handler.
+
+   --- a/azt_collab_client/translate.py
+   +++ b/azt_collab_client/translate.py
+   @@
+        S.CONFLICTS:              lambda p: ...
+   +    S.JOB_INTERRUPTED:        lambda p: _tr(
+   +        'Sync was interrupted; please retry.'),
+
+   Why: every status code that surfaces in a Result must have a
+   translation entry. Without this peers see "[JOB_INTERRUPTED] {}"
+   in their UI.
+
+
+4) azt_collabd/scheduler.py — persist jobs to $AZT_HOME/jobs.json,
+   add reconcile_on_startup.
+
+   Key additions:
+   - Job.from_dict() classmethod (round-trip for jobs.json load).
+   - Job.to_dict() now includes 'contributor' (was missing).
+   - _persist_locked(): atomic write of _jobs to jobs.json on every
+     state transition (_store_job, RUNNING transition, DONE transition).
+   - _load_persisted_locked(): reads jobs.json into an OrderedDict.
+   - reconcile_on_startup(): marks PENDING / RUNNING jobs as
+     DONE+JOB_INTERRUPTED, GC's DONE entries past 1h.
+   - _GC_AGE_SECONDS = 3600 constant.
+
+   Why: peer poll_job(job_id) survives daemon respawn. Without this,
+   the entire job table evaporates on kill -9 / OOM and peers see
+   None for any job they care about, with no signal that something
+   went wrong at the infrastructure layer.
+
+
+5) azt_collabd/server.py — call reconcile_on_startup before
+   start_watcher in the daemon's startup path.
+
+   --- a/azt_collabd/server.py
+   @@
+   +    # Mark any in-flight jobs left over from a previous daemon
+   +    # process (kill -9, OOM, container restart) as JOB_INTERRUPTED.
+   +    scheduler.reconcile_on_startup()
+   +
+        # Start the connectivity watcher so projects with pending_push
+        # get drained on offline→online transitions.
+        scheduler.start_watcher()
+
+   Why: covers the desktop loopback HTTP path. The Android service
+   path covers itself via server_apk/service.py:main calling the
+   same reconcile entry point.
+
+
+6) azt_collabd/android_cp/service.py — touch tracking + bind counter.
+
+   New module-level state: _last_touch_monotonic, _bound_count,
+   _state_lock. New helpers: touch(), seconds_since_last_touch(),
+   bound_client_count(), _on_bind(), _on_unbind(). dispatch()
+   and resolveAbsPath() callbacks call touch() on every entry.
+
+   Why: the service.py idle-stop loop reads these to decide when
+   to call stopSelf. Without the touch tracking, the loop has no
+   way to distinguish "actively serving peers" from "5 minutes of
+   zero traffic, safe to stop."
+
+
+7) android/src/main/java/.../AZTServiceProviderhost.java — new file.
+
+   Custom Android Service class extending PythonService.
+   - getStartType() override → START_STICKY.
+   - onBind() returns no-op IBinder, increments sBoundCount.
+   - onUnbind() decrements sBoundCount.
+   - canDisplayNotification() returns false (not a foreground service).
+   - static start(Context, String) builds and dispatches the start
+     Intent (mirrors p4a's auto-generated Service<Name>.start
+     pattern).
+
+   Why: the service body lives in service.py but Android requires a
+   Java class as the binding/start target. Existing AZTCollabProvider
+   sits in the same dir; this is the same pattern.
+
+
+8) p4a_hook.py — _inject_aztcollab_service step.
+
+   New _AZTCOLLAB_SERVICE_BLOCK constant (the <service> XML),
+   new _inject_aztcollab_service(toolchain) function that splices
+   it into the rendered AndroidManifest.xml inside <application>.
+   Mirrors _inject_aztcollab_provider exactly: same dual-file
+   targeting (dist root + src/main/), same dist_name == 'aztcollab'
+   gate, same idempotent sentinel.
+
+   Why: p4a's SDL2 bootstrap manifest template doesn't expose
+   injection inside <application>. The provider injection already
+   solved this with a post-render splice; reuse the mechanism for
+   the service.
+
+
+9) server_apk/service.py — replace placeholder with sticky-bound body.
+
+   Module-level code: configure() the GitHub App identity (mirroring
+   main.py), install_callbacks(), reconcile_on_startup(), then enter
+   an idle-stop loop. IDLE_CHECK_SECONDS=30, IDLE_TIMEOUT_SECONDS=300.
+   On idle-stop call PythonService.mService.stopSelf().
+
+   Why: this is the actual Python body invoked by p4a's PythonService
+   Java glue when the service starts (or respawns after a kill). MUST
+   be idempotent because Android may run it multiple times.
+
+
+10) server_apk/main.py — _ensure_provider_service hook before picker
+    dispatch.
+
+    New helper that calls AZTServiceProviderhost.start(activity, "")
+    on Android. Wired into main() between install_callbacks and the
+    Intent-action dispatch. Idempotent — Android collapses repeat
+    startService into a single running instance.
+
+    Why: the service must be running BEFORE the picker mounts so
+    that even a quick cancel-and-finish flow leaves the service
+    pinning the host for any URI grants outstanding from a prior pick.
+
+
+11) azt_collabd/ui/picker_app.py — don't sys.exit on Android.
+
+    --- a/azt_collabd/ui/picker_app.py
+    @@
+         self._exit_code = 0
+    +    if platform == 'android':
+    +        # Service keeps the process alive; do not stop Kivy here.
+    +        return
+         self.stop()
+    @@ def main():
+         PickerApp().run()
+    -    sys.exit(PickerApp._exit_code)
+    +    if platform != 'android':
+    +        sys.exit(PickerApp._exit_code)
+
+    Plus a new on_pause method returning True (Kivy default fails
+    fatal on pause without this; we need pause to succeed because
+    the Activity is finishing but the process must stay).
+
+    Why: this is the actual fix for the original bug. Without
+    starting the service AND keeping the Python process alive, the
+    cascade SIGKILL of peers continues.
+
+
+12) Version bumps.
+
+    --- a/azt_collabd/__init__.py
+    -__version__ = "0.14.5"
+    -MIN_CLIENT_VERSION = "0.18.0"
+    +__version__ = "0.16.0"
+    +MIN_CLIENT_VERSION = "0.20.0"
+
+    --- a/azt_collab_client/__init__.py
+    -__version__ = "0.19.2"
+    -MIN_SERVER_VERSION = "0.8.0"
+    +__version__ = "0.20.0"
+    +MIN_SERVER_VERSION = "0.16.0"
+
+    Why: per feedback_min_client_version.md, peer APKs ship a bundled
+    client; without floor bumps, version mismatches stay silent.
+    Pre-0.20 clients can't translate JOB_INTERRUPTED. Pre-0.16 servers
+    don't persist jobs.json so poll_job semantics differ.
+
+
+Validation
+----------
+- server_apk/test_install.py exercises the kill-recovery path on
+  desktop: spawns daemon, fires a request_sync (with high debounce so
+  the job sits in PENDING), kill -9 the daemon, calls poll_job —
+  expects auto-spawn and Result(JOB_INTERRUPTED). 8 sections covering
+  status-code definition, translation handler, version floors, and
+  the end-to-end flow. Sibling of the existing test_install.sh
+  (adb-driven on-device test).
+- Manual Android validation pending build:
+  - adb logcat | grep appDiedLocked: should NOT fire after picker
+    dismissal for at least 5 minutes idle.
+  - dumpsys activity services org.atoznback.aztcollab: should show
+    AZTServiceProviderhost in running list.
+  - Force-stop the server APK mid-session, then peer makes a write
+    via openFileDescriptor: should auto-spawn cleanly, no peer
+    SIGKILL.
+
+============================================================================
 2026-05-04 — clone-auth UX + URL-based credential routing
 ============================================================================
 

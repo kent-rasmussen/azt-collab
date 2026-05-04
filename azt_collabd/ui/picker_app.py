@@ -203,6 +203,18 @@ class PickerApp(App):
         if self.sm.has_screen(name):
             self.sm.current = name
 
+    def on_pause(self):
+        """Permit Kivy to pause when the Activity backgrounds. Returning
+        True tells Kivy to suspend its run loop instead of treating
+        pause as a fatal stop. Important on Android because the picker
+        Activity finishes (via setResult/finish) without bringing down
+        the host process — the AZTServiceProviderhost service keeps
+        running, and so does this Kivy app in a paused state.
+        Without this hook Kivy default-fails on the missing GL surface
+        and stops the app, which would propagate to sys.exit and take
+        the provider down with it."""
+        return True
+
     def on_start(self):
         """Once the app is running, watch ``$AZT_HOME/config.json`` so
         a language change made in a settings subprocess (opened via
@@ -420,6 +432,19 @@ class PickerApp(App):
             sys.stdout.write(f'AZT_PICK\t{path}\t{langcode}\n')
             sys.stdout.flush()
         self._exit_code = 0
+        if platform == 'android':
+            # Activity is finishing, but the AZTServiceProviderhost
+            # sticky-bound service must keep the host process alive so
+            # AZTCollabProvider can still serve openFileDescriptor()
+            # to the peer that just received the URI grant. Calling
+            # self.stop() here ends Kivy's run loop, which causes the
+            # picker_app.main() sys.exit() at the bottom of this file
+            # to terminate the process — taking the provider with it
+            # and triggering Android's "depends on provider in dying
+            # proc" cascade SIGKILL of the peer. So on Android we
+            # leave Kivy running headless; the service idle-stop
+            # policy decides when the process actually exits.
+            return
         self.stop()
 
     def _navigate_back(self):
@@ -824,7 +849,14 @@ class PickerApp(App):
 
 def main():
     PickerApp().run()
-    sys.exit(PickerApp._exit_code)
+    if platform != 'android':
+        sys.exit(PickerApp._exit_code)
+    # On Android we never reach here while the Activity is alive
+    # because _emit_and_quit early-returns instead of calling
+    # self.stop(). If we do reach here (e.g. an unexpected stop()
+    # call elsewhere), DO NOT sys.exit — the
+    # AZTServiceProviderhost service is still pinning the process
+    # for in-flight URI grants. Just return; the JVM stays up.
 
 
 if __name__ == '__main__':

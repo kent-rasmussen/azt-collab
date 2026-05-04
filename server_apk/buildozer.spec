@@ -58,20 +58,26 @@ android.ndk = 29
 
 # Custom suite signature permission. Same name and signature as
 # every peer APK. Without that match, install-time grant is denied
-# and peers cannot reach this provider — desired failure mode.
+# and peers cannot reach this provider — desired failure mode. The
+# same permission gates bindService against AZTServiceProviderhost.
 android.permissions = INTERNET, org.atoznback.AZT_COLLAB_ACCESS
 
-# ContentProvider + foreground-service declarations.
+# ContentProvider + sticky-bound service declarations.
 # Note: buildozer's key is `extra_manifest_xml` (NOT `manifest_extra_xml`,
 # which buildozer silently ignores). Content from this file is inlined
 # into p4a's --extra-manifest-xml and lands at top-level under
 # <manifest>, so this file may only contain top-level elements
-# (<permission>, <queries>, ...). The <provider> declaration that
-# belongs inside <application> is injected by the
-# _inject_aztcollab_provider step in p4a_hook.py.
+# (<permission>, <queries>, ...). The <provider> and <service>
+# declarations that belong inside <application> are injected by the
+# _inject_aztcollab_provider and _inject_aztcollab_service steps in
+# p4a_hook.py.
 android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
 
 # Suite Java glue is bundled here so peers don't have to ship it.
+# Holds AZTCollabProvider.java (provider class) and
+# AZTServiceProviderhost.java (sticky-bound service class). Peer APKs
+# also compile these but only the server APK declares them in its
+# manifest — the unused classes are harmless ballast.
 android.add_src = ../android/src/main/java
 
 # Sign with the suite keystore — same key as every peer APK.
