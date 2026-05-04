@@ -11,6 +11,659 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.16.0 — single source of truth for UI language; new public display_name + scan_catalog_languages
+- ``set_language(lang)`` no longer takes a ``persist`` keyword argument.
+  There is no transient mode any more — one preference, one store
+  (``$AZT_HOME/config.json :: ui.language``), sticks everywhere until
+  the next change. Internal apply-without-persist behaviour is now a
+  private ``_apply(lang)`` used only by the auto-init-on-import path.
+  Breaking change for callers that passed ``persist=False`` to apply a
+  preference without rewriting the file; the new pattern is just
+  ``set_language(language_pref())`` (idempotent re-write).
+- New public ``i18n.display_name(code)`` — single source of truth for
+  the language-code → human-name table. Peers that previously kept a
+  parallel ``_DISPLAY_NAMES`` dict (the recorder's ``i18n.py`` did)
+  now import this instead, eliminating the drift risk.
+- New public ``i18n.scan_catalog_languages(locale_dir, domain)`` —
+  walks ``<locale_dir>/<lang>/LC_MESSAGES/<domain>.{po,mo}`` and
+  returns ``[(code, display_name), ...]``. Both the client's own
+  ``available_languages()`` and the recorder's wrapper now share this
+  shape, so peer catalogs and the client catalog enumerate
+  identically.
+- Updated callers: ``azt_collabd/ui/picker_app.py`` (build-time apply
+  + mtime watcher) drop ``persist=False``; both calls just write the
+  same value back, harmless because the mtime watcher's
+  ``persisted == current_language()`` short-circuit prevents loops.
+
+### azt_collabd 0.13.21 — Bundle-based result extras to fix cross-package no_path loss
+- Logcat showed the picker emitting a real lift_path
+  (``/data/user/0/.../foo.lift``) via ``_emit_and_quit``, but the
+  calling recorder still reported ``no_path`` — meaning the
+  Intent's ``path`` extra was being lost across Android's IPC
+  delivery to the peer process.
+- Two likely culprits, both addressed by the same patch:
+  1. ``Intent()`` with no action has been observed to drop extras
+     on cross-package result delivery in some Android versions.
+     The result Intent now carries the same action the recorder
+     used for the request (``org.atoznback.aztcollab.PICK_PROJECT``).
+  2. ``Intent.putExtra(String, String)`` is one of ~15 overloads;
+     jnius's overload resolution can silently bind to a non-String
+     overload when both args are CPython strings, leaving
+     ``getStringExtra`` returning null on the peer side. Switched
+     to the explicit, single-signature
+     ``Bundle().putString('path', ...)`` →
+     ``Intent.putExtras(Bundle)``.
+- Added a diagnostic round-trip: the picker now reads the path
+  back out of the result Intent (via ``getStringExtra``) right
+  before ``setResult`` and prints it to logcat. If the verify
+  print shows the path correctly but the recorder still gets
+  ``no_path``, the loss is in Android's binder layer (genuinely
+  rare); if the verify print is empty, the typed-Bundle approach
+  also failed and we know to look further upstream.
+
+### azt_collabd 0.13.20 — clone-flow diagnostic prints
+- Added prints (to stderr → logcat ``python`` tag) at every step
+  of the clone flow so the next ``no_path`` reproduction tells us
+  exactly where the empty-path emission originates: ``clone worker
+  starting``, ``clone returned`` (with ok / lift_path / error), the
+  exception path, ``_after_clone_ok``, ``_after_clone_fail`` (with
+  result codes), and ``load_lift`` (existing-project tap).
+- Fixed a duplicate ``load_lift`` definition: a diagnostic-printing
+  version was added without removing the original, and Python's
+  last-def-wins on class bodies meant the diagnostic version was
+  silently shadowed. Removed the second definition.
+
+### azt_collabd 0.13.19 — debug bump for no_path triage
+- Version-only bump so the user can verify on the picker's bottom
+  strip (``server 0.13.19``) that the deployed build includes the
+  ``_emit_and_quit`` empty-path guard from 0.13.15 and the
+  Connect/Disconnect colour reactivity from 0.13.18.
+
+### azt_collabd 0.13.18 — Connect/Disconnect button colour tracks connection state
+- The four host action buttons (Connect / Disconnect GitHub,
+  Set GitLab credentials / Disconnect GitLab) used to be statically
+  green for Connect and dim for Disconnect. The visually-prominent
+  button now matches the user's likely next action: Connect is
+  green when not connected, Disconnect is green when connected.
+  Dim button stays clickable so reconnect-to-refresh-tokens and
+  similar flows still work — colour is a hint, not a gate.
+- The colour swap is driven by ``refresh()`` reading
+  ``credentials_status``, so the same round-trip that updates the
+  status block also updates these buttons. Re-renders every time
+  the screen is entered or the user taps Refresh Status.
+
+### azt_collabd 0.13.17 — Refresh button rename + reposition
+- ``Refresh`` button renamed to ``Refresh Status`` (more honest
+  about what it does — it only re-pulls the credential / online
+  read-out, doesn't do a sync) and moved to sit directly under the
+  status block. Affordance for "I changed something in another
+  window, pull the updated state" is now immediately adjacent to
+  the data it refreshes, with no spacer in between.
+
+### azt_collabd 0.13.16 — settings layout: status to the bottom, host rows compacted
+- ``SettingsScreen`` reorder: actionable rows (interface language,
+  contributor name, GitHub/GitLab connect+disconnect) at the top;
+  the read-only ``Status`` block moved to the bottom. Users land
+  here to do something, not to inspect — surfacing the controls
+  first matches the visit pattern.
+- GitHub and GitLab each collapsed from "section header + Connect
+  row + Disconnect row" (3 rows of vertical real estate) into a
+  single row with ``Connect…`` and ``Disconnect`` side-by-side.
+  Brand name is implicit in the button text. About 100dp of
+  vertical space recovered.
+
+### azt_collabd 0.13.15 — server-owned contributor; auto-start device flow; loading-overlay wrap; empty-path guard
+- New server-owned contributor field. ``store.get_contributor()`` /
+  ``set_contributor(name)`` persist a display name to
+  ``$AZT_HOME/config.json :: collab.contributor`` (sibling to
+  ``ui.language`` — config, not credentials). New endpoints
+  ``GET /v1/config/contributor`` and ``POST /v1/config/contributor``;
+  client wrappers ``azt_collab_client.get_contributor`` and
+  ``set_contributor``. ``store.get_status()`` now includes
+  ``contributor`` so the settings UI gets it on the existing
+  credentials-status round-trip. ``_h_project_sync``,
+  ``_h_init_project``, ``_h_project_sync_async``, and
+  ``scheduler._run_sync`` all route through new
+  ``store.resolve_contributor(passed)`` which prefers the caller's
+  explicit value, then the stored display name, then the
+  ``'Recorder'`` fallback. Peers can stop carrying their own "Your
+  name" preference; the suite has one source of truth on the server.
+- ``SettingsScreen`` got a "Your name (appears in commits)"
+  ``ThemedInput`` field with a transient "Saved." confirmation; the
+  field auto-saves on focus loss. Refresh repopulates it from the
+  server only when the user isn't actively editing.
+- ``GitHubConnectScreen`` auto-starts the device flow on screen
+  entry — no more "tap Begin to start" friction. The Begin button
+  stays around as a Retry surface, re-enabled by the worker's
+  failure path.
+- ``picker_app._show_loading_overlay`` Label now wraps on width
+  (same fix as ``_show_error``); long ``Cloning <url>...``
+  messages no longer overflow both edges.
+- ``picker_app._emit_and_quit`` refuses to emit an empty path. On
+  Android an empty path lands at the peer's
+  ``pick_project_android`` handler as ``RESULT_OK`` with no extra
+  and surfaces as ``no_path``. If anything upstream tries it now,
+  we log a stack trace to logcat and show an "Internal error:
+  tried to return an empty path" modal so the user can pick again
+  instead of bouncing back to the recorder with a cryptic failure.
+
+### azt_collabd 0.13.14 — error-modal text wraps; auto-copy GitHub user_code
+- ``picker_app._show_error`` Label was constructed with
+  ``text_size=(None, None)``, which disables wrapping — long
+  messages overflowed both edges of the modal. Now binds
+  ``text_size`` to the Label's width so text wraps inside the
+  modal panel; height stays free so the texture grows vertically
+  as needed (modal's fixed height clips the bottom for very long
+  messages, acceptable for typical 2–3-line errors).
+- GitHubConnectScreen used to auto-copy the device-flow
+  ``user_code`` to the clipboard so users could paste it into the
+  GitHub device page without an extra tap; this regressed during
+  the settings UI restyle. Restored the auto-copy and append the
+  existing ``(code copied)`` translated suffix to the on-screen
+  message when the copy succeeds (silently no-ops if Clipboard is
+  unavailable, e.g. on a headless device).
+
+### azt_collabd 0.13.13 — Android-aware ``azt_home()`` (and azt_collab_client mirror)
+- ``[Errno 13] Permission denied: '/data/.local/share/azt/...'`` on
+  every file op (template download, sync, etc.). p4a does not set
+  ``$HOME``, so ``os.path.expanduser('~')`` resolved to ``/data`` —
+  the Android system-data root, owned by ``root``, not writable by
+  the app's UID. ``azt_home()`` then composed a path no app can
+  write to.
+- ``paths.py`` (both ``azt_collabd/`` and ``azt_collab_client/`` —
+  duplicated by design) gained a ``_android_files_dir()`` helper
+  that calls ``PythonActivity.mActivity.getFilesDir()`` via jnius
+  and returns the app's private writable filesDir
+  (``/data/user/0/<pkg>/files``). ``azt_home()`` checks that first
+  on Android (after ``$AZT_HOME``, before XDG fallbacks). Desktop
+  unchanged. The ``$AZT_HOME`` env-var override still wins for
+  test rigs.
+
+### azt_collabd 0.13.12 — settings Back button uses a glyph CharisSIL has
+- ``SettingsScreen``'s "← Back" button used U+2190 (LEFTWARDS
+  ARROW) which isn't in the CharisSIL glyph table — rendered as
+  tofu under the project's default linguistic font. Swapped for
+  ``«`` (U+00AB, left guillemet): present in every Latin font,
+  reads as a back-pointer, and is the natural French equivalent
+  too.
+
+### azt_collabd 0.13.11 — preserve ``back_to`` across language-toggle screen rebuild
+- ``_set_ui_language`` (settings UI) and ``_check_language_change``
+  (picker subprocess) rebuilt the ScreenManager by recreating each
+  screen with ``cls(name=name)``. That recipe loses any property
+  the parent KV rule set on the *instance* (not the class) —
+  notably ``back_to: 'picker'`` on ``SettingsScreen`` in
+  ``picker_app._PickerRoot``. Symptom: the in-screen "← Back"
+  button vanished the first time the user toggled language and
+  didn't come back when toggling to English.
+- Both rebuild loops now capture ``back_to`` per-screen before the
+  ``clear_widgets`` and re-apply after instantiation. Generic
+  enough to extend to other instance-level properties later.
+
+### azt_collabd 0.13.10 — Android back button on picker subscreens
+- Hardware back / gesture on Android does not flow through
+  ``App.on_request_close`` (which only fires for the desktop X
+  button). It surfaces as ``key 27`` on ``Window.on_keyboard``.
+  Without an explicit binding, Kivy's default for an unhandled key
+  is ``App.stop`` — so back from settings / github / gitlab /
+  langpicker was closing the picker activity entirely.
+- ``PickerApp.on_start`` now binds ``Window.on_keyboard`` to a new
+  ``_on_back_button`` handler that delegates to ``_navigate_back``
+  (extracted from the existing ``on_request_close`` logic). On a
+  non-picker screen, back navigates to the screen's ``back_to``
+  property (or ``'picker'`` by default); on the picker itself, back
+  falls through to the normal ``RESULT_CANCELED + finish()`` exit.
+  Same screen-pop dance the recorder uses.
+
+### azt_collabd 0.13.9 — full traceback on template-download failures
+- ``_h_create_project_from_template`` was masking the original
+  failure type by catching ``Exception`` and returning only
+  ``str(ex)``. On the device a ``PermissionError`` surfaced as
+  ``provider HTTP 500: [Errno 13] Permission denied`` with no path
+  or call site. Now logs the full traceback to stderr/logcat
+  (``adb logcat | grep -i from_template``) and includes
+  ``traceback`` and ``ExceptionType`` in the response body so the
+  caller (picker / recorder) can surface them.
+- Confirms in code comments that the template download is an
+  anonymous public HTTPS GET — no GitHub credentials consulted.
+
+### azt_collabd 0.13.8 — drop "Active host" toggle from settings UI
+- ``SettingsScreen`` no longer renders the "Active host" SectionLabel
+  + GitHub/GitLab two-button row. URL-based credential routing
+  (``store.get_sync_credentials(url)`` → ``host_for_url(url)``)
+  has handled every common case since 0.12.0; the toggle was
+  vestigial. ``choose_host`` method dropped from ``SettingsScreen``.
+  ``set_collab_host`` server endpoint and client wrapper stay around
+  for wire compat (peers still calling them are safe; the value
+  silently affects only the self-hosted/unknown-URL fallback path
+  through ``get_collab_host()``).
+- The eventual "Publish" flow for new local-only projects will
+  pick credentials by inspecting which hosts have stored creds,
+  prompting the user only when more than one is configured —
+  rather than reading a global "active host" preference. Captured
+  here so future-me doesn't reintroduce the toggle.
+
+### azt_collabd 0.13.7 — locale files packaged in server APK
+- ``server_apk/buildozer.spec`` ``source.include_exts`` was
+  ``py,xml,gz,png``, silently dropping the ``.po``/``.mo`` files
+  under ``azt_collab_client/locales/`` at packaging time. On the
+  device, ``available_languages()`` walked an empty locale tree and
+  the settings UI's language toggle only offered English regardless
+  of which catalogs lived in the source tree. Added ``po,mo`` to
+  the extension list. Pre-compile any language's ``.mo`` before
+  rebuilding so the catalog ships pre-baked (faster first paint;
+  also dodges any APK-readonly issue with the runtime
+  ``_ensure_mo``):
+  ``python -c "from azt_collab_client.i18n import _ensure_mo;
+  _ensure_mo('fr')"``.
+
+### azt_collabd 0.13.6 — typing_extensions in APK requirements; BodyLabel recursion fixed at class level
+- Added ``typing_extensions`` to the server APK's ``requirements``
+  in ``server_apk/buildozer.spec``. dulwich (and a few of its
+  transitive imports) reach for ``typing_extensions`` at runtime;
+  on Android it isn't pulled in by default. Previously a clone
+  attempt would fail with ``ImportError: no module named
+  typing_extensions`` at the moment dulwich tried to do its first
+  network operation. Adding the recipe to requirements puts it on
+  the APK's PYTHONPATH. **Requires a clean build**
+  (``buildozer android clean && buildozer android debug deploy``)
+  for p4a to pick up the new recipe.
+- Promoted the ``text_size: self.width, None`` fix from
+  per-instance overrides on three ``BodyLabel`` uses to the
+  ``<BodyLabel@Label>`` class rule itself. Any ``BodyLabel`` whose
+  ``height: self.texture_size[1] + dp(8)`` would otherwise loop
+  with ``text_size: self.size`` is now safe by default. The earlier
+  per-instance overrides remain (redundant but harmless).
+
+### azt_collabd 0.13.5 — picker version-probe diagnostics
+- ``picker_app._probe_server_version`` now surfaces *why* the probe
+  failed when it can't show a real server version. Instead of a bare
+  ``server ?``, the bottom strip renders one of
+  ``server ? (server_unreachable)`` /
+  ``server ? (server_too_old)`` /
+  ``server ? (client_too_old)`` /
+  ``server ? (<ExceptionType>: ...)``. Distinguishes transport down
+  vs. version-handshake reject vs. RPC exception without needing
+  ``adb logcat``. Also prints a one-line diagnostic to stderr/logcat
+  so the post-mortem is in both places.
+
+### azt_collabd 0.13.4 — debug version bump
+- No code change. Version-only bump so a freshly-rebuilt server APK
+  reports a different ``__version__`` from the previous build,
+  letting the user verify on the picker's bottom strip
+  (``client X · server Y``) that the device is actually running the
+  new build vs a cached install.
+
+### azt_collabd 0.13.3 — picker shows both versions, auth-fallback for clone failures
+- Picker bottom strip now shows ``client X · server Y``. The server
+  half is fetched off the UI thread via
+  ``check_server_compat()``; renders ``server ?`` if the daemon is
+  unreachable. Was: client only.
+- ``_after_clone_fail`` got a fallback path: when the daemon's
+  worker didn't run far enough to attach ``CLONE_AUTH_REQUIRED``
+  (e.g. the clone-job kickoff itself failed and the result is None)
+  but the error string smells like auth (401 / 403 / 404 /
+  unauthorized / forbidden / not found / authentication /
+  credential), the auth-prompt modal still appears with the **Open
+  settings** button. Same heuristic the daemon uses, mirrored
+  client-side for the result-is-None case.
+- Auth-modal "Open settings" button now calls ``self.go_config()``
+  (in-process screen swap) instead of the removed
+  ``open_server_ui`` import. The Android Intent dance is gone from
+  this flow entirely.
+
+### azt_collabd 0.13.2 — picker hosts settings screens in-process
+- Picker's gear used to call ``azt_collab_client.open_server_ui()``,
+  which on Android fires ``getLaunchIntentForPackage`` on the server
+  APK. Because the server APK has a single ``PythonActivity`` already
+  running the picker, Android collapsed the task back to the calling
+  peer (the recorder) instead of switching to settings — there was
+  no path forward from the picker.
+- ``azt_collabd/ui/app.py`` now exposes a top-level
+  ``register_kv(font_name)`` (idempotent) that loads the settings/
+  GitHub/GitLab KV. ``CollabUIApp.build`` calls it; the picker_app
+  also calls it before its own KV so all class rules are in scope.
+- ``picker_app._PickerRoot`` ScreenManager now carries
+  ``SettingsScreen`` (with ``back_to: 'picker'``),
+  ``GitHubConnectScreen``, and ``GitLabFormScreen`` alongside the
+  existing ``ProjectPickerScreen`` / ``LangPickerScreen``. ``go_config()``
+  is now ``self.sm.current = 'settings'`` — no Intent, no subprocess.
+  Same code path on desktop and Android.
+- New ``go(name)`` method on ``PickerApp`` mirrors ``CollabUIApp.go``
+  so the existing settings-side KV (``app.go('github')``,
+  ``app.go('gitlab')``, ``app.go('settings')``) just works in both
+  hosts.
+- New ``back_to`` ``StringProperty`` on ``SettingsScreen``. When set
+  (the picker_app ``_PickerRoot`` KV sets it to ``'picker'``) the
+  screen renders an additional **← Back** ``NavBtn`` at the top of
+  the layout. Hidden / disabled in the standalone settings host
+  where back has no meaning. The Android back gesture / window-close
+  on non-picker screens is also intercepted by ``on_request_close``
+  to navigate back instead of exiting.
+- Known limitation: a peer calling ``open_server_ui()`` *while a
+  picker is already up* still hits the Android launch-flag bug
+  (settings doesn't appear; task may collapse to the peer). Rare in
+  practice and not worth a separate ``SettingsActivity`` declaration
+  yet — tracked as future work.
+
+### azt_collabd 0.13.1 — settings UI Clock-iteration warning fix
+- ``BodyLabel`` instances that combined ``text_size: self.size``
+  (inherited) with ``height: self.texture_size[1] + dp(8)`` were
+  forming a feedback loop on Android: texture_update changes height
+  → parent BoxLayout do_layout → child resize → text_size changes →
+  texture_update fires. Tolerable before; pushed past Kivy's
+  per-frame Clock iteration limit by the new language-toggle row
+  and the wrapping of every settings-UI string in ``_(...)``.
+  Surgical fix on the three offending BodyLabels (status_label,
+  gh_message, the gitlab-form intro): override
+  ``text_size: self.width, None`` so the wrap width is bound but
+  height flows from content alone, breaking the cycle.
+
+### azt_collabd 0.13.0 — settings UI translatable, language toggle, picker live retranslation
+- ``SettingsScreen`` gained an **Interface language** row at the top
+  with one button per ``azt_collab_client.i18n.available_languages()``.
+  Selecting a language calls ``i18n.set_language(code)`` (which
+  persists to ``$AZT_HOME/config.json`` under ``ui.language``) and
+  rebuilds every screen in the manager so KV ``text: _('...')``
+  bindings re-evaluate against the new catalog. Same dance the
+  recorder's ``ConfigScreen`` uses.
+- Every visible string in ``azt_collabd/ui/app.py`` (Settings, GitHub
+  device-flow, GitLab form) is now wrapped in ``_(...)``. KV imports
+  ``_ azt_collab_client.translate.tr`` so subsequent
+  ``set_translator``/language switches take effect.
+- ``picker_app.py`` watches ``$AZT_HOME/config.json`` mtime once a
+  second (Clock interval). When the persisted language changes — for
+  example because the user just toggled it in a settings subprocess
+  opened from the gear — the picker rebuilds its screens in place.
+  The user sees the picker live-retranslate without restart.
+- Apply persisted language at picker / settings startup so first
+  paint is in the right language.
+
+### azt_collabd 0.12.1 — picker gear wired to settings, both versions on settings page
+- Standalone picker (``python -m azt_collabd projects``) now shows
+  the settings gear in the top-right and wires it to the daemon's
+  settings UI via ``open_server_ui()`` instead of the previous no-op
+  stub. Rationale: first-time users land on the picker and need a
+  visible path to authentication; previously they had to fail a
+  clone before the auth-prompt modal offered one.
+- Settings UI (``python -m azt_collabd ui``) now displays both the
+  client and server versions in the bottom version strip:
+  ``client 0.14.1  ·  server 0.12.1`` — used to show only the
+  daemon version. The settings UI subprocess imports
+  ``azt_collab_client`` for ``__version__``.
+- Both version labels (settings + picker) bumped from
+  ``font_size: sp(11) / color: T.TEXT_FAINT`` to
+  ``sp(13) / T.TEXT_DIM`` so they're legible without straining.
+
+### azt_collabd 0.12.0 — URL-based credential routing, CLONE_AUTH_REQUIRED, MIN_CLIENT_VERSION handshake
+- New ``azt_collabd.MIN_CLIENT_VERSION = '0.14.0'`` — floor on the
+  ``azt_collab_client`` version this daemon will talk to. ``/v1/health``
+  now publishes ``min_client_version`` alongside ``version``. Symmetric
+  to the existing client-side ``MIN_SERVER_VERSION``: when a peer ships
+  a too-old client, the peer's startup handshake gets ``client_too_old``
+  and can prompt the user to update. Bump this constant in lockstep
+  with any wire-format addition that older clients can't decode (e.g.
+  the new ``CLONE_AUTH_REQUIRED`` status added in this release).
+- ``store.get_sync_credentials()`` now takes an optional remote URL and
+  picks credentials by host (``github.com`` → GitHub creds,
+  ``gitlab.com`` → GitLab creds), falling back to the user's saved
+  ``collab_host`` only when the URL is unrecognized (self-hosted /
+  empty). All call sites — ``_h_init_project``, ``_h_clone_project``,
+  ``_h_project_sync`` in ``server.py`` and ``_run_sync`` in
+  ``scheduler.py`` — pass the remote URL. Symptom this fixes: the user
+  picks a LIFT project without first visiting Settings; the daemon
+  used to send GitHub creds to a GitLab remote (or vice-versa) just
+  because ``collab_host`` was the wrong value.
+- New helper ``store.host_for_url(url)`` exposes the URL → host
+  classifier.
+- New status code ``CLONE_AUTH_REQUIRED`` (with ``host`` param). The
+  clone worker now appends it after final failure when either (a) no
+  token was available for the URL's host, or (b) the dulwich error
+  contains 401/403/404/auth keywords. The picker UI uses this to
+  branch into an auth-prompt modal instead of a generic error.
+- The auth-shaped retry already in ``_clone_worker`` was extracted to
+  ``_clone_error_looks_like_auth(result)`` and now also recognises
+  ``not found`` / 404 (private-repo case) — previously only matched
+  ``credential`` / ``auth``, so a 404-bearing failure skipped the
+  anonymous retry.
+
+### azt_collab_client 0.15.2 — Android ContentProvider path delivery fix
+- **Critical bug fix.** The Android transport
+  (``azt_collab_client/transports/android_cp.py``) built a URI like
+  ``content://<authority><path>`` and called
+  ``ContentResolver.call(uri, method, None, extras)``. But the
+  ``call(Uri, method, arg, extras)`` overload only delivers
+  ``method``, ``arg``, and ``extras`` to
+  ``ContentProvider.call(method, arg, extras)`` — the URI's path is
+  consumed by provider routing and never reaches the dispatch.
+- AZTCollabProvider.java reads ``arg`` as the path
+  (``cb.dispatch(method, arg != null ? arg : "", body)``), so on the
+  daemon side every RPC was being dispatched with ``path=""``,
+  producing ``{ok: False, error: 'not_found'}``. User-visible
+  symptom: every clone / list / sync / credential RPC silently
+  routed to the dispatcher's catch-all 404 branch.
+- Fix: pass the dispatch path as ``arg`` instead of None. The URI
+  shrinks to just the authority (no path component) since it's only
+  used for provider routing now. One-line change at the call site.
+- This was a long-standing bug that likely went unnoticed because
+  legacy peers symlinked ``azt_collabd`` and used the loopback
+  transport (Python interpreter in-process). Peers on the new
+  ContentProvider-only model would have hit it on every non-ping
+  call.
+
+### azt_collab_client 0.15.1 — picker gear icon bundled in package
+- Picker KV used to reference the gear icon as a relative
+  ``'icons/gear.png'`` path, which only resolves when the host's
+  cwd happens to contain that file (worked from the recorder repo
+  root, broke everywhere else — most visibly in the standalone
+  picker subprocess, where Kivy fell back to its missing-image
+  texture and the gear rendered as a white square).
+- The icon is now an absolute path computed from the package
+  location: ``azt_collab_client/ui/assets/gear.png``. The KV
+  template injects it at ``register_kv`` time alongside ``font_name``.
+- ``register_kv`` (a.k.a. ``register_picker_kv``) gained an optional
+  ``gear_icon=`` kwarg so hosts that want a custom icon can pass
+  one explicitly (the recorder still ships its own at
+  ``azt_recorder/icons/gear.png``); default falls back to the
+  package-bundled file.
+- **Important**: the binary file
+  ``azt_collab_client/ui/assets/gear.png`` is not committed by this
+  change; copy from any peer that already has one
+  (e.g. ``cp /home/kentr/bin/AZT/azt_recorder/icons/gear.png
+  azt_collab_client/ui/assets/gear.png``).
+
+### azt_collab_client 0.15.0 — own i18n domain (azt_collab_client.po), pure-Python msgfmt, fallback chain in translate.tr
+- New module ``azt_collab_client.i18n`` owns gettext domain
+  ``azt_collab_client``. Public API:
+  ``set_language(lang, persist=True)``, ``current_language()``,
+  ``available_languages()``, ``language_pref()``, ``_(msg)``,
+  ``gettext_translation()``. Persists the active language to
+  ``$AZT_HOME/config.json`` under ``ui.language``; auto-applies that
+  preference at import so all suite subprocesses converge on the same
+  language without a coordination channel.
+- New locale tree
+  ``azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po``
+  with French translations of all client-owned strings: picker UI,
+  langpicker, popups, ``translate.py`` status messages (the full
+  ``S.*`` set), and the settings-UI strings now owned by the client.
+- ``i18n.py`` ships a pure-Python PO→MO compiler (msgfmt-lite — single
+  magic, sorted msgid array, two parallel offset tables packed via
+  ``struct``). Runs lazily on first ``set_language`` whenever the
+  ``.mo`` is missing or older than the ``.po``. So peers that ship
+  only the ``.po`` (or contributors editing translations in-place) do
+  not need a build-time ``msgfmt`` step.
+- ``translate.py`` default translator changed from "try
+  ``from i18n import _`` (recorder)" to "use the client catalog
+  directly". ``set_translator(host_tr)`` overrides as before, but
+  ``tr(msg)`` now falls **back** to the client catalog whenever the
+  host translator returns ``msg`` unchanged. The fallback layer means
+  embedded peers (the recorder) do not need to duplicate client
+  strings into ``aztrecorder.po``: a string the recorder catalog
+  doesn't know falls through to ``azt_collab_client.po``. Owns its
+  own strings, no duplication, gettext-canonical.
+- Behavior change to be aware of: hosts that previously relied on
+  the implicit ``from i18n import _`` fallback now get the client
+  catalog first. Hosts with their own catalogs should keep calling
+  ``set_translator(host._)`` at startup; the new fallback in
+  ``tr()`` handles client strings transparently.
+
+### azt_collab_client 0.14.1 — picker version label clarified
+- Picker bottom-strip version label changed from ``collab X.Y.Z`` to
+  ``client X.Y.Z`` so users can tell client and server versions
+  apart at a glance (the settings page shows both).
+- ``ProjectPickerScreen`` version label sized up:
+  ``font_size: sp(13)`` / ``color: T.TEXT_DIM`` (was
+  ``sp(11)`` / ``T.TEXT_FAINT``). Same change applied in
+  ``azt_collabd/ui/app.py`` for consistency.
+
+### azt_collab_client 0.14.0 — auth-prompt modal on clone failure, client_too_old handshake
+- ``check_server_compat()`` gained a third branch: when the server's
+  ``min_client_version`` is greater than this client's ``__version__``,
+  the function now returns
+  ``{'ok': False, 'error': 'client_too_old', 'client_version', 'server_version', 'min_required'}``.
+  Mirrors the existing ``server_too_old`` shape so peer apps can branch
+  on the same dict. Forward-compatible with pre-0.12.0 daemons that
+  don't publish ``min_client_version`` (treated as "no floor").
+- New status mirror ``S.CLONE_AUTH_REQUIRED`` and translation:
+  *"Clone failed — repository not found. This may be a private
+  repository. Are you authenticated to {host}?"* (host is rendered
+  Title-cased: GitHub / Gitlab).
+- ``azt_collabd/ui/picker_app.py`` clone-fail flow now threads the
+  daemon's ``Result`` through ``_after_clone_fail``. When the result
+  carries ``CLONE_AUTH_REQUIRED``, the modal renders the translated
+  prompt and an extra **Open settings** button that calls
+  ``azt_collab_client.open_server_ui()``. Previously the user saw a
+  bare *"Clone failed: not found"* and had no path forward — they
+  would not have visited Settings before picking a project, so we
+  lead them there.
+- ``_show_error`` grew an optional ``extra_button=(label, callback)``
+  argument so the same modal helper can host either a single Dismiss
+  button (existing behavior) or a two-button row.
+
+### azt_collabd 0.11.0 — settings UI restyle, picker typography fix
+- The standalone settings UI (``python -m azt_collabd ui`` /
+  launcher activity in the server APK) was using stock Kivy buttons
+  with no theme, no ``font_name``, and no top bar. It looked
+  unrelated to the recorder. Restyled to mirror the recorder's
+  ``CollabScreen``: themed top bar (``T.SURFACE`` background,
+  ``T.ACCENT`` bold title), ``BG``-painted screens, ``SectionLabel``
+  / ``HeaderLabel`` / ``BodyLabel`` / ``DimLabel`` dynamic classes,
+  ``ThemedInput`` for text fields, ``RecBtn`` for primary actions,
+  ``NavBtn`` for secondary navigation. The host toggle now highlights
+  the active host with ``T.GREEN`` (was: a disabled stock button).
+- The standalone picker (``picker_app.py``) was rendering its
+  ``RecBtn`` with raw ``font_size: 16`` (un-scaled pixels — tiny on
+  hi-dpi phones), no ``font_name``, and a hardcoded blue
+  ``(0.2, 0.6, 1, 1)`` instead of a theme colour. Replaced with the
+  recorder's idiom: ``font_size: sp(16)``, ``font_name: FONT``,
+  ``normal_color: T.ACCENT``. The error / loading modal overlays
+  were also unstyled stock widgets; now ``T.SURFACE`` rounded
+  panels with ``T.TEXT`` labels and a themed dismiss button.
+- Both apps now call ``register_charis()`` from the new shared
+  helper at startup. If the CharisSIL TTFs can be located (the
+  recorder's ``fonts/`` dir during desktop dev, system font dirs on
+  Linux, or a future ``azt_collab_client/fonts/`` location) they
+  register under LabelBase name ``CharisSIL``; otherwise the apps
+  fall back to ``Roboto`` silently. The standalone server APK
+  doesn't currently bundle the TTFs (~20 MB), so on-device it falls
+  back to Roboto — sizes and theme are aligned, glyphs are not.
+  Bundling the fonts in the server APK is a follow-up.
+
+### azt_collab_client 0.13.6 — shared CharisSIL helper, larger picker logo
+- New ``azt_collab_client.ui.fonts.register_charis()`` (re-exported
+  as ``azt_collab_client.ui.register_charis``). Discovers
+  CharisSIL-Regular/Bold/Italic/BoldItalic TTFs across a small list
+  of likely locations (canonical client ``fonts/`` slot, sibling
+  recorder ``fonts/`` dir, system font dirs) and registers them
+  under LabelBase name ``CharisSIL``. Returns the LabelBase name to
+  use (``'CharisSIL'`` or ``'Roboto'``); idempotent.
+- ``ProjectPickerScreen`` typography: logo grew from ``dp(200)`` to
+  ``dp(240)``, title from ``sp(28)`` to ``sp(32)``, subtitle from
+  ``sp(16)`` to ``sp(18)``. Logo gets explicit
+  ``allow_stretch / keep_ratio: True`` so the larger size doesn't
+  pixelate. Title / subtitle now centred with explicit
+  ``halign: 'center'`` + ``text_size: self.size`` so they don't
+  drift left in narrow layouts.
+
+### azt_collab_client 0.13.5 — open_server_ui dispatches on Android + shared install popup
+- ``open_server_ui()``'s docstring has long promised that on Android
+  it would dispatch an Intent to the server APK's launcher activity.
+  It now does. New ``_open_server_ui_android`` resolves
+  ``PackageManager.getLaunchIntentForPackage('org.atoznback.aztcollab')``
+  and starts the activity. Returns
+  ``{'ok': True, 'launched': 'android-apk'}`` on success.
+- If the APK isn't installed, the helper opens a new install-prompt
+  popup (``ui.popups.install_server_apk_popup``) and returns
+  ``{'ok': False, 'error': 'server_apk_not_installed', 'prompted': True}``
+  so the caller knows the popup is on screen. The popup itself
+  routes through ``Intent.ACTION_VIEW`` on Android and
+  ``webbrowser.open`` on desktop, both pointed at
+  ``SERVER_APK_INSTALL_URL``.
+- New optional ``on_status`` callback on ``open_server_ui`` /
+  ``install_server_apk_popup``: the popup uses it to surface
+  "could not open install page — …" failures into the host's
+  status bar without the host having to reach into the popup
+  internals. Sister apps that don't pass ``on_status`` still work.
+- ``ui.popups`` and ``ui/__init__`` export
+  ``install_server_apk_popup`` so peers can also call it directly
+  (e.g. from a startup-time ``ServerUnavailable``-handling path,
+  not just from the settings button).
+- Decouples sister apps from per-app reimplementations of
+  "launch APK / show install prompt" and lets the viewer collapse
+  ~60 lines of jnius / popup boilerplate.
+
+### azt_collabd 0.10.6 — pin AZTCollabProvider callback proxies
+- **Bug fix:** ``android_cp/service.install_callbacks`` was passing
+  freshly-constructed ``_Dispatch()`` / ``_OpenFile()`` PythonJavaClass
+  instances inline to ``Provider.registerCallbacks``. Java held refs;
+  Python did not. After a GC cycle (typically within seconds of the
+  picker Activity launching) the proxy instances were freed, and the
+  next binder-thread call from a peer's ContentResolver into
+  ``AZTCollabProvider.call`` dereferenced the dead type object. Net
+  effect on hardware: ``Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR),
+  fault addr 0x143`` on Thread-3, with backtrace through
+  ``NativeInvocationHandler.invoke`` → ``_PyObject_GenericGetAttrWithDict``
+  → ``_PyType_Lookup``. From the peer's perspective the picker
+  Activity vanished and the recorder logged
+  ``[activity-result] code=18247 result=0`` (default RESULT_CANCELED
+  from the killed Activity).
+- Fix: store strong refs to both proxies at module scope before
+  handing them to Java. Validate with a clean rebuild
+  (``buildozer android clean && buildozer android debug``).
+
+### azt_collab_client 0.13.4 — gear icon source conditional
+- The picker KV had an unconditional ``source: 'icons/gear.png'`` even
+  when the host passed ``hide_settings_gear=True`` (size goes to 0×0
+  in that case but Kivy still tries to resolve the source). The
+  standalone picker app and any sister app that hides the gear was
+  logging ``[ERROR ] [Image ] Not found <icons/gear.png>`` on every
+  picker open. Cosmetic, not the cause of the segfault — but the
+  standalone server APK has no ``icons/`` dir of its own so the line
+  was particularly visible there.
+- Fix: gate the source on the same ``{show_gear}`` template flag the
+  size already uses (``source: 'icons/gear.png' if {show_gear} else ''``
+  in ``azt_collab_client/ui/picker.py``).
+
+### azt_collabd 0.10.5 — server APK ships non-Python assets
+- **Bug fix:** `server_apk/buildozer.spec` had `source.include_exts =
+  py,xml`, which silently stripped `azt_collab_client/ui/assets/
+  langtags_mini.json.gz` and `azt_collab_client/azt.png` from the
+  packaged APK. Net effect: tapping **Start New** in the picker
+  Activity raised `FileNotFoundError: ... langtags_mini.json.gz` from
+  `LangPickerScreen._load_langtags`, which crashed the Activity; the
+  Activity then finished without an explicit `setResult(-1, ...)` so
+  peers saw `[activity-result] code=18247 result=0` (RESULT_CANCELED
+  for `_AZT_PICK_REQ_CODE`). The same was true for any flow that
+  reaches the langpicker, including the path between Clone-Internet
+  and the post-clone confirmation when the user backs out via the
+  langpicker.
+- Fix: extend `source.include_exts` to `py,xml,gz,png`. `gz` covers
+  the langtags blob; `png` covers the suite icon used by `App.icon`
+  in `azt_collabd/ui/picker_app.py`. Validate with a clean rebuild
+  (`buildozer android clean && buildozer android debug`) — hot
+  patches into `.buildozer/.../build/` only prove the patch *content*
+  is right, not that the spec change actually fires.
+
 ### Suite naming convention
 - Adopted a single rule for surfacing the "azt collab" / "azt
   recorder" names across systems with incompatible identifier rules
@@ -160,6 +813,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
   Intent action is matched by the existing PythonActivity entry +
   the new `<intent-filter>` line described in
   `azt_recorder/docs/p4a_hook_picker_intent.diff`).
+
+### azt_collab_client 0.13.3 — pick_project UI-thread JNI dispatch
+- Bug fix: `_pick_project_android` was building the
+  `ActivityResultListener` proxy on the worker thread that called
+  `pick_project()`. Worker threads attached by jnius' thread hook
+  don't carry the app `ClassLoader`, so
+  `find_javaclass('org/kivy/android/PythonActivity$ActivityResultListener')`
+  fell back to the system loader (which has no app inner classes)
+  and raised `JavaException: ClassNotFoundException`. Net effect:
+  the recorder fired the `PICK_PROJECT` Intent, the worker thread
+  died before `startActivityForResult` ever ran, the recorder's
+  blocking modal stayed up forever showing only "Pick a project to
+  continue. Cancel" with no picker Activity behind it.
+- Fix: dispatch all JNI work (autoclass lookups, Intent build,
+  `resolveActivity`, `bind(on_activity_result=...)`,
+  `startActivityForResult`) to Kivy's main thread via
+  `Clock.schedule_once`. The Kivy main thread is the Android UI
+  thread, where the app `ClassLoader` is in scope and inner-class
+  resolution works. The caller's thread only blocks on the result
+  `Event`. Setup itself is bounded by a 10-second `Event.wait()` so
+  a wedged UI thread can't hang the caller indefinitely.
+- No API change; the function still returns the same dict shapes.
+
+### azt_collab_client 0.13.2 — test_peer.sh fingerprint extraction
+- `test_peer.sh` extends signing-fingerprint detection beyond
+  keytool/dumpsys (both miss v2/v3-only signed APKs) with apksigner
+  + openssl-on-META-INF fallbacks. Auto-discovers apksigner under
+  `ANDROID_HOME` / `ANDROID_SDK_ROOT` / buildozer's bundled SDK at
+  `~/.buildozer/android/platform/android-sdk/build-tools/*/apksigner`.
+- Diagnostic chain now reports every tool that was tried so a WARN
+  line tells you exactly which step failed (was: a single misleading
+  message that reflected only the first failure).
+- Strips `SHA[- ]?(256|1):` labels before regex extraction so the
+  fingerprint match can't latch onto the `56` inside `SHA256:` and
+  produce off-by-one bytes (was happening on the SUITE_FINGERPRINT
+  file itself).
+- Detects `CN=Android Debug` in apksigner output and reports
+  `peer is signed with the Android Debug keystore; SUITE_FINGERPRINT
+  check skipped (only meaningful for release builds)` instead of
+  failing with a spurious mismatch. Debug builds of all suite peers
+  share the same default Android debug keystore, so cross-app
+  signature-permission gates still work; the suite-fingerprint check
+  was only ever meant for release builds.
 
 ### azt_collab_client 0.13.1 — picker resilience
 - `_pick_project_android`: pre-check Intent resolvability via

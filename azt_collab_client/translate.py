@@ -1,35 +1,55 @@
 """Translate Status/Result objects into user-visible strings.
 
-Uses the recorder's i18n module (``from i18n import _``). Other apps in
-the suite that embed this client may set their own translator via
-``set_translator(fn)``.
+The client owns its own i18n (``azt_collab_client.i18n``), so picker
+UI, popups, and status messages render translated even when no host
+override is set. Hosts with their own catalogs (the recorder, with
+``aztrecorder.po``) call ``set_translator(host_tr)`` to override —
+``tr()`` then tries the host translator first and falls back to the
+client catalog, so client-owned strings still render translated even
+when the host's catalog doesn't carry them.
+
+Pre-suite hosts that imported a top-level ``i18n`` module continue to
+work: ``set_translator`` accepts any callable.
 """
 
 from . import status as S
+from . import i18n as _client_i18n
 
-try:
-    from i18n import _ as _default_tr
-except Exception:  # pragma: no cover — client used outside the recorder
-    def _default_tr(s):
-        return s
 
-_tr = _default_tr
+def _client_tr(msg):
+    return _client_i18n._(msg)
+
+
+# Default translator: the client's own catalog. Override with
+# ``set_translator`` from a host that has additional strings.
+_tr = _client_tr
 
 
 def set_translator(fn):
     """Override the translator. Callers pass a function taking a str and
-    returning a translated str."""
+    returning a translated str. Reset to the client default by passing
+    ``None``."""
     global _tr
-    _tr = fn
+    _tr = fn if fn is not None else _client_tr
 
 
 def tr(msg):
-    """Module-level wrapper that always delegates to the current ``_tr``.
+    """Translate ``msg`` through the host translator first, then fall
+    back to the client catalog. Useful for KV ``#:import`` so
+    subsequent ``set_translator`` calls take effect (KV imports bind
+    once; importing this wrapper instead of ``_tr`` makes the
+    indirection explicit).
 
-    Useful for KV ``#:import`` so subsequent ``set_translator`` calls
-    take effect (KV imports bind once; importing this wrapper instead
-    of ``_tr`` makes the indirection explicit)."""
-    return _tr(msg)
+    The fallback layer means an embedded peer does not need to
+    duplicate client strings into its own catalog: any string the host
+    catalog leaves unchanged falls through to the client's catalog,
+    which owns the picker/popup/status translations."""
+    if _tr is _client_tr:
+        return _tr(msg)
+    translated = _tr(msg)
+    if translated == msg:
+        return _client_tr(msg)
+    return translated
 
 
 def _fmt(template, params):
@@ -77,6 +97,10 @@ _HANDLERS = {
     S.PUSH_FAILED:            lambda p: _fmt(_tr('Push failed: {error}'), p),
     S.PULL_FAILED:            lambda p: _fmt(_tr('Pull failed: {error}'), p),
     S.CLONE_FAILED:           lambda p: _fmt(_tr('Clone failed: {error}'), p),
+    S.CLONE_AUTH_REQUIRED:    lambda p: _fmt(_tr(
+        'Clone failed — repository not found. This may be a private '
+        'repository.\n\nAre you authenticated to {host}?'),
+        {'host': (p.get('host') or '').capitalize() or 'GitHub'}),
     S.BRANCH_ERROR:           lambda p: _fmt(_tr('Branch error: {error}'), p),
     S.REMOTE_CREATE_FAILED:   lambda p: _fmt(_tr('Create repo failed: {error}'), p),
 

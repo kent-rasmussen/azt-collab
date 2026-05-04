@@ -18,7 +18,8 @@ into here; this package owns:
 - the public API surface (`azt_collab_client.__init__`)
 - the transport facade (`rpc.call` → `transports.pick_transport`)
 - decode-only mirrors of `Status` / `Result` / `Project` / `ProjectStatus`
-- a translator hook (`translate.set_translator`)
+- a translator hook (`translate.set_translator`) plus the client-owned
+  gettext catalog (`azt_collab_client.i18n` / `locales/`)
 - a shared Kivy picker UI (`azt_collab_client.ui`)
 
 ## Hard rules
@@ -47,8 +48,17 @@ into here; this package owns:
    `azt_collab_client.status` (re-exported as `S` from the package
    root). Translation lives in `translate.py` and runs through
    whatever callable was last passed to `set_translator(fn)`; the
-   default tries `from i18n import _` (recorder's translator) and
-   falls back to identity.
+   **default** is the client-owned catalog at
+   `azt_collab_client.i18n._`, and `tr()` falls back to that catalog
+   when a host translator returns the msgid unchanged. See the
+   *Internationalization* section below.
+
+5. **The client owns its own translatable strings.** Anything in
+   `picker.py` / `popups.py` / `langpicker.py` / `translate.py` /
+   the daemon's `ui/app.py` that's user-visible goes in
+   `azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po`.
+   Don't expect a host catalog (e.g. `aztrecorder.po`) to carry these;
+   the recorder is one consumer of the client among several.
 
 5. **Two `configure()` calls in the suite, both keyword-only and
    idempotent.** Host apps call:
@@ -182,6 +192,131 @@ from inside the client.
   to the current `_tr`, useful for KV `#:import` so subsequent
   `set_translator` calls take effect.
 
+## Internationalization (i18n)
+
+The client owns gettext domain `azt_collab_client`. Catalogs live at
+`azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po`
+(plus the `.mo` that `i18n._ensure_mo` auto-compiles on first
+`set_language` — there is no external `msgfmt` build dep).
+
+### What auto-runs
+
+- On import, `azt_collab_client.i18n` reads
+  `$AZT_HOME/config.json → ui.language` and applies that language.
+  Peer apps that touch `azt_collab_client` get the right initial
+  language without any setup.
+- `azt_collab_client.translate.tr(msg)` defaults to the client
+  catalog. KV templates that already do
+  `#:import _ azt_collab_client.translate.tr` keep working.
+
+### Public API (`azt_collab_client.i18n`)
+
+```python
+from azt_collab_client import i18n
+
+i18n.set_language('fr')                # switch + persist to config.json
+i18n.language_pref()                   # read persisted language ('en' default)
+i18n.current_language()                # active language (after fallback)
+i18n.available_languages()             # [(code, display_name), ...]
+i18n.display_name('fr')                # 'Français' (single source of truth)
+i18n.scan_catalog_languages(dir, dom)  # peer-side catalog discovery helper
+i18n._('Cancel')                       # translate via the client catalog
+i18n.gettext_translation()             # underlying gettext.NullTranslations
+                                       # subclass — for add_fallback chains
+```
+
+### Peer integration
+
+**Peer with no own catalog** (a small viewer, the standalone picker
+subprocess): nothing to do. The default translator is the client
+catalog; UI strings translate automatically once a language is
+selected from the daemon's settings UI (`open_server_ui()`).
+
+**Peer with its own catalog** (the recorder, with `aztrecorder.po`):
+chain via gettext's native `add_fallback` so peer-owned strings
+resolve in the peer catalog and client-owned strings fall through
+to ours:
+
+```python
+import gettext
+import azt_collab_client
+from azt_collab_client import i18n as collab_i18n
+
+def set_recorder_language(lang):
+    if lang == 'en':
+        recorder_t = gettext.NullTranslations()
+    else:
+        recorder_t = gettext.translation(
+            'aztrecorder', localedir=RECORDER_LOCALES, languages=[lang],
+            fallback=True)
+    collab_i18n.set_language(lang)             # client catalog + persist
+    recorder_t.add_fallback(collab_i18n.gettext_translation())
+    azt_collab_client.set_translator(recorder_t.gettext)
+```
+
+After this, `_(msg)` in recorder code resolves recorder strings
+first, then falls through to the client catalog. No string
+duplication; both catalogs stay single-source.
+
+`translate.tr` *also* has a software fallback in case the host
+forgets `add_fallback`: if `set_translator(host_tr)` is registered
+and `host_tr(msg)` returns `msg` unchanged, `tr` retries via the
+client catalog. So a misconfigured host still gets client strings
+translated for KV-rendered text. Don't rely on this in lieu of
+`add_fallback` — but it makes the failure mode "missing translation
+for client string" instead of "untranslated forever".
+
+### Live retranslation
+
+The daemon's settings UI (`python -m azt_collabd ui` /
+`open_server_ui()`) ships a language selector that calls
+`i18n.set_language(code)` and rebuilds its own ScreenManager so KV
+`text: _('...')` bindings re-evaluate.
+
+For peers that want to live-retranslate while running (so a user
+flipping language in a settings subprocess updates the peer's open
+window without restart), poll `$AZT_HOME/config.json` mtime on a
+`Clock.schedule_interval(..., 1.0)` and rebuild the relevant
+screens. Pattern in `azt_collabd/ui/picker_app.py:_check_language_change`:
+
+```python
+def _check_language_change(self, _dt):
+    new_mtime = self._get_config_mtime()
+    if new_mtime == self._config_mtime:
+        return
+    self._config_mtime = new_mtime
+    persisted = collab_i18n.language_pref()
+    if persisted == collab_i18n.current_language():
+        return
+    set_recorder_language(persisted)   # the chain shown above
+    # Then rebuild your ScreenManager (clear_widgets + re-add) so
+    # KV `text: _('...')` bindings re-evaluate.
+```
+
+If a peer doesn't want live retranslation, it can skip the watcher;
+the persisted language is picked up at next launch via the auto-init
+at import.
+
+### Adding a translation
+
+1. Wrap the user-visible string in `_(...)` (KV) or
+   `azt_collab_client.translate.tr(...)` / `i18n._(...)` (Python).
+2. Add the msgid + translation to the relevant
+   `azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po`.
+3. Delete the stale `.mo` next to it (or just edit the `.po` and
+   trust mtime — `_ensure_mo` recompiles whenever the `.mo` is older
+   than the `.po`).
+4. No daemon-side change needed; translations are client-only.
+
+### Adding a new language
+
+1. Create `azt_collab_client/locales/<code>/LC_MESSAGES/azt_collab_client.po`
+   (copy `fr/.../azt_collab_client.po` as a template).
+2. Add the display name to `i18n._DISPLAY_NAMES` if the BCP-47 code
+   isn't already there.
+3. `available_languages()` discovers it on next call; the settings UI
+   adds a button automatically.
+
 ## UI submodule (`azt_collab_client.ui`)
 
 Shared Kivy screens (`LangPickerScreen`, `ProjectPickerScreen`) and
@@ -224,9 +359,23 @@ At startup, before the first client call:
 ```python
 import azt_collab_client
 azt_collab_client.configure(app_id='<your-app-id>')
-azt_collab_client.set_translator(your_i18n._)   # if you have one
+
+# i18n: skip this block entirely if you don't have your own catalog —
+# azt_collab_client.i18n auto-applies the persisted UI language on
+# import, so the client catalog Just Works.
+#
+# If you DO have your own catalog (recorder pattern), chain it:
+#   import gettext
+#   from azt_collab_client import i18n as collab_i18n
+#   recorder_t = gettext.translation('aztrecorder', ...)
+#   recorder_t.add_fallback(collab_i18n.gettext_translation())
+#   azt_collab_client.set_translator(recorder_t.gettext)
+# See the "Internationalization (i18n)" section above.
+
 compat = azt_collab_client.check_server_compat()
-# branch on compat['ok'] / compat['error'] for install / update UX
+# branch on compat['ok'] / compat['error'] for install / update UX.
+# New error in 0.15.0+: 'client_too_old' — the server requires a
+# newer client than this peer ships. Surface "Please update this app".
 ```
 
 If the sister app embeds the daemon (i.e., has a sibling

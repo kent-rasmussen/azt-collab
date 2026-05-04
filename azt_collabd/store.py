@@ -177,13 +177,28 @@ def clear_gitlab():
 
 # ── sync credential selection ───────────────────────────────────────────────
 
-def get_sync_credentials():
-    """Return (git_user, token) for the currently selected host. Auto-refreshes
-    GitHub tokens. Returns ('', '') if not configured."""
-    host = get_collab_host()
+def host_for_url(url):
+    """Classify a remote URL by host. Returns 'github' | 'gitlab' | None.
+    None means: can't tell from the URL alone (self-hosted etc.) — caller
+    should fall back to the user's saved ``collab_host``."""
+    if not url:
+        return None
+    u = url.lower()
+    if 'github.com' in u:
+        return 'github'
+    if 'gitlab.com' in u:
+        return 'gitlab'
+    return None
+
+
+def get_sync_credentials(url=''):
+    """Return (git_user, token) for the host best suited to *url*. Falls
+    back to the user's saved ``collab_host`` when the URL is unrecognized
+    (self-hosted, missing, etc.). Auto-refreshes GitHub tokens. Returns
+    ('', '') if no credentials are stored for the chosen host."""
+    host = host_for_url(url) or get_collab_host()
     if host == 'gitlab':
-        user, token = get_gitlab()
-        return user, token
+        return get_gitlab()
     _, token = get_valid_github_token()
     return 'x-access-token', token
 
@@ -196,6 +211,7 @@ def get_status():
     gl = data.get('gitlab', {}) or {}
     return {
         'host': data.get('collab_host', 'github'),
+        'contributor': get_contributor(),
         'github': {
             'connected': bool(gh.get('access_token')),
             'username': gh.get('username', ''),
@@ -206,6 +222,59 @@ def get_status():
             'username': gl.get('username', ''),
         },
     }
+
+
+# ── contributor (commit-author display name) ────────────────────────────────
+#
+# The user's display name as it appears in ``git log``. Stored in
+# ``$AZT_HOME/config.json :: collab.contributor`` (sibling to
+# ``ui.language``); this is suite-wide settings, not credentials, so
+# it lives in config.json rather than credentials.json. Single source
+# of truth: every peer reads this from the server instead of carrying
+# its own ``"Your name"`` prefs row. Sync/init endpoints fall back to
+# this value when the calling peer passes an empty contributor.
+
+def _config_path():
+    return os.path.join(azt_home(), 'config.json')
+
+
+def _load_config_file():
+    try:
+        with open(_config_path()) as f:
+            return json.load(f) or {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_config_file(d):
+    p = _config_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def get_contributor():
+    """Stored display name for ``git log``. Empty string if unset."""
+    return (_load_config_file().get('collab') or {}).get('contributor', '')
+
+
+def set_contributor(name):
+    """Persist the user's display name. Strips whitespace; an empty
+    string clears the field (sync flows then revert to the
+    ``'Recorder'`` default)."""
+    cfg = _load_config_file()
+    cfg.setdefault('collab', {})['contributor'] = (name or '').strip()
+    _save_config_file(cfg)
+
+
+def resolve_contributor(passed):
+    """Pick the right contributor for a sync/commit op: caller's
+    explicit value wins, then the stored display name, then the
+    fallback ``'Recorder'``. Used by ``_h_project_sync`` /
+    ``_h_init_project`` / ``scheduler._run_sync``."""
+    return (passed or '').strip() or get_contributor() or 'Recorder'
 
 
 # ── migration from recorder's legacy prefs.json ─────────────────────────────

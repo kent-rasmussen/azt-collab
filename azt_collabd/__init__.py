@@ -17,7 +17,13 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.10.3"
+__version__ = "0.13.21"
+
+# Floor on the azt_collab_client version this daemon is willing to talk
+# to. Bump this when a daemon-side change relies on a status code or
+# wire-format addition that older clients can't decode/translate
+# usefully. Published on /v1/health so the client compares locally.
+MIN_CLIENT_VERSION = "0.14.0"
 
 from . import config
 from . import net

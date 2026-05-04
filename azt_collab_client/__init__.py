@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.13.1"
+__version__ = "0.16.0"
 MIN_SERVER_VERSION = "0.8.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
@@ -25,23 +25,28 @@ def configure(app_id: str):
     return None
 
 
-def open_server_ui():
-    """Open the standalone azt_collabd settings UI.
+def open_server_ui(on_status=None):
+    """Open the daemon settings UI on whichever platform we're on.
 
     Desktop: spawns ``python -m azt_collabd ui`` detached and returns
     ``{'ok': True, 'pid': <int>}``.
 
-    Android: returns ``{'ok': False, 'error': 'desktop_only'}`` for
-    now. Once the standalone server APK lands (cleanup-draft #3) this
-    will dispatch an Intent to the server APK's launcher activity;
-    sister apps still call this same helper.
+    Android: dispatches a launch intent to the installed server APK
+    (``org.atoznback.aztcollab``). On success returns
+    ``{'ok': True, 'launched': 'android-apk'}``. If the APK isn't
+    installed, opens an install-prompt popup
+    (``ui.popups.install_server_apk_popup``) and returns
+    ``{'ok': False, 'error': 'server_apk_not_installed', 'prompted': True}``.
+
+    ``on_status`` is forwarded to the install popup so the host can
+    surface "could not open install page" errors in its status bar.
 
     Sister apps should bind their "Open Sync Settings" button to this
     helper so the platform branching lives in one place::
 
         from azt_collab_client import open_server_ui
-        result = open_server_ui()
-        if not result['ok']:
+        result = open_server_ui(on_status=self._set_log)
+        if not result['ok'] and not result.get('prompted'):
             self._set_log(result['error'])
     """
     try:
@@ -49,7 +54,7 @@ def open_server_ui():
     except Exception:
         platform = ''
     if platform == 'android':
-        return {'ok': False, 'error': 'desktop_only'}
+        return _open_server_ui_android(on_status)
     import os
     import subprocess
     import sys as _sys
@@ -80,6 +85,40 @@ def open_server_ui():
                     'returncode': rc, 'detail': detail}
         _time.sleep(0.02)
     return {'ok': True, 'pid': proc.pid}
+
+
+def _open_server_ui_android(on_status):
+    try:
+        from jnius import autoclass, cast
+    except Exception as ex:
+        return {'ok': False, 'error': 'launch_failed',
+                'detail': f'jnius unavailable: {ex}'}
+    try:
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Intent = autoclass('android.content.Intent')
+        ctx = cast('android.content.Context', PythonActivity.mActivity)
+        pm = ctx.getPackageManager()
+        intent = pm.getLaunchIntentForPackage('org.atoznback.aztcollab')
+    except Exception as ex:
+        return {'ok': False, 'error': 'launch_failed',
+                'detail': f'{type(ex).__name__}: {ex}'}
+    if intent is None:
+        try:
+            from .ui.popups import install_server_apk_popup
+            install_server_apk_popup(on_status=on_status)
+        except Exception as ex:
+            return {'ok': False, 'error': 'server_apk_not_installed',
+                    'prompted': False,
+                    'detail': f'install popup failed: {ex}'}
+        return {'ok': False, 'error': 'server_apk_not_installed',
+                'prompted': True}
+    try:
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    except Exception as ex:
+        return {'ok': False, 'error': 'launch_failed',
+                'detail': f'{type(ex).__name__}: {ex}'}
+    return {'ok': True, 'launched': 'android-apk'}
 
 
 _AZT_PICK_REQ_CODE = 0x4747  # arbitrary; uniquely ours within the recorder
@@ -163,54 +202,40 @@ def _pick_project_android(timeout_seconds):
     try:
         from jnius import autoclass
         from android import activity as android_activity  # noqa: F401
+        from kivy.clock import Clock
     except Exception as ex:
         return {'ok': False, 'error': 'spawn_failed', 'detail': str(ex)}
-    PythonActivity = autoclass('org.kivy.android.PythonActivity')
-    Intent = autoclass('android.content.Intent')
-    ComponentName = autoclass('android.content.ComponentName')
-    intent = Intent('org.atoznback.aztcollab.PICK_PROJECT')
-    # Setting the component explicitly ensures the suite-signed server
-    # APK is the resolver (rather than any handler that might claim
-    # the action), and gives a clean ActivityNotFoundException when the
-    # APK isn't installed.
-    try:
-        intent.setComponent(ComponentName(
-            'org.atoznback.aztcollab',
-            'org.kivy.android.PythonActivity'))
-    except Exception:
-        pass
-    activity = PythonActivity.mActivity
-
-    # Pre-check that the Intent resolves to an installed Activity.
-    # Android's startActivityForResult does NOT reliably throw
-    # ActivityNotFoundException across all OEM builds — some return
-    # silently and never deliver an onActivityResult, which would
-    # block done.wait() forever. Resolving up-front avoids that
-    # wedge entirely.
-    try:
-        pm = activity.getPackageManager()
-        ri = pm.resolveActivity(intent, 0)
-        if ri is None:
-            return {'ok': False, 'error': 'server_apk_not_installed'}
-    except Exception:
-        # If the resolver query itself fails, fall through and let
-        # startActivityForResult try — the catch below covers the
-        # exception path.
-        pass
 
     done = threading.Event()
     holder = {'result': None}
 
     def _on_result(request_code, result_code, data):
+        import sys as _sys
         if request_code != _AZT_PICK_REQ_CODE:
+            print(f'[pick_project] _on_result: ignoring foreign '
+                  f'request_code={request_code} (ours={_AZT_PICK_REQ_CODE})',
+                  file=_sys.stderr, flush=True)
             return
+        # Diagnostic: log the raw result so a ``no_path`` mystery
+        # can be pinpointed (RESULT_OK with empty extra vs. caller
+        # set CANCELED vs. data is None vs. extras missing). The
+        # picker side has corresponding prints; together they narrow
+        # the empty-path origin to one of three regions.
+        print(f'[pick_project] _on_result: result_code={result_code} '
+              f'data_present={data is not None}',
+              file=_sys.stderr, flush=True)
         if result_code == -1 and data is not None:  # RESULT_OK
             try:
                 path = data.getStringExtra('path') or ''
                 langcode = data.getStringExtra('langcode') or ''
-            except Exception:
+            except Exception as _ex:
+                print(f'[pick_project] _on_result: getStringExtra raised: '
+                      f'{_ex!r}', file=_sys.stderr, flush=True)
                 path = ''
                 langcode = ''
+            print(f'[pick_project] _on_result: path={path!r} '
+                  f'langcode={langcode!r}',
+                  file=_sys.stderr, flush=True)
             holder['result'] = ({'ok': True, 'path': path,
                                  'langcode': langcode} if path
                                 else {'ok': False, 'error': 'no_path'})
@@ -218,17 +243,68 @@ def _pick_project_android(timeout_seconds):
             holder['result'] = {'ok': False, 'error': 'cancelled'}
         done.set()
 
-    android_activity.bind(on_activity_result=_on_result)
-    try:
-        activity.startActivityForResult(intent, _AZT_PICK_REQ_CODE)
-    except Exception as ex:
-        # ActivityNotFoundException — server APK not installed (or
-        # signed with a different key, or the PICK_PROJECT
-        # intent-filter hasn't been added to its manifest).
-        msg = str(ex)
-        if 'ActivityNotFound' in msg or 'No Activity' in msg:
-            return {'ok': False, 'error': 'server_apk_not_installed'}
-        return {'ok': False, 'error': 'spawn_failed', 'detail': msg}
+    # JNI proxy creation (android_activity.bind) needs the app
+    # ClassLoader to resolve PythonActivity's inner-class interfaces
+    # (ActivityResultListener). Worker threads attached by jnius'
+    # thread hook don't carry that ClassLoader, so doing the bind on
+    # one fails with ClassNotFoundException. Dispatch the JNI work to
+    # the Kivy main thread (which is the Android UI thread and has
+    # the right ClassLoader); only the wait stays on the caller.
+    setup_done = threading.Event()
+    setup = {'ok': True}
+
+    def _setup_on_ui(*_):
+        try:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            Intent = autoclass('android.content.Intent')
+            ComponentName = autoclass('android.content.ComponentName')
+            intent = Intent('org.atoznback.aztcollab.PICK_PROJECT')
+            # Setting the component explicitly ensures the suite-signed
+            # server APK is the resolver (rather than any handler that
+            # might claim the action), and gives a clean
+            # ActivityNotFoundException when the APK isn't installed.
+            try:
+                intent.setComponent(ComponentName(
+                    'org.atoznback.aztcollab',
+                    'org.kivy.android.PythonActivity'))
+            except Exception:
+                pass
+            activity = PythonActivity.mActivity
+            # Pre-check resolvability — some OEM builds silently no-op
+            # startActivityForResult instead of throwing, which would
+            # wedge done.wait() forever.
+            try:
+                pm = activity.getPackageManager()
+                ri = pm.resolveActivity(intent, 0)
+                if ri is None:
+                    setup['ok'] = False
+                    setup['error'] = 'server_apk_not_installed'
+                    return
+            except Exception:
+                pass
+            android_activity.bind(on_activity_result=_on_result)
+            activity.startActivityForResult(intent, _AZT_PICK_REQ_CODE)
+        except Exception as ex:
+            msg = str(ex)
+            setup['ok'] = False
+            if 'ActivityNotFound' in msg or 'No Activity' in msg:
+                setup['error'] = 'server_apk_not_installed'
+            else:
+                setup['error'] = 'spawn_failed'
+                setup['detail'] = msg
+        finally:
+            setup_done.set()
+
+    Clock.schedule_once(_setup_on_ui, 0)
+    if not setup_done.wait(timeout=10):
+        return {'ok': False, 'error': 'spawn_failed',
+                'detail': 'ui-thread setup wedged'}
+    if not setup.get('ok'):
+        out = {'ok': False, 'error': setup['error']}
+        if 'detail' in setup:
+            out['detail'] = setup['detail']
+        return out
+
     # Cap the wait so a launched-but-never-returns Activity can't
     # wedge the recorder forever. 10 minutes is a generous default
     # for picking a project; callers can pass a smaller timeout.
@@ -271,13 +347,21 @@ def check_server_compat():
     """One-shot version handshake. Returns one of:
 
       ``{'ok': True, 'server_version': '0.7.0'}``
-          server reachable and version >= MIN_SERVER_VERSION
+          server reachable; both directions of the version check pass.
 
       ``{'ok': False, 'error': 'server_too_old',
          'server_version': '0.5.0', 'min_required': '0.6.0'}``
           server reachable but older than this client supports;
           peer should surface "Please update the AZT Collaboration
-          service" to the user (cleanup-draft #3 q5).
+          service" to the user.
+
+      ``{'ok': False, 'error': 'client_too_old',
+         'client_version': '0.13.6', 'server_version': '0.12.0',
+         'min_required': '0.14.0'}``
+          server reachable, but it requires a newer client than this
+          peer ships. Peer should surface "Please update this app".
+          Symmetric to ``server_too_old`` so peer apps can branch on
+          the same shape.
 
       ``{'ok': False, 'error': 'server_unreachable'}``
           health probe failed; peer may retry or fall back to
@@ -297,6 +381,16 @@ def check_server_compat():
         return {'ok': False, 'error': 'server_too_old',
                 'server_version': server_version,
                 'min_required': MIN_SERVER_VERSION}
+    # Server publishes the minimum client it's willing to talk to. Old
+    # daemons that don't include the field are treated as "no floor",
+    # so this check is forward-compatible with pre-0.12.0 servers.
+    min_client = str(resp.get('min_client_version', '') or '')
+    if min_client and (_version_tuple(__version__)
+                       < _version_tuple(min_client)):
+        return {'ok': False, 'error': 'client_too_old',
+                'client_version': __version__,
+                'server_version': server_version,
+                'min_required': min_client}
     return {'ok': True, 'server_version': server_version}
 
 
@@ -324,6 +418,34 @@ def set_collab_host(host):
     """Persist the user's host selection (github|gitlab)."""
     try:
         call('POST', '/v1/credentials/host', {'host': host})
+    except ServerUnavailable:
+        pass
+
+
+# ── Contributor (commit author display name) ───────────────────────────────
+#
+# Server-owned: stored in ``$AZT_HOME/config.json :: collab.contributor``.
+# Sync / init endpoints fall back to this value when the peer passes an
+# empty ``contributor``. So peers that read this once can stop carrying
+# their own "Your name" preference; the suite has one source of truth.
+
+def get_contributor():
+    """Return the user's display name (commit author) stored on the
+    server. Empty string if unset or unreachable."""
+    try:
+        resp = call('GET', '/v1/config/contributor')
+    except ServerUnavailable:
+        return ''
+    if not resp.get('ok'):
+        return ''
+    return str(resp.get('contributor', ''))
+
+
+def set_contributor(name):
+    """Persist the user's display name on the server. Best-effort:
+    silently no-ops on transport failure."""
+    try:
+        call('POST', '/v1/config/contributor', {'contributor': name})
     except ServerUnavailable:
         pass
 
@@ -667,6 +789,7 @@ __all__ = [
     'configure', 'is_online', 'open_server_ui', 'pick_project',
     'check_server_compat',
     'get_credentials_status', 'set_collab_host',
+    'get_contributor', 'set_contributor',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',

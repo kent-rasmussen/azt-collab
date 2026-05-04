@@ -76,11 +76,19 @@ class AndroidContentProviderTransport(Transport):
             raise ServerUnavailable(f'provider call failed: {ex}')
 
     def _raw_call(self, method, path, body, timeout):
-        uri = self._Uri.parse(f'content://{self.authority}{path}')
+        # ContentResolver.call(uri, method, arg, extras) consumes the
+        # URI's authority for provider routing but does NOT deliver the
+        # URI's path to ContentProvider.call(method, arg, extras). Pass
+        # the dispatch path as ``arg`` — that's the channel the Java
+        # side reads (AZTCollabProvider.java line ~82,
+        # ``cb.dispatch(method, arg != null ? arg : "", body)``).
+        # Without this the daemon dispatch sees an empty path on every
+        # call and replies ``{ok: False, error: 'not_found'}``.
+        uri = self._Uri.parse(f'content://{self.authority}')
         extras = self._Bundle()
         if body is not None:
             extras.putString('body', json.dumps(body))
-        bundle = self._resolver.call(uri, method, None, extras)
+        bundle = self._resolver.call(uri, method, path, extras)
         if bundle is None:
             raise ServerUnavailable('provider returned null')
         status = bundle.getInt('status', 500)

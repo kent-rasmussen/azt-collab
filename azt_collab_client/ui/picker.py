@@ -24,9 +24,15 @@ to your ScreenManager:
         ... your other screens ...
 """
 
+import os
+
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.uix.screenmanager import Screen
+
+
+_BUNDLED_GEAR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'assets', 'gear.png')
 
 
 _KV_TEMPLATE = '''
@@ -59,7 +65,7 @@ _KV_TEMPLATE = '''
                 background_normal: ''
                 on_release: app.go_config()
                 Image:
-                    source: 'icons/gear.png'
+                    source: '{gear_icon}' if {show_gear} else ''
                     size: (dp(28), dp(28)) if {show_gear} else (0, 0)
                     size_hint: None, None
                     center: self.parent.center
@@ -72,23 +78,29 @@ _KV_TEMPLATE = '''
             Image:
                 source: app.icon
                 size_hint: None, None
-                size: dp(200), dp(200)
+                size: dp(240), dp(240)
                 pos_hint: {{'center_x': 0.5}}
+                allow_stretch: True
+                keep_ratio: True
             Label:
                 text: app.title
-                font_size: sp(28)
+                font_size: sp(32)
                 font_name: FONT
                 bold: True
                 color: T.ACCENT
                 size_hint_y: None
-                height: dp(40)
+                height: dp(44)
+                halign: 'center'
+                text_size: self.size
             Label:
                 text: app.subtitle
-                font_size: sp(16)
+                font_size: sp(18)
                 font_name: FONT
                 color: T.TEXT_DIM
                 size_hint_y: None
-                height: dp(24)
+                height: dp(28)
+                halign: 'center'
+                text_size: self.size
             Widget:
                 size_hint_y: None
                 height: dp(8)
@@ -120,25 +132,33 @@ _KV_TEMPLATE = '''
                         spacing: dp(6)
             Label:
                 text: app.version_string
-                font_size: sp(11)
+                font_size: sp(13)
                 font_name: FONT
-                color: T.TEXT_FAINT
+                color: T.TEXT_DIM
                 size_hint_y: None
-                height: dp(20)
+                height: dp(22)
                 halign: 'center'
                 text_size: self.size
 '''
 
 
-def register_kv(font_name='Roboto', hide_settings_gear=False):
+def register_kv(font_name='Roboto', hide_settings_gear=False,
+                gear_icon=None):
     """Load the picker KV with the host's font. Call after the host's
     main KV is loaded so the ``RecBtn`` rule is already in scope.
 
     Set ``hide_settings_gear=True`` for hosts that have no settings
-    screen of their own (the standalone picker subprocess uses this)."""
+    screen of their own.
+
+    ``gear_icon`` is an absolute path to a PNG; defaults to the
+    package-bundled ``ui/assets/gear.png``. Hosts that want a custom
+    icon (the recorder ships its own at ``azt_recorder/icons/gear.png``)
+    pass it explicitly — relative paths break in the standalone picker
+    subprocess where cwd isn't the host's repo root."""
     Builder.load_string(_KV_TEMPLATE.format(
         font_name=font_name,
         show_gear='True' if not hide_settings_gear else 'False',
+        gear_icon=(gear_icon or _BUNDLED_GEAR),
     ))
 
 

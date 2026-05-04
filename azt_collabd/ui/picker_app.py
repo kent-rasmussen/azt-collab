@@ -32,17 +32,32 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
-from kivy.uix.screenmanager import ScreenManager, SlideTransition
+from kivy.uix.screenmanager import (
+    NoTransition, ScreenManager, SlideTransition,
+)
 from kivy.utils import platform
 
 import azt_collab_client
 from azt_collab_client import (
-    clone_project, create_project_from_template, list_projects,
-    register_project,
+    S, clone_project, create_project_from_template, list_projects,
+    register_project, translate_status,
 )
+from azt_collab_client import i18n as _client_i18n
+from azt_collab_client.translate import tr as _tr
 from azt_collab_client.ui import (
     LangPickerScreen, ProjectPickerScreen,
-    clone_url_popup, register_langpicker_kv, register_picker_kv, theme,
+    clone_url_popup, register_charis,
+    register_langpicker_kv, register_picker_kv, theme,
+)
+# Settings live in azt_collabd.ui.app; host them in-process so the
+# picker's gear navigates within our own ScreenManager instead of
+# launching an Intent / subprocess. The Android server APK has a
+# single PythonActivity, so an Intent that asks Android to "launch
+# the settings UI" of a package whose activity is currently running
+# the picker just collapses the task back to the calling app.
+from azt_collabd.ui.app import (
+    GitHubConnectScreen, GitLabFormScreen, SettingsScreen,
+    register_kv as register_settings_kv,
 )
 
 
@@ -50,31 +65,28 @@ _AZT_ICON = os.path.join(
     os.path.dirname(azt_collab_client.__file__), 'azt.png')
 
 
-_KV = '''
+_KV_TEMPLATE = '''
 #:import dp kivy.metrics.dp
+#:import sp kivy.metrics.sp
+#:import T azt_collab_client.ui.theme
+#:set FONT '{font_name}'
 
-<RecBtn@Button>:
-    normal_color: 0.2, 0.6, 1, 1
-    size_hint_y: None
-    height: dp(52)
-    background_color: 0, 0, 0, 0
-    background_normal: ''
-    canvas.before:
-        Color:
-            rgba: self.normal_color
-        RoundedRectangle:
-            pos: self.pos
-            size: self.size
-            radius: [dp(8)]
-    color: 1, 1, 1, 1
-    font_size: 16
-    bold: True
+# RecBtn / NavBtn / SectionLabel / TopBar etc. come from
+# azt_collabd.ui.app.register_kv (called from build() before this
+# template loads), so the picker doesn't redefine them.
 
 <_PickerRoot>:
     ProjectPickerScreen:
         name: 'picker'
     LangPickerScreen:
         name: 'langpicker'
+    SettingsScreen:
+        name: 'settings'
+        back_to: 'picker'
+    GitHubConnectScreen:
+        name: 'github'
+    GitLabFormScreen:
+        name: 'gitlab'
 '''
 
 
@@ -87,10 +99,16 @@ class PickerApp(App):
     the shared screens require; every successful flow ends in
     ``_emit_and_quit(path)``."""
 
-    title = 'A-Z+T — Pick a project'
-    subtitle = StringProperty('Pick a project')
+    # Title / subtitle are populated in build() so they pick up the
+    # active translation; refreshed by _check_language_change after a
+    # live language switch.
+    title = 'A-Z+T'
+    subtitle = StringProperty('')
     icon = StringProperty(_AZT_ICON)
-    version_string = StringProperty(f'collab {azt_collab_client.__version__}')
+    # Initialized in on_start() to ``client X · server Y`` once the
+    # server's version is known. Shown as ``client X · server ?`` if
+    # the daemon is unreachable.
+    version_string = StringProperty(f'client {azt_collab_client.__version__}')
 
     # Process exit code; flipped to 0 on a successful emit. main()
     # reads this after App.run() returns.
@@ -103,16 +121,156 @@ class PickerApp(App):
     # Set by LangPickerScreen on Continue.
     _pending_vernlang = ''
 
+    # Resolved by build(); 'CharisSIL' if the TTFs were found,
+    # otherwise 'Roboto'. Read by the modal overlays.
+    _font_name = 'Roboto'
+
     # ── Lifecycle ─────────────────────────────────────────────────────
     def build(self):
         theme.set_theme('Ocean')
-        Builder.load_string(_KV)
-        register_picker_kv(font_name='Roboto', hide_settings_gear=True)
-        register_langpicker_kv(font_name='Roboto')
+        self._font_name = register_charis()
+        # Apply persisted UI language before anything renders so the
+        # initial paint is in the right language. azt_collab_client.i18n
+        # auto-applies on import, but reapplying here is harmless and
+        # keeps the contract explicit.
+        _client_i18n.set_language(_client_i18n.language_pref())
+        self.subtitle = _tr('Pick a project')
+        # Order matters: settings KV defines TopBar / NavBtn / SectionLabel /
+        # BodyLabel etc., which the SettingsScreen rule references. Load
+        # before our own KV so the _PickerRoot rule (which instantiates
+        # SettingsScreen) finds those class rules in scope.
+        register_settings_kv(font_name=self._font_name)
+        Builder.load_string(_KV_TEMPLATE.format(font_name=self._font_name))
+        register_picker_kv(font_name=self._font_name, hide_settings_gear=False)
+        register_langpicker_kv(font_name=self._font_name)
         self.sm = _PickerRoot(transition=SlideTransition())
         return self.sm
 
+    def go(self, name):
+        """Used by SettingsScreen / GitHubConnectScreen / GitLabFormScreen
+        KV (``app.go('github')`` etc.) to navigate within our
+        ``ScreenManager``. Mirrors ``CollabUIApp.go`` so the same KV
+        bindings work in either host."""
+        if self.sm.has_screen(name):
+            self.sm.current = name
+
+    def on_start(self):
+        """Once the app is running, watch ``$AZT_HOME/config.json`` so
+        a language change made in a settings subprocess (opened via
+        the gear) live-rebuilds the picker. Mtime polling at 1 Hz is
+        cheap and avoids platform-specific inotify."""
+        import azt_collabd
+        self._config_path = os.path.join(
+            azt_collabd.paths.azt_home(), 'config.json')
+        self._config_mtime = self._get_config_mtime()
+        Clock.schedule_interval(self._check_language_change, 1.0)
+        # Android hardware back button does not flow through
+        # App.on_request_close; it surfaces as a key 27 event on
+        # Window.on_keyboard. Bind the same back-nav logic there so
+        # the OS back button matches the in-screen "← Back" button:
+        # non-picker → picker; picker → finish (RESULT_CANCELED).
+        from kivy.core.window import Window
+        Window.bind(on_keyboard=self._on_back_button)
+        # Probe the server version once at startup so the bottom strip
+        # shows both halves. Done off the UI thread so a slow daemon
+        # doesn't block first paint.
+        import threading
+        threading.Thread(target=self._probe_server_version,
+                         daemon=True).start()
+
+    def _probe_server_version(self):
+        try:
+            compat = azt_collab_client.check_server_compat()
+            err = ''
+        except Exception as ex:
+            compat = {}
+            err = f'{type(ex).__name__}: {ex}'
+        # Diagnostic surfacing: when the probe doesn't return a real
+        # server version, render *why* directly into the version strip
+        # instead of a bare ``?``. ``check_server_compat`` returns
+        # one of: {ok: True, server_version} on success;
+        # {ok: False, error: 'server_unreachable'|'server_too_old'|
+        # 'client_too_old', server_version: ?, ...} otherwise.
+        # An exception path (rare; rpc/transport bugs) falls into
+        # ``err``.
+        if isinstance(compat, dict):
+            sv = compat.get('server_version') or ''
+            ce = compat.get('error') or ''
+            cd = compat.get('detail') or ''
+        else:
+            sv = ''
+            ce = ''
+            cd = ''
+        if sv:
+            label = f'server {sv}'
+        elif err:
+            label = f'server ? ({err[:60]})'
+        elif ce:
+            label = (f'server ? ({ce}: {cd[:60]})' if cd
+                     else f'server ? ({ce})')
+        else:
+            label = 'server ?'
+        print(f'[picker] _probe_server_version: compat={compat!r} '
+              f'err={err!r}', flush=True)
+        Clock.schedule_once(
+            lambda dt: setattr(
+                self, 'version_string',
+                f'client {azt_collab_client.__version__}'
+                f'  ·  '
+                f'{label}'),
+            0)
+
+    def _get_config_mtime(self):
+        try:
+            return os.path.getmtime(self._config_path)
+        except OSError:
+            return 0.0
+
+    def _check_language_change(self, _dt):
+        new_mtime = self._get_config_mtime()
+        if new_mtime == self._config_mtime:
+            return
+        self._config_mtime = new_mtime
+        persisted = _client_i18n.language_pref()
+        if persisted == _client_i18n.current_language():
+            return
+        _client_i18n.set_language(persisted)
+        self.subtitle = _tr('Pick a project')
+        sm = self.sm
+        old_t = sm.transition
+        sm.transition = NoTransition()
+        # See azt_collabd/ui/app.py:_set_ui_language for why we
+        # capture back_to: properties set by the parent KV rule
+        # (e.g. ``back_to: 'picker'`` on SettingsScreen in
+        # ``_PickerRoot``) live on the *instance*. Re-instantiating
+        # from the class alone loses them.
+        screens_info = [
+            {'name': s.name, 'cls': type(s),
+             'back_to': getattr(s, 'back_to', '')}
+            for s in list(sm.screens)
+        ]
+        current = sm.current
+        sm.clear_widgets()
+        for info in screens_info:
+            screen = info['cls'](name=info['name'])
+            if info['back_to']:
+                screen.back_to = info['back_to']
+            sm.add_widget(screen)
+        if current in [info['name'] for info in screens_info]:
+            sm.current = current
+        Clock.schedule_once(
+            lambda dt: setattr(sm, 'transition', old_t), 0.1)
+
     # ── Result emission ───────────────────────────────────────────────
+    def load_lift(self, path):
+        """Existing-project tap. Routed here from the picker's project
+        list. Logs and refuses empty paths so a stale registration
+        with no lift_path can't silently land at the recorder as
+        ``no_path``."""
+        print(f'[picker_app] load_lift(path={path!r})',
+              file=sys.stderr, flush=True)
+        self._emit_and_quit(path)
+
     def _emit_and_quit(self, path, langcode=''):
         """Write the chosen path (and optionally a langcode for
         from-template flows) and stop the app. On Android sets the
@@ -121,18 +279,56 @@ class PickerApp(App):
         Protocol: ``AZT_PICK\\t<path>\\t<langcode>\\n``. langcode is
         empty for existing / clone / open flows; populated only when
         the project came from a fresh template download (the recorder
-        uses it to drive set_vernlang + clean_template on load)."""
+        uses it to drive set_vernlang + clean_template on load).
+
+        Refuses to emit an empty path: on Android that lands at the
+        peer's ``pick_project_android`` handler as ``RESULT_OK`` with
+        no extra and surfaces as ``no_path``. If we got here with no
+        path, something upstream is broken — log it loudly and stay
+        in the picker so the user can pick again."""
+        if not path:
+            print(f'[picker_app] _emit_and_quit refused: empty path '
+                  f'(langcode={langcode!r}). Stack trace follows.',
+                  file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_stack(file=sys.stderr)
+            self._show_error(_tr(
+                'Internal error: tried to return an empty path. '
+                'Please pick again or report this.'))
+            return
         if platform == 'android':
             try:
                 from jnius import autoclass
                 PythonActivity = autoclass(
                     'org.kivy.android.PythonActivity')
                 Intent = autoclass('android.content.Intent')
+                Bundle = autoclass('android.os.Bundle')
                 activity = PythonActivity.mActivity
-                data = Intent()
-                data.putExtra('path', str(path))
+                # Build extras via Bundle.putString (typed) instead of
+                # Intent.putExtra (overloaded — jnius has been
+                # observed to silently pick a non-String overload,
+                # leaving getStringExtra returning null on the peer
+                # side and the recorder reporting "no_path"). Also
+                # give the result Intent the same action as the
+                # request so it isn't a bare "empty" Intent — some
+                # Android versions strip extras on cross-package
+                # delivery of action-less result Intents.
+                extras = Bundle()
+                extras.putString('path', str(path))
                 if langcode:
-                    data.putExtra('langcode', str(langcode))
+                    extras.putString('langcode', str(langcode))
+                data = Intent('org.atoznback.aztcollab.PICK_PROJECT')
+                data.putExtras(extras)
+                # Diagnostic round-trip: read the value back out
+                # before sending. If this prints empty / None, the
+                # putString itself silently failed and we know
+                # exactly where to look. If it prints the path but
+                # the recorder still sees no_path, the loss is in
+                # Android's IPC layer.
+                verify_path = data.getStringExtra('path')
+                print(f'[picker_app] result intent verify: '
+                      f'path={verify_path!r}',
+                      file=sys.stderr, flush=True)
                 activity.setResult(-1, data)  # RESULT_OK = -1
                 activity.finish()
             except Exception as ex:
@@ -148,9 +344,37 @@ class PickerApp(App):
         self._exit_code = 0
         self.stop()
 
+    def _navigate_back(self):
+        """If we're on a non-picker screen (settings, github, gitlab,
+        langpicker), pop back one step and return True. Each screen
+        can override the target via a ``back_to`` StringProperty;
+        default falls through to ``'picker'``. Returns False on the
+        picker itself so callers can proceed with their close
+        behavior."""
+        if not hasattr(self, 'sm') or self.sm.current == 'picker':
+            return False
+        cur = (self.sm.get_screen(self.sm.current)
+               if self.sm.has_screen(self.sm.current) else None)
+        target = getattr(cur, 'back_to', '') or 'picker'
+        if self.sm.has_screen(target):
+            self.sm.current = target
+            return True
+        return False
+
+    def _on_back_button(self, _window, key, *_args):
+        """Window keyboard hook for Android hardware back (key 27).
+        Mirrors the recorder's ``CollabApp._on_back_button`` pattern.
+        Returns True to consume the event."""
+        if key != 27:
+            return False
+        return self._navigate_back()
+
     def on_request_close(self, *args, **kwargs):
-        """Window-close (the X button). Treat as cancel; default exit
-        code stays 1 unless a flow already flipped it."""
+        """Desktop window close (the X button). Android back doesn't
+        fire this — it goes through Window.on_keyboard, see
+        ``_on_back_button``."""
+        if self._navigate_back():
+            return True
         if platform == 'android':
             try:
                 from jnius import autoclass
@@ -164,18 +388,76 @@ class PickerApp(App):
         return False  # let Kivy stop normally
 
     # ── Error / loading overlays ──────────────────────────────────────
-    def _show_error(self, msg):
+    def _show_error(self, msg, extra_button=None):
         """Modal overlay inside the picker window. Window stays open
-        after dismiss; user can retry or close."""
-        view = ModalView(size_hint=(0.85, None), height=dp(180),
-                         auto_dismiss=False)
-        box = BoxLayout(orientation='vertical', padding=dp(12),
-                        spacing=dp(10))
-        box.add_widget(Label(text=str(msg), halign='center',
-                             valign='middle'))
-        btn = Button(text='Dismiss', size_hint_y=None, height=dp(44))
-        btn.bind(on_release=view.dismiss)
-        box.add_widget(btn)
+        after dismiss; user can retry or close.
+
+        ``extra_button`` is an optional ``(label, callback)`` tuple. When
+        provided, the modal renders that button to the left of Dismiss;
+        the callback runs after the modal dismisses."""
+        from kivy.metrics import sp
+        from kivy.graphics import Color, RoundedRectangle
+        height = dp(240) if extra_button else dp(200)
+        view = ModalView(size_hint=(0.85, None), height=height,
+                         auto_dismiss=False,
+                         background_color=theme.OVERLAY_DARK)
+        box = BoxLayout(orientation='vertical', padding=dp(16),
+                        spacing=dp(12))
+        with box.canvas.before:
+            Color(*theme.SURFACE)
+            box._bg = RoundedRectangle(pos=box.pos, size=box.size,
+                                       radius=[dp(8)])
+        box.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                 size=lambda w, s: setattr(w._bg, 'size', s))
+        msg_label = Label(
+            text=str(msg), halign='center', valign='middle',
+            color=theme.TEXT, font_size=sp(15),
+            font_name=self._font_name)
+        # Bind text_size to width so long messages wrap inside the
+        # modal instead of overflowing both edges. Height is left
+        # ``None`` so wrap is width-bound only — texture grows
+        # vertically as needed; the modal's fixed height clips at
+        # the bottom for very long content (acceptable; typical
+        # error / auth-prompt messages are 2-3 lines).
+        msg_label.bind(width=lambda w, val: setattr(
+            w, 'text_size', (val, None)))
+        box.add_widget(msg_label)
+
+        def _make_btn(label, fill, on_release):
+            btn = Button(
+                text=_tr(label), size_hint_y=None, height=dp(48),
+                background_color=theme.TRANSPARENT, background_normal='',
+                color=(1, 1, 1, 1), font_size=sp(16),
+                font_name=self._font_name, bold=True)
+            with btn.canvas.before:
+                Color(*fill)
+                btn._bg = RoundedRectangle(pos=btn.pos, size=btn.size,
+                                           radius=[dp(8)])
+            btn.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                     size=lambda w, s: setattr(w._bg, 'size', s))
+            btn.bind(on_release=on_release)
+            return btn
+
+        if extra_button is not None:
+            extra_label, extra_cb = extra_button
+            row = BoxLayout(orientation='horizontal',
+                            size_hint_y=None, height=dp(48),
+                            spacing=dp(12))
+
+            def _on_extra(_btn):
+                view.dismiss()
+                try:
+                    extra_cb()
+                except Exception as ex:
+                    print(f'[picker_app] extra-button cb raised: {ex}')
+
+            row.add_widget(_make_btn(extra_label, theme.ACCENT, _on_extra))
+            row.add_widget(_make_btn(
+                'Dismiss', theme.SURFACE, lambda *_: view.dismiss()))
+            box.add_widget(row)
+        else:
+            box.add_widget(_make_btn(
+                'Dismiss', theme.ACCENT, lambda *_: view.dismiss()))
         view.add_widget(box)
         view.open()
 
@@ -183,11 +465,29 @@ class PickerApp(App):
         """Called by LangPickerScreen before new_from_template kicks
         off. Auto-dismissable=False so a stuck job doesn't accidentally
         close it; dismiss happens in the worker callback."""
+        from kivy.metrics import sp
+        from kivy.graphics import Color, RoundedRectangle
         self._dismiss_loading_overlay()
-        view = ModalView(size_hint=(0.7, None), height=dp(120),
-                         auto_dismiss=False)
-        view.add_widget(Label(text=str(msg), halign='center',
-                              valign='middle'))
+        view = ModalView(size_hint=(0.7, None), height=dp(140),
+                         auto_dismiss=False,
+                         background_color=theme.OVERLAY_DARK)
+        box = BoxLayout(orientation='vertical', padding=dp(16))
+        with box.canvas.before:
+            Color(*theme.SURFACE)
+            box._bg = RoundedRectangle(pos=box.pos, size=box.size,
+                                       radius=[dp(8)])
+        box.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                 size=lambda w, s: setattr(w._bg, 'size', s))
+        loading_label = Label(
+            text=str(msg), halign='center', valign='middle',
+            color=theme.TEXT, font_size=sp(15),
+            font_name=self._font_name)
+        # Wrap on width so long messages (e.g. ``Cloning <long-url>...``)
+        # don't run off both edges.
+        loading_label.bind(width=lambda w, val: setattr(
+            w, 'text_size', (val, None)))
+        box.add_widget(loading_label)
+        view.add_widget(box)
         view.open()
         self._loading_overlay = view
 
@@ -207,15 +507,17 @@ class PickerApp(App):
             ps = []
         return [(p.langcode, p.lift_path or p.working_dir) for p in ps]
 
-    def load_lift(self, path):
-        """Existing-project tap: emit and exit."""
-        self._emit_and_quit(path)
+    # load_lift is defined earlier with a diagnostic print; the
+    # second definition is removed so the diagnostic version actually
+    # binds (Python's last-def-wins on class bodies would otherwise
+    # silently shadow it).
 
     def go_config(self):
-        # No settings gear in this app; the gear is hidden via
-        # register_picker_kv(hide_settings_gear=True). This stub
-        # exists in case the contract is invoked anyway.
-        pass
+        """Tap the gear: switch to the in-process settings screen.
+        The picker remains in the same activity / window; ``SettingsScreen``
+        renders its "Back" button (because ``back_to: 'picker'`` is set
+        in the _PickerRoot KV) so the user can return."""
+        self.sm.current = 'settings'
 
     # ── Create flow: "I have one on my phone" ─────────────────────────
     def open_file(self):
@@ -223,7 +525,8 @@ class PickerApp(App):
         try:
             from plyer import filechooser
         except Exception as ex:
-            self._show_error(f'File chooser unavailable: {ex}')
+            self._show_error(
+                _tr('File chooser unavailable: {error}').format(error=ex))
             return
 
         def _on_chosen(selection):
@@ -258,16 +561,20 @@ class PickerApp(App):
                 on_selection=_on_chosen,
             )
         except Exception as ex:
-            self._show_error(f'Could not open file chooser: {ex}')
+            self._show_error(
+                _tr('Could not open file chooser: {error}').format(error=ex))
 
     # ── Create flow: "Clone Internet Repository" ──────────────────────
     def clone_dialog(self):
         """URL prompt → daemon clone → emit cloned path."""
         def _on_submit(url):
-            self._show_loading_overlay(f'Cloning {url}...')
+            self._show_loading_overlay(
+                _tr('Cloning {url}...').format(url=url))
             import threading
 
             def _worker():
+                print(f'[picker_app] clone worker starting url={url!r}',
+                      file=sys.stderr, flush=True)
                 try:
                     import azt_collabd
                     repo_name = (url.rstrip('/').split('/')[-1]
@@ -277,9 +584,19 @@ class PickerApp(App):
                         'projects', repo_name)
                     resp = clone_project(url, dest)
                 except Exception as ex:
+                    err_str = str(ex)
+                    print(f'[picker_app] clone exception: {err_str}',
+                          file=sys.stderr, flush=True)
                     Clock.schedule_once(
-                        lambda dt: self._after_clone_fail(str(ex)), 0)
+                        lambda dt: self._after_clone_fail(err_str, None), 0)
                     return
+                # Sanitize for logging — resp['result'] can be a
+                # ``Result`` object that's noisy; just dump keys+ok.
+                print(f'[picker_app] clone returned: '
+                      f'ok={resp.get("ok")!r} '
+                      f'lift_path={resp.get("lift_path")!r} '
+                      f'error={resp.get("error")!r}',
+                      file=sys.stderr, flush=True)
                 if resp.get('ok') and resp.get('lift_path'):
                     Clock.schedule_once(
                         lambda dt: self._after_clone_ok(
@@ -287,18 +604,52 @@ class PickerApp(App):
                 else:
                     Clock.schedule_once(
                         lambda dt: self._after_clone_fail(
-                            resp.get('error', 'unknown')), 0)
+                            resp.get('error', 'unknown'),
+                            resp.get('result')), 0)
             threading.Thread(target=_worker, daemon=True).start()
 
         clone_url_popup(_on_submit)
 
     def _after_clone_ok(self, lift_path):
+        print(f'[picker_app] _after_clone_ok lift_path={lift_path!r}',
+              file=sys.stderr, flush=True)
         self._dismiss_loading_overlay()
         self._emit_and_quit(lift_path)
 
-    def _after_clone_fail(self, err):
+    def _after_clone_fail(self, err, result):
+        print(f'[picker_app] _after_clone_fail err={err!r} '
+              f'result_codes={getattr(result, "codes", lambda: None)()!r}',
+              file=sys.stderr, flush=True)
         self._dismiss_loading_overlay()
-        self._show_error(f'Clone failed: {err}')
+        # If the daemon flagged the failure as auth-shaped (private repo
+        # / 401 / 403 / 404), show the auth-prompt modal with a button
+        # straight to settings. Users typically pick a project without
+        # visiting settings first, so we lead them there.
+        auth_status = None
+        if result is not None:
+            for st in getattr(result, 'statuses', []):
+                if st.code == S.CLONE_AUTH_REQUIRED:
+                    auth_status = st
+                    break
+        # Fallback: when the daemon's worker didn't run far enough to
+        # attach CLONE_AUTH_REQUIRED (result is None) but the error
+        # string itself smells like auth/not-found, still surface the
+        # auth modal — the user's likely problem is the same.
+        if auth_status is None and result is None:
+            msg = (err or '').lower()
+            if any(k in msg for k in (
+                    '401', '403', '404',
+                    'unauthorized', 'forbidden', 'not found',
+                    'authentication', 'credential')):
+                auth_status = S.Status(S.CLONE_AUTH_REQUIRED, {'host': ''})
+        if auth_status is not None:
+            msg = translate_status(auth_status)
+            self._show_error(
+                msg,
+                extra_button=('Open settings',
+                              lambda: self.go_config()))
+            return
+        self._show_error(_tr('Clone failed: {error}').format(error=err))
 
     # ── Create flow: "Start New" ──────────────────────────────────────
     def show_start_over(self):
@@ -356,7 +707,8 @@ class PickerApp(App):
 
     def _after_template_fail(self, err):
         self._dismiss_loading_overlay()
-        self._show_error(f'Could not create project: {err}')
+        self._show_error(
+            _tr('Could not create project: {error}').format(error=err))
 
 
 def main():

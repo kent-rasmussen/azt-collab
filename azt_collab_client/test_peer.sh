@@ -42,7 +42,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 expected_fp_file="$SCRIPT_DIR/../android/SUITE_FINGERPRINT"
 expected_fp=
 if [ -f "$expected_fp_file" ]; then
-    expected_fp=$(grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' "$expected_fp_file" | head -1)
+    # Strip any "SHA[- ]?256:" / "SHA[- ]?1:" labels first so the
+    # regex can't latch onto the "56" inside "SHA256:" and produce
+    # an off-by-one fingerprint.
+    expected_fp=$(sed -E 's/SHA[- ]?(256|1)[: ]+//g' "$expected_fp_file" \
+        | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' \
+        | head -1)
 fi
 
 # Sanity: server APK present?
@@ -123,31 +128,150 @@ for peer in $peers; do
         fi
     fi
 
-    # 4. signing fingerprint matches the suite (if we know it)
+    # 4. signing fingerprint matches the suite (if we know it).
+    #    Three fallbacks because dumpsys hides cert hashes on modern
+    #    Android and keytool / apksigner aren't always installed.
     if [ -n "$expected_fp" ]; then
+        peer_fp=
+        fp_source=
+        fp_diag=
+        peer_is_debug=0
+        # Append a message to fp_diag, preserving any earlier ones so
+        # the final WARN reflects every tool that was tried.
+        diag_add() {
+            if [ -z "$fp_diag" ]; then
+                fp_diag="$1"
+            else
+                fp_diag="$fp_diag; $1"
+            fi
+        }
+
+        # 4a. dumpsys (works on older Android / unusual configs).
         peer_fp=$(echo "$DUMP" \
             | grep -iE 'Signature|signing' \
+            | sed -E 's/SHA[- ]?(256|1)[: ]+//g' \
             | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' \
             | head -1)
-        if [ -z "$peer_fp" ]; then
-            # dumpsys often hides cert hashes; try keytool on the pulled APK instead.
-            peer_path=$(adb shell pm path "$peer" 2>/dev/null | tr -d '\r' | sed 's/^package://')
-            if [ -n "$peer_path" ] && command -v keytool >/dev/null; then
-                pulled=$(mktemp -t peer-apk.XXXXXX.apk)
-                adb pull "$peer_path" "$pulled" >/dev/null 2>&1
+        [ -n "$peer_fp" ] && fp_source=dumpsys
+
+        # Pull the APK once if we still need it (4b / 4c).
+        peer_path=$(adb shell pm path "$peer" 2>/dev/null \
+            | tr -d '\r' | sed 's/^package://')
+        pulled=
+        if [ -z "$peer_fp" ] && [ -n "$peer_path" ]; then
+            pulled=$(mktemp -t peer-apk.XXXXXX.apk)
+            if ! adb pull "$peer_path" "$pulled" >/dev/null 2>&1; then
+                diag_add "adb pull $peer_path failed"
+                rm -f "$pulled"
+                pulled=
+            fi
+        elif [ -z "$peer_path" ]; then
+            diag_add "pm path $peer returned no APK"
+        fi
+
+        # 4b. keytool (Java JDK). Reads v1 (JAR) signatures only —
+        #     APKs signed v2/v3-only will return no certs here.
+        if [ -z "$peer_fp" ] && [ -n "$pulled" ]; then
+            if command -v keytool >/dev/null; then
                 peer_fp=$(keytool -printcert -jarfile "$pulled" 2>/dev/null \
-                    | grep -i "SHA256:" \
+                    | sed -E 's/SHA[- ]?(256|1)[: ]+//g' \
                     | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' \
                     | head -1)
-                rm -f "$pulled"
+                if [ -n "$peer_fp" ]; then
+                    fp_source=keytool
+                else
+                    diag_add "keytool: no v1 cert (likely v2/v3-only signing)"
+                fi
+            else
+                diag_add "keytool not in PATH (install a JDK)"
             fi
         fi
+
+        # 4c. apksigner (Android SDK build-tools). Understands v2/v3.
+        if [ -z "$peer_fp" ] && [ -n "$pulled" ]; then
+            apksigner_bin=
+            # Prefer apksigner on PATH; fall back to the highest
+            # build-tools version under ANDROID_HOME / ANDROID_SDK_ROOT
+            # / buildozer's bundled SDK.
+            if command -v apksigner >/dev/null; then
+                apksigner_bin=$(command -v apksigner)
+            else
+                for sdk in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+                        "$HOME/.buildozer/android/platform/android-sdk"; do
+                    [ -z "$sdk" ] && continue
+                    candidate=$(ls "$sdk"/build-tools/*/apksigner 2>/dev/null \
+                        | sort -V | tail -1)
+                    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+                        apksigner_bin="$candidate"
+                        break
+                    fi
+                done
+            fi
+            if [ -n "$apksigner_bin" ] && [ -x "$apksigner_bin" ]; then
+                apksigner_out=$("$apksigner_bin" verify --print-certs "$pulled" 2>/dev/null)
+                peer_fp=$(echo "$apksigner_out" \
+                    | grep -i "SHA-256 digest" \
+                    | grep -oE '[0-9A-Fa-f]{64}' \
+                    | head -1 \
+                    | sed 's/\(..\)/\1:/g; s/:$//')
+                # Debug-signed APKs come out of `buildozer android
+                # debug` with the default Android Debug keystore
+                # (CN=Android Debug). The suite-fingerprint match only
+                # applies to release builds; flag the cert subject
+                # so the comparison below can skip cleanly.
+                if echo "$apksigner_out" | grep -q 'CN=Android Debug'; then
+                    peer_is_debug=1
+                fi
+                if [ -n "$peer_fp" ]; then
+                    fp_source=apksigner
+                else
+                    diag_add "apksigner: ran but no SHA-256 digest in output"
+                fi
+            else
+                diag_add "apksigner not found (set ANDROID_HOME or apt install apksigner)"
+            fi
+        fi
+
+        # 4d. openssl on the unzipped APK META-INF cert. v2/v3
+        #     signatures live in the APK Signing Block, not META-INF,
+        #     so this also fails on v2/v3-only APKs — but it's a
+        #     quick sanity fallback when neither keytool nor apksigner
+        #     is available.
+        if [ -z "$peer_fp" ] && [ -n "$pulled" ] && command -v openssl >/dev/null \
+                && command -v unzip >/dev/null; then
+            cert_dir=$(mktemp -d -t peer-cert.XXXXXX)
+            unzip -qq -o "$pulled" 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' \
+                -d "$cert_dir" 2>/dev/null
+            cert_file=$(ls "$cert_dir"/META-INF/*.RSA "$cert_dir"/META-INF/*.DSA \
+                "$cert_dir"/META-INF/*.EC 2>/dev/null | head -1)
+            if [ -n "$cert_file" ]; then
+                peer_fp=$(openssl pkcs7 -inform DER -in "$cert_file" -print_certs \
+                    2>/dev/null \
+                    | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+                    | sed -E 's/SHA[- ]?(256|1)[: ]+//g; s/Fingerprint=//' \
+                    | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' \
+                    | head -1)
+                if [ -n "$peer_fp" ]; then
+                    fp_source=openssl
+                else
+                    diag_add "openssl: cert in $cert_file not parseable"
+                fi
+            else
+                diag_add "openssl: no META-INF/*.{RSA,DSA,EC} (v2/v3-only APK)"
+            fi
+            rm -rf "$cert_dir"
+        fi
+
+        [ -n "$pulled" ] && rm -f "$pulled"
+
         if [ -z "$peer_fp" ]; then
-            hmm "couldn't read peer signing fingerprint to verify against suite"
+            hmm "couldn't read peer signing fingerprint: ${fp_diag:-unknown}"
+        elif [ "$peer_is_debug" = "1" ]; then
+            hmm "peer is signed with the Android Debug keystore (CN=Android Debug); SUITE_FINGERPRINT check skipped (only meaningful for release builds)"
         elif [ "${peer_fp,,}" = "${expected_fp,,}" ]; then
-            ok "signing fingerprint matches android/SUITE_FINGERPRINT"
+            ok "signing fingerprint matches android/SUITE_FINGERPRINT (via $fp_source)"
         else
-            bad "signing fingerprint mismatch:"
+            bad "signing fingerprint mismatch (via $fp_source):"
             echo "        peer:     $peer_fp"
             echo "        expected: $expected_fp"
         fi

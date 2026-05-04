@@ -1,0 +1,543 @@
+============================================================================
+2026-05-04 — clone-auth UX + URL-based credential routing
+============================================================================
+
+Problem
+-------
+User reported that cloning a private GitHub repo from the project picker
+showed only "clone failed: not found" with no recovery path. The user
+also asked that GitHub vs GitLab credentials be selected automatically
+based on the repo URL, since users will pick a LIFT project before ever
+visiting the settings page.
+
+Investigation
+-------------
+- Credentials *are* stored in independent github/gitlab blocks
+  (azt_collabd/store.py:4-22), but selection was driven by a single
+  `collab_host` setting (store.get_sync_credentials), not by URL host.
+- Daemon clone path (server._clone_worker → repo.clone_repo) returned
+  CLONE_FAILED with the dulwich error string. The auth-shaped retry only
+  matched "credential" / "auth" keywords, missing the 404 case GitHub
+  returns for unauthenticated access to private repos.
+- Picker UI (azt_collabd/ui/picker_app.py:_after_clone_fail) showed a
+  generic _show_error("Clone failed: ...") modal with no jump to
+  settings.
+
+Changes
+-------
+
+1) azt_collabd/status.py — add CLONE_AUTH_REQUIRED constant.
+
+   --- a/azt_collabd/status.py
+   +++ b/azt_collabd/status.py
+   @@
+    CLONE_FAILED = 'CLONE_FAILED'
+   +CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
+
+   Why: structured signal so the UI can decide whether to prompt for
+   auth, instead of substring-matching the (translated) error string.
+
+
+2) azt_collab_client/status.py — mirror.
+
+   --- a/azt_collab_client/status.py
+   +++ b/azt_collab_client/status.py
+   @@
+    CLONE_FAILED = 'CLONE_FAILED'
+   +CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
+
+   Why: client/status.py is a duplicate-on-purpose mirror; the package
+   CLAUDE.md (status codes & translation section) says additions go in
+   both places.
+
+
+3) azt_collab_client/translate.py — translation for the new status.
+
+   --- a/azt_collab_client/translate.py
+   +++ b/azt_collab_client/translate.py
+   @@
+        S.CLONE_FAILED:           lambda p: _fmt(_tr('Clone failed: {error}'), p),
+   +    S.CLONE_AUTH_REQUIRED:    lambda p: _fmt(_tr(
+   +        'Clone failed — repository not found. This may be a private '
+   +        'repository.\n\nAre you authenticated to {host}?'),
+   +        {'host': (p.get('host') or '').capitalize() or 'GitHub'}),
+
+   Why: human-facing prompt. Title-cases host ('github' → 'GitHub') and
+   defaults to 'GitHub' when host is unknown so the prompt isn't blank.
+
+
+4) azt_collabd/store.py — URL-based credential selection.
+
+   --- a/azt_collabd/store.py
+   +++ b/azt_collabd/store.py
+   @@
+   -def get_sync_credentials():
+   -    """Return (git_user, token) for the currently selected host. Auto-refreshes
+   -    GitHub tokens. Returns ('', '') if not configured."""
+   -    host = get_collab_host()
+   -    if host == 'gitlab':
+   -        user, token = get_gitlab()
+   -        return user, token
+   -    _, token = get_valid_github_token()
+   -    return 'x-access-token', token
+   +def host_for_url(url):
+   +    """Classify a remote URL by host. Returns 'github' | 'gitlab' | None.
+   +    None means: can't tell from the URL alone (self-hosted etc.) — caller
+   +    should fall back to the user's saved ``collab_host``."""
+   +    if not url:
+   +        return None
+   +    u = url.lower()
+   +    if 'github.com' in u:
+   +        return 'github'
+   +    if 'gitlab.com' in u:
+   +        return 'gitlab'
+   +    return None
+   +
+   +
+   +def get_sync_credentials(url=''):
+   +    """Return (git_user, token) for the host best suited to *url*. Falls
+   +    back to the user's saved ``collab_host`` when the URL is unrecognized
+   +    (self-hosted, missing, etc.). Auto-refreshes GitHub tokens. Returns
+   +    ('', '') if no credentials are stored for the chosen host."""
+   +    host = host_for_url(url) or get_collab_host()
+   +    if host == 'gitlab':
+   +        return get_gitlab()
+   +    _, token = get_valid_github_token()
+   +    return 'x-access-token', token
+
+   Why: the user pointed out that picking a LIFT file should not require
+   visiting Settings first to flip the host toggle. URL-based selection
+   means the right creds are used automatically; collab_host is only a
+   fallback for self-hosted / ambiguous URLs.
+
+
+5) azt_collabd/server.py — pass remote URL to get_sync_credentials, plus
+   updated _clone_worker auth diagnosis.
+
+   --- a/azt_collabd/server.py
+   +++ b/azt_collabd/server.py
+   @@ _h_init_project
+   -    git_user, token = store.get_sync_credentials()
+   +    git_user, token = store.get_sync_credentials(remote_url)
+
+   @@ _h_clone_project
+   -    git_user, token = store.get_sync_credentials()
+   +    git_user, token = store.get_sync_credentials(remote_url)
+
+   @@ _h_project_sync
+   -    git_user, token = store.get_sync_credentials()
+   +    git_user, token = store.get_sync_credentials(p.remote_url)
+
+   @@ _clone_worker (rewrite of the auth/retry block)
+   -    try:
+   -        lift_path, result = _clone_repo(
+   -            remote_url, dest_dir, username, token, on_progress=_on_progress)
+   -        if not lift_path and retry_anonymous_on_auth_fail:
+   -            looks_auth = False
+   -            for st in result.statuses:
+   -                msg = (st.params.get('error', '') or '').lower()
+   -                if st.code == 'CLONE_FAILED' and (
+   -                        'credential' in msg or 'auth' in msg):
+   -                    looks_auth = True
+   -                    break
+   -            if looks_auth:
+   -                lift_path, result = _clone_repo(
+   -                    remote_url, dest_dir, '', '',
+   -                    on_progress=_on_progress)
+   +    _AUTH_ERROR_KEYWORDS = (...)   # module-level
+   +    def _clone_error_looks_like_auth(result): ...
+   +
+   +    try:
+   +        had_token = bool(token)
+   +        lift_path, result = _clone_repo(
+   +            remote_url, dest_dir, username, token, on_progress=_on_progress)
+   +        if not lift_path and retry_anonymous_on_auth_fail \
+   +                and _clone_error_looks_like_auth(result):
+   +            lift_path, result = _clone_repo(
+   +                remote_url, dest_dir, '', '',
+   +                on_progress=_on_progress)
+   +        if not lift_path and result.has(S.CLONE_FAILED):
+   +            host = store.host_for_url(remote_url) or store.get_collab_host()
+   +            if (not had_token) or _clone_error_looks_like_auth(result):
+   +                result.add(S.CLONE_AUTH_REQUIRED, host=host)
+
+   Why: (a) every credential lookup is now URL-aware. (b) The keyword
+   list grew '401', '403', '404', 'unauthorized', 'forbidden',
+   'not found' so private-repo 404s trigger the anonymous retry and the
+   auth-required diagnosis. (c) After final failure, attach the
+   structured CLONE_AUTH_REQUIRED so the UI can prompt cleanly.
+
+
+6) azt_collabd/scheduler.py — pass project's remote URL.
+
+   --- a/azt_collabd/scheduler.py
+   +++ b/azt_collabd/scheduler.py
+   @@ _run_sync
+   -    git_user, token = get_sync_credentials()
+   +    git_user, token = get_sync_credentials(p.remote_url)
+
+   Why: scheduled syncs should also pick host-by-URL. p.remote_url is
+   the canonical project URL.
+
+
+7) azt_collabd/ui/picker_app.py — auth-prompt modal in _after_clone_fail.
+
+   - Imports: add S, open_server_ui, translate_status.
+   - _show_error(msg, extra_button=None): optional second button so the
+     same helper can show a one- or two-button modal.
+   - _after_clone_fail(err, result): if result carries
+     CLONE_AUTH_REQUIRED, render the translated prompt and an
+     "Open settings" button that calls open_server_ui(); otherwise show
+     the existing generic error.
+   - _worker (clone_dialog): now passes resp.get('result') alongside
+     the error string so _after_clone_fail can inspect it.
+
+   Why: the user's exact ask. The user explicitly said: "users will not
+   select settings before picking a (new or old) lift file from the
+   list" — so the picker has to lead them to Settings on auth failure.
+
+
+8) azt_collabd/__init__.py:        __version__ 0.11.0 → 0.12.0
+   azt_collab_client/__init__.py:   __version__ 0.13.6 → 0.14.0
+
+   Why: minor bump on both — additive feature (new status code, new
+   credential-routing path, new picker UX). MIN_SERVER_VERSION (0.8.0)
+   does not need to move; the wire format is unchanged.
+
+9) CHANGELOG.md — entries under [Unreleased] for both packages.
+
+
+10) azt_collabd/__init__.py — new MIN_CLIENT_VERSION constant.
+
+   --- a/azt_collabd/__init__.py
+   +++ b/azt_collabd/__init__.py
+   @@
+    __version__ = "0.12.0"
+   +
+   +# Floor on the azt_collab_client version this daemon is willing to
+   +# talk to.
+   +MIN_CLIENT_VERSION = "0.14.0"
+
+   Why: symmetric to the client-side MIN_SERVER_VERSION. When the
+   wire format gains an addition that older clients can't decode
+   (e.g. the new CLONE_AUTH_REQUIRED status), bump this floor.
+
+
+11) azt_collabd/server.py — publish min_client_version on /v1/health.
+
+   --- a/azt_collabd/server.py
+   +++ b/azt_collabd/server.py
+   @@
+    from . import __version__ as _VERSION
+   +from . import MIN_CLIENT_VERSION as _MIN_CLIENT_VERSION
+
+   @@ _h_health
+        payload = {
+   -        "ok": True, "version": _VERSION, "pid": os.getpid(),
+   +        "ok": True, "version": _VERSION,
+   +        "min_client_version": _MIN_CLIENT_VERSION,
+   +        "pid": os.getpid(),
+            "started_at": _started_at,
+        }
+
+   Why: gives every peer's startup handshake a chance to detect
+   "your client is too old for this server" without an extra round-trip.
+
+
+12) azt_collab_client/__init__.py — extend check_server_compat() to
+    return 'client_too_old' when the local client is below the server's
+    floor.
+
+   --- a/azt_collab_client/__init__.py
+   +++ b/azt_collab_client/__init__.py
+   @@ check_server_compat
+   +    min_client = str(resp.get('min_client_version', '') or '')
+   +    if min_client and (_version_tuple(__version__)
+   +                       < _version_tuple(min_client)):
+   +        return {'ok': False, 'error': 'client_too_old',
+   +                'client_version': __version__,
+   +                'server_version': server_version,
+   +                'min_required': min_client}
+
+   Why: peer apps already call check_server_compat() at startup and
+   branch on the result. Adding 'client_too_old' as a new branch lets
+   them prompt "Please update this app" without a separate API call.
+   Forward-compatible: pre-0.12.0 daemons don't publish the field, and
+   the empty-string check skips the comparison cleanly.
+
+
+============================================================================
+2026-05-04 (b) — picker gear wired, version-label visibility tweaks
+============================================================================
+
+Problem
+-------
+First-time users land on the project picker and have no path to
+settings — the gear was rendered in the picker KV but explicitly hidden
+in the standalone picker subprocess. Worse, when they finally hit a
+case that requires auth (private clone), there was no place to go.
+Also: the version strip at the bottom was tiny and washed out, and
+the settings page only showed the server version.
+
+Changes
+-------
+
+13) azt_collab_client/ui/picker.py — bump version label legibility.
+
+   --- a/azt_collab_client/ui/picker.py
+   +++ b/azt_collab_client/ui/picker.py
+   @@ Label rule (bottom version strip)
+   -                font_size: sp(11)
+   -                color: T.TEXT_FAINT
+   -                height: dp(20)
+   +                font_size: sp(13)
+   +                color: T.TEXT_DIM
+   +                height: dp(22)
+
+   Why: user feedback — "less small and transparent". TEXT_FAINT is
+   theme-defined as "barely visible"; TEXT_DIM is the legible-muted
+   tier.
+
+
+14) azt_collabd/ui/picker_app.py — gear ON, go_config wired,
+    version label clarified.
+
+   --- a/azt_collabd/ui/picker_app.py
+   +++ b/azt_collabd/ui/picker_app.py
+   @@
+   -    version_string = StringProperty(f'collab {azt_collab_client.__version__}')
+   +    version_string = StringProperty(f'client {azt_collab_client.__version__}')
+
+   @@ build()
+   -        register_picker_kv(font_name=self._font_name, hide_settings_gear=True)
+   +        register_picker_kv(font_name=self._font_name, hide_settings_gear=False)
+
+   @@ go_config (was a no-op stub)
+   -    def go_config(self):
+   -        # No settings gear in this app; the gear is hidden via
+   -        # register_picker_kv(hide_settings_gear=True). This stub
+   -        # exists in case the contract is invoked anyway.
+   -        pass
+   +    def go_config(self):
+   +        """Open the daemon settings UI in a separate process. The
+   +        picker stays open behind it; the user can authenticate, switch
+   +        host, etc., then come back and retry the create/clone flow."""
+   +        result = open_server_ui()
+   +        if not result.get('ok') and not result.get('prompted'):
+   +            self._show_error(
+   +                f'Could not open settings: {result.get("error", "unknown")}')
+
+   Imports added: ``S, open_server_ui, translate_status`` (open_server_ui
+   was new for this change; the others already added in the previous
+   patch).
+
+   Why: users land on the picker and need a visible path to
+   authentication BEFORE clone failure forces it. open_server_ui()
+   handles the desktop/Android branching internally, so this stays one
+   line.
+
+
+15) azt_collabd/ui/app.py — both versions on settings page, label
+    sized up.
+
+   --- a/azt_collabd/ui/app.py
+   +++ b/azt_collabd/ui/app.py
+   @@
+   -    version_string = StringProperty(f'collab {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}')
+   +    version_string = StringProperty(
+   +        f'client {azt_collab_client.__version__}'
+   +        f'  ·  '
+   +        f'server {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}'
+   +    )
+
+   @@ Label rule (bottom version strip on SettingsScreen)
+   -                    color: T.TEXT_FAINT
+   -                    font_size: sp(11)
+   -                    height: dp(20)
+   +                    color: T.TEXT_DIM
+   +                    font_size: sp(13)
+   +                    height: dp(22)
+
+   Why: user can see at a glance whether the daemon and client are
+   compatible — directly relevant when triaging "client_too_old" or
+   missing-feature reports. Same legibility bump as the picker.
+
+
+16) Versions: 0.12.0 → 0.12.1 (daemon), 0.14.0 → 0.14.1 (client).
+
+   Patch bumps — UX-only, no wire-format change. MIN_CLIENT_VERSION
+   stays at 0.14.0; an old client at 0.14.0 is still compatible with
+   a 0.12.1 daemon.
+
+
+============================================================================
+2026-05-04 (c) — UI i18n: client owns azt_collab_client.po with fallback
+============================================================================
+
+Problem
+-------
+The picker is the first page users see, but it had no UI language
+control and (when run as a subprocess) couldn't translate at all —
+the default translator's ``from i18n import _`` only resolves when
+launched from the recorder's directory. User asked for live
+retranslation with the toggle in **settings**, plus per-module
+gettext catalogs (no duplication, "client strings owned in the
+client").
+
+Architecture
+------------
+- New gettext domain ``azt_collab_client`` lives inside the client
+  package: ``azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po``.
+- Recorder keeps its existing ``aztrecorder`` domain. Client catalog
+  is its own; no string duplication.
+- ``azt_collab_client.translate.tr()`` defaults to the client
+  catalog. Hosts call ``set_translator(host_tr)`` to override; the
+  override is tried first, then ``tr()`` falls back to the client
+  catalog when the host translator returned the msgid unchanged.
+  Embedded peers therefore get client strings transparently without
+  any recorder-side change required for *this* PR. (A future
+  improvement on the recorder would be to chain via gettext's native
+  ``add_fallback`` for cleaner semantics, but that's optional.)
+- UI language is persisted in ``$AZT_HOME/config.json`` under
+  ``ui.language`` so settings and picker subprocesses converge on the
+  same language without a coordination channel.
+- Live retranslation in *settings* is in-process (clear+rebuild the
+  ScreenManager). Live retranslation in the *picker subprocess* is
+  driven by mtime polling on ``config.json`` (1 Hz) and the same
+  rebuild dance.
+
+Changes
+-------
+
+17) NEW azt_collab_client/i18n.py — gettext wrapper + pure-Python
+    msgfmt for our domain. Public API:
+    set_language / current_language / available_languages /
+    language_pref / _ / gettext_translation.
+
+    Auto-applies the persisted language at import time so subprocess
+    pickers/settings start in the right language with no setup.
+    Auto-compiles ``.po`` → ``.mo`` lazily on first ``set_language``
+    whenever the ``.mo`` is missing or older than the ``.po`` — the
+    compiler is a ~80-line pure-Python implementation of the GNU MO
+    format (single magic, sorted msgid array, two parallel offset
+    tables, packed via ``struct``). This keeps peers free of an
+    external ``msgfmt`` build step.
+
+
+18) NEW azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po
+    — French translations of every client-owned string: picker UI
+    (3), popups (10), langpicker (8), translate.py status messages
+    (~50), settings UI (~25), and picker_app.py error / loading
+    messages (~6). About 100 entries.
+
+    The matching ``.mo`` is generated lazily by ``i18n._ensure_mo``;
+    not committed here (would just round-trip on every PO edit).
+
+
+19) azt_collab_client/translate.py — flip default translator and add
+    fallback layer.
+
+   --- a/azt_collab_client/translate.py
+   +++ b/azt_collab_client/translate.py
+   @@
+   -try:
+   -    from i18n import _ as _default_tr
+   -except Exception:
+   -    def _default_tr(s):
+   -        return s
+   -_tr = _default_tr
+   +from . import i18n as _client_i18n
+   +
+   +def _client_tr(msg):
+   +    return _client_i18n._(msg)
+   +
+   +_tr = _client_tr   # default to client catalog, override via set_translator
+
+   @@ tr(msg)
+   -    return _tr(msg)
+   +    if _tr is _client_tr:
+   +        return _tr(msg)
+   +    translated = _tr(msg)
+   +    if translated == msg:
+   +        return _client_tr(msg)
+   +    return translated
+
+   Why: client owns its strings; embedded peers don't need to copy
+   them into their own catalog. Behavior change for hosts that
+   previously relied on the implicit recorder-i18n fallback — they
+   now get client strings first. Hosts with own catalogs should call
+   ``set_translator(host._)`` at startup as documented.
+
+
+20) azt_collabd/ui/app.py — settings UI translatable + language toggle.
+
+    - KV imports ``_ azt_collab_client.translate.tr``; visible strings
+      in SettingsScreen / GitHubConnectScreen / GitLabFormScreen now
+      wrapped in ``_(...)``.
+    - SettingsScreen gained an "Interface language" row + selector
+      (one button per ``available_languages()``, highlights current).
+    - New methods: ``_build_lang_selector`` (called from on_enter),
+      ``_set_ui_language(lang)`` (calls i18n.set_language, then
+      rebuilds the screenmanager via clear+re-add — same dance as
+      the recorder's ConfigScreen).
+    - Python-side strings (status_label content, error banners,
+      device-flow / gitlab form messages) wrapped in ``_tr(...)``.
+
+    Why: the picker gear opens this UI; users select a language here
+    and the change ripples to every suite app via config.json.
+
+
+21) azt_collabd/ui/picker_app.py — apply persisted language at
+    startup; live-retranslate when config.json changes.
+
+    - At ``build()``: ``i18n.set_language(language_pref(),
+      persist=False)``, then ``self.subtitle = _tr('Pick a project')``.
+    - New ``on_start()``: records ``$AZT_HOME/config.json`` mtime,
+      schedules ``_check_language_change`` at 1 Hz.
+    - ``_check_language_change`` reads ``language_pref()``, applies
+      it if changed, refreshes ``self.subtitle``, and rebuilds the
+      ScreenManager so the new ProjectPickerScreen / LangPickerScreen
+      instances pick up the new translation.
+    - Visible Python strings (loading-overlay text, error messages)
+      wrapped in ``_tr``. The "Open settings" extra-button label
+      passes through ``_tr`` via the existing extra_button hook.
+
+    Why: the picker subprocess can't observe in-process events from
+    the settings subprocess. mtime-poll-and-rebuild is the simplest
+    cross-process retranslation hook.
+
+
+22) Versions:
+    - azt_collabd 0.12.1 → 0.13.0 (settings UI feature)
+    - azt_collab_client 0.14.1 → 0.15.0 (new module + locales tree
+      + behavior change in translate.tr)
+
+    MIN_CLIENT_VERSION stays at 0.14.0 — no wire-format additions
+    in this round, so existing 0.14.0 peers remain compatible.
+
+
+Recorder-side follow-up (out of scope here)
+-------------------------------------------
+The recorder's ``i18n.py`` should chain its own translation with the
+client's via gettext's native fallback:
+
+    recorder_t = gettext.translation('aztrecorder', ...)
+    client_t   = azt_collab_client.i18n.gettext_translation()
+    recorder_t.add_fallback(client_t)
+
+That makes the embedded picker case symmetric with the
+``translate.tr`` fallback we already have here. Without it, the
+recorder still works (the ``translate.tr`` fallback covers client
+strings), but the recorder's own ``_('...')`` outside KV wouldn't
+benefit from the client catalog.
+
+
+Test coverage
+-------------
+There are no unit tests in this repo by design (per
+azt-collab/CLAUDE.md). The recorder-side step scripts at
+../azt_recorder/tests/stepN.sh are the canonical verification path. A
+manual repro (clone a private GitHub repo from the picker without
+authenticating first) should now show the auth-prompt modal with the
+"Open settings" button, and after authenticating + retrying the clone
+should succeed.

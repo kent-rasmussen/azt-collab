@@ -27,30 +27,42 @@ from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp, sp
 from kivy.properties import StringProperty
-from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.uix.button import Button
+from kivy.uix.screenmanager import (
+    NoTransition, Screen, ScreenManager, SlideTransition,
+)
 
 import azt_collab_client
-from azt_collab_client.ui import theme
+from azt_collab_client import i18n as _client_i18n
+from azt_collab_client.ui import register_charis, theme
 
 import azt_collabd
 from azt_collabd.status import AuthError
 from azt_collab_client import (
+    get_contributor,
     get_credentials_status,
     is_online,
     mark_github_app_installed,
     save_github_tokens,
     save_gitlab_credentials,
-    set_collab_host,
+    set_contributor,
     translate_status,
 )
+
+
+_tr = _client_i18n._
 
 
 _AZT_ICON = os.path.join(
     os.path.dirname(azt_collab_client.__file__), 'azt.png')
 
 
-KV = '''
+KV_TEMPLATE = '''
+#:import dp kivy.metrics.dp
+#:import sp kivy.metrics.sp
 #:import T azt_collab_client.ui.theme
+#:import _ azt_collab_client.translate.tr
+#:set FONT '{font_name}'
 
 <RootSM>:
     SettingsScreen:
@@ -59,11 +71,6 @@ KV = '''
         name: 'github'
     GitLabFormScreen:
         name: 'gitlab'
-
-<NavBar@BoxLayout>:
-    size_hint_y: None
-    height: dp(48)
-    spacing: dp(10)
 
 <RecBtn@Button>:
     normal_color: T.ACCENT
@@ -80,150 +87,366 @@ KV = '''
             radius: [dp(8)]
     color: 1, 1, 1, 1
     font_size: sp(16)
+    font_name: FONT
     bold: True
 
-<HeaderLabel@Label>:
+<NavBtn@Button>:
+    size_hint_y: None
+    height: dp(48)
+    background_color: T.TRANSPARENT
+    background_normal: ''
+    canvas.before:
+        Color:
+            rgba: T.SURFACE
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    color: T.ACCENT
+    font_size: sp(15)
+    font_name: FONT
+    bold: True
+
+<IconBtn@Button>:
+    background_color: T.TRANSPARENT
+    background_normal: ''
+    color: T.TEXT_DIM
     font_size: sp(20)
+    font_name: FONT
+
+<SectionLabel@Label>:
+    size_hint_y: None
+    height: dp(32)
+    font_size: sp(13)
+    font_name: FONT
+    bold: True
+    color: T.ACCENT
+    halign: 'left'
+    valign: 'middle'
+    text_size: self.size
+
+<HeaderLabel@Label>:
+    font_name: FONT
+    bold: True
+    color: T.ACCENT
+    font_size: sp(17)
     size_hint_y: None
     height: dp(40)
+    halign: 'left'
+    valign: 'middle'
+    text_size: self.size
 
 <BodyLabel@Label>:
-    text_size: self.size
+    font_name: FONT
+    color: T.TEXT
+    font_size: sp(14)
+    # Width-bound, height-free wrap. Several BodyLabel instances size
+    # themselves with ``height: self.texture_size[1] + dp(8)``, which
+    # forms a do_layout / texture_update feedback loop with the
+    # previous ``text_size: self.size``. ``(self.width, None)`` keeps
+    # wrapping at the widget width but lets texture_size[1] flow
+    # from content alone — no cycle.
+    text_size: self.width, None
     halign: 'left'
     valign: 'top'
-    font_size: sp(14)
+
+<DimLabel@Label>:
+    font_name: FONT
+    color: T.TEXT_DIM
+    font_size: sp(13)
+    text_size: self.size
+    halign: 'left'
+    valign: 'middle'
+
+<ThemedInput@TextInput>:
+    multiline: False
+    size_hint_y: None
+    height: dp(48)
+    font_size: sp(15)
+    font_name: FONT
+    background_color: T.SURFACE
+    foreground_color: T.TEXT
+    cursor_color: T.ACCENT
+    hint_text_color: T.HINT
+
+<TopBar@BoxLayout>:
+    title: ''
+    size_hint_y: None
+    height: dp(52)
+    padding: dp(8), dp(6)
+    canvas.before:
+        Color:
+            rgba: T.SURFACE
+        Rectangle:
+            pos: self.pos
+            size: self.size
+    Label:
+        text: root.title
+        font_name: FONT
+        bold: True
+        color: T.ACCENT
+        font_size: sp(17)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding_x: dp(8)
 
 <SettingsScreen>:
+    canvas.before:
+        Color:
+            rgba: T.BG
+        Rectangle:
+            pos: self.pos
+            size: self.size
     BoxLayout:
         orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(10)
-        HeaderLabel:
-            text: 'A-Z+T Collab — Settings'
-        BodyLabel:
-            id: status_label
-            text: 'Loading...'
-        Label:
-            text: 'Host'
-            size_hint_y: None
-            height: dp(28)
-            font_size: sp(14)
-        BoxLayout:
-            size_hint_y: None
-            height: dp(40)
-            spacing: dp(10)
-            Button:
-                id: host_github_btn
-                text: 'GitHub'
-                on_release: root.choose_host('github')
-            Button:
-                id: host_gitlab_btn
-                text: 'GitLab'
-                on_release: root.choose_host('gitlab')
-        BoxLayout:
-            size_hint_y: None
-            height: dp(48)
-            spacing: dp(10)
-            Button:
-                text: 'Connect GitHub'
-                on_release: app.go('github')
-            Button:
-                text: 'Set GitLab creds'
-                on_release: app.go('gitlab')
-        BoxLayout:
-            size_hint_y: None
-            height: dp(48)
-            spacing: dp(10)
-            Button:
-                text: 'Disconnect GitHub'
-                on_release: root.disconnect_github()
-            Button:
-                text: 'Disconnect GitLab'
-                on_release: root.disconnect_gitlab()
-        NavBar:
-            Button:
-                text: 'Refresh'
-                on_release: root.refresh()
+        TopBar:
+            title: _('AZT Collaboration — Settings')
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(20)
+                spacing: dp(14)
+                # Back button — only present when this SettingsScreen
+                # is reached from another screen (e.g. the picker's
+                # gear sets ``back_to: 'picker'`` in the picker_app
+                # _PickerRoot KV). Hidden / disabled in the standalone
+                # settings host where back has no meaning.
+                NavBtn:
+                    # ``«`` (U+00AB) instead of ``←`` (U+2190) because
+                    # the latter isn't in CharisSIL's glyph table —
+                    # would render as tofu under the linguistic font.
+                    # Guillemet is in every Latin font, reads as a
+                    # back-pointer, and Title-cases nicely in French.
+                    text: '«  ' + _('Back')
+                    size_hint_y: None
+                    height: dp(48) if root.back_to else 0
+                    opacity: 1 if root.back_to else 0
+                    disabled: not root.back_to
+                    on_release: app.go(root.back_to) if root.back_to else None
+                SectionLabel:
+                    text: _('Interface language')
+                BoxLayout:
+                    id: lang_selector_row
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
+                SectionLabel:
+                    text: _('Your name (appears in commits)')
+                ThemedInput:
+                    id: contributor_input
+                    hint_text: _('e.g. Kent Rasmussen')
+                    on_focus: root.save_contributor() if not self.focus else None
+                BodyLabel:
+                    id: contributor_msg
+                    text: ''
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: dp(20)
+                # GitHub: Connect + Disconnect on one row, no header.
+                # Active colour swaps with connection state (Connect
+                # is green when not connected, Disconnect is green
+                # when connected) — the visually-prominent button
+                # matches the user's likely next action. Set in
+                # ``refresh()`` rather than KV so the same control
+                # path that fetches credentials_status drives the
+                # colour.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(10)
+                    RecBtn:
+                        id: gh_connect_btn
+                        text: _('Connect to GitHub')
+                        normal_color: T.GREEN
+                        on_release: app.go('github')
+                    RecBtn:
+                        id: gh_disconnect_btn
+                        text: _('Disconnect GitHub')
+                        normal_color: T.BTN_INACTIVE
+                        on_release: root.disconnect_github()
+                # GitLab: same shape.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(10)
+                    RecBtn:
+                        id: gl_connect_btn
+                        text: _('Set GitLab credentials')
+                        normal_color: T.GREEN
+                        on_release: app.go('gitlab')
+                    RecBtn:
+                        id: gl_disconnect_btn
+                        text: _('Disconnect GitLab')
+                        normal_color: T.BTN_INACTIVE
+                        on_release: root.disconnect_gitlab()
+                # Status — read-only credential / online state, parked
+                # at the bottom now that the actionable rows live up
+                # top. Refresh Status sits directly under it so the
+                # button affordance for "I changed something elsewhere,
+                # pull it again" is right next to the data it updates.
+                SectionLabel:
+                    text: _('Status')
+                BodyLabel:
+                    id: status_label
+                    text: _('Loading...')
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(8)
+                NavBtn:
+                    text: _('Refresh Status')
+                    on_release: root.refresh()
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
+                Label:
+                    text: app.version_string
+                    font_name: FONT
+                    color: T.TEXT_DIM
+                    font_size: sp(13)
+                    size_hint_y: None
+                    height: dp(22)
+                    halign: 'center'
+                    text_size: self.size
 
 <GitHubConnectScreen>:
+    canvas.before:
+        Color:
+            rgba: T.BG
+        Rectangle:
+            pos: self.pos
+            size: self.size
     BoxLayout:
         orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(10)
-        HeaderLabel:
-            text: 'Connect to GitHub'
-        BodyLabel:
-            id: gh_message
-            text: 'Click "Begin" to start.'
-        BoxLayout:
-            size_hint_y: None
-            height: dp(64)
-            spacing: dp(10)
-            Label:
-                id: gh_user_code
-                text: ''
-                font_size: sp(28)
-                bold: True
-            Button:
-                size_hint_x: None
-                width: dp(80)
-                text: 'Copy'
-                on_release: root.copy_code()
-        NavBar:
-            Button:
-                id: gh_begin_btn
-                text: 'Begin'
-                on_release: root.begin()
-            Button:
-                text: 'Back'
-                on_release: app.go('settings')
+        TopBar:
+            title: _('Connect to GitHub')
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(20)
+                spacing: dp(14)
+                BodyLabel:
+                    id: gh_message
+                    text: _('Tap "Begin" to start the device-flow login.')
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(8)
+                    text_size: self.width, None
+                SectionLabel:
+                    text: _('Your one-time code')
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(72)
+                    spacing: dp(10)
+                    Label:
+                        id: gh_user_code
+                        text: ''
+                        font_name: FONT
+                        bold: True
+                        color: T.ACCENT
+                        font_size: sp(28)
+                        halign: 'center'
+                        valign: 'middle'
+                        text_size: self.size
+                    NavBtn:
+                        size_hint_x: None
+                        width: dp(96)
+                        text: _('Copy')
+                        on_release: root.copy_code()
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
+                RecBtn:
+                    id: gh_begin_btn
+                    text: _('Begin')
+                    normal_color: T.GREEN
+                    on_release: root.begin()
+                NavBtn:
+                    text: _('Back')
+                    on_release: app.go('settings')
 
 <GitLabFormScreen>:
+    canvas.before:
+        Color:
+            rgba: T.BG
+        Rectangle:
+            pos: self.pos
+            size: self.size
     BoxLayout:
         orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(10)
-        HeaderLabel:
-            text: 'GitLab credentials'
-        BodyLabel:
-            text: 'Enter your GitLab username and a personal access token (read/write to repos).'
-            size_hint_y: None
-            height: dp(60)
-        Label:
-            text: 'Username'
-            size_hint_y: None
-            height: dp(24)
-            font_size: sp(13)
-        TextInput:
-            id: gl_user
-            multiline: False
-            size_hint_y: None
-            height: dp(40)
-        Label:
-            text: 'Token'
-            size_hint_y: None
-            height: dp(24)
-            font_size: sp(13)
-        TextInput:
-            id: gl_token
-            password: True
-            multiline: False
-            size_hint_y: None
-            height: dp(40)
-        BodyLabel:
-            id: gl_msg
-            text: ''
-            size_hint_y: None
-            height: dp(40)
-        NavBar:
-            Button:
-                text: 'Save'
-                on_release: root.save()
-            Button:
-                text: 'Back'
-                on_release: app.go('settings')
-
+        TopBar:
+            title: _('GitLab credentials')
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(20)
+                spacing: dp(14)
+                BodyLabel:
+                    text: _('Enter your GitLab username and a personal access token (read/write to repos).')
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(8)
+                    text_size: self.width, None
+                DimLabel:
+                    text: _('Username')
+                    size_hint_y: None
+                    height: dp(24)
+                ThemedInput:
+                    id: gl_user
+                DimLabel:
+                    text: _('Personal access token')
+                    size_hint_y: None
+                    height: dp(24)
+                ThemedInput:
+                    id: gl_token
+                    password: True
+                BodyLabel:
+                    id: gl_msg
+                    text: ''
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: dp(40)
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
+                RecBtn:
+                    text: _('Save')
+                    normal_color: T.GREEN
+                    on_release: root.save()
+                NavBtn:
+                    text: _('Back')
+                    on_release: app.go('settings')
 '''
+
+
+_kv_loaded = False
+
+
+def register_kv(font_name='Roboto'):
+    """Load the settings/connect/form screen KV with the host's font.
+
+    Idempotent: safe to call from both ``CollabUIApp.build()`` (the
+    standalone settings subprocess) and ``picker_app.PickerApp.build()``
+    (the in-process settings hosted inside the picker, reachable via
+    the gear). Subsequent calls are no-ops so a second host doesn't
+    redefine class rules.
+
+    Hosts that want the settings screens in their own ``ScreenManager``
+    can add the screen instances after calling this — class rules
+    (``<SettingsScreen>``, ``<GitHubConnectScreen>``,
+    ``<GitLabFormScreen>``, plus the shared ``<RecBtn>``, ``<NavBtn>``,
+    ``<SectionLabel>``, ``<TopBar>`` etc.) will already be in scope."""
+    global _kv_loaded
+    if _kv_loaded:
+        return
+    Builder.load_string(KV_TEMPLATE.format(font_name=font_name))
+    _kv_loaded = True
 
 
 class RootSM(ScreenManager):
@@ -233,13 +456,75 @@ class RootSM(ScreenManager):
 # ── Settings ────────────────────────────────────────────────────────────────
 
 class SettingsScreen(Screen):
+    # Set by the host KV when this screen is reachable from somewhere
+    # else (e.g. ``back_to: 'picker'`` in ``picker_app._PickerRoot``).
+    # Empty string → no back button (standalone settings host).
+    back_to = StringProperty('')
+
     def on_enter(self):
         # Defer to next frame: on_enter can fire before the KV rule's
         # nested BoxLayout children have all been added to ``self.ids``
         # on Kivy >= 2.3, which raises a confusing
         # "'super' object has no attribute '__getattr__'" from
         # ObservableDict when a key is missing.
-        Clock.schedule_once(lambda *_: self.refresh(), 0)
+        def _ready(*_):
+            self._build_lang_selector()
+            self.refresh()
+        Clock.schedule_once(_ready, 0)
+
+    def _build_lang_selector(self):
+        """Populate the language selector row with one button per
+        catalog discovered under ``azt_collab_client/locales/`` plus
+        English. Selected language is highlighted; tapping a different
+        button calls ``_set_ui_language`` which rebuilds every screen
+        in the manager so translations take effect live."""
+        row = self.ids.get('lang_selector_row')
+        if row is None:
+            return
+        row.clear_widgets()
+        cur = _client_i18n.current_language()
+        for code, name in _client_i18n.available_languages():
+            btn = Button(
+                text=name,
+                font_size=sp(14),
+                size_hint_x=1,
+                background_color=(
+                    theme.ACCENT if code == cur else theme.SURFACE),
+                background_normal='',
+                color=theme.TEXT,
+            )
+            btn.bind(on_release=lambda b, c=code: self._set_ui_language(c))
+            row.add_widget(btn)
+
+    def _set_ui_language(self, lang_code):
+        if lang_code == _client_i18n.current_language():
+            return
+        _client_i18n.set_language(lang_code)
+        # Rebuild all screens so KV ``text: _('...')`` bindings
+        # re-evaluate against the new catalog. Same dance the
+        # recorder's ConfigScreen uses. Capture host-set properties
+        # (currently just ``back_to``) before clearing — they live on
+        # the *instance*, not the class, so recreating from the class
+        # alone loses them and (e.g.) the picker host's "← Back"
+        # button vanishes after a language toggle.
+        app = App.get_running_app()
+        sm = app.sm
+        old_transition = sm.transition
+        sm.transition = NoTransition()
+        screens_info = [
+            {'name': s.name, 'cls': type(s),
+             'back_to': getattr(s, 'back_to', '')}
+            for s in list(sm.screens)
+        ]
+        sm.clear_widgets()
+        for info in screens_info:
+            screen = info['cls'](name=info['name'])
+            if info['back_to']:
+                screen.back_to = info['back_to']
+            sm.add_widget(screen)
+        sm.current = 'settings'
+        Clock.schedule_once(
+            lambda dt: setattr(sm, 'transition', old_transition), 0.1)
 
     def refresh(self):
         try:
@@ -248,38 +533,71 @@ class SettingsScreen(Screen):
         except Exception as ex:
             label = self.ids.get('status_label')
             if label is not None:
-                label.text = f'Error: {ex}'
+                label.text = _tr('Error: {error}').format(error=ex)
             return
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
-        host = status.get('host', 'github')
-        gh_btn = self.ids.get('host_github_btn')
-        gl_btn = self.ids.get('host_gitlab_btn')
-        if gh_btn is not None:
-            gh_btn.disabled = (host == 'github')
-        if gl_btn is not None:
-            gl_btn.disabled = (host == 'gitlab')
+        # Highlight the action the user is most likely to want:
+        # Connect when not connected, Disconnect when connected.
+        # The other button stays clickable (disconnected ↔ reconnect
+        # for token refresh remains a valid flow), just dimmed.
+        gh_connected = bool(gh.get('connected'))
+        gl_connected = bool(gl.get('connected'))
+        for btn_id, fill in (
+            ('gh_connect_btn',
+             theme.BTN_INACTIVE if gh_connected else theme.GREEN),
+            ('gh_disconnect_btn',
+             theme.GREEN if gh_connected else theme.BTN_INACTIVE),
+            ('gl_connect_btn',
+             theme.BTN_INACTIVE if gl_connected else theme.GREEN),
+            ('gl_disconnect_btn',
+             theme.GREEN if gl_connected else theme.BTN_INACTIVE),
+        ):
+            btn = self.ids.get(btn_id)
+            if btn is not None:
+                btn.normal_color = fill
+        # Contributor field — only repopulate when the user isn't
+        # actively editing it, so a refresh during typing doesn't
+        # clobber in-progress input.
+        contrib_input = self.ids.get('contributor_input')
+        if contrib_input is not None and not contrib_input.focus:
+            contrib_input.text = status.get('contributor', '') or ''
+        yes = _tr('yes')
+        no = _tr('no')
         lines = [
-            f"Online:   {'yes' if online else 'no'}",
+            f"{_tr('Online:')}   {yes if online else no}",
             "",
             "GitHub",
-            f"  Connected:     {'yes' if gh.get('connected') else 'no'}",
-            f"  Username:      {gh.get('username', '') or '-'}",
-            f"  App installed: {'yes' if gh.get('app_installed') else 'no'}",
+            f"  {_tr('Connected:')}     {yes if gh.get('connected') else no}",
+            f"  {_tr('Username:')}      {gh.get('username', '') or '-'}",
+            f"  {_tr('App installed:')} "
+            f"{yes if gh.get('app_installed') else no}",
             "",
             "GitLab",
-            f"  Connected: {'yes' if gl.get('connected') else 'no'}",
-            f"  Username:  {gl.get('username', '') or '-'}",
+            f"  {_tr('Connected:')} {yes if gl.get('connected') else no}",
+            f"  {_tr('Username:')}  {gl.get('username', '') or '-'}",
         ]
         self.ids.status_label.text = '\n'.join(lines)
 
-    def choose_host(self, host):
-        try:
-            set_collab_host(host)
-        except Exception as ex:
-            self.ids.status_label.text = f'Error setting host: {ex}'
+    def save_contributor(self):
+        """Called on the contributor input losing focus. Persists the
+        trimmed value to the server (config.json :: collab.contributor)
+        and shows a transient confirmation."""
+        inp = self.ids.get('contributor_input')
+        msg = self.ids.get('contributor_msg')
+        if inp is None:
             return
-        self.refresh()
+        name = (inp.text or '').strip()
+        try:
+            set_contributor(name)
+        except Exception as ex:
+            if msg is not None:
+                msg.text = _tr('Error: {error}').format(error=ex)
+            return
+        if msg is not None:
+            msg.text = _tr('Saved.')
+            Clock.schedule_once(
+                lambda dt: setattr(msg, 'text', ''), 2.0)
 
     def disconnect_github(self):
         # Wipe by overwriting with empty token (server.store.clear_github
@@ -289,7 +607,8 @@ class SettingsScreen(Screen):
                                username='')
             mark_github_app_installed(False)
         except Exception as ex:
-            self.ids.status_label.text = f'Error: {ex}'
+            self.ids.status_label.text = _tr(
+                'Error: {error}').format(error=ex)
             return
         self.refresh()
 
@@ -297,7 +616,8 @@ class SettingsScreen(Screen):
         try:
             save_gitlab_credentials('', '')
         except Exception as ex:
-            self.ids.status_label.text = f'Error: {ex}'
+            self.ids.status_label.text = _tr(
+                'Error: {error}').format(error=ex)
             return
         self.refresh()
 
@@ -306,14 +626,18 @@ class SettingsScreen(Screen):
 
 class GitHubConnectScreen(Screen):
     def on_pre_enter(self):
-        self.ids.gh_message.text = 'Click "Begin" to start.'
+        self.ids.gh_message.text = _tr('Starting device flow...')
         self.ids.gh_user_code.text = ''
-        self.ids.gh_begin_btn.disabled = False
+        # Begin button stays around as a Retry surface — re-enabled in
+        # the worker's failure path. We auto-fire begin() on entry so
+        # the user doesn't need an extra tap to kick off device flow.
+        self.ids.gh_begin_btn.disabled = True
         self._user_code = ''
+        Clock.schedule_once(lambda dt: self.begin(), 0)
 
     def begin(self):
         self.ids.gh_begin_btn.disabled = True
-        self.ids.gh_message.text = 'Starting device flow...'
+        self.ids.gh_message.text = _tr('Starting device flow...')
         threading.Thread(target=self._worker, daemon=True).start()
 
     def copy_code(self):
@@ -322,8 +646,8 @@ class GitHubConnectScreen(Screen):
         try:
             from kivy.core.clipboard import Clipboard
             Clipboard.copy(self._user_code)
-            self.ids.gh_message.text = (self.ids.gh_message.text +
-                                        '\n(code copied)')
+            self.ids.gh_message.text = (self.ids.gh_message.text + '\n'
+                                        + _tr('(code copied)'))
         except Exception:
             pass
 
@@ -345,8 +669,24 @@ class GitHubConnectScreen(Screen):
             def _show(dt, _code=user_code, _uri=verify_uri):
                 self._user_code = _code
                 self.ids.gh_user_code.text = _code
-                self.ids.gh_message.text = (
-                    f'Opening {_uri}\nEnter the code on the GitHub page.')
+                # Auto-copy the user_code so the user can paste it
+                # straight into the GitHub device page without
+                # needing to tap the Copy button. Best-effort: a
+                # clipboard failure (Android headless test devices,
+                # X11 missing on a CI box, etc.) is silent.
+                copied_ok = False
+                try:
+                    from kivy.core.clipboard import Clipboard
+                    Clipboard.copy(_code)
+                    copied_ok = True
+                except Exception:
+                    pass
+                msg = _tr(
+                    'Opening {uri}\nEnter the code on the GitHub page.'
+                ).format(uri=_uri)
+                if copied_ok:
+                    msg += '\n' + _tr('(code copied)')
+                self.ids.gh_message.text = msg
             Clock.schedule_once(_show, 0)
             try:
                 webbrowser.open(verify_uri)
@@ -367,19 +707,22 @@ class GitHubConnectScreen(Screen):
                 pass
 
             def _done(dt, _u=username):
-                self.ids.gh_message.text = f'Connected as {_u}.'
+                self.ids.gh_message.text = _tr(
+                    'Connected as {username}.').format(username=_u)
                 self.ids.gh_begin_btn.disabled = False
             Clock.schedule_once(_done, 0)
 
         except AuthError as ex:
             msg = translate_status(ex.status)
             def _err(dt, _m=msg):
-                self.ids.gh_message.text = f'Failed: {_m}'
+                self.ids.gh_message.text = _tr(
+                    'Failed: {error}').format(error=_m)
                 self.ids.gh_begin_btn.disabled = False
             Clock.schedule_once(_err, 0)
         except Exception as ex:
             def _err(dt, _e=str(ex)):
-                self.ids.gh_message.text = f'Failed: {_e}'
+                self.ids.gh_message.text = _tr(
+                    'Failed: {error}').format(error=_e)
                 self.ids.gh_begin_btn.disabled = False
             Clock.schedule_once(_err, 0)
 
@@ -400,14 +743,16 @@ class GitLabFormScreen(Screen):
         u = self.ids.gl_user.text.strip()
         t = self.ids.gl_token.text.strip()
         if not u or not t:
-            self.ids.gl_msg.text = 'Enter both username and token.'
+            self.ids.gl_msg.text = _tr('Enter both username and token.')
             return
         try:
             save_gitlab_credentials(u, t)
         except Exception as ex:
-            self.ids.gl_msg.text = f'Error: {ex}'
+            self.ids.gl_msg.text = _tr(
+                'Error: {error}').format(error=ex)
             return
-        self.ids.gl_msg.text = f'Saved for {u}.'
+        self.ids.gl_msg.text = _tr(
+            'Saved for {username}.').format(username=u)
 
 
 # ── App ─────────────────────────────────────────────────────────────────────
@@ -421,11 +766,16 @@ class CollabUIApp(App):
     title = 'A-Z+T Collab'
     subtitle = StringProperty('Settings')
     icon = StringProperty(_AZT_ICON)
-    version_string = StringProperty(f'collab {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}')
+    version_string = StringProperty(
+        f'client {azt_collab_client.__version__}'
+        f'  ·  '
+        f'server {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}'
+    )
 
     def build(self):
         theme.set_theme('Ocean')
-        Builder.load_string(KV)
+        font_name = register_charis()
+        register_kv(font_name)
         self.sm = RootSM(transition=SlideTransition())
         return self.sm
 

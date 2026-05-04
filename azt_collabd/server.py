@@ -39,6 +39,7 @@ from .repo import sync_repo as _sync_repo, repo_status_summary as _repo_status
 from .status import Result, Status
 from . import status as S
 from . import __version__ as _VERSION
+from . import MIN_CLIENT_VERSION as _MIN_CLIENT_VERSION
 
 # Kept alive for the server's lifetime so the flock on server.lock stays held.
 _server_lock_fd = None
@@ -159,7 +160,9 @@ UNAUTHENTICATED_PATHS = ('/v1/health',)
 
 def _h_health(_body):
     payload = {
-        "ok": True, "version": _VERSION, "pid": os.getpid(),
+        "ok": True, "version": _VERSION,
+        "min_client_version": _MIN_CLIENT_VERSION,
+        "pid": os.getpid(),
         "started_at": _started_at,
     }
     crash = _last_crash_summary()
@@ -174,6 +177,16 @@ def _h_online(_body):
 
 def _h_credentials_status(_body):
     return 200, {"ok": True, **store.get_status()}
+
+
+def _h_get_contributor(_body):
+    return 200, {"ok": True, "contributor": store.get_contributor()}
+
+
+def _h_set_contributor(body):
+    name = body.get('contributor', '')
+    store.set_contributor(name)
+    return 200, {"ok": True, "contributor": store.get_contributor()}
 
 
 def _h_github_install_url(_body):
@@ -388,11 +401,11 @@ def _h_init_project(body):
     working_dir = body.get('working_dir', '')
     remote_url = body.get('remote_url', '')
     branch = body.get('branch', 'main')
-    contributor = body.get('contributor', 'Recorder')
+    contributor = store.resolve_contributor(body.get('contributor', ''))
     if not working_dir or not remote_url:
         return 400, {"ok": False,
                      "error": "missing_working_dir_or_remote_url"}
-    git_user, token = store.get_sync_credentials()
+    git_user, token = store.get_sync_credentials(remote_url)
     if not token:
         return 200, {"ok": True,
                      "result": Result().add(S.AUTH_REQUIRED).to_dict()}
@@ -410,6 +423,27 @@ _clone_jobs = {}
 _clone_lock = threading.Lock()
 
 
+_AUTH_ERROR_KEYWORDS = (
+    '401', '403', '404',
+    'unauthorized', 'forbidden', 'not found',
+    'authentication', 'credential',
+)
+
+
+def _clone_error_looks_like_auth(result):
+    """True if any CLONE_FAILED status carries an error message that
+    smells like 401/403/404 / auth-related. Used to decide whether to
+    retry anonymously and (after final failure) whether to surface
+    CLONE_AUTH_REQUIRED to the UI."""
+    for st in result.statuses:
+        if st.code != 'CLONE_FAILED':
+            continue
+        msg = (st.params.get('error', '') or '').lower()
+        if any(k in msg for k in _AUTH_ERROR_KEYWORDS):
+            return True
+    return False
+
+
 def _clone_worker(job_id, remote_url, dest_dir, username, token,
                   retry_anonymous_on_auth_fail=True):
     from .repo import clone_repo as _clone_repo
@@ -424,20 +458,23 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
                     del job['progress'][:-500]
 
     try:
+        had_token = bool(token)
         lift_path, result = _clone_repo(
             remote_url, dest_dir, username, token, on_progress=_on_progress)
-        if not lift_path and retry_anonymous_on_auth_fail:
-            looks_auth = False
-            for st in result.statuses:
-                msg = (st.params.get('error', '') or '').lower()
-                if st.code == 'CLONE_FAILED' and (
-                        'credential' in msg or 'auth' in msg):
-                    looks_auth = True
-                    break
-            if looks_auth:
-                lift_path, result = _clone_repo(
-                    remote_url, dest_dir, '', '',
-                    on_progress=_on_progress)
+        if not lift_path and retry_anonymous_on_auth_fail \
+                and _clone_error_looks_like_auth(result):
+            lift_path, result = _clone_repo(
+                remote_url, dest_dir, '', '',
+                on_progress=_on_progress)
+
+        # Final-failure auth diagnosis: if both attempts failed with
+        # auth-shaped errors, OR we never had creds for the URL's host,
+        # tell the UI so it can prompt the user to authenticate.
+        if not lift_path and result.has(S.CLONE_FAILED):
+            host = store.host_for_url(remote_url) or store.get_collab_host()
+            if (not had_token) or _clone_error_looks_like_auth(result):
+                result.add(S.CLONE_AUTH_REQUIRED, host=host)
+
         with _clone_lock:
             job = _clone_jobs.get(job_id)
             if job is not None:
@@ -468,7 +505,21 @@ def _h_create_project_from_template(body):
     except (ValueError, RuntimeError) as ex:
         return 400, {"ok": False, "error": str(ex)}
     except Exception as ex:
-        return 500, {"ok": False, "error": str(ex)}
+        # Log a full traceback to stderr/logcat so the failure mode is
+        # diagnosable without a debugger. The Android log tag is
+        # "python" — find it with
+        # ``adb logcat | grep -E '\[server\] from_template'``.
+        import traceback
+        tb = traceback.format_exc()
+        print(f'[server] from_template failed: {type(ex).__name__}: {ex}\n'
+              f'  template_url={template_url!r}\n'
+              f'  vernlang={vernlang!r}\n'
+              f'  dest_dir={dest_dir!r}\n'
+              f'{tb}',
+              file=sys.stderr, flush=True)
+        return 500, {"ok": False,
+                     "error": f'{type(ex).__name__}: {ex}',
+                     "traceback": tb}
     return 200, {"ok": True, "project": p.to_dict()}
 
 
@@ -478,7 +529,7 @@ def _h_clone_project(body):
     if not remote_url or not dest_dir:
         return 400, {"ok": False,
                      "error": "missing_remote_url_or_dest_dir"}
-    git_user, token = store.get_sync_credentials()
+    git_user, token = store.get_sync_credentials(remote_url)
     job_id = secrets.token_hex(8)
     with _clone_lock:
         _clone_jobs[job_id] = {
@@ -544,8 +595,8 @@ def _h_project_sync(langcode, body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
-    contributor = body.get('contributor', 'Recorder')
-    git_user, token = store.get_sync_credentials()
+    contributor = store.resolve_contributor(body.get('contributor', ''))
+    git_user, token = store.get_sync_credentials(p.remote_url)
     if not token:
         res = Result().add(S.AUTH_REQUIRED)
         return 200, {"ok": True, "result": res.to_dict()}
@@ -590,7 +641,7 @@ def _h_project_sync_async(langcode, body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
-    contributor = body.get('contributor', 'Recorder')
+    contributor = store.resolve_contributor(body.get('contributor', ''))
     job_id = scheduler.request_sync(langcode, contributor)
     return 200, {"ok": True, "job_id": job_id}
 
@@ -617,6 +668,8 @@ def dispatch(method, path, body):
             return _h_online(body)
         if path == '/v1/credentials/status':
             return _h_credentials_status(body)
+        if path == '/v1/config/contributor':
+            return _h_get_contributor(body)
         if path == '/v1/credentials/github/install_url':
             return _h_github_install_url(body)
         if path == '/v1/credentials/github/client_id':
@@ -642,6 +695,8 @@ def dispatch(method, path, body):
     if method == 'POST':
         if path == '/v1/credentials/host':
             return _h_set_host(body)
+        if path == '/v1/config/contributor':
+            return _h_set_contributor(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':

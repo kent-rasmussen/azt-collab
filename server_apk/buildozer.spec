@@ -19,13 +19,19 @@ source.dir = .
 # We pull the daemon and client from sibling directories. Buildozer
 # resolves these paths at packaging time, then the resulting APK
 # bundles both packages alongside server_apk/main.py.
+# Extensions: py (code) + xml (manifest extras) + gz (langtags_mini.json.gz
+# under azt_collab_client/ui/assets/) + png (azt_collab_client/azt.png,
+# referenced by azt_collabd/ui/picker_app.py as App.icon).
 source.include_patterns = main.py,service.py
-source.include_exts = py,xml
+# po/mo: gettext catalogs under azt_collab_client/locales/<lang>/LC_MESSAGES.
+# Without these the device's available_languages() finds nothing and the
+# settings UI only offers English.
+source.include_exts = py,xml,gz,png,po,mo
 
 version.regex = __version__ = ['"](.*)['"]
 version.filename = %(source.dir)s/../azt_collabd/__init__.py
 
-requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3
+requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3,typing_extensions
 # Pulled in via path symlink at packaging time. (See setup.sh in this
 # directory for the symlink dance — we mirror the sister-app pattern
 # documented in README.md so the server APK source tree contains

@@ -167,10 +167,12 @@ def _fire(langcode):
 
 
 def _run_sync(langcode, contributor):
+    from . import store as _store
+    contributor = _store.resolve_contributor(contributor)
     p = projects.get(langcode)
     if p is None:
         return Result().add(S.NO_REPO)
-    git_user, token = get_sync_credentials()
+    git_user, token = get_sync_credentials(p.remote_url)
     if not token:
         return Result().add(S.AUTH_REQUIRED)
     if not _has_internet():

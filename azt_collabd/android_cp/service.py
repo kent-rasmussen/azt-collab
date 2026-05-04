@@ -24,6 +24,17 @@ from ..paths import azt_home
 
 _installed = False
 
+# Strong refs to the PythonJavaClass proxy instances handed to
+# AZTCollabProvider.registerCallbacks. Java holds them for dispatch,
+# but pyjnius does not pin them on the Python side — without these
+# globals a GC cycle frees the proxies and the next binder-thread
+# callback into them dereferences a freed type object. That manifests
+# as SIGSEGV in _PyType_Lookup on Thread-3, with the call coming from
+# AZTCollabProvider.call → NativeInvocationHandler.invoke (see
+# CHANGELOG azt_collabd 0.10.6).
+_dispatch_cb = None
+_openfile_cb = None
+
 
 def _is_android():
     try:
@@ -36,7 +47,7 @@ def _is_android():
 def install_callbacks():
     """Register the Python dispatch + openFile callbacks with the Java
     AZTCollabProvider class. Idempotent. No-op off Android."""
-    global _installed
+    global _installed, _dispatch_cb, _openfile_cb
     if _installed:
         return
     if not _is_android():
@@ -87,7 +98,9 @@ def install_callbacks():
         def resolveAbsPath(self, rel, mode):
             return _resolve_path(rel, mode)
 
-    Provider.registerCallbacks(_Dispatch(), _OpenFile())
+    _dispatch_cb = _Dispatch()
+    _openfile_cb = _OpenFile()
+    Provider.registerCallbacks(_dispatch_cb, _openfile_cb)
     _installed = True
 
 

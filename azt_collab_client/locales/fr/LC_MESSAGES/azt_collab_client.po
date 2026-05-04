@@ -1,0 +1,382 @@
+# French translation catalog for azt_collab_client.
+# Maintained alongside the source. Compile via the in-package msgfmt
+# (azt_collab_client.i18n auto-compiles to .mo on first set_language).
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: azt_collab_client 0.15.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: fr\n"
+
+# ── picker.py ─────────────────────────────────────────────────────────────
+
+msgid "I have one on my phone"
+msgstr "J'en ai un sur mon téléphone"
+
+msgid "Clone Internet Repository"
+msgstr "Cloner un dépôt Internet"
+
+msgid "Start New"
+msgstr "Démarrer un nouveau"
+
+msgid "Pick a project"
+msgstr "Choisir un projet"
+
+# ── popups.py — clone_url_popup ───────────────────────────────────────────
+
+msgid "Clone a git repository containing a LIFT file:"
+msgstr "Cloner un dépôt git contenant un fichier LIFT :"
+
+msgid "Paste the repository URL here"
+msgstr "Collez l'URL du dépôt ici"
+
+msgid "Cancel"
+msgstr "Annuler"
+
+msgid "Clone"
+msgstr "Cloner"
+
+msgid "Clone Repository"
+msgstr "Cloner le dépôt"
+
+# ── popups.py — install_server_apk_popup ──────────────────────────────────
+
+msgid "The AZT collaboration service (server APK) is not installed."
+msgstr "Le service de collaboration AZT (APK serveur) n'est pas installé."
+
+msgid "Install it to enable sync, then reopen this app."
+msgstr "Installez-le pour activer la synchronisation, puis rouvrez cette application."
+
+msgid "Open install page"
+msgstr "Ouvrir la page d'installation"
+
+msgid "Dismiss"
+msgstr "Fermer"
+
+msgid "AZT collaboration service required"
+msgstr "Service de collaboration AZT requis"
+
+# ── langpicker.py ─────────────────────────────────────────────────────────
+
+msgid "Choose your language"
+msgstr "Choisissez votre langue"
+
+msgid "Type a language name..."
+msgstr "Saisissez un nom de langue..."
+
+msgid "Select region:"
+msgstr "Choisir la région :"
+
+msgid "I'm working on a dialect"
+msgstr "Je travaille sur un dialecte"
+
+msgid "Variant code (2-8 chars)"
+msgstr "Code de variante (2 à 8 caractères)"
+
+msgid "Continue"
+msgstr "Continuer"
+
+msgid "Multiple / all regions"
+msgstr "Plusieurs / toutes régions"
+
+msgid "Language code: {code}"
+msgstr "Code de langue : {code}"
+
+msgid "Setting up wordlist for {code}..."
+msgstr "Préparation de la liste de mots pour {code}..."
+
+# ── translate.py — status messages ────────────────────────────────────────
+
+msgid "Initialized git repository."
+msgstr "Dépôt git initialisé."
+
+msgid "Repository already initialized."
+msgstr "Dépôt déjà initialisé."
+
+msgid "Created .gitignore."
+msgstr ".gitignore créé."
+
+msgid "Committed ({sha})."
+msgstr "Validé ({sha})."
+
+msgid "Committed."
+msgstr "Validé."
+
+msgid "Committed local changes."
+msgstr "Modifications locales validées."
+
+msgid "Committed locally (offline)"
+msgstr "Validé localement (hors ligne)"
+
+msgid "Committed (no remote configured)"
+msgstr "Validé (aucun dépôt distant configuré)"
+
+msgid "Committed and pushed {n} file(s)"
+msgstr "{n} fichier(s) validé(s) et envoyé(s)"
+
+msgid "Nothing new to commit."
+msgstr "Rien de nouveau à valider."
+
+msgid "Remote set to {url}"
+msgstr "Dépôt distant défini sur {url}"
+
+msgid "Remote updated to {url}"
+msgstr "Dépôt distant mis à jour : {url}"
+
+msgid "Remote: {url}"
+msgstr "Dépôt distant : {url}"
+
+msgid "Created remote repository {owner_repo}."
+msgstr "Dépôt distant {owner_repo} créé."
+
+msgid "Pushed to {url} (branch: {branch})."
+msgstr "Envoyé vers {url} (branche : {branch})."
+
+msgid "Pushed to {branch}."
+msgstr "Envoyé vers {branch}."
+
+msgid "Pushed."
+msgstr "Envoyé."
+
+msgid "Pulled latest changes."
+msgstr "Dernières modifications récupérées."
+
+msgid "Cloned to {dir}"
+msgstr "Cloné dans {dir}"
+
+msgid "Found: {file}"
+msgstr "Trouvé : {file}"
+
+msgid "No .lift file found in cloned repository."
+msgstr "Aucun fichier .lift trouvé dans le dépôt cloné."
+
+msgid "On branch {branch}."
+msgstr "Sur la branche {branch}."
+
+msgid "Staged all changes."
+msgstr "Toutes les modifications ajoutées à l'index."
+
+msgid "Open your git host to create a pull request."
+msgstr "Ouvrez votre hébergeur git pour créer une pull request."
+
+msgid "No new audio"
+msgstr "Pas de nouveau fichier audio"
+
+msgid "No repo"
+msgstr "Aucun dépôt"
+
+msgid "Not a git repository. Publish the project first."
+msgstr "Pas un dépôt git. Publiez d'abord le projet."
+
+msgid "No remote configured. Publish the project first."
+msgstr "Aucun dépôt distant configuré. Publiez d'abord le projet."
+
+msgid "Commit: {error}"
+msgstr "Validation : {error}"
+
+msgid "Push failed: {error}"
+msgstr "Échec de l'envoi : {error}"
+
+msgid "Pull failed: {error}"
+msgstr "Échec de la récupération : {error}"
+
+msgid "Clone failed: {error}"
+msgstr "Échec du clonage : {error}"
+
+msgid "Branch error: {error}"
+msgstr "Erreur de branche : {error}"
+
+msgid "Create repo failed: {error}"
+msgstr "Échec de la création du dépôt : {error}"
+
+msgid "Not connected to GitHub. Go to Setup > Connect to GitHub."
+msgstr "Non connecté à GitHub. Allez dans Configuration > Se connecter à GitHub."
+
+msgid "App not installed. Visit {url} and select \"All repositories\"."
+msgstr "Application non installée. Visitez {url} et sélectionnez « Tous les dépôts »."
+
+msgid "App not authorized for {owner_repo}. Add it at {url}"
+msgstr "Application non autorisée pour {owner_repo}. Ajoutez-le à {url}"
+
+msgid "Access denied (403). Check app permissions at {url}"
+msgstr "Accès refusé (403). Vérifiez les permissions de l'application à {url}"
+
+msgid "Authorization expired. Please try again."
+msgstr "Autorisation expirée. Veuillez réessayer."
+
+msgid "Authorization denied by user."
+msgstr "Autorisation refusée par l'utilisateur."
+
+msgid "Authorization timed out."
+msgstr "Délai d'autorisation dépassé."
+
+msgid "Another sync is in progress. Try again in a moment."
+msgstr "Une autre synchronisation est en cours. Réessayez dans un instant."
+
+msgid "Merge conflicts in {paths}"
+msgstr "Conflits de fusion dans {paths}"
+
+msgid "Merge conflicts; review the entries flagged azt-lift-conflict."
+msgstr "Conflits de fusion ; vérifiez les entrées marquées azt-lift-conflict."
+
+msgid "Sync service unavailable: {error}"
+msgstr "Service de synchronisation indisponible : {error}"
+
+msgid "Sync service error: {error}"
+msgstr "Erreur du service de synchronisation : {error}"
+
+msgid "Clone failed — repository not found. This may be a private repository.\n\nAre you authenticated to {host}?"
+msgstr "Échec du clonage — dépôt introuvable. Il peut s'agir d'un dépôt privé.\n\nÊtes-vous authentifié auprès de {host} ?"
+
+# ── settings UI strings (azt_collabd/ui/app.py) ───────────────────────────
+
+msgid "AZT Collaboration — Settings"
+msgstr "Collaboration AZT — Paramètres"
+
+msgid "Status"
+msgstr "État"
+
+msgid "Loading..."
+msgstr "Chargement..."
+
+msgid "Active host"
+msgstr "Hôte actif"
+
+msgid "GitHub"
+msgstr "GitHub"
+
+msgid "GitLab"
+msgstr "GitLab"
+
+msgid "Connect to GitHub"
+msgstr "Se connecter à GitHub"
+
+msgid "Disconnect GitHub"
+msgstr "Se déconnecter de GitHub"
+
+msgid "Set GitLab credentials"
+msgstr "Configurer les identifiants GitLab"
+
+msgid "Disconnect GitLab"
+msgstr "Se déconnecter de GitLab"
+
+msgid "Refresh"
+msgstr "Actualiser"
+
+msgid "Refresh Status"
+msgstr "Actualiser l'état"
+
+msgid "Interface language"
+msgstr "Langue de l'interface"
+
+msgid "GitLab credentials"
+msgstr "Identifiants GitLab"
+
+msgid "Enter your GitLab username and a personal access token (read/write to repos)."
+msgstr "Saisissez votre nom d'utilisateur GitLab et un jeton d'accès personnel (lecture/écriture des dépôts)."
+
+msgid "Username"
+msgstr "Nom d'utilisateur"
+
+msgid "Personal access token"
+msgstr "Jeton d'accès personnel"
+
+msgid "Save"
+msgstr "Enregistrer"
+
+msgid "Back"
+msgstr "Retour"
+
+msgid "Tap \"Begin\" to start the device-flow login."
+msgstr "Touchez « Commencer » pour démarrer la connexion par flux d'appareil."
+
+msgid "Your one-time code"
+msgstr "Votre code à usage unique"
+
+msgid "Copy"
+msgstr "Copier"
+
+msgid "Begin"
+msgstr "Commencer"
+
+# ── settings UI Python-side messages ──────────────────────────────────────
+
+msgid "yes"
+msgstr "oui"
+
+msgid "no"
+msgstr "non"
+
+msgid "Online:"
+msgstr "En ligne :"
+
+msgid "Connected:"
+msgstr "Connecté :"
+
+msgid "Username:"
+msgstr "Nom d'utilisateur :"
+
+msgid "App installed:"
+msgstr "Application installée :"
+
+msgid "Error: {error}"
+msgstr "Erreur : {error}"
+
+msgid "Error setting host: {error}"
+msgstr "Erreur lors du changement d'hôte : {error}"
+
+msgid "Starting device flow..."
+msgstr "Démarrage du flux d'appareil..."
+
+msgid "(code copied)"
+msgstr "(code copié)"
+
+msgid "Opening {uri}\nEnter the code on the GitHub page."
+msgstr "Ouverture de {uri}\nSaisissez le code sur la page GitHub."
+
+msgid "Connected as {username}."
+msgstr "Connecté en tant que {username}."
+
+msgid "Failed: {error}"
+msgstr "Échec : {error}"
+
+msgid "Enter both username and token."
+msgstr "Saisissez le nom d'utilisateur et le jeton."
+
+msgid "Saved for {username}."
+msgstr "Enregistré pour {username}."
+
+# ── settings: contributor (commit-author name) ────────────────────────────
+
+msgid "Your name (appears in commits)"
+msgstr "Votre nom (apparaît dans les commits)"
+
+msgid "e.g. Kent Rasmussen"
+msgstr "par ex. Kent Rasmussen"
+
+msgid "Saved."
+msgstr "Enregistré."
+
+msgid "Internal error: tried to return an empty path. Please pick again or report this."
+msgstr "Erreur interne : tentative de retour d'un chemin vide. Veuillez réessayer ou signaler ce problème."
+
+# ── picker_app.py messages ────────────────────────────────────────────────
+
+msgid "Cloning {url}..."
+msgstr "Clonage de {url}..."
+
+msgid "File chooser unavailable: {error}"
+msgstr "Sélecteur de fichiers indisponible : {error}"
+
+msgid "Could not open file chooser: {error}"
+msgstr "Impossible d'ouvrir le sélecteur de fichiers : {error}"
+
+msgid "Could not create project: {error}"
+msgstr "Impossible de créer le projet : {error}"
+
+msgid "Could not open settings: {error}"
+msgstr "Impossible d'ouvrir les paramètres : {error}"
+
+msgid "Open settings"
+msgstr "Ouvrir les paramètres"
