@@ -841,9 +841,16 @@ class SettingsScreen(Screen):
             daemon=True).start()
 
     def _publish_worker(self, working_dir, remote_url, contributor):
+        import sys
+        print(f'[publish] init_project working_dir={working_dir!r} '
+              f'remote_url={remote_url!r} contributor={contributor!r}',
+              file=sys.stderr, flush=True)
         try:
             result = init_project(working_dir, remote_url,
                                   branch='main', contributor=contributor)
+            codes = result.codes()
+            print(f'[publish] init_project done: codes={codes!r}',
+                  file=sys.stderr, flush=True)
             text = translate_result(result) or _tr('Done.')
             # SERVER_UNAVAILABLE / SERVER_ERROR are wire-only codes
             # (no S.* alias); rpc-failure wrappers stamp them as
@@ -854,17 +861,29 @@ class SettingsScreen(Screen):
                 S.AUTH_REQUIRED, S.APP_NOT_INSTALLED,
                 S.REPO_NOT_AUTHORIZED, S.ACCESS_DENIED)
         except Exception as ex:
+            print(f'[publish] init_project raised: '
+                  f'{type(ex).__name__}: {ex}',
+                  file=sys.stderr, flush=True)
             text = _tr('Publish failed: {error}').format(error=str(ex))
             ok = False
         Clock.schedule_once(
             lambda dt: self._publish_done(text, ok), 0)
 
     def _publish_done(self, msg, ok):
-        self._set_publish_msg(msg)
-        # On success the project now has a remote_url, so a refresh
-        # naturally hides the publish row. On failure, re-enable so
-        # the user can retry.
+        # Refresh first so a successful publish (which now leaves the
+        # project with a populated remote_url) hides the row. Set the
+        # outcome message AFTER refresh — _refresh_publish_row's first
+        # act is to clear msg.text, so doing it the other way around
+        # silently wipes the outcome the user needs to see.
         self.refresh()
+        self._set_publish_msg(msg)
+        if not ok:
+            # Failure: row is still visible (remote_url stayed empty);
+            # re-enable the button so the user can retry once they've
+            # fixed whatever the message describes.
+            btn = self.ids.get('publish_btn')
+            if btn is not None:
+                btn.disabled = False
 
     def _set_publish_msg(self, text):
         msg = self.ids.get('publish_msg')

@@ -11,6 +11,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.19.1 + azt_collab_client 0.23.0 — server-canonical recent state + last_commit
+- **Publish outcome message no longer clobbered by refresh.**
+  `_publish_done` was setting the message *then* calling `refresh()`,
+  which started by clearing `msg.text`, so the user only saw
+  "Publishing..." and never the result. Reorder: refresh first, then
+  set the outcome. Re-enables the button on failure.
+- **`[publish]` stderr trace** in `_publish_worker`: prints the
+  arguments going into `init_project` and the resulting `Result.codes()`
+  (or the exception). Pairs with the `[sync-rpc]` / `[sync]` traces
+  added in 0.18.2 so a publish failure has a logcat trail.
+
 ### azt_collabd 0.19.0 + azt_collab_client 0.23.0 — server-canonical recent state + last_commit
 - **`last_project` is now server-tracked.** Was: each peer wrote
   `$AZT_HOME/config.json::recent.last_langcode` directly, which broke
