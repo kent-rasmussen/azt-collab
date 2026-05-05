@@ -82,7 +82,8 @@ def generate():
     bbox = draw.textbbox((0, 0), APP_NAME, font=name_font)
     tw = bbox[2] - bbox[0]
     draw.text(((WIDTH - tw) // 2, name_y), APP_NAME, fill=GREEN_RGB, font=name_font)
-
+    
+    TEXT_RGB='#000000' #black for green background
     # Tagline
     tag_y = name_y + 55
     bbox = draw.textbbox((0, 0), APP_TAGLINE, font=tagline_font)
@@ -95,7 +96,7 @@ def generate():
     bbox = draw.textbbox((0, 0), ver_display, font=version_font)
     vw = bbox[2] - bbox[0]
     draw.text(((WIDTH - vw) // 2, version_y), ver_display,
-              fill=TEXT_RGB[:3] + (102,),  # off-white at ~40 % alpha
+              fill=TEXT_RGB, #[:3] + (102,),  # off-white at ~40 % alpha
               font=version_font)
 
     img.save('server_apk/presplash.png')

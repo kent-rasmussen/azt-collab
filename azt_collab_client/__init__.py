@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.20.1"
+__version__ = "0.22.0"
 # 0.16.0 floor: the daemon now persists scheduler jobs across
 # kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
 # job_ids on respawn, so poll_job returns None and the peer can't
@@ -567,6 +567,31 @@ def save_gitlab_credentials(username, token):
          {'username': username, 'token': token})
 
 
+def test_gitlab_credentials(username='', token=''):
+    """Validate the supplied GitLab username + PAT against
+    ``gitlab.com/api/v4/user``. Empty fields fall through to the
+    stored credentials on the server side, so the UI's Test button can
+    re-check what's already saved without making the user retype.
+
+    Returns ``{'ok': bool, 'valid': bool, 'server_username': str,
+    'error': str}``. ``ok=False`` means the daemon was unreachable;
+    ``valid=False`` with a populated ``error`` means the daemon ran
+    the check and the credentials were rejected (or the username
+    didn't match what GitLab returned)."""
+    try:
+        resp = call('POST', '/v1/credentials/gitlab/test',
+                    {'username': username, 'token': token})
+    except ServerUnavailable as ex:
+        return {'ok': False, 'valid': False, 'server_username': '',
+                'error': f'server_unavailable: {ex}'}
+    return {
+        'ok': bool(resp.get('ok')),
+        'valid': bool(resp.get('valid')),
+        'server_username': resp.get('server_username', '') or '',
+        'error': resp.get('error', '') or '',
+    }
+
+
 def migrate_from_prefs(prefs_path):
     """One-shot (idempotent) migration from a legacy prefs.json. The
     server moves gh_*/gl_*/collab_host keys into credentials.json and
@@ -875,7 +900,8 @@ __all__ = [
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',
-    'save_gitlab_credentials', 'migrate_from_prefs',
+    'save_gitlab_credentials', 'test_gitlab_credentials',
+    'migrate_from_prefs',
     'list_projects', 'open_project', 'register_project', 'rename_project',
     'derive_langcode', 'init_project',
     'create_project_from_template',

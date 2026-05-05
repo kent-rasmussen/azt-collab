@@ -13,9 +13,15 @@ Schema:
       },
       "gitlab": {
         "username": "...",
-        "token": "..."
+        "token": "...",
+        "confirmed": true
       }
     }
+
+    "confirmed" is set true when a live test against the host's API
+    succeeds (gitlab.com/api/v4/user). For GitHub, the equivalent
+    "credentials work for this host" signal is derived from
+    ``connected AND app_installed`` rather than stored separately.
 
 All fields are optional. The file is written atomically with mode 0600
 on POSIX. A one-shot migration helper copies legacy keys out of the
@@ -165,7 +171,20 @@ def get_gitlab():
 
 def set_gitlab(username, token):
     def mut(d):
-        d['gitlab'] = {'username': username, 'token': token}
+        # A bare save resets the verified flag; the user must re-test
+        # before the daemon will treat these creds as known-working.
+        d['gitlab'] = {'username': username, 'token': token,
+                       'confirmed': False}
+    _update(mut)
+
+
+def set_gitlab_confirmed(confirmed):
+    """Persist the result of a successful (or failed) live test against
+    ``gitlab.com``. Called by ``_h_test_gitlab``."""
+    def mut(d):
+        block = dict(d.get('gitlab', {}))
+        block['confirmed'] = bool(confirmed)
+        d['gitlab'] = block
     _update(mut)
 
 
@@ -205,21 +224,31 @@ def get_sync_credentials(url=''):
 
 def get_status():
     """Return a dict describing what's configured. Safe to hand to the UI;
-    never contains raw tokens."""
+    never contains raw tokens.
+
+    ``confirmed`` per host means "credentials are known to work here":
+    GitHub requires a saved access token *and* the App installed (the
+    user can't push without both); GitLab requires a successful live
+    test against ``gitlab.com/api/v4/user`` (persisted on the gitlab
+    block as ``confirmed``)."""
     data = load()
     gh = data.get('github', {}) or {}
     gl = data.get('gitlab', {}) or {}
+    gh_connected = bool(gh.get('access_token'))
+    gh_app_installed = bool(gh.get('app_installed', False))
     return {
         'host': data.get('collab_host', 'github'),
         'contributor': get_contributor(),
         'github': {
-            'connected': bool(gh.get('access_token')),
+            'connected': gh_connected,
             'username': gh.get('username', ''),
-            'app_installed': bool(gh.get('app_installed', False)),
+            'app_installed': gh_app_installed,
+            'confirmed': gh_connected and gh_app_installed,
         },
         'gitlab': {
             'connected': bool(gl.get('token')),
             'username': gl.get('username', ''),
+            'confirmed': bool(gl.get('confirmed', False)),
         },
     }
 

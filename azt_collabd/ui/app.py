@@ -39,13 +39,20 @@ from azt_collab_client.ui import register_charis, theme
 import azt_collabd
 from azt_collabd.status import AuthError
 from azt_collab_client import (
+    S,
     get_contributor,
     get_credentials_status,
+    init_project,
     is_online,
+    last_project,
     mark_github_app_installed,
+    open_project,
+    project_status,
     save_github_tokens,
     save_gitlab_credentials,
+    test_gitlab_credentials,
     set_contributor,
+    translate_result,
     translate_status,
 )
 
@@ -262,7 +269,7 @@ KV_TEMPLATE = '''
                         id: gh_connect_btn
                         text: _('Connect to GitHub')
                         normal_color: T.GREEN
-                        on_release: app.go('github')
+                        on_release: root.connect_github()
                     RecBtn:
                         id: gh_disconnect_btn
                         text: _('Disconnect GitHub')
@@ -275,7 +282,7 @@ KV_TEMPLATE = '''
                     spacing: dp(10)
                     RecBtn:
                         id: gl_connect_btn
-                        text: _('Set GitLab credentials')
+                        text: _('Connect to GitLab')
                         normal_color: T.GREEN
                         on_release: app.go('gitlab')
                     RecBtn:
@@ -283,6 +290,30 @@ KV_TEMPLATE = '''
                         text: _('Disconnect GitLab')
                         normal_color: T.BTN_INACTIVE
                         on_release: root.disconnect_gitlab()
+                # Publish — visible only for the most-recent project
+                # when it has no remote yet AND at least one host's
+                # credentials have been confirmed. ``refresh()`` flips
+                # the height/opacity to hide the entire row when not
+                # applicable (the Kivy hide/show pattern from
+                # ~/.claude-sil/CLAUDE.md).
+                BoxLayout:
+                    id: publish_row
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: 0
+                    opacity: 0
+                    spacing: dp(8)
+                    RecBtn:
+                        id: publish_btn
+                        text: _('Publish data')
+                        normal_color: T.GREEN
+                        on_release: root.publish()
+                    BodyLabel:
+                        id: publish_msg
+                        text: ''
+                        color: T.TEXT_DIM
+                        size_hint_y: None
+                        height: dp(20)
                 # Status — read-only credential / online state, parked
                 # at the bottom now that the actionable rows live up
                 # top. Refresh Status sits directly under it so the
@@ -379,7 +410,7 @@ KV_TEMPLATE = '''
     BoxLayout:
         orientation: 'vertical'
         TopBar:
-            title: _('GitLab credentials')
+            title: _('Connect to GitLab')
         ScrollView:
             do_scroll_x: False
             BoxLayout:
@@ -416,9 +447,10 @@ KV_TEMPLATE = '''
                     size_hint_y: None
                     height: dp(8)
                 RecBtn:
-                    text: _('Save')
+                    id: gl_test_btn
+                    text: _('Test connection')
                     normal_color: T.GREEN
-                    on_release: root.save()
+                    on_release: root.test()
                 NavBtn:
                     text: _('Back')
                     on_release: app.go('settings')
@@ -572,12 +604,66 @@ class SettingsScreen(Screen):
             f"  {_tr('Username:')}      {gh.get('username', '') or '-'}",
             f"  {_tr('App installed:')} "
             f"{yes if gh.get('app_installed') else no}",
+            f"  {_tr('Confirmed:')}     {yes if gh.get('confirmed') else no}",
             "",
             "GitLab",
             f"  {_tr('Connected:')} {yes if gl.get('connected') else no}",
             f"  {_tr('Username:')}  {gl.get('username', '') or '-'}",
+            f"  {_tr('Confirmed:')} {yes if gl.get('confirmed') else no}",
         ]
         self.ids.status_label.text = '\n'.join(lines)
+        self._refresh_publish_row(status)
+
+    def _refresh_publish_row(self, status):
+        """Show / hide / enable the "Publish <langcode> data" row.
+
+        Visible only when (a) ``last_project()`` resolves to a langcode
+        and (b) that project does not already have a remote URL. When
+        visible, the button is enabled iff at least one host's
+        credentials are confirmed (GitHub: connected + app installed;
+        GitLab: a successful Test). The actual host pick happens at
+        click time — single-confirmed hosts publish directly, both
+        confirmed pops the host-chooser overlay."""
+        row = self.ids.get('publish_row')
+        btn = self.ids.get('publish_btn')
+        msg = self.ids.get('publish_msg')
+        if row is None or btn is None:
+            return
+        # Reset to hidden by default; the rest of this function flips
+        # back on if every condition holds.
+        row.height = 0
+        row.opacity = 0
+        if msg is not None:
+            msg.text = ''
+        langcode = ''
+        try:
+            langcode = (last_project() or '').strip()
+        except Exception:
+            return
+        if not langcode:
+            return
+        try:
+            ps = project_status(langcode)
+        except Exception:
+            ps = None
+        if ps is None or (ps.remote_url or '').strip():
+            # Either the project's gone (deleted out-of-band) or it
+            # already has a remote — nothing to publish.
+            return
+        gh_confirmed = bool(status.get('github', {}).get('confirmed'))
+        gl_confirmed = bool(status.get('gitlab', {}).get('confirmed'))
+        n_confirmed = int(gh_confirmed) + int(gl_confirmed)
+        btn.text = _tr('Publish {langcode} data').format(langcode=langcode)
+        btn.disabled = (n_confirmed == 0)
+        btn.normal_color = (
+            theme.GREEN if n_confirmed else theme.BTN_INACTIVE)
+        if msg is not None and n_confirmed == 0:
+            msg.text = _tr(
+                'Connect to GitHub or GitLab first to enable publish.')
+        # Heights: button + message (the BodyLabel inside is dp(20))
+        # plus the BoxLayout's internal spacing (dp(8)).
+        row.height = dp(52) + dp(8) + dp(20)
+        row.opacity = 1
 
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the
@@ -598,6 +684,154 @@ class SettingsScreen(Screen):
             msg.text = _tr('Saved.')
             Clock.schedule_once(
                 lambda dt: setattr(msg, 'text', ''), 2.0)
+
+    def connect_github(self):
+        """Navigate to the GitHub device-flow screen and kick the flow.
+        Putting the auto-start here (rather than in
+        ``GitHubConnectScreen.on_pre_enter``) ties it to the explicit
+        user gesture — language-change rebuilds re-instantiate the
+        screen tree without firing this path."""
+        app = App.get_running_app()
+        app.go('github')
+        sm = app.sm
+        if sm.has_screen('github'):
+            screen = sm.get_screen('github')
+            Clock.schedule_once(lambda dt: screen.begin(), 0)
+
+    def publish(self):
+        """Create a remote repo on a confirmed git host for the
+        most-recently-used project and push the local working tree up.
+
+        Mirrors the recorder's ``do_publish`` flow (main.py:2884) but
+        runs from the daemon's settings UI so any peer that hands the
+        user into the gear can publish without owning the publish UI.
+        Host pick: single-confirmed → use it; both → overlay."""
+        langcode = (last_project() or '').strip()
+        if not langcode:
+            return  # button shouldn't have been visible
+        status = get_credentials_status()
+        confirmed = []
+        if status.get('github', {}).get('confirmed'):
+            confirmed.append('github')
+        if status.get('gitlab', {}).get('confirmed'):
+            confirmed.append('gitlab')
+        if not confirmed:
+            self._set_publish_msg(_tr(
+                'Connect to GitHub or GitLab first to enable publish.'))
+            return
+        if len(confirmed) == 1:
+            self._do_publish(langcode, confirmed[0], status)
+            return
+        self._show_host_picker(langcode, status)
+
+    def _show_host_picker(self, langcode, status):
+        """Modal with one button per confirmed host, plus Cancel."""
+        from kivy.graphics import Color, RoundedRectangle
+        from kivy.uix.modalview import ModalView
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        view = ModalView(size_hint=(0.85, None), height=dp(280),
+                         auto_dismiss=False,
+                         background_color=theme.OVERLAY_DARK)
+        box = BoxLayout(orientation='vertical', padding=dp(16),
+                        spacing=dp(12))
+        with box.canvas.before:
+            Color(*theme.SURFACE)
+            box._bg = RoundedRectangle(pos=box.pos, size=box.size,
+                                       radius=[dp(8)])
+        box.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                 size=lambda w, s: setattr(w._bg, 'size', s))
+        prompt = Label(
+            text=_tr('Publish to which service?'),
+            color=theme.TEXT, font_size=sp(15),
+            size_hint_y=None, height=dp(48),
+            halign='center', valign='middle')
+        prompt.bind(size=lambda w, s: setattr(w, 'text_size', s))
+        box.add_widget(prompt)
+
+        def _make_btn(label, fill, on_release):
+            btn = Button(
+                text=label, size_hint_y=None, height=dp(48),
+                background_color=theme.TRANSPARENT, background_normal='',
+                color=(1, 1, 1, 1), font_size=sp(16), bold=True)
+            with btn.canvas.before:
+                Color(*fill)
+                btn._bg = RoundedRectangle(pos=btn.pos, size=btn.size,
+                                           radius=[dp(8)])
+            btn.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                     size=lambda w, s: setattr(w._bg, 'size', s))
+            btn.bind(on_release=on_release)
+            return btn
+
+        def _pick(host):
+            view.dismiss()
+            self._do_publish(langcode, host, status)
+
+        box.add_widget(_make_btn(
+            'GitHub', theme.GREEN, lambda *_: _pick('github')))
+        box.add_widget(_make_btn(
+            'GitLab', theme.GREEN, lambda *_: _pick('gitlab')))
+        box.add_widget(_make_btn(
+            _tr('Cancel'), theme.SURFACE, lambda *_: view.dismiss()))
+        view.add_widget(box)
+        view.open()
+
+    def _do_publish(self, langcode, host, status):
+        """Resolve project + URL, kick the worker thread."""
+        block = status.get(host, {}) or {}
+        user = (block.get('username', '') or '').strip()
+        if not user:
+            self._set_publish_msg(_tr(
+                'No {host} username on file.').format(host=host))
+            return
+        project = open_project(langcode)
+        if project is None or not project.working_dir:
+            self._set_publish_msg(_tr(
+                'Project {langcode} not found.').format(langcode=langcode))
+            return
+        domain = 'gitlab.com' if host == 'gitlab' else 'github.com'
+        remote_url = f'https://{domain}/{user}/{langcode}.git'
+        contributor = (status.get('contributor', '') or '').strip() or 'Recorder'
+        btn = self.ids.get('publish_btn')
+        if btn is not None:
+            btn.disabled = True
+        self._set_publish_msg(_tr('Publishing to {url}...').format(
+            url=remote_url))
+        threading.Thread(
+            target=self._publish_worker,
+            args=(project.working_dir, remote_url, contributor),
+            daemon=True).start()
+
+    def _publish_worker(self, working_dir, remote_url, contributor):
+        try:
+            result = init_project(working_dir, remote_url,
+                                  branch='main', contributor=contributor)
+            text = translate_result(result) or _tr('Done.')
+            # SERVER_UNAVAILABLE / SERVER_ERROR are wire-only codes
+            # (no S.* alias); rpc-failure wrappers stamp them as
+            # bare-string statuses, so check by string. The auth
+            # codes do have S.* aliases.
+            ok = not result.has_any(
+                'SERVER_UNAVAILABLE', 'SERVER_ERROR',
+                S.AUTH_REQUIRED, S.APP_NOT_INSTALLED,
+                S.REPO_NOT_AUTHORIZED, S.ACCESS_DENIED)
+        except Exception as ex:
+            text = _tr('Publish failed: {error}').format(error=str(ex))
+            ok = False
+        Clock.schedule_once(
+            lambda dt: self._publish_done(text, ok), 0)
+
+    def _publish_done(self, msg, ok):
+        self._set_publish_msg(msg)
+        # On success the project now has a remote_url, so a refresh
+        # naturally hides the publish row. On failure, re-enable so
+        # the user can retry.
+        self.refresh()
+
+    def _set_publish_msg(self, text):
+        msg = self.ids.get('publish_msg')
+        if msg is not None:
+            msg.text = text or ''
 
     def disconnect_github(self):
         # Wipe by overwriting with empty token (server.store.clear_github
@@ -626,14 +860,18 @@ class SettingsScreen(Screen):
 
 class GitHubConnectScreen(Screen):
     def on_pre_enter(self):
+        # Reset visible state on entry, but do NOT auto-fire begin().
+        # The "Connect to GitHub" button on the settings screen calls
+        # ``begin()`` explicitly after navigating here, so users still
+        # get one-tap entry into the device flow. Auto-firing here
+        # would re-trigger the flow whenever the screen tree was
+        # rebuilt for an unrelated reason — most visibly on every
+        # language change, since ``_set_ui_language`` clears + re-adds
+        # all screens.
         self.ids.gh_message.text = _tr('Starting device flow...')
         self.ids.gh_user_code.text = ''
-        # Begin button stays around as a Retry surface — re-enabled in
-        # the worker's failure path. We auto-fire begin() on entry so
-        # the user doesn't need an extra tap to kick off device flow.
-        self.ids.gh_begin_btn.disabled = True
+        self.ids.gh_begin_btn.disabled = False
         self._user_code = ''
-        Clock.schedule_once(lambda dt: self.begin(), 0)
 
     def begin(self):
         self.ids.gh_begin_btn.disabled = True
@@ -739,20 +977,54 @@ class GitLabFormScreen(Screen):
         self.ids.gl_token.text = ''
         self.ids.gl_msg.text = ''
 
-    def save(self):
+    def test(self):
+        """Save the entered credentials and immediately validate them
+        against gitlab.com. The single-button affordance avoids the
+        "did I press Save before Test?" footgun — Test is the only
+        operation, and on success the credentials are persisted."""
         u = self.ids.gl_user.text.strip()
         t = self.ids.gl_token.text.strip()
         if not u or not t:
             self.ids.gl_msg.text = _tr('Enter both username and token.')
             return
-        try:
-            save_gitlab_credentials(u, t)
-        except Exception as ex:
-            self.ids.gl_msg.text = _tr(
-                'Error: {error}').format(error=ex)
-            return
-        self.ids.gl_msg.text = _tr(
-            'Saved for {username}.').format(username=u)
+        self.ids.gl_test_btn.disabled = True
+        self.ids.gl_msg.text = _tr('Testing...')
+        threading.Thread(
+            target=self._test_worker, args=(u, t), daemon=True).start()
+
+    def _test_worker(self, username, token):
+        # Server-side: a successful test persists credentials and sets
+        # gitlab.confirmed=True in one shot. Failed tests neither save
+        # nor mark confirmed, so the user can correct the PAT and retry
+        # without first having to disconnect.
+        info = test_gitlab_credentials(username, token)
+        msg = self._format_test_result(info, username)
+        Clock.schedule_once(lambda dt: self._test_done(msg), 0)
+
+    def _format_test_result(self, info, username):
+        if not info.get('ok'):
+            return _tr('Server unavailable: {error}').format(
+                error=info.get('error', '') or '?')
+        if info.get('valid'):
+            return (_tr('Connected as {username}. Credentials saved.')
+                    .format(username=info.get('server_username', '')
+                            or username))
+        err = info.get('error', '') or 'unknown'
+        if err == 'invalid_token':
+            return _tr('Invalid token. Check your personal access token.')
+        if err == 'username_mismatch':
+            return _tr(
+                'Token is valid, but belongs to {server_username}, '
+                'not {username}.').format(
+                    server_username=info.get('server_username', '?'),
+                    username=username)
+        if err.startswith('network_error'):
+            return _tr('Network error — check your connection.')
+        return _tr('Test failed: {error}').format(error=err)
+
+    def _test_done(self, msg):
+        self.ids.gl_msg.text = msg
+        self.ids.gl_test_btn.disabled = False
 
 
 # ── App ─────────────────────────────────────────────────────────────────────

@@ -242,6 +242,43 @@ def diagnose_403(token, remote_url):
 _diagnose_403 = diagnose_403
 
 
+def test_gitlab_credentials(username, token):
+    """Hit GitLab's ``/api/v4/user`` with the supplied PAT and confirm
+    the returned ``username`` matches. Returns
+    ``{'valid': bool, 'server_username': str, 'error': str}`` —
+    callers translate to user-visible text."""
+    _ensure_ssl()
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+    if not username or not token:
+        return {'valid': False, 'server_username': '',
+                'error': 'missing_username_or_token'}
+    req = Request(
+        'https://gitlab.com/api/v4/user',
+        headers={'PRIVATE-TOKEN': token},
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except HTTPError as e:
+        if e.code in (401, 403):
+            return {'valid': False, 'server_username': '',
+                    'error': 'invalid_token'}
+        return {'valid': False, 'server_username': '',
+                'error': f'http_{e.code}'}
+    except URLError as e:
+        return {'valid': False, 'server_username': '',
+                'error': f'network_error: {e.reason}'}
+    except Exception as e:
+        return {'valid': False, 'server_username': '',
+                'error': f'{type(e).__name__}: {e}'}
+    server_username = data.get('username', '') or ''
+    if server_username.lower() != username.lower():
+        return {'valid': False, 'server_username': server_username,
+                'error': 'username_mismatch'}
+    return {'valid': True, 'server_username': server_username, 'error': ''}
+
+
 def add_collaborator(owner, repo_name, collaborator, token):
     """Add *collaborator* to *owner/repo_name* on GitHub. Silently succeeds if
     already a collaborator or if the invitation was already sent."""

@@ -15,6 +15,9 @@ Endpoints:
                                                username, token_time?}
     POST /v1/credentials/github/app_installed {installed}
     POST /v1/credentials/gitlab               {username, token}
+    POST /v1/credentials/gitlab/test          {username?, token?}
+                                              — falls back to stored creds
+                                                if body fields are absent
     POST /v1/credentials/migrate_from_prefs   {prefs_path}
     POST /v1/sync                             {project_dir, contributor}
                                               — creds come from the store
@@ -416,6 +419,29 @@ def _h_set_gitlab(body):
         return 400, {"ok": False, "error": "missing_username_or_token"}
     store.set_gitlab(username, token)
     return 200, {"ok": True}
+
+
+def _h_test_gitlab(body):
+    """Validate GitLab credentials by hitting ``/api/v4/user``. If
+    ``username`` / ``token`` are absent in the body, fall back to the
+    stored values so callers can re-test what's already saved without
+    having the user retype the PAT.
+
+    On a successful test the credentials are persisted and the
+    ``confirmed`` flag is set, so the UI's single Test button covers
+    both save and verify in one user gesture."""
+    username = body.get('username', '') or ''
+    token = body.get('token', '') or ''
+    if not username or not token:
+        stored_user, stored_token = store.get_gitlab()
+        username = username or stored_user
+        token = token or stored_token
+    from . import auth as _auth
+    info = _auth.test_gitlab_credentials(username, token)
+    if info.get('valid'):
+        store.set_gitlab(username, token)
+        store.set_gitlab_confirmed(True)
+    return 200, {"ok": True, **info}
 
 
 def _h_migrate_from_prefs(body):
@@ -843,6 +869,8 @@ def dispatch(method, path, body):
             return _h_set_github_app_installed(body)
         if path == '/v1/credentials/gitlab':
             return _h_set_gitlab(body)
+        if path == '/v1/credentials/gitlab/test':
+            return _h_test_gitlab(body)
         if path == '/v1/credentials/migrate_from_prefs':
             return _h_migrate_from_prefs(body)
         if path == '/v1/projects/register':

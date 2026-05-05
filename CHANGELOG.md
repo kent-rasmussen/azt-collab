@@ -11,6 +11,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.18.0 + azt_collab_client 0.22.0 — settings UX cleanup
+- **GitLab "Connect" + Test button.** The settings screen's GitLab
+  affordance is now labelled "Connect to GitLab" (was "Set GitLab
+  credentials") to match GitHub's wording. The form screen replaces
+  the bare "Save" button with a single "Test connection" button: the
+  daemon-side `_h_test_gitlab` endpoint runs a live check against
+  `gitlab.com/api/v4/user`, and only on success does it persist the
+  credentials and stamp `gitlab.confirmed=True` in the store, so the
+  user can't end up with a stored bad token. New endpoint
+  `POST /v1/credentials/gitlab/test` (falls back to stored creds if
+  body fields are empty) and client wrapper
+  `test_gitlab_credentials(username, token)`.
+- **Per-host `confirmed` flag.** `get_credentials_status()` now
+  reports `github.confirmed` (derived: `connected AND app_installed`)
+  and `gitlab.confirmed` (persisted; cleared on save, set on a
+  successful Test). There is no longer a single "active host" — both
+  hosts can be confirmed independently, and consumers (publish flow
+  below, future sync flows) pick one based on context.
+- **"Publish &lt;langcode&gt; data" button on the settings screen.**
+  Visible only when `last_project()` resolves to a langcode whose
+  project doesn't already have a remote; enabled when at least one
+  host is `confirmed`. On click, single-confirmed hosts publish
+  directly via `init_project(working_dir, remote_url, ...)`; both
+  confirmed surfaces a small overlay so the user picks GitHub or
+  GitLab. Mirrors the recorder's `do_publish` flow but moves it into
+  the daemon UI, so any peer that exposes the gear can publish
+  without owning the publish UI.
+- **GitHub device flow no longer auto-fires on screen rebuild.**
+  `GitHubConnectScreen.on_pre_enter` previously kicked the device
+  flow on every entry, which meant a language-change rebuild — which
+  clears + re-adds every screen — re-launched device flow even though
+  the user was nowhere near the GitHub screen. The auto-start now
+  lives on the explicit "Connect to GitHub" button via the new
+  `SettingsScreen.connect_github()`, so language changes (and any
+  other rebuild) leave the GitHub screen quiet.
+
 ### azt_collabd 0.16.0 + azt_collab_client 0.20.0 — sticky-bound server APK service + persistent scheduler jobs
 - **Server APK lifetime fix.** The picker Activity now leaves the
   Python process running on Android instead of calling `App.stop()` /
