@@ -7,14 +7,30 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.24.0"
-# 0.16.0 floor: the daemon now persists scheduler jobs across
-# kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
+__version__ = "0.25.0"
+# Floor on the azt_collabd version this client is willing to talk
+# to. ``check_server_compat()`` returns ``server_too_old`` when the
+# running daemon is below this; peer apps surface that to the user
+# as "please update the AZT collaboration service."
+#
+# 0.16.0 floor: the daemon now persists scheduler jobs across kills
+# (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
 # job_ids on respawn, so poll_job returns None and the peer can't
-# distinguish "never existed" from "interrupted." Bumping the floor
-# forces the user to update the server APK / azt_collabd if the
-# peer ships against 0.20+ client.
-MIN_SERVER_VERSION = "0.16.0"
+# distinguish "never existed" from "interrupted."
+#
+# 0.25.0 floor: synchronized release. The daemon now stamps
+# `last_project` on every langcode-bound RPC and exposes new
+# endpoints (`/v1/recent/last_project`, `/v1/credentials/gitlab/test`)
+# that this client uses; new dataclass fields (`Project.last_commit`,
+# `ProjectStatus.commits_ahead`) require the daemon to populate them;
+# `_h_init_project` writes `remote_url` / `last_sync` / `last_commit`
+# back to projects.json; the post-push remote-mirror update keeps
+# `commits_ahead` honest; `_resolve_path` consults
+# `projects.json::working_dir` instead of assuming dirname ==
+# langcode. A 0.25 client against a pre-0.25 daemon would silently
+# lose all of these. Lock-step bump intended to flush every peer APK
+# through a rebuild.
+MIN_SERVER_VERSION = "0.25.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
 )

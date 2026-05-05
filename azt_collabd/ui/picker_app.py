@@ -448,54 +448,28 @@ class PickerApp(App):
         self.stop()
 
     def _navigate_back(self):
-        """If we're on a non-picker screen (settings, github, gitlab,
-        langpicker), pop back one step and return True. Each screen
-        can override the target via a ``back_to`` StringProperty;
-        default falls through to ``'picker'``. Returns False on the
-        picker itself so callers can proceed with their close
-        behavior.
+        """Handle a back-press inside the picker subprocess.
 
-        Special case for ``langpicker``: a user who reached the
-        language-picker via Start-New and then changed their mind
-        almost certainly wants to return to whatever project they had
-        before, not be parked back at the project list. So when the
-        host has a ``last_project()`` that still resolves to a live
-        registered project, back-from-langpicker emits that project
-        and exits the picker subprocess (the recorder receives it and
-        auto-resumes). If no last project is recorded — cold start
-        with nothing previously opened — fall through to the default
-        'picker' target so the user still has somewhere to go."""
-        if not hasattr(self, 'sm') or self.sm.current == 'picker':
+        Three classes of screen, three behaviours:
+
+        * Sub-screens with somewhere to go (settings / github / gitlab
+          when reached from the picker) — pop back to the screen named
+          by ``back_to`` (default ``'picker'``).
+        * The project-picker screen itself and the langpicker — exit
+          the picker subprocess and return the user to the recorder.
+          When ``last_project()`` resolves to a live registered
+          project we emit it so the recorder auto-resumes; otherwise
+          we emit a clean cancel (the recorder's ``_handle_pick``
+          silently returns to whatever it was showing). Either way
+          the user lands on the recorder, never on a stale picker
+          screen with one more back-press needed to actually exit.
+        * Anything else with no ``back_to`` and no matching screen
+          — return False so Kivy / Android default-close fires."""
+        if not hasattr(self, 'sm'):
             return False
-        if self.sm.current == 'langpicker':
-            # Back from langpicker always exits the picker subprocess
-            # — a user who reached Start-New and changed their mind
-            # wants to be back on the recorder, not be re-parked at
-            # the project list (which is what the previous "fall
-            # through to 'picker'" behaviour did, requiring a second
-            # back-press to actually exit). When ``last_project``
-            # resolves, emit it so the recorder auto-resumes; when it
-            # doesn't, emit a clean cancel so the recorder's
-            # ``_handle_pick`` silently returns the user to whatever
-            # it was showing. Either branch ends the subprocess.
-            try:
-                from azt_collab_client import last_project, open_project
-                langcode = (last_project() or '').strip()
-                project = open_project(langcode) if langcode else None
-            except Exception:
-                project = None
-            if project is not None and project.lift_exists \
-                    and project.lift_path:
-                print(f'[picker_app] langpicker back → resuming '
-                      f'last_project={langcode!r}',
-                      file=sys.stderr, flush=True)
-                self._emit_and_quit(project.lift_path,
-                                    langcode=langcode)
-            else:
-                print('[picker_app] langpicker back → no resumable '
-                      'last_project; emitting cancel',
-                      file=sys.stderr, flush=True)
-                self._emit_cancel_and_quit()
+        if self.sm.current in ('picker', 'langpicker'):
+            self._exit_to_last_project_or_cancel(
+                from_screen=self.sm.current)
             return True
         cur = (self.sm.get_screen(self.sm.current)
                if self.sm.has_screen(self.sm.current) else None)
@@ -504,6 +478,28 @@ class PickerApp(App):
             self.sm.current = target
             return True
         return False
+
+    def _exit_to_last_project_or_cancel(self, from_screen):
+        """Emit ``last_project`` if it resolves; cancel otherwise.
+        Centralised so both back-from-picker and back-from-langpicker
+        produce the same exit shape."""
+        try:
+            from azt_collab_client import last_project, open_project
+            langcode = (last_project() or '').strip()
+            project = open_project(langcode) if langcode else None
+        except Exception:
+            project = None
+        if project is not None and project.lift_exists \
+                and project.lift_path:
+            print(f'[picker_app] {from_screen} back → resuming '
+                  f'last_project={langcode!r}',
+                  file=sys.stderr, flush=True)
+            self._emit_and_quit(project.lift_path, langcode=langcode)
+        else:
+            print(f'[picker_app] {from_screen} back → no resumable '
+                  f'last_project; emitting cancel',
+                  file=sys.stderr, flush=True)
+            self._emit_cancel_and_quit()
 
     def _on_back_button(self, _window, key, *_args):
         """Window keyboard hook for Android hardware back (key 27).

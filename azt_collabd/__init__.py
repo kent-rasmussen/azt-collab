@@ -17,7 +17,7 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.21.3"
+__version__ = "0.25.0"
 
 # Floor on the azt_collab_client version this daemon is willing to talk
 # to. Published on /v1/health so the client compares locally and a peer
@@ -44,7 +44,19 @@ __version__ = "0.21.3"
 # ``check_server_compat()`` so the user is prompted to update the
 # peer APK, instead of debugging the silent loop. Saved-memory note
 # in feedback_min_client_version.md applies.
-MIN_CLIENT_VERSION = "0.23.0"
+#
+# 0.25.0 floor: synchronized release with azt_collab_client 0.25.0.
+# Lock-step bump intended to flush every peer APK through a rebuild
+# so the cumulative work since the prior synchronization point —
+# RPC-based recent state, picker auto-retry on RESULT_CANCELED-with-
+# data, picker→last_project back-press, sync-chain logcat traces,
+# `:provider` stdio bridge, dulwich `repo.refs.get` → `__getitem__`
+# fix, post-push remote-mirror update, URI-resolution decoupled from
+# on-disk dir name, `commits_ahead` field, `last_commit` field,
+# server-canonical `last_project`, GitLab Test button + per-host
+# `confirmed` flag, settings UI Publish-by-langcode flow — all land
+# at once in every peer.
+MIN_CLIENT_VERSION = "0.25.0"
 
 from . import config
 from . import net

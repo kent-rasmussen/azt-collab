@@ -11,6 +11,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.25.0 + azt_collab_client 0.25.0 — synchronized release
+- Lock-step version bump of both packages plus their cross-floors:
+  `azt_collabd.MIN_CLIENT_VERSION` → 0.25.0,
+  `azt_collab_client.MIN_SERVER_VERSION` → 0.25.0. Intended to flush
+  every peer APK through a rebuild so the cumulative work since the
+  prior synchronization point lands in lockstep across the suite.
+  The user-visible content of this release is the union of every
+  entry below, plus the four-month gap of additive changes that
+  preceded them. After this synchronization any peer running an
+  older bundled client will surface `client_too_old` from
+  `check_server_compat()` and any client talking to an older daemon
+  will surface `server_too_old`, prompting an update on either side
+  rather than silently degrading.
+- Notable behaviour requiring lock-step:
+  - `last_project` server-tracked via `/v1/recent/last_project`
+    (older clients keep using their own sandbox, breaking on
+    Android).
+  - GitLab Test button drives `_h_test_gitlab` and the new per-host
+    `confirmed` flag.
+  - `Project.last_commit`, `ProjectStatus.commits_ahead` exposed on
+    the wire; `_h_init_project` writes `last_sync` / `last_commit`
+    back to projects.json on a successful publish.
+  - `_resolve_path` reads `working_dir` from the registry; URIs
+    decouple from on-disk dir naming.
+  - `:provider` stdio bridge so daemon `print(..., file=sys.stderr)`
+    actually reaches logcat.
+  - dulwich `repo.refs[name]` (with `KeyError`) replaces the
+    incorrect `.get()` call that was failing every sync silently;
+    post-push remote-mirror update fixes `(+N)` indicator stickiness.
+
+### azt_collabd 0.21.4 + azt_collab_client 0.24.0 — back from picker also returns to last project
+- 0.21.3 only special-cased the BCP-47 langpicker; back from the
+  *project picker screen itself* still hit the `if self.sm.current
+  == 'picker': return False` early exit and let Android close the
+  Activity with `RESULT_CANCELED`. The user's case from logcat —
+  picker screen opens, back press, no `[picker_app]` trace at all,
+  recorder receives an empty cancel — is exactly that path. New
+  `_exit_to_last_project_or_cancel` helper centralises the
+  emit-resumable-or-cancel shape, called from both the `picker` and
+  `langpicker` branches of `_navigate_back`. Either exits the
+  picker subprocess in one back-press, with the recorder receiving
+  either the resumable project or a clean cancel.
+
 ### azt_collabd 0.21.3 + azt_collab_client 0.24.0 — back-from-langpicker always exits subprocess
 - 0.21.1 added the langpicker→last_project special case but only
   when `last_project()` resolved; otherwise it fell through to the
