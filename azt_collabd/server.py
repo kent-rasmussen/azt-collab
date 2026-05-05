@@ -487,13 +487,20 @@ def _touch_project(langcode):
         return
     try:
         store.set_last_langcode(langcode)
+        print(f'[recent] _touch_project({langcode!r}) → '
+              f'{store._config_path()!r}',
+              file=sys.stderr, flush=True)
     except Exception as ex:
         print(f'[recent] _touch_project({langcode!r}) failed: {ex}',
               file=sys.stderr, flush=True)
 
 
 def _h_get_last_project(_body):
-    return 200, {"ok": True, "langcode": store.get_last_langcode()}
+    val = store.get_last_langcode()
+    print(f'[recent] GET /v1/recent/last_project → {val!r} '
+          f'(from {store._config_path()!r})',
+          file=sys.stderr, flush=True)
+    return 200, {"ok": True, "langcode": val}
 
 
 def _h_set_last_project(body):
@@ -502,7 +509,11 @@ def _h_set_last_project(body):
     — but the wrapper exists so peers that genuinely want to *clear*
     the recent slot (or pin a different project than the one they
     just touched) have an affordance."""
-    store.set_last_langcode(body.get('langcode', '') or '')
+    val = body.get('langcode', '') or ''
+    store.set_last_langcode(val)
+    print(f'[recent] POST /v1/recent/last_project ← {val!r} '
+          f'(to {store._config_path()!r})',
+          file=sys.stderr, flush=True)
     return 200, {"ok": True}
 
 
@@ -549,11 +560,19 @@ def _h_init_project(body):
         return 500, {"ok": False, "error": str(ex)}
     # Stamp recent on whichever langcode this working_dir maps to —
     # init_project is what publish flows through, so the project is
-    # certainly in active use.
+    # certainly in active use. Also write the remote_url back into
+    # projects.json so subsequent reads (e.g. the publish button's
+    # visibility check via Project.remote_url) reflect that the
+    # project is now published. _init_repo updates the *local* git
+    # config but the project registry is a separate datastore;
+    # without this back-write the publish row stays visible after a
+    # successful publish, prompting the user to publish a second time.
     try:
         for p in projects.list_all():
             if os.path.abspath(p.working_dir) == os.path.abspath(working_dir):
                 _touch_project(p.langcode)
+                if remote_url and p.remote_url != remote_url:
+                    projects.set_remote_url(p.langcode, remote_url)
                 break
     except Exception:
         pass

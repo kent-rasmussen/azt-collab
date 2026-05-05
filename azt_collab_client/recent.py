@@ -29,6 +29,8 @@ the picker emits in its result and that ``open_project()`` accepts.
 recent again as a side effect.
 """
 
+import sys
+
 from .rpc import call, ServerUnavailable
 
 
@@ -38,11 +40,18 @@ def last_project() -> str:
     touched yet."""
     try:
         resp = call('GET', '/v1/recent/last_project')
-    except ServerUnavailable:
+    except ServerUnavailable as ex:
+        print(f'[recent] last_project: ServerUnavailable: {ex}',
+              file=sys.stderr, flush=True)
         return ''
     if not resp.get('ok'):
+        print(f'[recent] last_project: not ok, resp={resp!r}',
+              file=sys.stderr, flush=True)
         return ''
-    return (resp.get('langcode', '') or '').strip()
+    val = (resp.get('langcode', '') or '').strip()
+    print(f'[recent] last_project → {val!r}',
+          file=sys.stderr, flush=True)
+    return val
 
 
 def set_last_project(langcode: str) -> None:
@@ -55,5 +64,9 @@ def set_last_project(langcode: str) -> None:
     try:
         call('POST', '/v1/recent/last_project',
              {'langcode': langcode or ''})
-    except ServerUnavailable:
-        pass
+        print(f'[recent] set_last_project({langcode!r}) sent',
+              file=sys.stderr, flush=True)
+    except ServerUnavailable as ex:
+        print(f'[recent] set_last_project({langcode!r}): '
+              f'ServerUnavailable: {ex}',
+              file=sys.stderr, flush=True)

@@ -47,6 +47,7 @@ from azt_collab_client import (
     last_project,
     mark_github_app_installed,
     open_project,
+    project_status,
     save_github_tokens,
     save_gitlab_credentials,
     test_gitlab_credentials,
@@ -646,8 +647,22 @@ class SettingsScreen(Screen):
         project = self._pick_publish_candidate()
         if project is None:
             return
-        if (project.remote_url or '').strip():
-            # Already published — nothing to do here.
+        # Authoritative remote_url comes from project_status, which
+        # reads the live git config. The Project's remote_url is the
+        # cached projects.json value — pre-0.20.1 daemons forgot to
+        # write it back on a successful init_project, so existing
+        # published projects can have an empty cached remote_url even
+        # though their working_dir's `.git/config` lists origin
+        # correctly. Trusting Project.remote_url alone would re-show
+        # the publish button on those repos forever.
+        live_remote_url = (project.remote_url or '').strip()
+        try:
+            ps = project_status(project.langcode)
+        except Exception:
+            ps = None
+        if ps is not None and (ps.remote_url or '').strip():
+            live_remote_url = ps.remote_url.strip()
+        if live_remote_url:
             return
         langcode = project.langcode
         gh_confirmed = bool(status.get('github', {}).get('confirmed'))

@@ -11,6 +11,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.20.3 + azt_collab_client 0.23.3 — recent-state stderr trace
+- Diagnostic prints around every read/write of `last_langcode`:
+  daemon-side `[recent] _touch_project(...) → /path/to/config.json`,
+  `[recent] GET /v1/recent/last_project → 'lang' (from /path/...)`,
+  and matching `POST` line; client-side
+  `[recent] last_project → 'lang'` / `set_last_project(...) sent` /
+  `ServerUnavailable: ...`. Pairs the path being written with the
+  path being read so a divergent-`$AZT_HOME` bug shows up in logcat
+  side-by-side instead of having to be inferred. No behaviour change.
+
+### azt_collabd 0.20.2 + azt_collab_client 0.23.2 — MIN_CLIENT_VERSION floor for the recent.py RPC migration
+- **`MIN_CLIENT_VERSION` raised to 0.23.0.** Pre-0.23 clients keep
+  reading `$AZT_HOME/config.json::recent.last_langcode` from their
+  own package's filesDir, which on Android sits in a different
+  sandbox from the daemon's. The daemon stamps last_project on
+  every langcode-bound RPC, but the peer's bundled client never sees
+  it — recorder auto-resume falls through to the picker on every
+  restart. Bumping the floor makes `check_server_compat()` return
+  `client_too_old` instead of silently degrading, so the recorder
+  surfaces the "please update" warning. Saved-memory note
+  `feedback_min_client_version.md` documents this exact failure mode.
+
+### azt_collabd 0.20.1 + azt_collab_client 0.23.2 — publish-row sticking after success
+- **`_h_init_project` writes remote_url back to `projects.json`.**
+  Symptom: a publish that returned `PUSHED` left the project's
+  `Project.remote_url` empty in the registry, so the settings UI
+  immediately re-rendered the publish row asking the user to publish
+  again. `_init_repo` updates the *local* git config but the
+  registry is a separate datastore; the back-write was missing. Now
+  the daemon walks `projects.list_all()`, finds the entry whose
+  `working_dir` matches, and writes the URL via
+  `projects.set_remote_url`.
+- **`_pick_publish_candidate` consults the live git remote.** Even
+  with the back-write fix, projects published before 0.20.1 carry
+  an empty cached `remote_url`. The settings UI now also reads the
+  authoritative value via `project_status(langcode).remote_url`
+  (which checks `.git/config`); the row hides if either source
+  reports a remote. Defensive belt-and-braces so existing published
+  repos behave correctly without a manual reconcile.
+
 ### azt_collabd 0.20.0 + azt_collab_client 0.23.1 — `commits_ahead` on ProjectStatus
 - **`commits_ahead: int` on `ProjectStatus`.** Filed by recorder
   1.37.6 in `NOTES_TO_DAEMON.md`: the recorder's sync indicator
