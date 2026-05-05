@@ -1,6 +1,6 @@
 # azt-collab
 
-Shared collaboration backend for the A-Z+T suite of linguistic tools.
+Shared collaboration backend for the A-Z+T suite of linguistic tools. To use, install https://github.com/apps/azt-collaboration in your GitHub account and authorize
 
 A single local daemon (`azt_collabd`) per device manages git
 collaboration for LIFT projects: GitHub/GitLab credentials, project
