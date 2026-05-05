@@ -700,6 +700,15 @@ class PickerApp(App):
         in the _PickerRoot KV) so the user can return."""
         self.sm.current = 'settings'
 
+    def share_apk(self):
+        """Settings screen's "Share this app" button. Same shape as
+        ``CollabUIApp.share_apk`` — both host the SettingsScreen, so
+        the KV's ``app.share_apk()`` resolves on either app. Reuses
+        the existing ``_show_error`` modal for failures."""
+        from azt_collab_client.ui import share_running_apk
+        share_running_apk(filename='azt_collab.apk',
+                          on_error=self._show_error)
+
     # ── Create flow: "I have one on my phone" ─────────────────────────
     def open_file(self):
         """Native file chooser → best-effort register → emit path."""

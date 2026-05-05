@@ -34,7 +34,9 @@ from kivy.uix.screenmanager import (
 
 import azt_collab_client
 from azt_collab_client import i18n as _client_i18n
-from azt_collab_client.ui import register_charis, theme
+from azt_collab_client.ui import (
+    icon_path, register_charis, share_running_apk, theme,
+)
 
 import azt_collabd
 from azt_collabd.status import AuthError
@@ -70,6 +72,7 @@ KV_TEMPLATE = '''
 #:import T azt_collab_client.ui.theme
 #:import _ azt_collab_client.translate.tr
 #:set FONT '{font_name}'
+#:set SHARE_ICON '{share_icon}'
 
 <RootSM>:
     SettingsScreen:
@@ -234,6 +237,25 @@ KV_TEMPLATE = '''
                     opacity: 1 if root.back_to else 0
                     disabled: not root.back_to
                     on_release: app.go(root.back_to) if root.back_to else None
+                # ── Share this app ─────────────────────────────────────
+                # No-op on desktop (share_running_apk surfaces a
+                # translated "Android only" message via on_error); on
+                # Android this shares the running server APK so a user
+                # can hand it to a teammate that needs the daemon.
+                RecBtn:
+                    text: _('Share this app')
+                    halign: 'left'
+                    padding: [dp(52), 0]
+                    text_size: self.size
+                    valign: 'middle'
+                    normal_color: T.SURFACE
+                    on_release: app.share_apk()
+                    Image:
+                        source: SHARE_ICON
+                        size_hint: None, None
+                        size: dp(24), dp(24)
+                        x: self.parent.x + dp(16)
+                        center_y: self.parent.center_y
                 SectionLabel:
                     text: _('Interface language')
                 BoxLayout:
@@ -477,7 +499,10 @@ def register_kv(font_name='Roboto'):
     global _kv_loaded
     if _kv_loaded:
         return
-    Builder.load_string(KV_TEMPLATE.format(font_name=font_name))
+    Builder.load_string(KV_TEMPLATE.format(
+        font_name=font_name,
+        share_icon=icon_path('share_dark'),
+    ))
     _kv_loaded = True
 
 
@@ -1125,6 +1150,26 @@ class CollabUIApp(App):
 
     def go(self, name):
         self.sm.current = name
+
+    def share_apk(self):
+        """Hand the running server APK to Android's share sheet so the
+        user can send it to a teammate. No-op (with a translated
+        error popup) on desktop — there's no APK to share."""
+        share_running_apk(filename='azt_collab.apk',
+                          on_error=self._show_error)
+
+    def _show_error(self, msg):
+        """Minimal error popup for share_apk. The settings screen has
+        no inline status surface for app-level errors; a popup is loud
+        enough to not be missed and dismissable in one tap."""
+        from kivy.uix.popup import Popup
+        from kivy.uix.label import Label
+        Popup(
+            title=_tr('Error'),
+            content=Label(text=str(msg), color=theme.TEXT,
+                          font_size=sp(14)),
+            size_hint=(0.85, None), height=dp(220),
+        ).open()
 
 
 def main():

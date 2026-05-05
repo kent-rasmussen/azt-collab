@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.25.1\n"
+"Project-Id-Version: azt_collab_client 0.25.2\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -80,6 +80,24 @@ msgstr "Installez-le pour activer la synchronisation, puis rouvrez cette applica
 
 msgid "Open install page"
 msgstr "Ouvrir la page d'installation"
+
+msgid "Share this app"
+msgstr "Partager cette application"
+
+msgid "Share app"
+msgstr "Partager l'application"
+
+msgid "APK sharing is only available on Android."
+msgstr "Le partage d'APK est uniquement disponible sur Android."
+
+msgid "Share failed: could not create MediaStore entry"
+msgstr "Échec du partage : impossible de créer l'entrée MediaStore"
+
+msgid "Could not share APK:\n{error}"
+msgstr "Impossible de partager l'APK :\n{error}"
+
+msgid "Error"
+msgstr "Erreur"
 
 msgid "Dismiss"
 msgstr "Fermer"

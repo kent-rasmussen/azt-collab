@@ -11,6 +11,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.25.2 — "Share this app" on the settings screen
+- Added a Share-this-app row to `<SettingsScreen>` (`azt_collabd/ui/app.py`),
+  positioned right under the Back NavBtn so it leads the scrollable
+  body the same way the recorder's settings screen does. Hands the
+  running server APK to Android's share sheet via the existing
+  `azt_collab_client.ui.share_running_apk` helper — useful for
+  onboarding teammates to the collab service. Hosted by both the
+  standalone `python -m azt_collabd ui` (`CollabUIApp.share_apk`) and
+  the in-process settings reached from the picker's gear
+  (`PickerApp.share_apk`); the KV's `app.share_apk()` resolves on
+  whichever App owns the screen at runtime.
+- Icon (`share_dark.png`) sourced via `azt_collab_client.ui.icon_path`
+  and threaded into the KV through `register_kv` next to the existing
+  font-name substitution. Desktop hosts get the button too; tapping
+  it surfaces the translated "APK sharing is only available on
+  Android." message via the helper's `on_error` callback.
+- French translations added for `Share this app`, `Share app`, `Error`,
+  and the three `share_running_apk` failure messages
+  (`APK sharing is only available on Android.`, the MediaStore-insert
+  failure, the generic `Could not share APK:` wrapper).
+
 ### azt_collab_client 0.25.2 — public `ensure_mo` for peers
 - `azt_collab_client.i18n.ensure_mo(locale_dir, domain, lang)` exposes
   the lazy `.po` → `.mo` compile path peers were previously missing.
