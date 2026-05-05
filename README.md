@@ -1,6 +1,12 @@
 # azt-collab
 
-Shared collaboration backend for the A-Z+T suite of linguistic tools. To use, install https://github.com/apps/azt-collaboration in your GitHub account and authorize
+Shared collaboration backend for the A-Z+T suite of linguistic tools. 
+To use, 
+1. Create an account on https://github.com, if you don't already have one
+2. install https://github.com/apps/azt-collaboration in your GitHub account and 
+3. authorize:
+- with "All repositories" allows the app to create repositories for you (start here)
+- with selected respositories, the app will be able to share via those repositories for you.
 
 A single local daemon (`azt_collabd`) per device manages git
 collaboration for LIFT projects: GitHub/GitLab credentials, project
