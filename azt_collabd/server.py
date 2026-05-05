@@ -578,21 +578,36 @@ def _h_init_project(body):
                             branch, contributor)
     except Exception as ex:
         return 500, {"ok": False, "error": str(ex)}
-    # Stamp recent on whichever langcode this working_dir maps to —
-    # init_project is what publish flows through, so the project is
-    # certainly in active use. Also write the remote_url back into
-    # projects.json so subsequent reads (e.g. the publish button's
-    # visibility check via Project.remote_url) reflect that the
-    # project is now published. _init_repo updates the *local* git
-    # config but the project registry is a separate datastore;
-    # without this back-write the publish row stays visible after a
-    # successful publish, prompting the user to publish a second time.
+    # On success update the registry to reflect the new state:
+    #
+    #   * ``_touch_project`` — publish is active use; mark recent.
+    #   * ``set_remote_url``  — _init_repo writes the local git config
+    #     but the registry is a separate datastore; without this
+    #     back-write the publish row stays visible after a successful
+    #     publish.
+    #   * ``set_last_sync`` on PUSHED — without it the recorder's
+    #     "not backed up" warning persists forever after a successful
+    #     publish, because the indicator reads ``last_sync == 0`` as
+    #     "never synced." Sister handlers in ``scheduler._run_sync`` /
+    #     ``_h_project_sync`` already stamp this; init_project was the
+    #     odd one out.
+    #   * ``set_last_commit`` on COMMITTED / COMMITTED_AND_PUSHED —
+    #     same idea for the commit timestamp peers display alongside.
+    codes = result.codes()
     try:
         for p in projects.list_all():
             if os.path.abspath(p.working_dir) == os.path.abspath(working_dir):
                 _touch_project(p.langcode)
                 if remote_url and p.remote_url != remote_url:
                     projects.set_remote_url(p.langcode, remote_url)
+                if ('PUSHED' in codes
+                        or 'COMMITTED_AND_PUSHED' in codes):
+                    projects.set_last_sync(p.langcode)
+                if ('COMMITTED' in codes
+                        or 'COMMITTED_AND_PUSHED' in codes
+                        or 'COMMITTED_LOCAL' in codes
+                        or 'COMMITTED_NO_REMOTE' in codes):
+                    projects.set_last_commit(p.langcode)
                 break
     except Exception:
         pass

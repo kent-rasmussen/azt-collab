@@ -11,6 +11,116 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.21.0 + azt_collab_client 0.24.0 — sync was failing every cycle; remote-mirror not bumped after push
+- **Sync was raising `AttributeError` on every cycle.** Pre-0.21.0
+  `_sync_repo_locked` did `repo.refs.get(branch_ref) or repo.head()`,
+  but `dulwich.refs.DiskRefsContainer` has no `.get()` method — only
+  `__getitem__` (raises `KeyError`) and `read_ref()`. The call
+  raised `AttributeError` post-fetch on every sync, propagated to
+  `scheduler._fire`'s catch-all, and the job was marked
+  `PUSH_FAILED`. Symptom: commits piled up locally but never
+  pushed; "I see Audio recordings by Recorder commits showing up on
+  GitHub minutes apart" was the queue draining whenever a build
+  with the diagnostic try/except (added in 0.20.9) happened to be
+  running. Replaced with a small `_read_ref(name)` helper that
+  uses `__getitem__` + `KeyError`. Both `branch_ref` and
+  `remote_ref` reads, plus the retry-loop's post-fetch read, now
+  use it.
+- **`commits_ahead` stuck at `(+N)` after a successful push.**
+  Symptom: `[sync] done: codes=['NOTHING_TO_COMMIT', 'PUSHED']` ran
+  cleanly but the recorder's indicator kept showing `(+10)`. Cause:
+  `porcelain.push` advances the remote on GitHub but doesn't update
+  the *local mirror* `refs/remotes/origin/<branch>` —
+  `_count_commits_ahead` then compares the just-pushed `local_sha`
+  against the pre-push mirror and reports the count of just-pushed
+  commits as still-pending. Bumping the mirror explicitly after a
+  successful push (`repo.refs[remote_ref] = local_sha`) reflects
+  what CLI `git push` does and lets `commits_ahead` read 0 on the
+  next status poll.
+
+### azt_collabd 0.20.9 + azt_collab_client 0.24.0 — sync-hang trace, post-fetch ref reads
+- The 0.20.8 trace narrowed the hang to the `local_sha = repo.refs.get(...)
+  or repo.head()` line, so 0.20.9 splits that into separate
+  `[sync-trace]` prints around `repo.refs.get(branch_ref)`,
+  `repo.head()`, and `repo.refs.get(remote_ref)`. Whichever call
+  doesn't produce its trailing print is where dulwich is wedging.
+  Each is wrapped in try/except to surface a raise vs a hang
+  cleanly.
+
+### azt_collabd 0.20.8 + azt_collab_client 0.24.0 — sync-hang trace
+- `[sync-trace]` prints between every step in `_sync_repo_locked`
+  after the fetch (`fetch begin/done`, `local_sha`, `remote_sha`,
+  `needs_merge`, `fast-forward`/`local ahead`/`merge_diverged
+  begin/done`, `push loop begin`, `push attempt`, `push done`/`push
+  raised`). Pinpoints exactly which step wedges between fetch
+  returning and the function exiting — your latest log shows
+  `fetch` returning HTTP 200 followed by silence until the next
+  status-poll, so the hang is somewhere between `local_sha = ...`
+  and the `push` HTTPS call.
+
+### azt_collabd 0.20.7 + azt_collab_client 0.24.0 — last_sync on publish + `:provider` stdio bridge
+- **Publish stamps `last_sync` / `last_commit`.** `_h_init_project`
+  ran the publish (commit + push) and updated `remote_url` in
+  `projects.json`, but did **not** stamp `last_sync` from the result
+  codes. Sister handlers in `scheduler._run_sync` and
+  `_h_project_sync` already did. Symptom: a successful publish left
+  `Project.last_sync == 0`, the recorder's UI read that as "never
+  synced" and kept showing the "data isn't being backed up" warning
+  forever — even though the repo was sitting on github.com fully
+  pushed. After this fix, a publish that returns `PUSHED` (or
+  `COMMITTED_AND_PUSHED`) immediately stamps `last_sync` so the
+  indicator flips on the next refresh.
+- **Daemon prints now reach logcat.** `server_apk/service.py` calls
+  a new `_bridge_stdio_to_logcat()` at module top that pipes
+  `sys.stdout` / `sys.stderr` through `android.util.Log` under tag
+  `python`. p4a auto-redirects stdio for `PythonActivity` (the
+  Activity process where the picker / settings UI / recorder Kivy
+  apps run), but not for `PythonService` — and the daemon
+  (server.py, scheduler.py, repo.py) lives in the `:provider`
+  process driven by PythonService. Pre-0.20.6 every `print` from
+  daemon code went to a black hole, so functionally correct sync
+  flows (RPC returns a job_id, the timer fires, the repo gets
+  pushed) appeared in logcat as if nothing happened. After this fix
+  the `[sync-async]` / `[sync-debounce]` / `[sync-fire]` / `[sync]`
+  traces actually show up.
+
+### azt_collabd 0.20.5 + azt_collab_client 0.24.0 — picker failure → notify + exit
+- After `_pick_project_android`'s one-retry loop exhausts on
+  `unexpected_cancel`, the client now schedules a Kivy modal on the
+  UI thread: "The project picker failed to return a result. The app
+  will now close — please reopen it." with a single OK button that
+  calls `App.get_running_app().stop()` (and `os._exit(0)` as a belt-
+  and-braces). Lives in the client so every peer using
+  `pick_project()` gets the same fallback without per-host wiring;
+  documents in the function docstring that `unexpected_cancel` is
+  now a terminal status from the caller's perspective (the user
+  will see the modal and exit before the caller observes the
+  return value). Triggered by the user reporting empty-recorder
+  windows three times in one debug session.
+
+### azt_collabd 0.20.5 + azt_collab_client 0.23.6 — client-side request_sync trace
+- `[sync-client] request_sync(<lang>, ...)` printed at every entry,
+  with success/failure/transport branches. Closes the visibility gap
+  between "the recorder called the RPC" and "the daemon received it"
+  — if the client log is silent, the recorder never tried; if the
+  client log shows a send but the daemon's `[sync-async]` is silent,
+  the RPC is being dropped at the transport layer.
+
+### azt_collabd 0.20.5 + azt_collab_client 0.23.5 — picker auto-retry on RESULT_CANCELED-with-data
+- `_pick_project_android` now wraps the launch+wait in a one-retry
+  loop. The picker contract is RESULT_OK→data /
+  RESULT_CANCELED→no-data; the combo "non-OK + data attached"
+  shouldn't be reachable normally (Android can synthesize it on
+  back-press during `setResult`, or with OEM launcher tampering).
+  Pre-0.23.5 we'd silently swallow that case as `'cancelled'` and
+  drop the user on a recorder window with no project. Now the
+  client classifies it as `'unexpected_cancel'` and re-launches the
+  picker once, so the user gets another shot at choosing.
+- The retry-loop refactor extracts the inner launch/wait logic into
+  `_pick_project_android_once`; `attempt=` is included in the
+  `[pick_project] _on_result: ...` trace so each invocation is
+  identifiable in logcat.
+
 ### azt_collabd 0.20.5 + azt_collab_client 0.23.4 — full sync chain trace
 - Three new diagnostics so a request → debounce → fire → run path is
   visible end-to-end in logcat: `[sync-async] <lang>` at RPC arrival

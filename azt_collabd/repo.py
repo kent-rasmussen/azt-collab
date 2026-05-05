@@ -10,6 +10,7 @@ rather than raising; that matches the existing log-append style.
 import io
 import json
 import os
+import sys
 
 from . import config as _config
 from . import status as S
@@ -823,7 +824,21 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     branch_ref = _enc(f'refs/heads/{branch}')
     remote_ref = _enc(f'refs/remotes/origin/{branch}')
 
+    # ``repo.refs[name]`` raises ``KeyError`` on missing; mirror the
+    # ``dict.get`` semantic the old code intended. ``DiskRefsContainer``
+    # has no ``.get`` method — assuming it did was the bug that made
+    # every sync silently fail post-fetch with ``AttributeError``,
+    # caught by ``scheduler._fire``'s catch-all as ``PUSH_FAILED``.
+
+    def _read_ref(name):
+        try:
+            return repo.refs[name]
+        except KeyError:
+            return None
+
     # Fetch (no merge yet)
+    print(f'[sync-trace] fetch begin remote={remote_url!r}',
+          file=sys.stderr, flush=True)
     try:
         porcelain.fetch(
             repo, remote_url,
@@ -836,22 +851,43 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
             return result
         # Non-fatal: maybe remote is empty or temporarily unreachable.
         result.add(S.PULL_FAILED, error=str(exc))
+    print('[sync-trace] fetch done',
+          file=sys.stderr, flush=True)
 
-    local_sha = repo.refs.get(branch_ref) or repo.head()
-    remote_sha = repo.refs.get(remote_ref)
+    # ``repo.refs`` is ``DiskRefsContainer`` which does NOT define a
+    # dict-style ``.get()`` — only ``__getitem__`` (raises ``KeyError``
+    # on missing) and ``read_ref()``. The pre-0.20.9 code used
+    # ``.get()`` and silently raised ``AttributeError`` on every sync,
+    # which propagated to ``scheduler._fire``'s catch-all and marked
+    # the job ``PUSH_FAILED`` — every sync committed locally but
+    # never pushed, until enough commits piled up that a later
+    # accidentally-fixed cycle flushed the queue. Use the proper
+    # dulwich API: subscript + ``KeyError`` for missing.
+    local_sha = _read_ref(branch_ref) or repo.head()
+    remote_sha = _read_ref(remote_ref)
+    print(f'[sync-trace] local_sha={local_sha!r} '
+          f'remote_sha={remote_sha!r}',
+          file=sys.stderr, flush=True)
 
     retries_remaining = max(1, _settings.merge_retry_max())
     needs_merge = remote_sha is not None and remote_sha != local_sha
+    print(f'[sync-trace] needs_merge={needs_merge}',
+          file=sys.stderr, flush=True)
 
     if needs_merge and _is_ancestor(repo, local_sha, remote_sha):
         # Fast-forward
+        print('[sync-trace] fast-forward', file=sys.stderr, flush=True)
         repo.refs[branch_ref] = remote_sha
         local_sha = remote_sha
         result.add(S.PULLED)
     elif needs_merge and _is_ancestor(repo, remote_sha, local_sha):
         # We're already ahead — nothing to merge
+        print('[sync-trace] local ahead of remote',
+              file=sys.stderr, flush=True)
         pass
     elif needs_merge:
+        print('[sync-trace] merge_diverged begin',
+              file=sys.stderr, flush=True)
         try:
             merged_sha, conflicts = _merge_diverged(
                 repo, project_dir, branch, local_sha, remote_sha)
@@ -860,24 +896,51 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
             if conflicts:
                 result.add('CONFLICTS',
                            paths=[c.path for c in conflicts][:50])
+            print(f'[sync-trace] merge_diverged done '
+                  f'conflicts={len(conflicts)}',
+                  file=sys.stderr, flush=True)
         except Exception as exc:
+            print(f'[sync-trace] merge_diverged FAILED: {exc}',
+                  file=sys.stderr, flush=True)
             result.add(S.PULL_FAILED, error=f'merge failed: {exc}')
             return result
 
     # Push, with retry loop for races (someone pushed between our
     # fetch and our push).
     refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
+    print(f'[sync-trace] push loop begin retries={retries_remaining}',
+          file=sys.stderr, flush=True)
     while retries_remaining > 0:
         retries_remaining -= 1
+        print(f'[sync-trace] push attempt '
+              f'(retries_remaining_after={retries_remaining})',
+              file=sys.stderr, flush=True)
         try:
             porcelain.push(
                 repo, remote_url, refspec,
                 username=username, password=token,
                 errstream=io.BytesIO(),
             )
+            print('[sync-trace] push done',
+                  file=sys.stderr, flush=True)
+            # Push advances the remote on GitHub but doesn't update the
+            # *local mirror* of refs/remotes/origin/<branch>. Without
+            # this set, ``_count_commits_ahead`` keeps comparing the
+            # just-pushed local SHA against the pre-push remote mirror
+            # and reports ``(+N)`` to the recorder's sync indicator
+            # even though we're fully in sync. Bumping the mirror
+            # explicitly is what ``git push`` does in CLI git too.
+            try:
+                repo.refs[remote_ref] = local_sha
+            except Exception as ex:
+                print(f'[sync-trace] post-push remote-mirror '
+                      f'update failed: {ex!r}',
+                      file=sys.stderr, flush=True)
             result.add(S.PUSHED, branch=branch)
             return result
         except Exception as exc:
+            print(f'[sync-trace] push raised: {exc!r}',
+                  file=sys.stderr, flush=True)
             if '403' in str(exc):
                 result.statuses.append(diagnose_403(token, remote_url))
                 return result
@@ -891,7 +954,7 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
                     username=username, password=token,
                     errstream=io.BytesIO(),
                 )
-                new_remote = repo.refs.get(remote_ref)
+                new_remote = _read_ref(remote_ref)
                 if new_remote and new_remote != local_sha and \
                         not _is_ancestor(repo, local_sha, new_remote):
                     merged_sha, _ = _merge_diverged(

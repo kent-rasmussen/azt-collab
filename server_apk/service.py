@@ -42,6 +42,73 @@ for _candidate in (_HERE, _PARENT):
     if _candidate not in sys.path:
         sys.path.insert(0, _candidate)
 
+
+def _bridge_stdio_to_logcat():
+    """Redirect ``sys.stdout`` and ``sys.stderr`` to ``android.util.Log``
+    under tag ``python``.
+
+    p4a auto-redirects stdio for ``PythonActivity`` (the picker UI's
+    process, where Kivy peers run), but not for ``PythonService``
+    (this `:provider` process, where the daemon — server.py,
+    scheduler.py, repo.py — runs after the ContentProvider lazy-spawn).
+    Without this bridge every ``print(..., file=sys.stderr)`` from the
+    daemon side goes to a black hole, so a sync chain that's
+    functionally correct (RPC returns a job_id, the timer fires, the
+    repo gets pushed) appears in logcat as if nothing happened.
+
+    Idempotent / no-op outside Android (jnius unavailable). Best-effort:
+    a missing ``android.util.Log`` symbol falls through silently rather
+    than wedging the daemon."""
+    try:
+        from jnius import autoclass
+    except ImportError:
+        return
+    try:
+        Log = autoclass('android.util.Log')
+    except Exception:
+        return
+
+    class _LogcatWriter:
+        def __init__(self, tag, level_fn):
+            self.tag = tag
+            self._level_fn = level_fn
+            self._buf = ''
+
+        def write(self, s):
+            if not isinstance(s, str):
+                try:
+                    s = s.decode('utf-8', 'replace')
+                except Exception:
+                    s = str(s)
+            self._buf += s
+            while '\n' in self._buf:
+                line, self._buf = self._buf.split('\n', 1)
+                if line:
+                    try:
+                        self._level_fn(self.tag, line)
+                    except Exception:
+                        pass
+
+        def flush(self):
+            if self._buf:
+                try:
+                    self._level_fn(self.tag, self._buf)
+                except Exception:
+                    pass
+                self._buf = ''
+
+        def isatty(self):
+            return False
+
+    try:
+        sys.stdout = _LogcatWriter('python', Log.i)
+        sys.stderr = _LogcatWriter('python', Log.e)
+    except Exception:
+        pass
+
+
+_bridge_stdio_to_logcat()
+
 # Idle-stop policy. Tunable but sized for typical SIL field-recorder
 # sessions: a quick edit-record-pick burst easily fits in 5 minutes,
 # while a longer offline-edit-then-go-online flow doesn't keep the

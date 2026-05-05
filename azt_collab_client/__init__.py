@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.23.4"
+__version__ = "0.24.0"
 # 0.16.0 floor: the daemon now persists scheduler jobs across
 # kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
 # job_ids on respawn, so poll_job returns None and the peer can't
@@ -209,6 +209,19 @@ def _pick_project_desktop(timeout_seconds):
 
 
 def _pick_project_android(timeout_seconds):
+    """Launch the picker Activity in the server APK and wait for its
+    result.
+
+    Wraps a single launch+wait pass in a tiny retry loop so the
+    "RESULT_CANCELED with non-null data" anomaly auto-recovers: that
+    state shouldn't be reachable through a normal pick flow (the
+    picker's ``_emit_and_quit`` either sets RESULT_OK with data or
+    ``on_request_close`` sets RESULT_CANCELED with no data). Android
+    can synthesize it when the user back-presses during ``setResult``,
+    or when an OEM launcher tampers with the result Intent. Either
+    way, silently swallowing it as a clean cancel leaves the user on
+    a recorder window with no project loaded; re-launching the picker
+    once gives them another chance to choose."""
     import threading
     try:
         from jnius import autoclass
@@ -216,6 +229,106 @@ def _pick_project_android(timeout_seconds):
         from kivy.clock import Clock
     except Exception as ex:
         return {'ok': False, 'error': 'spawn_failed', 'detail': str(ex)}
+
+    last_result = None
+    for attempt in range(2):
+        last_result = _pick_project_android_once(
+            timeout_seconds, autoclass, android_activity, Clock,
+            attempt=attempt)
+        if last_result.get('error') != 'unexpected_cancel':
+            break
+        # else: anomaly — fall through to one retry attempt.
+    if last_result and last_result.get('error') == 'unexpected_cancel':
+        # Both attempts hit the RESULT_CANCELED-with-data anomaly. We
+        # don't have a recovery left — leaving the recorder running on
+        # an empty window is the worst UX (user sees no project, no
+        # explanation). Show a single-button modal so the user knows
+        # *why* the app is closing, then stop the host App on confirm.
+        _show_picker_failure_and_exit(Clock)
+    return last_result or {'ok': False, 'error': 'cancelled'}
+
+
+def _show_picker_failure_and_exit(Clock):
+    """Schedule a Kivy modal on the UI thread that informs the user the
+    picker failed and exits the host App when they tap OK. Called from
+    the worker thread after both ``_pick_project_android_once``
+    attempts return ``'unexpected_cancel'``. Returns immediately; the
+    actual stop happens when the user taps the button.
+
+    Lives in the client (not the recorder) so every peer that goes
+    through ``pick_project()`` gets the same fallback without each
+    host having to wire its own ``_handle_pick`` branch for
+    ``unexpected_cancel``."""
+    import sys as _sys
+
+    def _show(*_):
+        try:
+            from kivy.app import App
+            from kivy.uix.modalview import ModalView
+            from kivy.uix.boxlayout import BoxLayout
+            from kivy.uix.label import Label
+            from kivy.uix.button import Button
+            from kivy.metrics import dp, sp
+            from .translate import tr as _tr
+        except Exception as ex:
+            print(f'[pick_project] _show_picker_failure_and_exit: '
+                  f'kivy unavailable, exiting silently: {ex}',
+                  file=_sys.stderr, flush=True)
+            try:
+                import os as _os
+                _os._exit(1)
+            except Exception:
+                pass
+            return
+
+        view = ModalView(size_hint=(0.85, None), height=dp(220),
+                         auto_dismiss=False)
+        box = BoxLayout(orientation='vertical', padding=dp(16),
+                        spacing=dp(12))
+        msg = Label(
+            text=_tr('The project picker failed to return a result. '
+                     'The app will now close — please reopen it.'),
+            halign='center', valign='middle')
+        msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+        box.add_widget(msg)
+        btn = Button(text=_tr('OK'), size_hint_y=None, height=dp(48),
+                     font_size=sp(16), bold=True)
+
+        def _exit(*_a):
+            try:
+                view.dismiss()
+            except Exception:
+                pass
+            try:
+                app = App.get_running_app()
+                if app is not None:
+                    app.stop()
+            except Exception:
+                pass
+            # Belt and braces: if Kivy didn't actually stop (the host
+            # may have on_stop hooks that swallow), force-exit so the
+            # user isn't left in the broken state.
+            try:
+                import os as _os
+                _os._exit(0)
+            except Exception:
+                pass
+
+        btn.bind(on_release=_exit)
+        box.add_widget(btn)
+        view.add_widget(box)
+        view.open()
+
+    print('[pick_project] picker anomaly persisted across retry; '
+          'scheduling failure modal',
+          file=_sys.stderr, flush=True)
+    Clock.schedule_once(_show, 0)
+
+
+def _pick_project_android_once(timeout_seconds, autoclass,
+                               android_activity, Clock, attempt=0):
+    import threading
+    import sys as _sys
 
     done = threading.Event()
     holder = {'result': None}
@@ -243,7 +356,6 @@ def _pick_project_android(timeout_seconds):
             pass
 
     def _on_result(request_code, result_code, data):
-        import sys as _sys
         if request_code != _AZT_PICK_REQ_CODE:
             print(f'[pick_project] _on_result: ignoring foreign '
                   f'request_code={request_code} (ours={_AZT_PICK_REQ_CODE})',
@@ -255,7 +367,7 @@ def _pick_project_android(timeout_seconds):
         # picker side has corresponding prints; together they narrow
         # the empty-path origin to one of three regions.
         print(f'[pick_project] _on_result: result_code={result_code} '
-              f'data_present={data is not None}',
+              f'data_present={data is not None} attempt={attempt}',
               file=_sys.stderr, flush=True)
         if result_code == -1 and data is not None:  # RESULT_OK
             try:
@@ -272,6 +384,17 @@ def _pick_project_android(timeout_seconds):
             holder['result'] = ({'ok': True, 'path': path,
                                  'langcode': langcode} if path
                                 else {'ok': False, 'error': 'no_path'})
+        elif data is not None:
+            # Anomaly: RESULT_CANCELED (or any non-OK code) with data
+            # attached. The picker contract is RESULT_OK→data /
+            # RESULT_CANCELED→no-data; this combination shouldn't be
+            # reachable normally. Don't silently swallow as 'cancelled'
+            # — surface a distinct code so the outer loop can retry
+            # the picker once before giving up.
+            print(f'[pick_project] _on_result: anomaly — non-OK with '
+                  f'data; will retry the picker',
+                  file=_sys.stderr, flush=True)
+            holder['result'] = {'ok': False, 'error': 'unexpected_cancel'}
         else:
             holder['result'] = {'ok': False, 'error': 'cancelled'}
         done.set()
@@ -847,14 +970,27 @@ def request_sync(langcode, contributor):
     """Schedule a debounced sync server-side. Returns a job_id (str) or
     None on transport failure. Multiple calls within the debounce
     window collapse into one run; the server commits and pushes once."""
+    import sys as _sys
+    print(f'[sync-client] request_sync({langcode!r}, '
+          f'contributor={contributor!r}) sending',
+          file=_sys.stderr, flush=True)
     try:
         resp = call('POST', f'/v1/projects/{langcode}/sync_async',
                     {'contributor': contributor})
-    except ServerUnavailable:
+    except ServerUnavailable as ex:
+        print(f'[sync-client] request_sync({langcode!r}) → '
+              f'ServerUnavailable: {ex}',
+              file=_sys.stderr, flush=True)
         return None
     if not resp.get('ok'):
+        print(f'[sync-client] request_sync({langcode!r}) → '
+              f'not ok, resp={resp!r}',
+              file=_sys.stderr, flush=True)
         return None
-    return resp.get('job_id')
+    job_id = resp.get('job_id')
+    print(f'[sync-client] request_sync({langcode!r}) → job_id={job_id!r}',
+          file=_sys.stderr, flush=True)
+    return job_id
 
 
 def poll_job(job_id):
