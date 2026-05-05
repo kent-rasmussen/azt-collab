@@ -11,6 +11,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.20.3 + azt_collab_client 0.23.4 — recent-state stderr trace
+- `azt_collab_client/CLAUDE.md` rule #2 expanded to cover the
+  *gating* failure mode (peers silently skip auto-sync on Android
+  because their local filesystem check returns False) and to
+  include the verbatim fix-shape snippet for `_project_has_remote`,
+  so future Claude sessions touching a peer don't have to re-derive
+  the daemon-served replacement.
+
 ### azt_collabd 0.20.3 + azt_collab_client 0.23.3 — recent-state stderr trace
 - Diagnostic prints around every read/write of `last_langcode`:
   daemon-side `[recent] _touch_project(...) → /path/to/config.json`,

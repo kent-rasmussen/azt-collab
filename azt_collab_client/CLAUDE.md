@@ -46,14 +46,42 @@ into here; this package owns:
    raises or silently returns the empty/false answer regardless of
    the actual project state. On desktop both processes share
    $AZT_HOME and the local check happens to work, which makes this
-   an easy bug to merge without noticing. The recorder's
-   `_project_has_remote()` (`main.py:3865`) is the canonical
-   anti-pattern: it runs `dulwich.Repo(self.recorder.db.dir)` to
-   answer "is this project backed up?", which fails on Android even
-   after a successful publish and falsely shows the
-   "data isn't being backed up" warning. Switch state-shaped checks
-   like this to the daemon-served `project_status(langcode).remote_url`
-   /  `.last_commit` / `.last_sync`.
+   an easy bug to merge without noticing.
+
+   The blast radius is wider than just the misleading warning. Any
+   peer flow that *gates* on a local-filesystem state check (e.g.
+   "only auto-sync if the project has a remote") will silently
+   skip the gated work on Android — symptom: the recorder
+   correctly publishes the repo and the daemon correctly receives
+   commit RPCs, but no `[sync]` / `[sync-rpc]` lines ever appear in
+   logcat because the recorder never asked.
+
+   The recorder's `_project_has_remote()` (`main.py:3865`) is the
+   canonical anti-pattern: it runs `dulwich.Repo(self.recorder.db.dir)`
+   to answer "is this project backed up?", which fails on Android
+   even after a successful publish and falsely shows the
+   "data isn't being backed up" warning. The fix shape (use this
+   pattern verbatim for any similar check):
+
+   ```python
+   def _project_has_remote(self):
+       if not self.recorder:
+           return False
+       langcode = getattr(self, '_current_langcode', '')
+       if not langcode:
+           return False
+       try:
+           from azt_collab_client import project_status
+           ps = project_status(langcode)
+       except Exception:
+           return False
+       return bool(ps and (ps.remote_url or '').strip())
+   ```
+
+   The same shape works for `last_commit` / `last_sync` /
+   `commits_ahead` queries — `project_status` carries them all and
+   the daemon already touches the project as recent on every call,
+   so peers don't have to manually mark recency.
 
 3. **No `azt_collabd` import.** This package must keep working when
    the daemon is running in a separate process or a different APK.
