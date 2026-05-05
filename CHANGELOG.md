@@ -11,6 +11,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.21.3 + azt_collab_client 0.24.0 — back-from-langpicker always exits subprocess
+- 0.21.1 added the langpicker→last_project special case but only
+  when `last_project()` resolved; otherwise it fell through to the
+  default `'picker'` target, which left the user on the project
+  picker screen requiring a second back-press to actually exit.
+  Now the langpicker back-press always exits the picker subprocess
+  in one step: emit `last_project` if it resolves (recorder
+  auto-resumes), or emit a clean cancel if it doesn't (recorder's
+  `_handle_pick` silently returns to whatever it was showing).
+  Either way, the user lands on the recorder, never on the project
+  picker. New `_emit_cancel_and_quit` helper factors the
+  `setResult(RESULT_CANCELED) + finish` shape out of
+  `on_request_close` so it's reachable from anywhere.
+
+### azt_collabd 0.21.2 + azt_collab_client 0.24.0 — URI resolution decoupled from on-disk dir name
+- **Cloned project's LIFT URI returned `FileNotFoundException`.**
+  `_resolve_path` in the ContentProvider was building
+  `$AZT_HOME/projects/<langcode>/...` from the URI's first segment,
+  but the picker_app's clone worker uses the URL's repo basename for
+  `dest_dir` (e.g. `en_Demo.git` → `projects/en_Demo/`), while the
+  URI handed back to peers uses the user-chosen langcode (e.g.
+  `content://.../en/SILCAWL.lift`). Mismatch → resolver looked under
+  the wrong directory → file-not-found → recorder's "lift namespace
+  scan failed: forbidden: /en/SILCAWL.lift" log line. `_resolve_path`
+  now consults `projects.get(langcode).working_dir` so URI resolution
+  is independent of how the on-disk directory was named at clone
+  time. Falls back to the legacy `<projects>/<langcode>` path when
+  the project isn't in the registry, preserving pre-registry URIs.
+
+### azt_collabd 0.21.1 + azt_collab_client 0.24.0 — back-from-langpicker resumes last project
+- `_navigate_back` in `picker_app.py` now special-cases the
+  `langpicker` screen: a user who reached Start-New and then changed
+  their mind almost always wants to return to whatever project they
+  had open before, not be re-parked at the project list. When
+  `last_project()` resolves to a live registered project, back from
+  `langpicker` emits that project's path and exits the picker
+  subprocess (recorder auto-resumes). Cold-start fallback (no
+  recorded last project) still goes to the picker screen so the
+  user has somewhere to land.
+
 ### azt_collabd 0.21.0 + azt_collab_client 0.24.0 — sync was failing every cycle; remote-mirror not bumped after push
 - **Sync was raising `AttributeError` on every cycle.** Pre-0.21.0
   `_sync_repo_locked` did `repo.refs.get(branch_ref) or repo.head()`,

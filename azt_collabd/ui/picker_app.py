@@ -453,9 +453,50 @@ class PickerApp(App):
         can override the target via a ``back_to`` StringProperty;
         default falls through to ``'picker'``. Returns False on the
         picker itself so callers can proceed with their close
-        behavior."""
+        behavior.
+
+        Special case for ``langpicker``: a user who reached the
+        language-picker via Start-New and then changed their mind
+        almost certainly wants to return to whatever project they had
+        before, not be parked back at the project list. So when the
+        host has a ``last_project()`` that still resolves to a live
+        registered project, back-from-langpicker emits that project
+        and exits the picker subprocess (the recorder receives it and
+        auto-resumes). If no last project is recorded — cold start
+        with nothing previously opened — fall through to the default
+        'picker' target so the user still has somewhere to go."""
         if not hasattr(self, 'sm') or self.sm.current == 'picker':
             return False
+        if self.sm.current == 'langpicker':
+            # Back from langpicker always exits the picker subprocess
+            # — a user who reached Start-New and changed their mind
+            # wants to be back on the recorder, not be re-parked at
+            # the project list (which is what the previous "fall
+            # through to 'picker'" behaviour did, requiring a second
+            # back-press to actually exit). When ``last_project``
+            # resolves, emit it so the recorder auto-resumes; when it
+            # doesn't, emit a clean cancel so the recorder's
+            # ``_handle_pick`` silently returns the user to whatever
+            # it was showing. Either branch ends the subprocess.
+            try:
+                from azt_collab_client import last_project, open_project
+                langcode = (last_project() or '').strip()
+                project = open_project(langcode) if langcode else None
+            except Exception:
+                project = None
+            if project is not None and project.lift_exists \
+                    and project.lift_path:
+                print(f'[picker_app] langpicker back → resuming '
+                      f'last_project={langcode!r}',
+                      file=sys.stderr, flush=True)
+                self._emit_and_quit(project.lift_path,
+                                    langcode=langcode)
+            else:
+                print('[picker_app] langpicker back → no resumable '
+                      'last_project; emitting cancel',
+                      file=sys.stderr, flush=True)
+                self._emit_cancel_and_quit()
+            return True
         cur = (self.sm.get_screen(self.sm.current)
                if self.sm.has_screen(self.sm.current) else None)
         target = getattr(cur, 'back_to', '') or 'picker'
@@ -478,6 +519,16 @@ class PickerApp(App):
         ``_on_back_button``."""
         if self._navigate_back():
             return True
+        self._emit_cancel_and_quit()
+        return False  # let Kivy stop normally
+
+    def _emit_cancel_and_quit(self):
+        """Set RESULT_CANCELED on the picker Activity and finish it.
+        Mirrors the cancel branch of ``on_request_close`` so the same
+        teardown shape is reachable from anywhere (e.g. a back-press
+        from langpicker that doesn't have a ``last_project`` to
+        resume). On desktop, just sets the exit code; ``main()`` reads
+        ``_exit_code`` after ``App.run`` returns."""
         if platform == 'android':
             try:
                 from jnius import autoclass
@@ -486,9 +537,15 @@ class PickerApp(App):
                 activity = PythonActivity.mActivity
                 activity.setResult(0)  # RESULT_CANCELED
                 activity.finish()
-            except Exception:
-                pass
-        return False  # let Kivy stop normally
+            except Exception as ex:
+                print(f'[picker_app] _emit_cancel_and_quit android '
+                      f'finish failed: {ex}',
+                      file=sys.stderr, flush=True)
+            return
+        # Desktop: signal cancel and stop the Kivy run loop so main()
+        # exits with the cancel code (1).
+        self._exit_code = 1
+        self.stop()
 
     # ── Error / loading overlays ──────────────────────────────────────
     def _show_error(self, msg, extra_button=None):

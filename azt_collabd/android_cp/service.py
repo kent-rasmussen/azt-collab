@@ -167,14 +167,14 @@ _ALLOWED_MEDIA_DIRS = ('audio', 'images')
 
 def _resolve_path(rel, mode):
     """Map a provider-supplied relative path to an absolute path under
-    ``$AZT_HOME/projects/``. Returns None on path-traversal attempts or
+    the project's actual ``working_dir`` from projects.json. Returns
+    None on path-traversal attempts, unknown langcodes, or
     structurally-disallowed shapes so the Java side raises
     FileNotFoundException.
 
     ``rel`` is expected as the URI's path component (Java-side
     ``Uri.getPath()``), which always carries a leading slash. The
-    ``lstrip('/')`` below makes ``os.path.join(base, rel)`` compose
-    under ``base`` instead of treating ``rel`` as absolute.
+    ``lstrip('/')`` below normalises that.
 
     Allowed path shapes (defence-in-depth — even ``..`` would be
     caught by ``commonpath``, but rejecting structurally lets us also
@@ -186,9 +186,16 @@ def _resolve_path(rel, mode):
     - ``<lang>/audio/<file>``    — sibling audio recording
     - ``<lang>/images/<file>``   — sibling image asset
 
-    Anything else returns None. ``..`` and empty segments are
-    rejected explicitly; ``/`` inside a segment is impossible after
-    splitting."""
+    The first segment is the **langcode** — the daemon's
+    ``projects.json`` key — not the on-disk directory name. Pre-0.21.2
+    this code assumed the directory name == langcode and built
+    ``$AZT_HOME/projects/<langcode>/...`` directly; that broke for
+    clones whose ``dest_dir`` was URL-derived (e.g. ``en_Demo.git``
+    cloned to ``projects/en_Demo/`` but the user chose langcode
+    ``en``, so the URI ``content://.../en/SILCAWL.lift`` resolved to
+    ``projects/en/SILCAWL.lift`` which didn't exist). Going through
+    ``projects.get(langcode).working_dir`` keeps the URI form
+    independent of the on-disk layout."""
     if not rel:
         return None
     rel = rel.lstrip('/')
@@ -207,8 +214,22 @@ def _resolve_path(rel, mode):
     else:
         return None
 
-    base = os.path.realpath(os.path.join(azt_home(), 'projects'))
-    target = os.path.realpath(os.path.join(base, rel))
+    # Resolve the langcode → working_dir via the registry. Falls back
+    # to ``$AZT_HOME/projects/<langcode>`` only when the project
+    # isn't registered, which preserves pre-registry URIs (created
+    # before the picker auto-registers) without breaking the new
+    # decoupled-layout flow.
+    from .. import projects as _projects
+    langcode = parts[0]
+    p = _projects.get(langcode)
+    if p is not None and p.working_dir:
+        base = os.path.realpath(p.working_dir)
+        rel_under_base = os.path.join(*parts[1:])
+    else:
+        base = os.path.realpath(os.path.join(azt_home(), 'projects',
+                                             langcode))
+        rel_under_base = os.path.join(*parts[1:])
+    target = os.path.realpath(os.path.join(base, rel_under_base))
     # Containment check: target must live under base. Belt-and-braces
     # alongside the structural check above; if a future symlink trick
     # bypasses the segment whitelist, this still 403s.
