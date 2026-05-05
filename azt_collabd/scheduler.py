@@ -242,6 +242,9 @@ def request_sync(langcode, contributor):
         else:
             # Latest contributor name wins (last-call-wins debounce)
             job.contributor = contributor
+        print(f'[sync-debounce] {langcode!r} debounce={debounce_s}s '
+              f'job_id={job.id!r}',
+              file=sys.stderr, flush=True)
         if debounce_s <= 0:
             # Run immediately on a worker thread so request_sync stays
             # non-blocking for the caller.
@@ -262,7 +265,13 @@ def _fire(langcode):
         _pending_timers.pop(langcode, None)
         job = _pending_jobs.pop(langcode, None)
     if job is None:
+        print(f'[sync-fire] {langcode!r} debounce timer fired but '
+              f'no pending job — already drained?',
+              file=sys.stderr, flush=True)
         return
+    print(f'[sync-fire] {langcode!r} debounce timer fired, '
+          f'running job_id={job.id!r}',
+          file=sys.stderr, flush=True)
     with _lock:
         job.state = JobState.RUNNING
         job.started_at = time.time()

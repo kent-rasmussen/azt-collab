@@ -11,6 +11,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.20.5 + azt_collab_client 0.23.4 — full sync chain trace
+- Three new diagnostics so a request → debounce → fire → run path is
+  visible end-to-end in logcat: `[sync-async] <lang>` at RPC arrival
+  in `_h_project_sync_async`, `[sync-debounce] <lang>` from
+  `scheduler.request_sync` (so we see whether the recorder's
+  `_auto_commit_sync` reached the queue), and `[sync-fire] <lang>`
+  from `_fire` (so we see whether the debounce timer actually fired
+  before the daemon process got recycled).
+
+### azt_collabd 0.20.4 + azt_collab_client 0.23.4 — empty-registry disk scan
+- When `_h_list_projects` returns zero entries, also print what
+  `$AZT_HOME/projects/` actually contains on disk. Distinguishes
+  "registry wiped but working trees survived" (recoverable: a
+  future endpoint can scan + auto-register) from "filesDir gone"
+  (server APK clean-installed; nothing to recover).
+
 ### azt_collabd 0.20.3 + azt_collab_client 0.23.4 — recent-state stderr trace
 - `azt_collab_client/CLAUDE.md` rule #2 expanded to cover the
   *gating* failure mode (peers silently skip auto-sync on Android

@@ -469,6 +469,26 @@ def _h_list_projects(_body):
           f'{projects.projects_path()!r} → '
           f'{[i["langcode"] for i in items]!r}',
           file=sys.stderr, flush=True)
+    # Empty registry → also report what's on disk under
+    # ``$AZT_HOME/projects/`` so we can distinguish "registry wiped
+    # but the working trees survived" (recoverable: scan + register)
+    # from "the entire filesDir is gone" (e.g. server APK clean-
+    # install). Only run when the registry says zero — the directory
+    # listing is cheap but pointless when we already have an answer.
+    if not items:
+        try:
+            projects_dir = os.path.join(azt_home(), 'projects')
+            if os.path.isdir(projects_dir):
+                disk_dirs = sorted(os.listdir(projects_dir))
+            else:
+                disk_dirs = None
+            print(f'[server] list_projects: registry empty; '
+                  f'projects_dir={projects_dir!r} '
+                  f'on_disk={disk_dirs!r}',
+                  file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[server] list_projects: disk-scan failed: {ex}',
+                  file=sys.stderr, flush=True)
     return 200, {"ok": True, "projects": items}
 
 
@@ -898,10 +918,15 @@ def _h_set_project_last_sync(langcode, body):
 def _h_project_sync_async(langcode, body):
     p = projects.get(langcode)
     if p is None:
+        print(f'[sync-async] {langcode!r} → project_not_found',
+              file=sys.stderr, flush=True)
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
     contributor = store.resolve_contributor(body.get('contributor', ''))
     job_id = scheduler.request_sync(langcode, contributor)
+    print(f'[sync-async] {langcode!r} contributor={contributor!r} '
+          f'enqueued job_id={job_id!r}',
+          file=sys.stderr, flush=True)
     return 200, {"ok": True, "job_id": job_id}
 
 
