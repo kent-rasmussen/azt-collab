@@ -407,9 +407,27 @@ def _ensure_remote_repo(remote_url, username, token):
 
 def repo_status_summary(project_dir):
     """
-    Return (branch, remote_url, n_changes) describing the project directory,
-    or None if it is not a git repository. (Not a Result — this is a raw
-    accessor for UI status indicators.)
+    Return (branch, remote_url, n_changes, commits_ahead) describing
+    the project directory, or None if it is not a git repository.
+    (Not a Result — this is a raw accessor for UI status indicators.)
+
+    ``commits_ahead`` is the number of commits on the current branch
+    not yet pushed to ``refs/remotes/origin/<branch>``. Computed from
+    the *local* cache of the remote ref (no network round-trip) so
+    the value is whatever is true given the last fetch / push:
+
+    - No origin remote configured → 0 (publish hasn't happened)
+    - Origin configured but never pushed → 0 (no remote ref to
+      compare against; the indicator should read OK rather than
+      double-counting the unpushed initial commit as "behind")
+    - Local commits since last push → N>0 (the case peers display
+      as ``(+n)``)
+
+    A stale cache (peer was offline since last commit, didn't fetch)
+    can under-report; that's acceptable per the recorder's UX
+    contract — the indicator falls back to OK rather than guessing
+    against unobserved remote state. Filed by azt_recorder 1.37.6 in
+    ``azt_collab_client/NOTES_TO_DAEMON.md``.
     """
     try:
         from dulwich import porcelain
@@ -441,9 +459,36 @@ def repo_status_summary(project_dir):
         except Exception:
             n = 0
 
-        return branch, remote_url, n
+        commits_ahead = _count_commits_ahead(repo, branch)
+
+        return branch, remote_url, n, commits_ahead
     except Exception:
         return None
+
+
+def _count_commits_ahead(repo, branch):
+    """Count commits on ``refs/heads/<branch>`` not yet on
+    ``refs/remotes/origin/<branch>`` using the local ref cache. Any
+    failure (detached HEAD, no remote ref cached, walker error)
+    returns 0 — the indicator's contract is "OK on uncertainty."""
+    try:
+        local_ref = b'refs/heads/' + branch.encode()
+        remote_ref = b'refs/remotes/origin/' + branch.encode()
+        try:
+            local_sha = repo.refs[local_ref]
+        except KeyError:
+            return 0
+        try:
+            remote_sha = repo.refs[remote_ref]
+        except KeyError:
+            return 0
+        if local_sha == remote_sha:
+            return 0
+        walker = repo.get_walker(
+            include=[local_sha], exclude=[remote_sha])
+        return sum(1 for _ in walker)
+    except Exception:
+        return 0
 
 
 def init_repo(project_dir, remote_url, username, token,

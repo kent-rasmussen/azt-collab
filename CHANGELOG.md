@@ -11,7 +11,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
-### azt_collabd 0.19.1 + azt_collab_client 0.23.0 — server-canonical recent state + last_commit
+### azt_collabd 0.20.0 + azt_collab_client 0.23.1 — `commits_ahead` on ProjectStatus
+- **`commits_ahead: int` on `ProjectStatus`.** Filed by recorder
+  1.37.6 in `NOTES_TO_DAEMON.md`: the recorder's sync indicator
+  needs the count of local commits not yet pushed to the remote so
+  it can render `(+n)` instead of an opaque `*` marker.
+  `repo_status_summary` now returns a 4-tuple
+  `(branch, remote_url, n_changes, commits_ahead)`; `_h_project_status`
+  forwards `commits_ahead` on the wire. Computed locally from
+  `refs/heads/<branch>` vs. `refs/remotes/origin/<branch>` (no
+  network round-trip), so a stale cache may under-report — the
+  recorder's UX contract is "OK on uncertainty," so under-reporting
+  is the right failure mode. Returns 0 whenever the local cache
+  doesn't have a remote ref to compare against (no remote
+  configured / never pushed). Client dataclass already had the
+  field with `default 0` for forward-compat. NOTES_TO_DAEMON entry
+  cleared.
+
+### azt_collabd 0.19.1 + azt_collab_client 0.23.1 — server-canonical recent state + last_commit
+- **`azt_collab_client/CLAUDE.md` rule #2 added** — "no reading
+  project state from the local filesystem either," with the
+  recorder's `_project_has_remote()` (dulwich.Repo on the working
+  dir) called out as the canonical anti-pattern. Reads silently work
+  on desktop and silently fail on Android because the daemon's
+  working_dir lives in the server APK's private filesDir. Future
+  peers must use `project_status(langcode)` for state-shaped checks.
 - **Publish outcome message no longer clobbered by refresh.**
   `_publish_done` was setting the message *then* calling `refresh()`,
   which started by clearing `msg.text`, so the user only saw

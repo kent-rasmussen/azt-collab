@@ -55,6 +55,11 @@ class ProjectStatus:
     last_sync: float
     working_dir: str
     lift_path: str
+    # Number of local commits on the current branch not yet pushed
+    # to the remote — the count peers display as "(+n)" alongside
+    # last_sync. Defaults to 0 for forward-compat with daemons that
+    # don't yet emit it (see NOTES_TO_DAEMON.md).
+    commits_ahead: int = 0
 
     @classmethod
     def from_dict(cls, d):
@@ -68,4 +73,5 @@ class ProjectStatus:
             last_sync=float(d.get('last_sync', 0.0)),
             working_dir=d.get('working_dir', ''),
             lift_path=d.get('lift_path', ''),
+            commits_ahead=int(d.get('commits_ahead', 0)),
         )

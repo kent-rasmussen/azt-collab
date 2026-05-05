@@ -31,18 +31,42 @@ into here; this package owns:
    `subprocess(['git', ...])` in this package, stop — add (or use) a
    server endpoint instead.
 
-2. **No `azt_collabd` import.** This package must keep working when
+2. **No reading project state from the local filesystem either.**
+   This is a corollary of (1) but worth its own line because the
+   failure mode is silent on desktop and only surfaces on Android.
+   Anything that opens the project's working_dir to inspect it —
+   `dulwich.Repo(working_dir).get_config()` to check
+   `remote.origin.url`, `os.path.exists(os.path.join(working_dir,
+   '.git'))`, walking the audio dir for backup detection, etc. —
+   must instead go through `project_status(langcode)` (or a new
+   server endpoint if the field you need isn't there). Reason: on
+   Android the daemon's working_dir lives in the standalone server
+   APK's private filesDir; peer processes (recorder, viewer, ...)
+   have no UID-level read on it, so any local-filesystem check
+   raises or silently returns the empty/false answer regardless of
+   the actual project state. On desktop both processes share
+   $AZT_HOME and the local check happens to work, which makes this
+   an easy bug to merge without noticing. The recorder's
+   `_project_has_remote()` (`main.py:3865`) is the canonical
+   anti-pattern: it runs `dulwich.Repo(self.recorder.db.dir)` to
+   answer "is this project backed up?", which fails on Android even
+   after a successful publish and falsely shows the
+   "data isn't being backed up" warning. Switch state-shaped checks
+   like this to the daemon-served `project_status(langcode).remote_url`
+   /  `.last_commit` / `.last_sync`.
+
+3. **No `azt_collabd` import.** This package must keep working when
    the daemon is running in a separate process or a different APK.
    `paths.py`, `status.py`, and `projects.py` are duplicated on
    purpose so the client doesn't depend on the server package.
 
-3. **No Kivy at import time at the package root.** `azt_collab_client.ui`
+4. **No Kivy at import time at the package root.** `azt_collab_client.ui`
    imports Kivy; `azt_collab_client` itself does not. Sister apps may
    import the top-level module from non-Kivy contexts (CLI helpers,
    tests). Keep it that way — guard any Kivy imports inside `ui/` or
    inside functions that are only called from a Kivy host.
 
-4. **Structured `Result`s drive logic; translated text is for humans.**
+5. **Structured `Result`s drive logic; translated text is for humans.**
    Use `result.has(S.PUSHED)` / `result.has_any(S.AUTH_REQUIRED, ...)`
    — never substring-match on translated strings. `S` is
    `azt_collab_client.status` (re-exported as `S` from the package
@@ -53,14 +77,14 @@ into here; this package owns:
    when a host translator returns the msgid unchanged. See the
    *Internationalization* section below.
 
-5. **The client owns its own translatable strings.** Anything in
+6. **The client owns its own translatable strings.** Anything in
    `picker.py` / `popups.py` / `langpicker.py` / `translate.py` /
    the daemon's `ui/app.py` that's user-visible goes in
    `azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po`.
    Don't expect a host catalog (e.g. `aztrecorder.po`) to carry these;
    the recorder is one consumer of the client among several.
 
-5. **Two `configure()` calls in the suite, both keyword-only and
+7. **Two `configure()` calls in the suite, both keyword-only and
    idempotent.** Host apps call:
    - `azt_collab_client.configure(app_id=...)` — currently a no-op,
      reserved for app-identity / provider-routing later. Safe to

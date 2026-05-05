@@ -852,9 +852,9 @@ def _h_project_status(langcode, _body):
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
     summary = _repo_status(p.working_dir)
-    branch, remote_url, n_changes = ('', '', 0)
+    branch, remote_url, n_changes, commits_ahead = ('', '', 0, 0)
     if summary is not None:
-        branch, remote_url, n_changes = summary
+        branch, remote_url, n_changes, commits_ahead = summary
     api = _project_for_api(p)
     return 200, {
         "ok": True,
@@ -862,6 +862,7 @@ def _h_project_status(langcode, _body):
         "branch": branch,
         "remote_url": remote_url or p.remote_url,
         "n_changes": n_changes,
+        "commits_ahead": commits_ahead,
         "last_commit": p.last_commit,
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
