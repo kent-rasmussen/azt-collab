@@ -45,9 +45,9 @@ from azt_collab_client import (
     init_project,
     is_online,
     last_project,
+    list_projects,
     mark_github_app_installed,
     open_project,
-    project_status,
     save_github_tokens,
     save_gitlab_credentials,
     test_gitlab_credentials,
@@ -617,39 +617,40 @@ class SettingsScreen(Screen):
     def _refresh_publish_row(self, status):
         """Show / hide / enable the "Publish <langcode> data" row.
 
-        Visible only when (a) ``last_project()`` resolves to a langcode
-        and (b) that project does not already have a remote URL. When
-        visible, the button is enabled iff at least one host's
-        credentials are confirmed (GitHub: connected + app installed;
-        GitLab: a successful Test). The actual host pick happens at
-        click time — single-confirmed hosts publish directly, both
-        confirmed pops the host-chooser overlay."""
+        Picks the candidate project in this priority order:
+
+        1. ``last_project()`` (suite-wide "last opened" key). The
+           recorder updates it via ``set_last_project`` when a project
+           is chosen through the picker.
+        2. If that's empty or doesn't resolve to a registered project,
+           fall back to scanning ``list_projects()`` and picking the
+           one with the largest ``last_sync`` (most recently active).
+           This covers users on older recorder versions that load a
+           project without going through the picker — without this
+           fallback the publish row would silently stay hidden even
+           though the daemon clearly has a project on file.
+
+        The row is visible only when a candidate is found AND that
+        project has no remote yet. The button is enabled iff at least
+        one host's credentials are confirmed."""
         row = self.ids.get('publish_row')
         btn = self.ids.get('publish_btn')
         msg = self.ids.get('publish_msg')
         if row is None or btn is None:
             return
-        # Reset to hidden by default; the rest of this function flips
-        # back on if every condition holds.
+        # Reset to hidden by default; the rest flips it back on only
+        # if every condition holds.
         row.height = 0
         row.opacity = 0
         if msg is not None:
             msg.text = ''
-        langcode = ''
-        try:
-            langcode = (last_project() or '').strip()
-        except Exception:
+        project = self._pick_publish_candidate()
+        if project is None:
             return
-        if not langcode:
+        if (project.remote_url or '').strip():
+            # Already published — nothing to do here.
             return
-        try:
-            ps = project_status(langcode)
-        except Exception:
-            ps = None
-        if ps is None or (ps.remote_url or '').strip():
-            # Either the project's gone (deleted out-of-band) or it
-            # already has a remote — nothing to publish.
-            return
+        langcode = project.langcode
         gh_confirmed = bool(status.get('github', {}).get('confirmed'))
         gl_confirmed = bool(status.get('gitlab', {}).get('confirmed'))
         n_confirmed = int(gh_confirmed) + int(gl_confirmed)
@@ -660,10 +661,50 @@ class SettingsScreen(Screen):
         if msg is not None and n_confirmed == 0:
             msg.text = _tr(
                 'Connect to GitHub or GitLab first to enable publish.')
-        # Heights: button + message (the BodyLabel inside is dp(20))
-        # plus the BoxLayout's internal spacing (dp(8)).
+        # Heights: button + message (BodyLabel is dp(20)) + spacing.
         row.height = dp(52) + dp(8) + dp(20)
         row.opacity = 1
+
+    def _pick_publish_candidate(self):
+        """Return the Project we'd publish if the user clicked now,
+        or ``None`` if there's nothing reasonable to pick. See
+        ``_refresh_publish_row`` for the priority order."""
+        import sys
+        try:
+            langcode = (last_project() or '').strip()
+        except Exception as ex:
+            print(f'[settings] last_project raised: {ex}',
+                  file=sys.stderr, flush=True)
+            langcode = ''
+        if langcode:
+            try:
+                project = open_project(langcode)
+            except Exception as ex:
+                print(f'[settings] open_project({langcode!r}) raised: '
+                      f'{ex}', file=sys.stderr, flush=True)
+                project = None
+            if project is not None and project.lift_exists:
+                print(f'[settings] publish candidate from last_project: '
+                      f'{langcode!r} (remote_url={project.remote_url!r})',
+                      file=sys.stderr, flush=True)
+                return project
+            print(f'[settings] last_project={langcode!r} did not '
+                  f'resolve; falling back to list_projects',
+                  file=sys.stderr, flush=True)
+        try:
+            projects = list_projects() or []
+        except Exception as ex:
+            print(f'[settings] list_projects raised: {ex}',
+                  file=sys.stderr, flush=True)
+            projects = []
+        live = [p for p in projects if p.lift_exists]
+        print(f'[settings] list_projects: {len(projects)} total, '
+              f'{len(live)} live: '
+              f'{[(p.langcode, p.remote_url) for p in live]!r}',
+              file=sys.stderr, flush=True)
+        if not live:
+            return None
+        return max(live, key=lambda p: p.last_sync or 0.0)
 
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the
@@ -706,9 +747,13 @@ class SettingsScreen(Screen):
         runs from the daemon's settings UI so any peer that hands the
         user into the gear can publish without owning the publish UI.
         Host pick: single-confirmed → use it; both → overlay."""
-        langcode = (last_project() or '').strip()
-        if not langcode:
+        # Re-pick rather than trusting a captured langcode — the user
+        # may have changed projects in another peer between the row
+        # rendering and this click.
+        project = self._pick_publish_candidate()
+        if project is None:
             return  # button shouldn't have been visible
+        langcode = project.langcode
         status = get_credentials_status()
         confirmed = []
         if status.get('github', {}).get('confirmed'):

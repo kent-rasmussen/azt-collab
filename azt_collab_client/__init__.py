@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.22.0"
+__version__ = "0.22.1"
 # 0.16.0 floor: the daemon now persists scheduler jobs across
 # kills (jobs.json + reconcile_on_startup). Pre-0.16 daemons forget
 # job_ids on respawn, so poll_job returns None and the peer can't
