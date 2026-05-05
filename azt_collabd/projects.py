@@ -12,11 +12,22 @@ Schema (``$AZT_HOME/projects.json``):
         "working_dir": "/abs/path/to/tree",
         "lift_path":   "/abs/path/to/tree/langcode.lift",
         "remote_url":  "https://github.com/owner/langcode.git",
+        "last_commit": 1712345600.0,
         "last_sync":   1712345678.0,
         "created_at":  1700000000.0
       },
       ...
     }
+
+``last_commit`` and ``last_sync`` are deliberately separate. The
+former stamps any "the daemon committed work locally" outcome
+(``COMMITTED_LOCAL``, ``COMMITTED_NO_REMOTE``,
+``COMMITTED_AND_PUSHED``). The latter only stamps when the daemon
+successfully reached the remote (``PUSHED``, ``PULLED``,
+``COMMITTED_AND_PUSHED``). Peers can render the more recent of the
+two with a marker so the user sees "13:45* committed but not yet
+pushed" vs. "13:45 backed up". Filed by azt_recorder 1.37.3 in
+``azt_collab_client/NOTES_TO_DAEMON.md``.
 """
 
 import json
@@ -41,6 +52,7 @@ class Project:
     working_dir: str
     lift_path: str = ''
     remote_url: str = ''
+    last_commit: float = 0.0
     last_sync: float = 0.0
     created_at: float = 0.0
 
@@ -50,6 +62,7 @@ class Project:
             'working_dir': self.working_dir,
             'lift_path': self.lift_path,
             'remote_url': self.remote_url,
+            'last_commit': self.last_commit,
             'last_sync': self.last_sync,
             'created_at': self.created_at,
         }
@@ -61,6 +74,7 @@ class Project:
             working_dir=d.get('working_dir', ''),
             lift_path=d.get('lift_path', ''),
             remote_url=d.get('remote_url', ''),
+            last_commit=float(d.get('last_commit', 0.0)),
             last_sync=float(d.get('last_sync', 0.0)),
             created_at=float(d.get('created_at', 0.0)),
         )
@@ -180,6 +194,21 @@ def set_last_sync(langcode, ts=None):
     def mut(d):
         if langcode in d:
             d[langcode]['last_sync'] = float(ts)
+    _update(mut)
+
+
+def set_last_commit(langcode, ts=None):
+    """Stamp the timestamp of the most recent local commit. Set on
+    ``COMMITTED_LOCAL`` / ``COMMITTED_NO_REMOTE`` /
+    ``COMMITTED_AND_PUSHED`` outcomes — any path where the daemon
+    actually wrote a commit object to the working tree, push or no
+    push. Peers render this alongside ``last_sync`` so the
+    "committed but not yet pushed" state has a real timestamp."""
+    if ts is None:
+        ts = time.time()
+    def mut(d):
+        if langcode in d:
+            d[langcode]['last_commit'] = float(ts)
     _update(mut)
 
 

@@ -45,7 +45,6 @@ from azt_collab_client import (
     init_project,
     is_online,
     last_project,
-    list_projects,
     mark_github_app_installed,
     open_project,
     save_github_tokens,
@@ -666,45 +665,39 @@ class SettingsScreen(Screen):
         row.opacity = 1
 
     def _pick_publish_candidate(self):
-        """Return the Project we'd publish if the user clicked now,
-        or ``None`` if there's nothing reasonable to pick. See
-        ``_refresh_publish_row`` for the priority order."""
+        """Return the Project the daemon last touched, or ``None`` if
+        there isn't one (no project ever opened on this device, server
+        unreachable, or stale registry).
+
+        ``last_project()`` is server-tracked from azt_collabd 0.19+ /
+        client 0.23+: every langcode-bound RPC auto-stamps via
+        ``server._touch_project``, so the langcode that comes back is
+        always the most recently active project regardless of which
+        peer touched it. No fallback scanning is needed — if no
+        project has ever been touched, hiding the publish row is the
+        correct UX."""
         import sys
-        try:
-            langcode = (last_project() or '').strip()
-        except Exception as ex:
-            print(f'[settings] last_project raised: {ex}',
+        langcode = (last_project() or '').strip()
+        if not langcode:
+            print('[settings] last_project: empty (no project '
+                  'touched on this device yet)',
                   file=sys.stderr, flush=True)
-            langcode = ''
-        if langcode:
-            try:
-                project = open_project(langcode)
-            except Exception as ex:
-                print(f'[settings] open_project({langcode!r}) raised: '
-                      f'{ex}', file=sys.stderr, flush=True)
-                project = None
-            if project is not None and project.lift_exists:
-                print(f'[settings] publish candidate from last_project: '
-                      f'{langcode!r} (remote_url={project.remote_url!r})',
-                      file=sys.stderr, flush=True)
-                return project
-            print(f'[settings] last_project={langcode!r} did not '
-                  f'resolve; falling back to list_projects',
-                  file=sys.stderr, flush=True)
-        try:
-            projects = list_projects() or []
-        except Exception as ex:
-            print(f'[settings] list_projects raised: {ex}',
-                  file=sys.stderr, flush=True)
-            projects = []
-        live = [p for p in projects if p.lift_exists]
-        print(f'[settings] list_projects: {len(projects)} total, '
-              f'{len(live)} live: '
-              f'{[(p.langcode, p.remote_url) for p in live]!r}',
-              file=sys.stderr, flush=True)
-        if not live:
             return None
-        return max(live, key=lambda p: p.last_sync or 0.0)
+        try:
+            project = open_project(langcode)
+        except Exception as ex:
+            print(f'[settings] open_project({langcode!r}) raised: '
+                  f'{ex}', file=sys.stderr, flush=True)
+            return None
+        if project is None or not project.lift_exists:
+            print(f'[settings] last_project={langcode!r} no longer '
+                  f'resolves to a live project',
+                  file=sys.stderr, flush=True)
+            return None
+        print(f'[settings] publish candidate: {langcode!r} '
+              f'(remote_url={project.remote_url!r})',
+              file=sys.stderr, flush=True)
+        return project
 
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the

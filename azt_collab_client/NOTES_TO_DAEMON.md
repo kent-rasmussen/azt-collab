@@ -14,4 +14,4 @@ CHANGELOG is the historical record; this file is the live queue).
 
 ---
 
-_(no current notes)_
+*(no outstanding items)*

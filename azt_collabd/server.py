@@ -19,6 +19,12 @@ Endpoints:
                                               — falls back to stored creds
                                                 if body fields are absent
     POST /v1/credentials/migrate_from_prefs   {prefs_path}
+    GET  /v1/recent/last_project              → {langcode}
+    POST /v1/recent/last_project              {langcode}
+                                              — explicit override; every
+                                                langcode-bound endpoint
+                                                already auto-stamps via
+                                                _touch_project
     POST /v1/sync                             {project_dir, contributor}
                                               — creds come from the store
 """
@@ -466,10 +472,45 @@ def _h_list_projects(_body):
     return 200, {"ok": True, "projects": items}
 
 
+def _touch_project(langcode):
+    """Stamp *langcode* as the device's most-recently-touched project.
+
+    Called from every langcode-bound endpoint so peers don't have to
+    remember to write ``set_last_project``; opening a project to read
+    it (``_h_get_project``), checking its sync state
+    (``_h_project_status``), or syncing it (``_h_project_sync``)
+    naturally marks it recent. Single source of truth across peers
+    and platforms — fixes the Android-sandbox split where the
+    recorder's $AZT_HOME and the daemon's $AZT_HOME are different
+    files."""
+    if not langcode:
+        return
+    try:
+        store.set_last_langcode(langcode)
+    except Exception as ex:
+        print(f'[recent] _touch_project({langcode!r}) failed: {ex}',
+              file=sys.stderr, flush=True)
+
+
+def _h_get_last_project(_body):
+    return 200, {"ok": True, "langcode": store.get_last_langcode()}
+
+
+def _h_set_last_project(body):
+    """Explicit override. Most peers shouldn't need to call this —
+    every langcode-bound endpoint already stamps via ``_touch_project``
+    — but the wrapper exists so peers that genuinely want to *clear*
+    the recent slot (or pin a different project than the one they
+    just touched) have an affordance."""
+    store.set_last_langcode(body.get('langcode', '') or '')
+    return 200, {"ok": True}
+
+
 def _h_get_project(langcode, _body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
     return 200, {"ok": True, "project": _project_for_api(p)}
 
 
@@ -506,6 +547,16 @@ def _h_init_project(body):
                             branch, contributor)
     except Exception as ex:
         return 500, {"ok": False, "error": str(ex)}
+    # Stamp recent on whichever langcode this working_dir maps to —
+    # init_project is what publish flows through, so the project is
+    # certainly in active use.
+    try:
+        for p in projects.list_all():
+            if os.path.abspath(p.working_dir) == os.path.abspath(working_dir):
+                _touch_project(p.langcode)
+                break
+    except Exception:
+        pass
     return 200, {"ok": True, "result": result.to_dict()}
 
 
@@ -592,6 +643,7 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
                 projects.register(job_langcode, dest_dir,
                                   lift_path=lift_path,
                                   remote_url=remote_url)
+                _touch_project(job_langcode)
                 # Confirm the registry write hit disk (the user
                 # reported previously-cloned projects not showing
                 # up on next open — most likely the auto-register
@@ -634,6 +686,7 @@ def _h_create_project_from_template(body):
     try:
         p = projects.create_from_template(
             template_url, vernlang, dest_dir)
+        _touch_project(p.langcode)
     except (ValueError, RuntimeError) as ex:
         return 400, {"ok": False, "error": str(ex)}
     except Exception as ex:
@@ -734,6 +787,11 @@ def _h_rename_project(langcode, body):
         return 400, {"ok": False, "error": str(ex)}
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
+    # The just-renamed project becomes recent — both because the user
+    # is actively interacting with it and because if it *was* the
+    # recent one, last_project still points at the old langcode and
+    # peers would silently resolve nothing.
+    _touch_project(new_langcode)
     return 200, {"ok": True, "project": _project_for_api(p)}
 
 
@@ -751,6 +809,7 @@ def _h_register_project(body):
     if not remote_url:
         remote_url = projects.derive_remote_url(working_dir)
     p = projects.register(langcode, working_dir, lift_path, remote_url)
+    _touch_project(langcode)
     return 200, {"ok": True, "project": _project_for_api(p)}
 
 
@@ -758,19 +817,32 @@ def _h_project_sync(langcode, body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
     contributor = store.resolve_contributor(body.get('contributor', ''))
+    print(f'[sync-rpc] {langcode!r} contributor={contributor!r} '
+          f'remote_url={p.remote_url!r}',
+          file=sys.stderr, flush=True)
     git_user, token = store.get_sync_credentials(p.remote_url)
     if not token:
+        print(f'[sync-rpc] {langcode!r} → AUTH_REQUIRED',
+              file=sys.stderr, flush=True)
         res = Result().add(S.AUTH_REQUIRED)
         return 200, {"ok": True, "result": res.to_dict()}
     try:
         res = _sync_repo(p.working_dir, git_user, token, contributor)
     except Exception as ex:
+        print(f'[sync-rpc] {langcode!r} raised: {ex}',
+              file=sys.stderr, flush=True)
         return 500, {"ok": False, "error": str(ex)}
     codes = res.codes()
+    print(f'[sync-rpc] {langcode!r} done: codes={codes!r}',
+          file=sys.stderr, flush=True)
     if ('PUSHED' in codes or 'PULLED' in codes
             or 'COMMITTED_AND_PUSHED' in codes):
         projects.set_last_sync(langcode)
+    if ('COMMITTED_LOCAL' in codes or 'COMMITTED_NO_REMOTE' in codes
+            or 'COMMITTED_AND_PUSHED' in codes):
+        projects.set_last_commit(langcode)
     return 200, {"ok": True, "result": res.to_dict()}
 
 
@@ -778,6 +850,7 @@ def _h_project_status(langcode, _body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
     summary = _repo_status(p.working_dir)
     branch, remote_url, n_changes = ('', '', 0)
     if summary is not None:
@@ -789,6 +862,7 @@ def _h_project_status(langcode, _body):
         "branch": branch,
         "remote_url": remote_url or p.remote_url,
         "n_changes": n_changes,
+        "last_commit": p.last_commit,
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
         "lift_path": api['lift_path'],
@@ -805,6 +879,7 @@ def _h_project_sync_async(langcode, body):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
     contributor = store.resolve_contributor(body.get('contributor', ''))
     job_id = scheduler.request_sync(langcode, contributor)
     return 200, {"ok": True, "job_id": job_id}
@@ -842,6 +917,8 @@ def dispatch(method, path, body):
             parts = path.split('/')
             if len(parts) == 6 and parts[5]:
                 return _h_github_device_flow_status(parts[5], body)
+        if path == '/v1/recent/last_project':
+            return _h_get_last_project(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -873,6 +950,8 @@ def dispatch(method, path, body):
             return _h_test_gitlab(body)
         if path == '/v1/credentials/migrate_from_prefs':
             return _h_migrate_from_prefs(body)
+        if path == '/v1/recent/last_project':
+            return _h_set_last_project(body)
         if path == '/v1/projects/register':
             return _h_register_project(body)
         if path.startswith('/v1/projects/'):

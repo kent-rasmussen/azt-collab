@@ -30,6 +30,7 @@ clients can poll status. Old jobs are pruned past _MAX_JOBS.
 
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -288,19 +289,39 @@ def _fire(langcode):
 def _run_sync(langcode, contributor):
     from . import store as _store
     contributor = _store.resolve_contributor(contributor)
+    # Async sync runs from a worker thread well after the request_sync
+    # call returned, so the request-time _touch_project on the server
+    # handler has already fired. We re-touch here just to keep the
+    # invariant "every sync attempt marks the project recent" — the
+    # write is cheap and idempotent.
+    _store.set_last_langcode(langcode)
+    print(f'[sync] {langcode!r} contributor={contributor!r} starting',
+          file=sys.stderr, flush=True)
     p = projects.get(langcode)
     if p is None:
+        print(f'[sync] {langcode!r} → NO_REPO',
+              file=sys.stderr, flush=True)
         return Result().add(S.NO_REPO)
     git_user, token = get_sync_credentials(p.remote_url)
     if not token:
+        print(f'[sync] {langcode!r} → AUTH_REQUIRED (no token for '
+              f'remote_url={p.remote_url!r})',
+              file=sys.stderr, flush=True)
         return Result().add(S.AUTH_REQUIRED)
     if not _has_internet():
+        print(f'[sync] {langcode!r} → COMMITTED_OFFLINE',
+              file=sys.stderr, flush=True)
         return Result().add(S.COMMITTED_OFFLINE)
     res = _sync_repo(p.working_dir, git_user, token, contributor)
     codes = res.codes()
+    print(f'[sync] {langcode!r} done: codes={codes!r}',
+          file=sys.stderr, flush=True)
     if 'PUSHED' in codes or 'PULLED' in codes \
             or 'COMMITTED_AND_PUSHED' in codes:
         projects.set_last_sync(langcode)
+    if ('COMMITTED_LOCAL' in codes or 'COMMITTED_NO_REMOTE' in codes
+            or 'COMMITTED_AND_PUSHED' in codes):
+        projects.set_last_commit(langcode)
     return res
 
 

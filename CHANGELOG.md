@@ -11,7 +11,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
-### azt_collabd 0.18.0 + azt_collab_client 0.22.0 — settings UX cleanup
+### azt_collabd 0.19.0 + azt_collab_client 0.23.0 — server-canonical recent state + last_commit
+- **`last_project` is now server-tracked.** Was: each peer wrote
+  `$AZT_HOME/config.json::recent.last_langcode` directly, which broke
+  on Android where every peer's sandbox holds its own config.json
+  (the recorder's write and the settings-UI subprocess's read landed
+  in different files), and broke on desktop whenever a load path
+  forgot to call `set_last_project`. Now: every langcode-bound RPC
+  (`open_project`, `project_status`, `sync`, `sync_async`, `register`,
+  `init`, `clone`, `from_template`, `rename`) auto-stamps via the new
+  `server._touch_project` helper, and `last_project()` /
+  `set_last_project()` are thin wrappers around new endpoints
+  `GET`/`POST /v1/recent/last_project`. Single source of truth across
+  peers and platforms; peers don't have to remember to call
+  `set_last_project` from any specific load path.
+- **Publish picker simplified.** With server-canonical
+  `last_project`, the unpublished-projects-preference fallback in
+  `SettingsScreen._pick_publish_candidate` (added in 0.18.1 to work
+  around stale recorder-written state) is gone. The settings UI now
+  resolves `last_project()` straight to the candidate Project; if
+  that doesn't return a live project, the publish row hides — which
+  is the correct UX, because nothing has been touched.
+- **`Project.last_commit` field, separate from `last_sync`.** Filed
+  by the recorder team in `azt_collab_client/NOTES_TO_DAEMON.md`:
+  peer sync indicators couldn't distinguish "committed locally but
+  not pushed" from "silently broken" because `last_sync` only
+  stamped on `PUSHED` / `PULLED` / `COMMITTED_AND_PUSHED`. Daemon
+  now also stamps `last_commit` on `COMMITTED_LOCAL` /
+  `COMMITTED_NO_REMOTE` / `COMMITTED_AND_PUSHED` (any path where a
+  commit object hit the working tree). Both fields ride on
+  `Project` and `ProjectStatus`; pre-0.19 daemons that don't emit
+  `last_commit` get a 0.0 default in the client dataclass for
+  forward-compat. `NOTES_TO_DAEMON.md` entry deleted per its own
+  instructions.
+- **Sync trace lines** retained from 0.18.2: `[sync]` lines from
+  `scheduler._run_sync` and `[sync-rpc]` from `_h_project_sync` so
+  successful syncs show up in `adb logcat -s python`.
+
+### azt_collabd 0.18.2 + azt_collab_client 0.22.1 — settings UX cleanup
+- Sync trace lines on stderr (visible via `adb logcat -s python` on
+  Android): `[sync] <lang> ... starting` / `... done: codes=[...]` from
+  `scheduler._run_sync` and `[sync-rpc] ...` from `_h_project_sync`.
+  Previously a successful sync emitted nothing — the structured
+  `Result` carried the outcome but there was no trail in logcat to
+  confirm the daemon had even seen the request.
+- Publish-candidate fallback also prefers unpublished projects (the
+  filtered `list_projects()` search would otherwise pick a
+  more-recently-synced sibling that was already published, hiding
+  the publish row even though a sibling project still needed
+  publishing).
+- Publish candidate falls back from `last_project()` to the
+  highest-`last_sync` entry in `list_projects()` when the suite-wide
+  "last opened" key is empty (older recorder load paths don't always
+  write it). Diagnostic stderr lines from `_pick_publish_candidate`
+  surface why the row stayed hidden.
+
+
 - **GitLab "Connect" + Test button.** The settings screen's GitLab
   affordance is now labelled "Connect to GitLab" (was "Set GitLab
   credentials") to match GitHub's wording. The form screen replaces

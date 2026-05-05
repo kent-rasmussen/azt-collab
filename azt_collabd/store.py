@@ -306,6 +306,26 @@ def resolve_contributor(passed):
     return (passed or '').strip() or get_contributor() or 'Recorder'
 
 
+# ── recent project (server-canonical) ───────────────────────────────────────
+#
+# Single source of truth for "what project did this device most recently
+# touch?" Lives in ``$AZT_HOME/config.json :: recent.last_langcode`` so
+# every peer (recorder, viewer, settings UI) reads the same value
+# regardless of which platform/sandbox it runs in. Stamped server-side
+# on every langcode-bound endpoint (``server._touch_project``) — peers
+# don't have to remember to call ``set_last_project`` from the right
+# load path; just touching the project via any RPC marks it recent.
+
+def get_last_langcode():
+    return (_load_config_file().get('recent') or {}).get('last_langcode', '')
+
+
+def set_last_langcode(langcode):
+    cfg = _load_config_file()
+    cfg.setdefault('recent', {})['last_langcode'] = (langcode or '').strip()
+    _save_config_file(cfg)
+
+
 # ── migration from recorder's legacy prefs.json ─────────────────────────────
 
 _LEGACY_GITHUB = {
