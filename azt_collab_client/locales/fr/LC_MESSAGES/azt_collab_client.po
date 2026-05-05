@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.15.0\n"
+"Project-Id-Version: azt_collab_client 0.25.1\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -23,6 +23,27 @@ msgstr "Démarrer un nouveau"
 msgid "Pick a project"
 msgstr "Choisir un projet"
 
+# ── popups.py — confirm_langcode_popup ────────────────────────────────────
+
+msgid "Project language code"
+msgstr "Code de langue du projet"
+
+msgid ""
+"Confirm or edit. The daemon derived this from the file or URL — change it "
+"if it isn't right for your project."
+msgstr ""
+"Confirmez ou modifiez. Le démon l'a déduit du fichier ou de l'URL — "
+"changez-le s'il ne correspond pas à votre projet."
+
+msgid "e.g. en-x-pilot"
+msgstr "par ex. en-x-pilot"
+
+msgid "Confirm"
+msgstr "Confirmer"
+
+msgid "Confirm project language code"
+msgstr "Confirmer le code de langue du projet"
+
 # ── popups.py — clone_url_popup ───────────────────────────────────────────
 
 msgid "Clone a git repository containing a LIFT file:"
@@ -30,6 +51,15 @@ msgstr "Cloner un dépôt git contenant un fichier LIFT :"
 
 msgid "Paste the repository URL here"
 msgstr "Collez l'URL du dépôt ici"
+
+msgid "code: "
+msgstr "code : "
+
+msgid "change code"
+msgstr "changer le code"
+
+msgid "OK"
+msgstr "OK"
 
 msgid "Cancel"
 msgstr "Annuler"
@@ -255,11 +285,20 @@ msgstr "Se connecter à GitHub"
 msgid "Disconnect GitHub"
 msgstr "Se déconnecter de GitHub"
 
+msgid "Connect to GitLab"
+msgstr "Se connecter à GitLab"
+
 msgid "Set GitLab credentials"
 msgstr "Configurer les identifiants GitLab"
 
 msgid "Disconnect GitLab"
 msgstr "Se déconnecter de GitLab"
+
+msgid "Publish data"
+msgstr "Publier les données"
+
+msgid "Test connection"
+msgstr "Tester la connexion"
 
 msgid "Refresh"
 msgstr "Actualiser"
@@ -320,6 +359,9 @@ msgstr "Nom d'utilisateur :"
 msgid "App installed:"
 msgstr "Application installée :"
 
+msgid "Confirmed:"
+msgstr "Confirmé :"
+
 msgid "Error: {error}"
 msgstr "Erreur : {error}"
 
@@ -344,8 +386,57 @@ msgstr "Échec : {error}"
 msgid "Enter both username and token."
 msgstr "Saisissez le nom d'utilisateur et le jeton."
 
+msgid "Testing..."
+msgstr "Test en cours..."
+
+msgid "Server unavailable: {error}"
+msgstr "Serveur indisponible : {error}"
+
+msgid "Connected as {username}. Credentials saved."
+msgstr "Connecté en tant que {username}. Identifiants enregistrés."
+
+msgid "Invalid token. Check your personal access token."
+msgstr "Jeton invalide. Vérifiez votre jeton d'accès personnel."
+
+msgid "Token is valid, but belongs to {server_username}, not {username}."
+msgstr ""
+"Le jeton est valide, mais appartient à {server_username}, et non à "
+"{username}."
+
+msgid "Network error — check your connection."
+msgstr "Erreur réseau — vérifiez votre connexion."
+
+msgid "Test failed: {error}"
+msgstr "Échec du test : {error}"
+
 msgid "Saved for {username}."
 msgstr "Enregistré pour {username}."
+
+# ── settings: publish row ─────────────────────────────────────────────────
+
+msgid "Publish {langcode} data"
+msgstr "Publier les données {langcode}"
+
+msgid "Connect to GitHub or GitLab first to enable publish."
+msgstr "Connectez-vous d'abord à GitHub ou GitLab pour activer la publication."
+
+msgid "Publish to which service?"
+msgstr "Publier vers quel service ?"
+
+msgid "No {host} username on file."
+msgstr "Aucun nom d'utilisateur {host} enregistré."
+
+msgid "Project {langcode} not found."
+msgstr "Projet {langcode} introuvable."
+
+msgid "Publishing to {url}..."
+msgstr "Publication vers {url}..."
+
+msgid "Done."
+msgstr "Terminé."
+
+msgid "Publish failed: {error}"
+msgstr "Échec de la publication : {error}"
 
 # ── settings: contributor (commit-author name) ────────────────────────────
 
@@ -360,6 +451,13 @@ msgstr "Enregistré."
 
 msgid "Internal error: tried to return an empty path. Please pick again or report this."
 msgstr "Erreur interne : tentative de retour d'un chemin vide. Veuillez réessayer ou signaler ce problème."
+
+msgid ""
+"The project picker failed to return a result. The app will now close — "
+"please reopen it."
+msgstr ""
+"Le sélecteur de projet n'a pas pu renvoyer de résultat. L'application va "
+"se fermer — veuillez la rouvrir."
 
 # ── picker_app.py messages ────────────────────────────────────────────────
 
@@ -380,3 +478,20 @@ msgstr "Impossible d'ouvrir les paramètres : {error}"
 
 msgid "Open settings"
 msgstr "Ouvrir les paramètres"
+
+# ── share.py — share running APK via Android share sheet ──────────────────
+
+msgid "Share this app"
+msgstr "Partager cette appli"
+
+msgid "Share app"
+msgstr "Partager l'appli"
+
+msgid "Share failed: could not create MediaStore entry"
+msgstr "Échec du partage : impossible de créer l'entrée MediaStore"
+
+msgid "Could not share APK:\n{error}"
+msgstr "Impossible de partager l'APK :\n{error}"
+
+msgid "APK sharing is only available on Android."
+msgstr "Le partage de l'APK n'est disponible que sur Android."

@@ -16,9 +16,11 @@ from .popups import (
 )
 from .fonts import register_charis
 from .icons import icon_path
+from .share import share_running_apk
 
 __all__ = ['LangPickerScreen', 'register_langpicker_kv',
            'ProjectPickerScreen', 'register_picker_kv',
            'clone_url_popup', 'confirm_langcode_popup',
            'install_server_apk_popup',
-           'register_charis', 'icon_path']
+           'register_charis', 'icon_path',
+           'share_running_apk']

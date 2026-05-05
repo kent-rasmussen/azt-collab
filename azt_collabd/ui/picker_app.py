@@ -849,7 +849,7 @@ class PickerApp(App):
             msg = translate_status(auth_status)
             self._show_error(
                 msg,
-                extra_button=('Open settings',
+                extra_button=(_tr('Open settings'),
                               lambda: self.go_config()))
             return
         self._show_error(_tr('Clone failed: {error}').format(error=err))

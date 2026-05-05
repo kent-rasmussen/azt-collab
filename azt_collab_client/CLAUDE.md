@@ -281,6 +281,8 @@ i18n.current_language()                # active language (after fallback)
 i18n.available_languages()             # [(code, display_name), ...]
 i18n.display_name('fr')                # 'Français' (single source of truth)
 i18n.scan_catalog_languages(dir, dom)  # peer-side catalog discovery helper
+i18n.ensure_mo(dir, dom, lang)         # compile .po → .mo for an arbitrary
+                                       # peer catalog (lazy; no msgfmt dep)
 i18n._('Cancel')                       # translate via the client catalog
 i18n.gettext_translation()             # underlying gettext.NullTranslations
                                        # subclass — for add_fallback chains
@@ -296,7 +298,9 @@ selected from the daemon's settings UI (`open_server_ui()`).
 **Peer with its own catalog** (the recorder, with `aztrecorder.po`):
 chain via gettext's native `add_fallback` so peer-owned strings
 resolve in the peer catalog and client-owned strings fall through
-to ours:
+to ours. Call `i18n.ensure_mo(...)` first so the peer can ship
+`.po`-only just like the client does — no external `msgfmt` build
+step:
 
 ```python
 import gettext
@@ -307,6 +311,7 @@ def set_recorder_language(lang):
     if lang == 'en':
         recorder_t = gettext.NullTranslations()
     else:
+        collab_i18n.ensure_mo(RECORDER_LOCALES, 'aztrecorder', lang)
         recorder_t = gettext.translation(
             'aztrecorder', localedir=RECORDER_LOCALES, languages=[lang],
             fallback=True)
@@ -314,6 +319,11 @@ def set_recorder_language(lang):
     recorder_t.add_fallback(collab_i18n.gettext_translation())
     azt_collab_client.set_translator(recorder_t.gettext)
 ```
+
+`ensure_mo` writes the `.mo` next to the `.po`. On Android that's
+inside the APK's private filesDir (where p4a extracts Python source
+on first run — writable, so the lazy compile works the same way for
+peers as for the client).
 
 After this, `_(msg)` in recorder code resolves recorder strings
 first, then falls through to the client catalog. No string

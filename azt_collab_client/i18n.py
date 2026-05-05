@@ -193,12 +193,20 @@ def _compile_mo(po_path, mo_path):
     os.replace(tmp, mo_path)
 
 
-def _ensure_mo(lang):
-    """Compile <lang>/LC_MESSAGES/<DOMAIN>.po → .mo if .mo is missing
-    or older than the .po. No-op for English (no catalog needed)."""
+def ensure_mo(locale_dir, domain, lang):
+    """Compile ``<locale_dir>/<lang>/LC_MESSAGES/<domain>.po`` → ``.mo``
+    if the ``.mo`` is missing or older than the ``.po``. No-op for
+    English (no catalog needed) or when the ``.po`` is absent.
+
+    Peer i18n modules call this before ``gettext.translation(...)`` so
+    they can ship ``.po``-only and skip the external ``msgfmt`` build
+    step the same way the client does. Writes the ``.mo`` next to the
+    ``.po``; on Android that's inside the APK's private filesDir
+    (writable, since p4a extracts Python source there at first run).
+    Errors are logged and swallowed — gettext falls back to msgid."""
     if lang == 'en':
         return
-    base = os.path.join(_LOCALE_DIR, lang, 'LC_MESSAGES', _DOMAIN)
+    base = os.path.join(locale_dir, lang, 'LC_MESSAGES', domain)
     po, mo = base + '.po', base + '.mo'
     if not os.path.isfile(po):
         return
@@ -209,6 +217,10 @@ def _ensure_mo(lang):
         _compile_mo(po, mo)
     except Exception as ex:
         print(f'[client.i18n] compile {po}: {ex}', file=sys.stderr)
+
+
+def _ensure_mo(lang):
+    ensure_mo(_LOCALE_DIR, _DOMAIN, lang)
 
 
 # ── public API ─────────────────────────────────────────────────────────────

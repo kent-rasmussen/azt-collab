@@ -11,6 +11,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.25.2 — public `ensure_mo` for peers
+- `azt_collab_client.i18n.ensure_mo(locale_dir, domain, lang)` exposes
+  the lazy `.po` → `.mo` compile path peers were previously missing.
+  Peer i18n modules call it before `gettext.translation(...)` so they
+  can ship `.po`-only and skip the external `msgfmt` build step the
+  same way the client does. Writes the `.mo` next to the `.po`; on
+  Android that's inside the APK's private filesDir, which is
+  writable. See the *Internationalization (i18n)* section of
+  `azt_collab_client/CLAUDE.md` for the integration recipe.
+- `_ensure_mo(lang)` is now a thin wrapper around `ensure_mo` for the
+  client's own domain — no behaviour change for the client itself.
+
+### azt_collabd 0.25.1 + azt_collab_client 0.25.1 — French catalog catch-up
+- Added 28 missing French translations to
+  `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+  covering the popup confirm-langcode flow, the clone-URL popup's
+  inline `code: ` / `change code` / `OK` affordances, the daemon
+  settings UI's publish row + GitLab Test screen, and the picker's
+  empty-result fallback dialog. Catalog Project-Id-Version follows
+  the package bump.
+- Wrapped a stray ``'Open settings'`` literal in
+  `azt_collabd/ui/picker_app.py:852` (clone-failure auth modal) with
+  `_tr` so the translation already in the catalog actually fires.
+
 ### azt_collabd 0.25.0 + azt_collab_client 0.25.0 — synchronized release
 - Lock-step version bump of both packages plus their cross-floors:
   `azt_collabd.MIN_CLIENT_VERSION` → 0.25.0,
