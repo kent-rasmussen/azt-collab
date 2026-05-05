@@ -12,6 +12,13 @@ class Project:
     remote_url: str = ''
     last_sync: float = 0.0
     created_at: float = 0.0
+    # True iff the daemon could stat the project's LIFT file at the
+    # time of the API response. Peers should check this before
+    # handing lift_path to LiftHandle — a stale projects.json entry
+    # whose underlying file was deleted out-of-band would otherwise
+    # surface as a not-found at open time. Defaults to True for
+    # forward-compat with pre-0.16 daemons that don't emit the flag.
+    lift_exists: bool = True
 
     @classmethod
     def from_dict(cls, d):
@@ -23,6 +30,7 @@ class Project:
             remote_url=d.get('remote_url', ''),
             last_sync=float(d.get('last_sync', 0.0)),
             created_at=float(d.get('created_at', 0.0)),
+            lift_exists=bool(d.get('lift_exists', True)),
         )
 
 

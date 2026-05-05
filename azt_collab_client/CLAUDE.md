@@ -143,6 +143,15 @@ All exposed by `azt_collab_client.__all__`. Patterns:
   use `clone_project_start` + `clone_project_status` for a
   Clock-driven progress loop),
   `project_status(langcode)` → `ProjectStatus | None`.
+  Each `Project` carries a `lift_exists` boolean — the daemon's stat
+  result against the project's LIFT path at API-response time. Peers
+  resolving a `last_project()` / favourite langcode to a `Project`
+  for auto-resume should check `lift_exists` before handing
+  `lift_path` to `LiftHandle`; a False value means the file was
+  deleted out-of-band (user wipe, external rm) and the peer should
+  fall through to the picker rather than crashing on a not-found.
+  The picker's host-side `list_projects()` filters missing entries
+  out automatically.
 - **Sync.** `sync_project(langcode, contributor)` blocks; returns
   `Result`. `request_sync(langcode, contributor)` is fire-and-forget
   (returns a `job_id`, debounced server-side). `poll_job(job_id)`

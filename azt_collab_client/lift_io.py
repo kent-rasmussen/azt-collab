@@ -198,4 +198,26 @@ def _open_content_uri(uri, mode):
         raise IOError(f'openFileDescriptor returned null for {uri!r} '
                       f'(mode={java_mode!r})')
     fd = pfd.detachFd()
+    if java_mode == 'w':
+        # Defensive: ParcelFileDescriptor.parseMode("w") should set
+        # MODE_TRUNCATE → O_TRUNC at open time, but empirically that
+        # truncation does not always fire across the ContentProvider
+        # boundary (a write shorter than the existing file leaves the
+        # original tail intact, producing a doubled / mid-file </lift>
+        # corruption). ftruncate to 0 here unconditionally so a partial
+        # write can never resurface old content. Cheap (no I/O on a
+        # fresh-or-already-zero file).
+        try:
+            os.ftruncate(fd, 0)
+        except OSError as ex:
+            # If ftruncate fails (rare — maybe the FD is read-only or
+            # the underlying fs doesn't support it), close the FD and
+            # surface as IOError so the caller doesn't end up writing
+            # into a possibly-tail-contaminated file.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise IOError(
+                f'ftruncate failed for {uri!r}: {ex}') from ex
     return os.fdopen(fd, 'rb' if java_mode == 'r' else 'wb')

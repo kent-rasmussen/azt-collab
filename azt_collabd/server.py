@@ -66,16 +66,32 @@ def _on_android():
 
 
 def _project_for_api(p):
-    """Convert a Project to its API-facing dict. On Android, replaces
-    ``lift_path`` (a filesystem path inside the server APK's
-    sandbox, useless to peer apps in other packages) with the
-    equivalent content URI under our ContentProvider authority. The
-    URI shape mirrors what the picker emits in its result Intent —
-    ``content://org.atoznback.aztcollab/<lang>/<basename>`` — so peers
-    that called LiftHandle on the picker URI can do the same with the
-    Project from list_projects / open_project on later runs without
-    knowing about the path-vs-URI distinction."""
+    """Convert a Project to its API-facing dict.
+
+    Two adaptations:
+
+    * On Android, replaces ``lift_path`` (a filesystem path inside
+      the server APK's sandbox, useless to peer apps in other
+      packages) with the equivalent content URI under our
+      ContentProvider authority. The URI shape mirrors what the
+      picker emits in its result Intent —
+      ``content://org.atoznback.aztcollab/<lang>/<basename>`` — so
+      peers that called LiftHandle on the picker URI can do the same
+      with the Project from list_projects / open_project on later
+      runs without knowing about the path-vs-URI distinction.
+
+    * Adds a ``lift_exists`` boolean computed against the actual
+      filesystem path. The daemon's projects.json can outlive the
+      LIFT file (the file may be deleted out-of-band: user wipe,
+      external rm, sync conflict resolution, etc.). Peers that resolve
+      a recent / favourite project to a Project record need to know
+      whether the file is still openable BEFORE they hand the URI to
+      LiftHandle and crash on a not-found. UI can hide / mark / offer
+      re-clone based on this flag.
+    """
     d = p.to_dict()
+    fs_path = p.lift_path  # always the filesystem path, pre-URI
+    d['lift_exists'] = bool(fs_path and os.path.isfile(fs_path))
     if _on_android() and d.get('lift_path'):
         # If lift_path is already a URI (e.g. registered by a future
         # caller that did its own conversion), don't double-wrap.

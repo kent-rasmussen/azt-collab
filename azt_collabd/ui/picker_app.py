@@ -611,15 +611,29 @@ class PickerApp(App):
                   f'{type(ex).__name__}: {ex}',
                   file=sys.stderr, flush=True)
             ps = []
+        # Filter out projects whose LIFT file the daemon couldn't stat
+        # (deleted out-of-band: user wipe, external rm, sync conflict
+        # resolution, ...). Showing them in the picker would only let
+        # the user tap and crash on a later open with a not-found.
+        # If the user wants to re-establish, they can re-clone or
+        # re-create with the same vernlang. ``lift_exists`` defaults
+        # True so a pre-0.16 daemon (which doesn't emit the flag)
+        # behaves as before.
+        live = [p for p in ps if p.lift_exists]
+        if len(live) != len(ps):
+            missing = [p.langcode for p in ps if not p.lift_exists]
+            print(f'[picker_app] hiding {len(missing)} project(s) '
+                  f'with missing LIFT: {missing!r}',
+                  file=sys.stderr, flush=True)
         # Diagnostic: confirm previously-cloned projects survive
         # across picker launches. If this prints 0 right after a
         # successful clone, the registry write didn't persist (bad
         # AZT_HOME, write permission, etc.).
-        print(f'[picker_app] list_projects: {len(ps)} project(s) '
+        print(f'[picker_app] list_projects: {len(live)} project(s) '
               f'from registry: '
-              f'{[p.langcode for p in ps]!r}',
+              f'{[p.langcode for p in live]!r}',
               file=sys.stderr, flush=True)
-        return [(p.langcode, p.lift_path or p.working_dir) for p in ps]
+        return [(p.langcode, p.lift_path or p.working_dir) for p in live]
 
     # load_lift is defined earlier with a diagnostic print; the
     # second definition is removed so the diagnostic version actually
