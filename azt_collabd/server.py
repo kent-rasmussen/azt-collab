@@ -427,6 +427,48 @@ def _h_set_gitlab(body):
     return 200, {"ok": True}
 
 
+def _h_test_github(body):
+    """Validate the stored GitHub access token by hitting
+    ``api.github.com/user``. Mirrors ``_h_test_gitlab`` so the UI's
+    per-host Test buttons share a shape.
+
+    Refresh path: the token may be near expiry. We pull through
+    ``store.get_valid_github_token`` which proactively refreshes when
+    the access token is older than 7 hours, so a successful test
+    after a refresh persists the new token automatically (set on
+    refresh by ``store.set_github_tokens``, which also clears
+    ``confirmed`` — we re-set it on the success branch below).
+
+    On a successful test we also persist the freshly-probed
+    ``app_installed`` flag (the GitHub probe is on the same token,
+    one extra HTTP round-trip already done inside
+    ``test_github_credentials``) so the connect screen's "Install
+    GitHub App" CTA shows up only when warranted."""
+    from . import auth as _auth
+    username, token = store.get_valid_github_token()
+    if not token:
+        store.set_github_confirmed(False)
+        return 200, {"ok": True, "valid": False,
+                     "server_username": "",
+                     "app_installed": False,
+                     "error": "missing_token"}
+    info = _auth.test_github_credentials(token)
+    if info.get('valid'):
+        # Refresh username if the user renamed on GitHub since last
+        # connect; harmless on the typical "name unchanged" path.
+        server_user = info.get('server_username', '') or username
+        if server_user and server_user != username:
+            store.set_github_tokens(
+                access_token=token,
+                username=server_user,
+            )
+        store.set_github_app_installed(bool(info.get('app_installed')))
+        store.set_github_confirmed(True)
+    else:
+        store.set_github_confirmed(False)
+    return 200, {"ok": True, **info}
+
+
 def _h_test_gitlab(body):
     """Validate GitLab credentials by hitting ``/api/v4/user``. If
     ``username`` / ``token`` are absent in the body, fall back to the
@@ -1008,6 +1050,8 @@ def dispatch(method, path, body):
             return _h_set_gitlab(body)
         if path == '/v1/credentials/gitlab/test':
             return _h_test_gitlab(body)
+        if path == '/v1/credentials/github/test':
+            return _h_test_github(body)
         if path == '/v1/credentials/migrate_from_prefs':
             return _h_migrate_from_prefs(body)
         if path == '/v1/recent/last_project':

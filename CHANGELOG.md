@@ -11,6 +11,175 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collab_client 0.28.1 — bootstrap hardening + first automated tests
+- **Filter prereleases** from the latest-release probe in
+  `update.py:_fetch_latest`. Walks `/releases?per_page=20` for the
+  first stable entry; falls back to `/releases/latest` if every
+  recent release is a prerelease or the listing endpoint refused.
+  Closes the v0.28.0 bug where a project pushing a `vN-rc` tag would
+  silently auto-install onto every peer.
+- **bootstrap idempotence guard.** A second `bootstrap()` call within
+  the same process now no-ops. Prevents double-prompting when an
+  on_start hook fires twice during a Kivy reload or two startup
+  hooks both wire the helper.
+- **Decline memory.** When the user taps "Not now" on a prompt, the
+  declined version is persisted to
+  `$AZT_HOME/config.json :: bootstrap.declined.<repo>=<version>`.
+  Subsequent launches skip the prompt for that exact version; a
+  new upstream release moves us off the recorded value
+  automatically (string compare, not semver).
+- **Disambiguate "server APK absent" from "daemon unreachable"** by
+  probing `PackageManager.getPackageInfo('org.atoznback.aztcollab')`
+  before issuing the install prompt. If the package is installed but
+  the daemon happens to be down (no network, OOM-killed mid-call),
+  the helper now skips the install prompt and continues to the
+  self-check instead of asking the user to install something that's
+  already there. New status string
+  "AZT Collaboration installed but unreachable. Continuing offline."
+- **First automated test scaffold.** New `azt-collab/tests/` directory
+  with pytest fixtures (per-test `$AZT_HOME` redirection, jnius stub,
+  Kivy headless flags, platform monkeypatch) and five test modules
+  covering version-tuple corner cases, GitHub-API mocks for
+  `check_for_update`, bootstrap dispatch + idempotence + decline
+  memory + package-presence disambiguation, the `github.confirmed`
+  store lifecycle, and a translation-coverage drift detector.
+  Run with `pytest tests/ -q`. CLAUDE.md updated to retire the
+  "no automated test suite anywhere in the suite" claim.
+- **`docs/research_notes_2026-05.md`** captures the state of the
+  art for the technologies we depend on (Android 16, the March-2026
+  sideloading lockdown, ACTION_VIEW deprecation in favor of
+  PackageInstaller, buildozer/Kivy versions, GitHub API behavior).
+  Action items are owned in the file. Refresh before each major
+  release.
+- **`docs/test_plan.md`** is the canonical failure-mode matrix. Every
+  bug found in the bootstrap workflow lands here as a row in §10
+  before it gets fixed.
+- One new translation: "AZT Collaboration installed but unreachable.
+  Continuing offline."
+
+### azt_collab_client 0.28.0 — bootstrap() one-call peer entry point
+- New `azt_collab_client.ui.bootstrap(...)` helper. Peers call it
+  once on `App.on_start` and the helper handles, in this order:
+  1. `check_server_compat()`. On `server_unreachable` →
+     "Install AZT Collaboration?" Yes/No popup → `check_for_update`
+     against `kent-rasmussen/azt-collab` → Android system installer.
+     `server_too_old` runs the analogous "Update AZT Collaboration?"
+     prompt. `client_too_old` jumps to step 2.
+  2. Probe peer's own latest release on GitHub. If newer →
+     "Update <peer>?" Yes/No → download+install the peer's APK.
+  3. `on_done` — every up-to-date / declined / completed-install
+     branch lands here so the host's normal startup always
+     resumes.
+  Suite UX rule encoded by this helper: **the user installs one
+  APK** (the peer they opened); the standalone server APK and all
+  subsequent updates are provisioned by the peer itself on first
+  run. Spawns a worker thread for the version probes so first
+  paint isn't blocked; popups marshal back to the Kivy UI thread.
+- Android-only effects. Desktop hosts call `on_done` immediately.
+- Buildozer requirement documented (`REQUEST_INSTALL_PACKAGES` in
+  the peer's `android.permissions`); without it the install intent
+  silently no-ops.
+- `azt_collab_client/CLAUDE.md` documents the integration recipe so
+  the recorder, viewer, and any future peer can wire one
+  ten-line `App.on_start` call and let the helper take it from
+  there.
+- New translations (fr): "AZT Collaboration", "Checking
+  installation…", "Install AZT Collaboration?", "Update AZT
+  Collaboration?", "Update {name}?", body strings for each prompt,
+  "Install" / "Update" / "Not now" buttons, "Update needed" info
+  popup, "Updating {name}…", "AZT Collaboration is up to date.",
+  and the rare client-too-old-no-newer-release fallback message.
+
+### azt_collabd 0.27.0 + azt_collab_client 0.27.0 — symmetric host credential flow
+- **`github.confirmed` is now a stored flag**, not derived. Mirrors
+  the existing GitLab semantics: set true by a successful live test,
+  reset to false on any settings change (token save, app-install
+  flag flip, disconnect). Per-host shape is now uniform — both
+  GitHub and GitLab expose `connected` ("settings present") and
+  `confirmed` ("tested OK against the host's API").
+- New endpoint `POST /v1/credentials/github/test` (handler
+  `_h_test_github`) and matching client wrapper
+  `azt_collab_client.test_github_credentials()`. Hits
+  `api.github.com/user` with the stored access token; on success
+  also probes `api.github.com/user/installations` so the same Test
+  button refreshes both `confirmed` and `app_installed` in one
+  user gesture, matching the GitLab Test pattern.
+- Auth helper `azt_collabd.auth.test_github_credentials(token)`
+  added alongside the existing `test_gitlab_credentials` —
+  consistent shape, same return dict (`{valid, server_username,
+  app_installed, error}`).
+- **`GitHubConnectScreen` is now state-aware.** Three shapes picked
+  in `on_pre_enter` from `credentials_status['github']`:
+  * not connected → device-flow box visible, manage hidden,
+    `begin()` auto-fires.
+  * connected, not confirmed → manage view (Test + Install GitHub
+    App if not installed + Re-authenticate + Disconnect); device
+    flow hidden; nothing auto-fires.
+  * connected, confirmed → same controls plus a "(verified)"
+    badge in the status line.
+  Show/hide uses the Kivy hide/show pattern (height: 0, opacity: 0)
+  per `~/.claude-sil/CLAUDE.md`. The screen is fully self-contained:
+  Disconnect / Re-authenticate / Install-app no longer require the
+  user to bounce back to settings.
+- `SettingsScreen.connect_github()` reduced to a one-liner navigate.
+  Auto-firing `begin()` on every entry to the screen is gone — the
+  user with a token already on file isn't re-prompted for device
+  flow; they get the manage view and pick Test or Re-authenticate
+  themselves.
+- Lock-step bump to 0.27.0 with cross-floors:
+  `azt_collabd.MIN_CLIENT_VERSION` → 0.27.0,
+  `azt_collab_client.MIN_SERVER_VERSION` → 0.27.0. New wire endpoint
+  + bundled-client peer APKs need the floor bump or version
+  mismatches stay silent (ref. memory note on
+  MIN_CLIENT_VERSION discipline).
+- Translations (fr) for the new state-aware strings:
+  "Re-authenticate", "Disconnect", "Install GitHub App",
+  "Connected as {username} (verified).", the not-yet-tested and
+  app-not-installed variants, "Token rejected by GitHub. Tap
+  Re-authenticate.", "Could not open install page: {error}", and
+  the "Opening {uri}\nWhen you finish on GitHub..." prompt.
+
+### azt_collabd 0.26.0 + azt_collab_client 0.26.0 — in-app self-update
+- New `azt_collab_client.ui.check_for_update(repo, current_version,
+  asset_filename, on_status, ...)` reusable updater. Spawns a worker
+  thread, polls `GET /repos/{repo}/releases/latest`, compares the
+  release tag to the caller's `__version__` as a semver tuple, and on
+  a newer release downloads the matching asset and dispatches
+  `Intent.ACTION_VIEW` with the APK MIME type so Android's system
+  installer takes over. All callbacks marshal back to the Kivy UI
+  thread; non-Android hosts get a translated
+  "APK install is only available on Android." through `on_error`.
+- `REQUEST_INSTALL_PACKAGES` added to
+  `server_apk/buildozer.spec → android.permissions`. The helper
+  detects Android 8+ "Install unknown apps" gating via
+  `PackageManager.canRequestPackageInstalls()` and routes the user to
+  `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` on first use.
+- `azt_collabd.configure(update_repo=...)` + `AZT_UPDATE_REPO` env var
+  + `azt_collabd.config.update_repo()` accessor; default is
+  `kent-rasmussen/azt-collab` (the canonical release feed at
+  https://github.com/kent-rasmussen/azt-collab/releases/latest).
+- "Update this app" button + status `BodyLabel` added to
+  `<SettingsScreen>` directly under the existing "Share this app"
+  row. Hosted by both `CollabUIApp.update_app` (standalone settings
+  subprocess) and `PickerApp.update_app` (in-process settings reached
+  from the picker's gear). Same KV `app.update_app()` resolves on
+  whichever App owns the screen.
+- `azt_collab_client/CLAUDE.md` documents the integration recipe so
+  peers (recorder targeting `kent-rasmussen/azt-recorder`, future
+  viewer, …) can wire the same button into their own settings screens
+  by passing their own `repo` / `__version__` / `asset_filename`.
+- Translations added (fr): "Update this app", "Up to date.",
+  "Checking for updates…", "Downloading {pct}%…",
+  "Preparing install…", "Installing…",
+  "APK install is only available on Android.", and the failure
+  variants ("Update check failed: {error}", missing-tag /
+  missing-asset / missing-URL detail strings, "Download failed",
+  "Install failed", "Could not create download dir", and the
+  Install-unknown-apps prompt).
+- Lock-step bump to 0.26.0 across `azt_collabd` and `azt_collab_client`
+  (no wire-format change; just keeping the cross-floors aligned now
+  that the client gained shared UI surface peers will rely on).
+
 ### azt_collabd 0.25.2 — "Share this app" on the settings screen
 - Added a Share-this-app row to `<SettingsScreen>` (`azt_collabd/ui/app.py`),
   positioned right under the Back NavBtn so it leads the scrollable

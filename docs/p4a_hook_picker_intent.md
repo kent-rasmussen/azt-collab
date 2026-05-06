@@ -9,8 +9,7 @@ Intent action at startup and mounts `picker_app` when it's
 `PICK_PROJECT`. The only missing piece is the manifest declaration so
 Android resolves the Intent to the server APK's `PythonActivity`.
 
-This change lives in
-`/home/kentr/bin/raspy/buildozer_tweaks/p4a_hook.py` — outside both
+This change lives in P4A_LOCAL_RECIPES/p4a_hook.py` — outside both
 `azt_recorder/` and `azt-collab/` — so it isn't applied by the
 in-repo edits for picker-migration step 7.
 

@@ -626,6 +626,140 @@ that resolve in its own cwd — that's fine, no migration required; the
 client-first rule applies to *new* shared-shape assets and to any
 asset whose move-to-shared is forced by a second consumer.
 
+### Self-update — `check_for_update`
+
+`azt_collab_client.ui.check_for_update(...)` is a reusable updater
+each suite APK plugs into its settings screen. Identity is fully
+parametric so the same helper serves the server APK and every peer.
+
+**Helper contract.** Spawns a worker thread, marshals callbacks back
+to the Kivy UI thread via `Clock.schedule_once`, and on Android
+downloads + dispatches `ACTION_VIEW` with the
+`application/vnd.android.package-archive` MIME type so the system
+installer takes over. Non-Android hosts get a translated
+"APK install is only available on Android." through `on_error`.
+
+Required args (all keyword-only):
+
+- `repo` — `'owner/repo'` on GitHub. Hits
+  `GET /repos/<owner>/<repo>/releases/latest`.
+- `current_version` — caller's `__version__`; compared as a semver
+  tuple against the release's `tag_name` (`v` / `V` prefix tolerated).
+- `asset_filename` — exact name of the release asset to fetch. Each
+  app names its own (`azt_collab.apk`, `azt_recorder.apk`, …).
+- `on_status` — `callable(str)`; receives translated state strings
+  ("Checking for updates…", "Downloading {pct}%…", "Installing…").
+
+Optional: `on_no_update`, `on_error`, `download_dir` (defaults to
+`$AZT_HOME/updates`).
+
+**Server-APK adapter** (already shipped):
+
+```python
+# azt_collabd/ui/app.py — CollabUIApp.update_app
+from azt_collabd.config import update_repo  # 'kent-rasmussen/azt-collab'
+check_for_update(
+    repo=update_repo(),
+    current_version=azt_collabd.__version__,
+    asset_filename='azt_collab.apk',
+    on_status=self._set_update_msg,
+    on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
+    on_error=self._show_error,
+)
+```
+
+The repo defaults to `kent-rasmussen/azt-collab` and is overridable
+via `azt_collabd.configure(update_repo=...)` or the `AZT_UPDATE_REPO`
+env var, so a fork can ship the same code aimed at a different
+release feed.
+
+**Peer adapter pattern** (recorder, viewer, …):
+
+```python
+# In your App subclass (e.g. CollabApp.update_app for the recorder):
+def update_app(self):
+    from azt_collab_client.ui import check_for_update
+    check_for_update(
+        repo='kent-rasmussen/azt-recorder',   # or your fork
+        current_version=__version__,           # peer's own __version__
+        asset_filename='azt_recorder.apk',     # peer's release asset
+        on_status=self._set_update_msg,
+        on_no_update=lambda: self._set_update_msg(_('Up to date.')),
+        on_error=self._show_error,
+    )
+```
+
+Wire the button into the peer's settings KV alongside the existing
+"Share this app" affordance — same shape, different `on_release`.
+
+**Manifest cost.** Each APK that exposes the button needs
+`REQUEST_INSTALL_PACKAGES` in `buildozer.spec → android.permissions`.
+Android 8+ also requires the user to flip the per-source
+"Install unknown apps" toggle the first time; the helper detects
+this via `PackageManager.canRequestPackageInstalls()` and routes to
+`Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` so the user lands on the
+right page in one tap.
+
+**No SHA verification in v1.** TLS to GitHub plus Android's
+signature-match install check (suite keystore enforced everywhere)
+are the integrity layers. A future hardening pass can add a `.sha256`
+companion asset if the release process publishes one.
+
+### Bootstrap — `bootstrap()`
+
+Suite invariant: **the user installs one APK** — the peer they
+opened. The standalone server APK and any subsequent updates are
+provisioned by the peer itself on first run.
+
+`azt_collab_client.ui.bootstrap(...)` is the single entry point that
+implements this. Each peer calls it once, early in startup
+(`App.on_start` is the natural seam):
+
+```python
+# in your App.on_start (recorder, viewer, …):
+from azt_collab_client.ui import bootstrap
+bootstrap(
+    peer_repo='kent-rasmussen/azt-recorder',
+    peer_version=__version__,
+    peer_asset_filename='azt_recorder.apk',
+    peer_display_name='AZT Recorder',     # optional; used in prompts
+    on_status=self._set_status_label,     # progress / state strings
+    on_done=self._continue_normal_startup,
+    on_error=self._show_error,
+    font_name=self._font_name,
+)
+```
+
+The helper:
+
+1. Calls `check_server_compat()`. On `server_unreachable` it
+   prompts "Install AZT Collaboration?" and on Yes downloads
+   `azt_collab.apk` from `kent-rasmussen/azt-collab/releases/latest`
+   via `check_for_update`. `server_too_old` shows the matching
+   "Update AZT Collaboration?" prompt. `client_too_old` jumps to
+   step 2.
+2. Probes the peer's own latest release. If newer, prompts
+   "Update <peer name>?" and on Yes downloads + installs the peer's
+   own APK.
+3. Calls `on_done` so the host proceeds with normal startup. Every
+   branch (no-op, declined, completed install) eventually fires
+   `on_done` so the host doesn't get stuck.
+
+**Buildozer requirement.** The peer's `buildozer.spec` must list
+`REQUEST_INSTALL_PACKAGES` in `android.permissions` so the install
+intent fires. Without it the install silently no-ops. Android 8+
+also requires the user to flip the per-source "Install unknown
+apps" toggle the first time; the underlying `check_for_update`
+detects this and routes to `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES`
+with our package pre-scoped.
+
+**Defaults.** `server_repo` defaults to `kent-rasmussen/azt-collab`
+and `server_asset_filename` defaults to `azt_collab.apk`. A fork
+that ships its own service can override both.
+
+**Desktop hosts** call `on_done` immediately — there's no APK to
+install, so the bootstrap is a no-op outside Android.
+
 ## Sister-app integration recap
 
 Setup is symlink-based, not pip-installed. From a sibling app's

@@ -21,6 +21,7 @@ _COLLAB_DEFAULT = 'kent-rasmussen'
 _TEMPLATE_URL_DEFAULT = (
     'https://raw.githubusercontent.com/'
     'kent-rasmussen/lift_templates/main/SILCAWL.lift')
+_UPDATE_REPO_DEFAULT = 'kent-rasmussen/azt-collab'
 
 _cfg = {
     'client_id': os.environ.get('AZT_GITHUB_APP_CLIENT_ID',
@@ -30,14 +31,21 @@ _cfg = {
                                    _COLLAB_DEFAULT),
     'template_url': os.environ.get('AZT_DEFAULT_TEMPLATE_URL',
                                    _TEMPLATE_URL_DEFAULT),
+    'update_repo': os.environ.get('AZT_UPDATE_REPO',
+                                  _UPDATE_REPO_DEFAULT),
 }
 
 
 def configure(*, client_id=None, app_slug=None, collaborator=None,
-              template_url=None):
-    """Override GitHub App identity / default template URL. Any arg
-    left None keeps the current value. Call once at host-app startup
-    (before the first auth/repo op)."""
+              template_url=None, update_repo=None):
+    """Override GitHub App identity / default template URL / update
+    source repo. Any arg left None keeps the current value. Call once
+    at host-app startup (before the first auth/repo op).
+
+    ``update_repo`` is the ``owner/repo`` slug consumed by the
+    self-update flow (``azt_collab_client.ui.check_for_update``); each
+    sister app may pass its own to point the SettingsScreen's
+    "Update this app" button at its release feed."""
     if client_id is not None:
         _cfg['client_id'] = client_id
     if app_slug is not None:
@@ -46,10 +54,16 @@ def configure(*, client_id=None, app_slug=None, collaborator=None,
         _cfg['collaborator'] = collaborator
     if template_url is not None:
         _cfg['template_url'] = template_url
+    if update_repo is not None:
+        _cfg['update_repo'] = update_repo
 
 
 def default_template_url():
     return _cfg['template_url']
+
+
+def update_repo():
+    return _cfg['update_repo']
 
 
 def get():

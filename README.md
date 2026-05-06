@@ -242,7 +242,7 @@ Workflow when shipping to Android:
    code. Re-running is safe.
 4. `cd server_apk && buildozer android debug` — packages the current
    source into the APK. The build relies on local recipe overrides
-   under `/home/kentr/bin/raspy/buildozer_tweaks/recipes/` (NDK r29
+   via P4A_LOCAL_RECIPES (NDK r29
    compatibility for harfbuzz / kivy) and on the
    `_inject_aztcollab_provider` step in
    `buildozer_tweaks/p4a_hook.py` (which patches the rendered

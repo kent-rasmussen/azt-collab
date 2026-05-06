@@ -242,6 +242,57 @@ def diagnose_403(token, remote_url):
 _diagnose_403 = diagnose_403
 
 
+def test_github_credentials(token):
+    """Hit ``api.github.com/user`` with the supplied access token.
+    Returns ``{'valid': bool, 'server_username': str,
+    'app_installed': bool, 'error': str}`` — callers translate to
+    user-visible text. ``app_installed`` is best-effort: we run
+    ``check_app_installed`` opportunistically so the same Test button
+    refreshes both flags at once. Mirror of
+    ``test_gitlab_credentials`` so the UI's per-host Test buttons have
+    a uniform shape."""
+    _ensure_ssl()
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+    if not token:
+        return {'valid': False, 'server_username': '',
+                'app_installed': False, 'error': 'missing_token'}
+    req = Request(
+        'https://api.github.com/user',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+        },
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except HTTPError as e:
+        if e.code in (401, 403):
+            return {'valid': False, 'server_username': '',
+                    'app_installed': False, 'error': 'invalid_token'}
+        return {'valid': False, 'server_username': '',
+                'app_installed': False, 'error': f'http_{e.code}'}
+    except URLError as e:
+        return {'valid': False, 'server_username': '',
+                'app_installed': False,
+                'error': f'network_error: {e.reason}'}
+    except Exception as e:
+        return {'valid': False, 'server_username': '',
+                'app_installed': False,
+                'error': f'{type(e).__name__}: {e}'}
+    server_username = data.get('login', '') or ''
+    # Best-effort app-install probe — same token, separate endpoint.
+    # A failure here is non-fatal: the credential test still passes.
+    try:
+        info = check_app_installed(token)
+        app_installed = bool(info.get('installed'))
+    except Exception:
+        app_installed = False
+    return {'valid': True, 'server_username': server_username,
+            'app_installed': app_installed, 'error': ''}
+
+
 def test_gitlab_credentials(username, token):
     """Hit GitLab's ``/api/v4/user`` with the supplied PAT and confirm
     the returned ``username`` matches. Returns

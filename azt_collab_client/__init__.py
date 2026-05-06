@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.25.2"
+__version__ = "0.28.1"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -30,7 +30,7 @@ __version__ = "0.25.2"
 # langcode. A 0.25 client against a pre-0.25 daemon would silently
 # lose all of these. Lock-step bump intended to flush every peer APK
 # through a rebuild.
-MIN_SERVER_VERSION = "0.25.0"
+MIN_SERVER_VERSION = "0.27.0"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/atoznback/azt-collab/releases/latest'
 )
@@ -731,6 +731,35 @@ def test_gitlab_credentials(username='', token=''):
     }
 
 
+def test_github_credentials():
+    """Validate the stored GitHub access token against
+    ``api.github.com/user`` and refresh the cached ``app_installed``
+    flag at the same time. No args — the daemon reads the token from
+    its credentials store. The flow is symmetric with
+    ``test_gitlab_credentials``: a successful test persists
+    ``confirmed=True`` (and the freshly-probed ``app_installed``);
+    failure persists ``confirmed=False`` so the UI's verified badge
+    drops back off until the user re-tests.
+
+    Returns ``{'ok': bool, 'valid': bool, 'server_username': str,
+    'app_installed': bool, 'error': str}``. ``ok=False`` means the
+    daemon was unreachable; ``valid=False`` with a populated
+    ``error`` means the daemon ran the check and the token failed."""
+    try:
+        resp = call('POST', '/v1/credentials/github/test', {})
+    except ServerUnavailable as ex:
+        return {'ok': False, 'valid': False, 'server_username': '',
+                'app_installed': False,
+                'error': f'server_unavailable: {ex}'}
+    return {
+        'ok': bool(resp.get('ok')),
+        'valid': bool(resp.get('valid')),
+        'server_username': resp.get('server_username', '') or '',
+        'app_installed': bool(resp.get('app_installed')),
+        'error': resp.get('error', '') or '',
+    }
+
+
 def migrate_from_prefs(prefs_path):
     """One-shot (idempotent) migration from a legacy prefs.json. The
     server moves gh_*/gl_*/collab_host keys into credentials.json and
@@ -1053,6 +1082,7 @@ __all__ = [
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',
     'save_gitlab_credentials', 'test_gitlab_credentials',
+    'test_github_credentials',
     'migrate_from_prefs',
     'list_projects', 'open_project', 'register_project', 'rename_project',
     'derive_langcode', 'init_project',

@@ -709,6 +709,34 @@ class PickerApp(App):
         share_running_apk(filename='azt_collab.apk',
                           on_error=self._show_error)
 
+    def update_app(self):
+        """Settings screen's "Update this app" button — same wiring as
+        ``CollabUIApp.update_app``. Status messages land on the
+        SettingsScreen's ``update_msg`` BodyLabel; failures go through
+        the picker's existing modal ``_show_error``."""
+        import azt_collabd
+        from azt_collabd.config import update_repo
+        from azt_collab_client.ui import check_for_update
+        check_for_update(
+            repo=update_repo(),
+            current_version=azt_collabd.__version__,
+            asset_filename='azt_collab.apk',
+            on_status=self._set_update_msg,
+            on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
+            on_error=self._show_error,
+        )
+
+    def _set_update_msg(self, text):
+        try:
+            screen = self.sm.get_screen('settings') if \
+                self.sm.has_screen('settings') else None
+            msg = screen.ids.get('update_msg') if screen is not None \
+                else None
+        except Exception:
+            msg = None
+        if msg is not None:
+            msg.text = text or ''
+
     # ── Create flow: "I have one on my phone" ─────────────────────────
     def open_file(self):
         """Native file chooser → best-effort register → emit path."""

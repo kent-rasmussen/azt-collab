@@ -18,10 +18,12 @@ Schema:
       }
     }
 
-    "confirmed" is set true when a live test against the host's API
-    succeeds (gitlab.com/api/v4/user). For GitHub, the equivalent
-    "credentials work for this host" signal is derived from
-    ``connected AND app_installed`` rather than stored separately.
+    "confirmed" is set true on each block when a live test against
+    the host's API succeeds (gitlab.com/api/v4/user for GitLab,
+    api.github.com/user for GitHub). It is reset to False whenever
+    the underlying credentials change (token save / app-install flag
+    flip / disconnect), so a stale "verified" badge never outlives
+    the credentials it was vouching for.
 
 All fields are optional. The file is written atomically with mode 0600
 on POSIX. A one-shot migration helper copies legacy keys out of the
@@ -107,7 +109,9 @@ def get_github():
 
 def set_github_tokens(*, access_token, refresh_token='', username='',
                      token_time=None):
-    """Replace the GitHub token block."""
+    """Replace the GitHub token block. Resets ``confirmed`` to False —
+    fresh credentials must pass a live test before the UI re-shows
+    the verified badge."""
     def mut(d):
         block = dict(d.get('github', {}))
         block['access_token'] = access_token
@@ -116,14 +120,31 @@ def set_github_tokens(*, access_token, refresh_token='', username='',
                                else float(token_time))
         if username:
             block['username'] = username
+        block['confirmed'] = False
         d['github'] = block
     _update(mut)
 
 
 def set_github_app_installed(installed):
+    """Persist whether the GitHub App is installed for this user.
+    Treated as a settings-change: resets ``confirmed`` so the user is
+    prompted to re-test once the app-install state has flipped."""
     def mut(d):
         block = dict(d.get('github', {}))
         block['app_installed'] = bool(installed)
+        block['confirmed'] = False
+        d['github'] = block
+    _update(mut)
+
+
+def set_github_confirmed(confirmed):
+    """Persist the result of a successful (or failed) live test against
+    ``api.github.com``. Called by ``_h_test_github``. Mirrors
+    ``set_gitlab_confirmed`` so the two host blocks have the same
+    confirmation lifecycle."""
+    def mut(d):
+        block = dict(d.get('github', {}))
+        block['confirmed'] = bool(confirmed)
         d['github'] = block
     _update(mut)
 
@@ -226,11 +247,13 @@ def get_status():
     """Return a dict describing what's configured. Safe to hand to the UI;
     never contains raw tokens.
 
-    ``confirmed`` per host means "credentials are known to work here":
-    GitHub requires a saved access token *and* the App installed (the
-    user can't push without both); GitLab requires a successful live
-    test against ``gitlab.com/api/v4/user`` (persisted on the gitlab
-    block as ``confirmed``)."""
+    Per host:
+        ``connected``  — settings present (a token is on file).
+        ``confirmed``  — settings tested OK against the host's live API.
+                         Cleared on any settings change so the UI never
+                         shows a stale verified badge.
+    GitHub additionally exposes ``app_installed`` for the
+    "Install GitHub App" CTA on the connect screen."""
     data = load()
     gh = data.get('github', {}) or {}
     gl = data.get('gitlab', {}) or {}
@@ -243,7 +266,7 @@ def get_status():
             'connected': gh_connected,
             'username': gh.get('username', ''),
             'app_installed': gh_app_installed,
-            'confirmed': gh_connected and gh_app_installed,
+            'confirmed': bool(gh.get('confirmed', False)),
         },
         'gitlab': {
             'connected': bool(gl.get('token')),

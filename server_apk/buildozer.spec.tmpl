@@ -1,3 +1,35 @@
+# =============================================================================
+#                            EDIT THIS FILE
+#
+#   This is the SOURCE template for the AZT Collaboration server APK
+#   buildozer config. Every build-time configuration change goes here.
+#
+#   When you change something here, or in one of the vaiables below
+#   (and only then), run build_buildozer_spec.sh to rebuild 
+#   the buildozer.spec file, by substituting ``${VAR}`` placeholders 
+#   with env-var values. That rendered spec is generated per-machine, 
+#   gitignored, and recreated on every ``build_buildozer_spec.sh`` 
+#   invocation — DO NOT edit it; your changes will be clobbered.
+#
+#   Workflow:
+#       1. Edit this file (buildozer.spec.tmpl).
+#       2. Run ``build_buildozer_spec.sh``
+#
+#   Required env vars (build.sh validates):
+#       P4A_HOOK                — absolute path to p4a_hook.py
+#       P4A_LOCAL_RECIPES       — absolute path to the local-recipes dir
+#       AZT_BUILDOZER_BUILDDIR  — absolute path to the buildozer cache
+#                                 (e.g. /home/you/AZT/.buildozer)
+#
+#   Release-signing env vars (only for ``buildozer android release``;
+#   p4a consumes these directly, no spec entry — see signing comment
+#   further down):
+#       P4A_RELEASE_KEYSTORE
+#       P4A_RELEASE_KEYALIAS
+#       P4A_RELEASE_KEYSTORE_PASSWD
+#       P4A_RELEASE_KEYALIAS_PASSWD
+# =============================================================================
+
 [app]
 
 # AZT Collaboration service — single-purpose APK that owns $AZT_HOME on
@@ -29,6 +61,8 @@ source.include_patterns = main.py,service.py
 source.include_exts = py,xml,gz,png,po,mo
 
 version.regex = __version__ = ['"](.*)['"]
+# This buildozer is running in a subdirectory of the azt-collab package,
+# so pulls from a sibling without leaving the repository
 version.filename = %(source.dir)s/../azt_collabd/__init__.py
 
 requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3,typing_extensions
@@ -44,15 +78,18 @@ fullscreen = 0
 # / authority — see azt_collab_client/transports/android_cp.py.
 android.package = org.atoznback.aztcollab
 p4a.branch = master
-p4a.hook = /home/kentr/bin/raspy/buildozer_tweaks/p4a_hook.py
-p4a.local_recipes = /home/kentr/bin/raspy/buildozer_tweaks/recipes
-android.api = 36 
+# The hook + local recipes live in a sibling repo (buildozer_tweaks/)
+# that maintainers check out next to this one. Set the env vars
+# P4A_HOOK and P4A_LOCAL_RECIPES; build.sh substitutes here.
+p4a.hook = ${P4A_HOOK}
+p4a.local_recipes = ${P4A_LOCAL_RECIPES}
+android.api = 36
 #was 33
-android.minapi = 26 
+android.minapi = 26
 #was 21
 android.archs = arm64-v8a, armeabi-v7a
 #p4a.develop:
-android.ndk = 29 
+android.ndk = 29
 #p4a.master:
 #android.ndk = 27
 
@@ -60,7 +97,7 @@ android.ndk = 29
 # every peer APK. Without that match, install-time grant is denied
 # and peers cannot reach this provider — desired failure mode. The
 # same permission gates bindService against AZTServiceProviderhost.
-android.permissions = INTERNET, org.atoznback.AZT_COLLAB_ACCESS
+android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, org.atoznback.AZT_COLLAB_ACCESS
 
 # ContentProvider + sticky-bound service declarations.
 # Note: buildozer's key is `extra_manifest_xml` (NOT `manifest_extra_xml`,
@@ -81,14 +118,20 @@ android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
 android.add_src = ../android/src/main/java
 
 # Sign with the suite keystore — same key as every peer APK.
-#This avoids creating an aab, but also turns off signing (you need to self-sign)
+# Force apk (not aab) so a) we can sideload via the bootstrap
+# updater, and b) the keystore-signed output is verifiable against
+# android/SUITE_FINGERPRINT directly.
+#
+# Signing config is **not** in this spec. The ``android.signing.*``
+# keys that buildozer historically supported are ignored on the APK
+# release path we use — confirmed empirically: the spec entry alone
+# does not produce a signed APK. p4a consumes env vars instead.
+# See the env-var list at the top of this file.
 android.release_artifact = apk
-android.signing.keystore = /home/kentr/bin/azt-suite.keystore                                                     
-android.signing.key_alias = azt                                              
 p4a.sign = True
 
 [buildozer]
 
 log_level = 2
 warn_on_root = 0
-build_dir = /home/kentr/bin/AZT/.buildozer
+build_dir = ${AZT_BUILDOZER_BUILDDIR}

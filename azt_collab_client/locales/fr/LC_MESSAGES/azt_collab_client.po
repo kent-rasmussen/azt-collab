@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.25.2\n"
+"Project-Id-Version: azt_collab_client 0.28.1\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -83,6 +83,136 @@ msgstr "Ouvrir la page d'installation"
 
 msgid "Share this app"
 msgstr "Partager cette application"
+
+# ── bootstrap.py — startup install/update workflow ───────────────────────
+
+msgid "AZT Collaboration"
+msgstr "AZT Collaboration"
+
+msgid "Checking installation…"
+msgstr "Vérification de l'installation…"
+
+msgid "Could not check service: {error}"
+msgstr "Impossible de vérifier le service : {error}"
+
+msgid "Service check returned: {error}"
+msgstr "Le contrôle du service a renvoyé : {error}"
+
+msgid "AZT Collaboration installed but unreachable. Continuing offline."
+msgstr ""
+"AZT Collaboration installé mais inaccessible. Poursuite en mode "
+"hors ligne."
+
+msgid "Install AZT Collaboration?"
+msgstr "Installer AZT Collaboration ?"
+
+msgid ""
+"This app needs the AZT Collaboration service ({name}) to sync your "
+"data. Tap Install to download and install it."
+msgstr ""
+"Cette application a besoin du service AZT Collaboration ({name}) "
+"pour synchroniser vos données. Touchez Installer pour le "
+"télécharger et l'installer."
+
+msgid "Update AZT Collaboration?"
+msgstr "Mettre à jour AZT Collaboration ?"
+
+msgid ""
+"A newer version of the AZT Collaboration service ({name}) is "
+"required. Tap Update to download and install it."
+msgstr ""
+"Une nouvelle version du service AZT Collaboration ({name}) est "
+"requise. Touchez Mettre à jour pour la télécharger et l'installer."
+
+msgid "Update {name}?"
+msgstr "Mettre à jour {name} ?"
+
+msgid ""
+"A newer version of this app ({version}) is available. Tap Update "
+"to download and install it."
+msgstr ""
+"Une nouvelle version de cette application ({version}) est "
+"disponible. Touchez Mettre à jour pour la télécharger et "
+"l'installer."
+
+msgid "Install"
+msgstr "Installer"
+
+msgid "Update"
+msgstr "Mettre à jour"
+
+msgid "Not now"
+msgstr "Plus tard"
+
+msgid "Update needed"
+msgstr "Mise à jour requise"
+
+msgid ""
+"This app is too old for the AZT Collaboration service, but no "
+"newer version is published yet. Please check back later."
+msgstr ""
+"Cette application est trop ancienne pour le service AZT "
+"Collaboration, mais aucune version plus récente n'est publiée. "
+"Veuillez réessayer plus tard."
+
+msgid "Installing AZT Collaboration…"
+msgstr "Installation d'AZT Collaboration…"
+
+msgid "AZT Collaboration is up to date."
+msgstr "AZT Collaboration est à jour."
+
+msgid "Updating {name}…"
+msgstr "Mise à jour de {name}…"
+
+# ── update.py — self-update flow ──────────────────────────────────────────
+
+msgid "Update this app"
+msgstr "Mettre à jour cette application"
+
+msgid "Up to date."
+msgstr "À jour."
+
+msgid "Checking for updates…"
+msgstr "Recherche de mises à jour…"
+
+msgid "Downloading {pct}%…"
+msgstr "Téléchargement {pct} %…"
+
+msgid "Preparing install…"
+msgstr "Préparation de l'installation…"
+
+msgid "Installing…"
+msgstr "Installation en cours…"
+
+msgid "APK install is only available on Android."
+msgstr "L'installation d'APK est uniquement disponible sur Android."
+
+msgid "Update check failed: {error}"
+msgstr "Échec de la recherche de mise à jour : {error}"
+
+msgid "Update check failed: no tag in latest release"
+msgstr "Échec de la recherche de mise à jour : aucune balise dans la dernière version"
+
+msgid "Update check failed: no {file} in release {tag}"
+msgstr "Échec de la recherche de mise à jour : aucun {file} dans la version {tag}"
+
+msgid "Update check failed: asset has no download URL"
+msgstr "Échec de la recherche de mise à jour : l'asset n'a pas d'URL de téléchargement"
+
+msgid "Could not create download dir: {error}"
+msgstr "Impossible de créer le dossier de téléchargement : {error}"
+
+msgid "Download failed: {error}"
+msgstr "Échec du téléchargement : {error}"
+
+msgid "Install failed: {error}"
+msgstr "Échec de l'installation : {error}"
+
+msgid ""
+"Allow \"Install unknown apps\" for this app, then tap Update again."
+msgstr ""
+"Autorisez « Installer des applications inconnues » pour cette "
+"application, puis appuyez à nouveau sur Mettre à jour."
 
 msgid "Share app"
 msgstr "Partager l'application"
@@ -302,6 +432,61 @@ msgstr "Se connecter à GitHub"
 
 msgid "Disconnect GitHub"
 msgstr "Se déconnecter de GitHub"
+
+# ── GitHub connect/manage screen ──────────────────────────────────────────
+
+msgid "Re-authenticate"
+msgstr "Se reconnecter"
+
+msgid "Disconnect"
+msgstr "Se déconnecter"
+
+msgid "Install GitHub App"
+msgstr "Installer l'application GitHub"
+
+msgid "Connected as {username} (verified)."
+msgstr "Connecté en tant que {username} (vérifié)."
+
+msgid "Connected as {username}. Tap Test connection to verify."
+msgstr ""
+"Connecté en tant que {username}. Touchez Tester la connexion pour "
+"vérifier."
+
+msgid ""
+"Connected as {username}. Install the GitHub App so the daemon can "
+"push your project, then tap Test connection."
+msgstr ""
+"Connecté en tant que {username}. Installez l'application GitHub pour "
+"que le démon puisse pousser votre projet, puis touchez Tester la "
+"connexion."
+
+msgid ""
+"Connected as {username} (verified). Credentials and app install "
+"confirmed."
+msgstr ""
+"Connecté en tant que {username} (vérifié). Identifiants et "
+"installation de l'application confirmés."
+
+msgid ""
+"Connected as {username} (verified). Install the GitHub App to "
+"enable push."
+msgstr ""
+"Connecté en tant que {username} (vérifié). Installez l'application "
+"GitHub pour activer le push."
+
+msgid "Token rejected by GitHub. Tap Re-authenticate."
+msgstr "Jeton refusé par GitHub. Touchez Se reconnecter."
+
+msgid "Could not open install page: {error}"
+msgstr "Impossible d'ouvrir la page d'installation : {error}"
+
+msgid ""
+"Opening {uri}\n"
+"When you finish on GitHub, return here and tap Test connection."
+msgstr ""
+"Ouverture de {uri}\n"
+"Quand vous avez terminé sur GitHub, revenez ici et touchez Tester "
+"la connexion."
 
 msgid "Connect to GitLab"
 msgstr "Se connecter à GitLab"

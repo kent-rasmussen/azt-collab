@@ -17,7 +17,7 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.25.2"
+__version__ = "0.27.0"
 
 # Floor on the azt_collab_client version this daemon is willing to talk
 # to. Published on /v1/health so the client compares locally and a peer
@@ -56,7 +56,7 @@ __version__ = "0.25.2"
 # server-canonical `last_project`, GitLab Test button + per-host
 # `confirmed` flag, settings UI Publish-by-langcode flow — all land
 # at once in every peer.
-MIN_CLIENT_VERSION = "0.25.0"
+MIN_CLIENT_VERSION = "0.27.0"
 
 from . import config
 from . import net

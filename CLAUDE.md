@@ -98,7 +98,11 @@ python examples/sister_app.py /path/to/some_lift_project
 
 ## Tests
 
-There is **no automated test suite anywhere in the suite**. The legacy `../azt_recorder/tests/stepN.sh` stack scripts were removed once their slices stabilised. Daemon-touching changes get a manual smoke against `examples/sister_app.py` from a sibling app's venv:
+A pytest scaffold lives at `azt-collab/tests/` (established v0.28.1) covering the install/update path: `_version_tuple` corner cases, GitHub-API mocks for `check_for_update`, bootstrap dispatch + idempotence, the `github.confirmed` lifecycle, and a translation-coverage drift detector that AST-walks every `_(...)` / `_tr(...)` site and asserts the msgid is in the French .po. Run with `pytest tests/ -q` from this repo root. No CI is wired up; the manual matrix in `docs/test_plan.md` §8 covers what the unit tests can't (real Android, real keystore, real network).
+
+`docs/test_plan.md` is the canonical failure-mode list — refer to it before shipping any release that touches the install/update or credential paths. `docs/research_notes_2026-05.md` captures the platform state of the art (Android 16 sideloading lockdown, ACTION_VIEW deprecation, etc.); refresh before each major release.
+
+Daemon-touching changes still get a manual smoke against `examples/sister_app.py` from a sibling app's venv:
 
 ```bash
 cd ../azt_recorder
