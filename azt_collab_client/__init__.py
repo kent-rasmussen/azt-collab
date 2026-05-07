@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.28.6"
+__version__ = "0.28.18"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -30,17 +30,17 @@ __version__ = "0.28.6"
 # langcode. A 0.25 client against a pre-0.25 daemon would silently
 # lose all of these. Lock-step bump intended to flush every peer APK
 # through a rebuild.
-MIN_SERVER_VERSION = "0.27.0"
-# Direct-download URL for the latest server APK asset. Tapping
-# "Open install page" in install_server_apk_popup opens this URL,
-# which on Android triggers Chrome's download flow straight to the
-# system installer (no extra "find the asset" step on the releases
-# page). GitHub serves this stable redirect for any release that
-# uploaded an asset with this exact filename — matches what
-# azt_collab_client.ui.bootstrap fetches programmatically.
+MIN_SERVER_VERSION = "0.28.17"
+# Public release page for the server APK. Tapping "Open install
+# page" in ``install_server_apk_popup`` opens this URL in the
+# browser so the user can read release notes / browse the project
+# before downloading. The actual download is then a one-tap step on
+# the page (or a separate "Install" button in the popup that does
+# the in-app download via the GitHub API + Android system
+# installer; that path uses ``asset['browser_download_url']`` from
+# the release JSON, not this constant).
 SERVER_APK_INSTALL_URL = (
-    'https://github.com/kent-rasmussen/azt-collab/'
-    'releases/latest/download/aztcollab.apk'
+    'https://github.com/kent-rasmussen/azt-collab/releases/latest'
 )
 from . import status as S
 from .status import Status, Result

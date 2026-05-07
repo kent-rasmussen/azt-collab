@@ -35,6 +35,7 @@ import urllib.request
 from kivy.clock import Clock
 
 from .. import _version_tuple
+from ..net import _ensure_ssl
 from ..paths import azt_home
 from ..translate import tr as _tr
 
@@ -109,6 +110,7 @@ def _fetch_latest(repo):
     cached = _release_cache.get(repo)
     if cached and (time.time() - cached[0]) < _RELEASE_CACHE_TTL_S:
         return cached[1]
+    _ensure_ssl()
     list_url = f'{_GITHUB_API}/repos/{repo}/releases?per_page=20'
     req = urllib.request.Request(list_url, headers={
         'Accept': 'application/vnd.github+json',
@@ -137,6 +139,7 @@ def _fetch_latest(repo):
 
 
 def _fetch_latest_singleton(repo):
+    _ensure_ssl()
     url = f'{_GITHUB_API}/repos/{repo}/releases/latest'
     req = urllib.request.Request(url, headers={
         'Accept': 'application/vnd.github+json',
@@ -155,6 +158,24 @@ def _pick_asset(release, asset_filename):
 
 _DOWNLOAD_RETRY_ATTEMPTS = 3
 _DOWNLOAD_RETRY_BACKOFF_S = 5
+def _wrappable_url(url):
+    """Insert soft line-breaks at path separators so a URL fits a
+    narrow popup body. Kivy Labels wrap at whitespace; URLs have no
+    whitespace, so they overflow / clip without help. We use real
+    newlines (rather than zero-width spaces) because Kivy's text
+    measurement doesn't honour zero-width characters consistently."""
+    if not url or len(url) < 50:
+        return url
+    # Break after each '/' but keep the slash on the previous line.
+    # Resulting display:
+    #     https://
+    #     github.com/
+    #     kent-rasmussen/
+    #     azt-collab/
+    #     releases/...
+    return url.replace('/', '/\n')
+
+
 # HTTP statuses we treat as transient on the asset download. 404 is
 # load-bearing here: during a release upload GitHub publishes the
 # release JSON (so /releases/latest returns it and ``browser_download_url``
@@ -178,33 +199,70 @@ def _download(url, dest, total_bytes, on_progress, on_status=None,
     we're doing instead of a hung worker thread. Final-attempt
     failure raises; caller turns it into a translated error message."""
     import urllib.error
+    import sys
+    _ensure_ssl()
     last_exc = None
     for i in range(attempts):
         try:
             req = urllib.request.Request(url, headers={
-                'User-Agent': _USER_AGENT,
+                # GitHub's CDN serves 404 to some bot-pattern UAs;
+                # mimic curl which definitely works for the same URL.
+                'User-Agent': 'azt-collab-updater/1 (+curl-compat)',
+                'Accept': '*/*',
             })
             tmp = dest + '.part'
             received = 0
-            with urllib.request.urlopen(req, timeout=60) as resp, \
-                    open(tmp, 'wb') as out:
-                while True:
-                    chunk = resp.read(_DOWNLOAD_CHUNK)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    received += len(chunk)
-                    if total_bytes and on_progress is not None:
-                        on_progress(int(received * 100 / total_bytes))
+            print(f'[update] GET {url}', file=sys.stderr, flush=True)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                # Log redirect chain so 404s on the CDN side are
+                # distinguishable from 404s on github.com.
+                final_url = resp.geturl()
+                if final_url != url:
+                    print(f'[update] redirected to {final_url}',
+                          file=sys.stderr, flush=True)
+                print(f'[update] {resp.status} {resp.reason}',
+                      file=sys.stderr, flush=True)
+                # If the caller didn't pre-compute total_bytes (the
+                # direct-download path that bypasses the GitHub API
+                # has no asset metadata), read it from the response
+                # headers so progress percentages still work.
+                if not total_bytes:
+                    try:
+                        total_bytes = int(resp.headers.get(
+                            'Content-Length') or 0)
+                    except (TypeError, ValueError):
+                        total_bytes = 0
+                with open(tmp, 'wb') as out:
+                    while True:
+                        chunk = resp.read(_DOWNLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        received += len(chunk)
+                        if total_bytes and on_progress is not None:
+                            on_progress(int(received * 100 / total_bytes))
             os.replace(tmp, dest)
             return
         except urllib.error.HTTPError as e:
             last_exc = e
+            # Log enough to disambiguate "github.com 404" from "CDN
+            # redirect-target 404" — they have very different
+            # diagnoses (asset truly missing vs. bot-pattern
+            # rejection on the CDN edge).
+            try:
+                hit_url = e.url
+            except Exception:
+                hit_url = url
+            print(f'[update] HTTP {e.code} from {hit_url}',
+                  file=sys.stderr, flush=True)
             if e.code not in _DOWNLOAD_RETRY_STATUSES \
                     or i == attempts - 1:
                 raise
         except (urllib.error.URLError, OSError) as e:
             last_exc = e
+            print(f'[update] transport error on {url}: '
+                  f'{type(e).__name__}: {e}',
+                  file=sys.stderr, flush=True)
             if i == attempts - 1:
                 raise
         wait = _DOWNLOAD_RETRY_BACKOFF_S * (i + 1)
@@ -296,7 +354,9 @@ def _trigger_install(uri):
 def check_for_update(*, repo, current_version, asset_filename,
                      on_status, on_no_update=None, on_error=None,
                      download_dir=None, install_target_package=None,
-                     on_install_complete=None):
+                     on_install_complete=None,
+                     on_user_action_needed=None,
+                     install_label=None):
     """Check GitHub for a newer release of ``asset_filename`` in
     ``repo``; download and trigger Android's installer if found.
 
@@ -419,7 +479,9 @@ def check_for_update(*, repo, current_version, asset_filename,
             _download(download_url, dest, size, _on_progress,
                       on_status=_on_retry_status)
         except Exception as ex:
-            _ui_error(_tr('Download failed: {error}').format(error=ex))
+            _ui_error(
+                _tr('Download failed: {error}').format(error=ex)
+                + '\n' + _wrappable_url(download_url))
             return
 
         _ui_status(_tr('Preparing install…'))
@@ -434,10 +496,13 @@ def check_for_update(*, repo, current_version, asset_filename,
                     'org.kivy.android.PythonActivity')
                 activity = PythonActivity.mActivity
                 if not _can_install_packages(activity):
+                    label = install_label or _tr('Update')
                     _safe_call(on_status, _tr(
                         'Allow "Install unknown apps" for this app, '
-                        'then tap Update again.'))
+                        'then tap {label} again.'
+                    ).format(label=label))
                     _open_unknown_sources_settings(activity)
+                    _safe_call(on_user_action_needed)
                     return
                 uri = _media_store_uri(dest, asset_filename)
                 _trigger_install(uri)
@@ -454,17 +519,138 @@ def check_for_update(*, repo, current_version, asset_filename,
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def install_apk_from_url(*, url, asset_filename, on_status,
+                         on_error=None, on_install_complete=None,
+                         on_user_action_needed=None,
+                         install_target_package=None,
+                         install_label=None,
+                         download_dir=None):
+    """Direct-URL install path. Skips the GitHub API entirely —
+    just GETs the URL, hands the bytes to Android's installer,
+    optionally polls for install completion via change-detection.
+
+    Use for stable redirect URLs like
+    ``https://github.com/<owner>/<repo>/releases/latest/download/<asset>``
+    where you don't need version comparison and the API path's
+    "fetch JSON, walk releases, pick asset by name, retry on 404"
+    machinery is overkill. ``check_for_update`` is for the
+    self-update case where version comparison matters; this is for
+    the popup's "install the missing service" case where the user
+    just wants the latest stable APK installed.
+
+    Same callback shape as ``check_for_update`` minus
+    ``on_no_update`` (this path always installs) and minus the
+    ``current_version`` parameter (no comparison).
+
+    Spawns a worker thread; callbacks marshal back to the Kivy UI
+    thread so hosts may update labels directly. Android-only — non-
+    Android hosts get a translated "Android only" through
+    ``on_error``."""
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    if platform != 'android':
+        _safe_call(on_error,
+                   _tr('APK install is only available on Android.'))
+        return
+
+    if download_dir is None:
+        download_dir = os.path.join(azt_home(), 'updates')
+
+    def _ui_status(msg):
+        _on_ui(_safe_call, on_status, msg)
+
+    def _ui_error(msg):
+        _on_ui(_safe_call, on_error, msg)
+
+    def _worker():
+        _ui_status(_tr('Downloading…'))
+        try:
+            os.makedirs(download_dir, exist_ok=True)
+        except OSError as ex:
+            _ui_error(_tr('Could not create download dir: {error}')
+                      .format(error=ex))
+            return
+        dest = os.path.join(download_dir, asset_filename)
+
+        def _on_progress(pct):
+            _ui_status(_tr('Downloading {pct}%…').format(pct=pct))
+
+        def _on_retry_status(msg):
+            _ui_status(msg)
+
+        try:
+            _download(url, dest, 0, _on_progress,
+                      on_status=_on_retry_status)
+        except Exception as ex:
+            _ui_error(
+                _tr('Download failed: {error}').format(error=ex)
+                + '\n' + _wrappable_url(url))
+            return
+
+        _ui_status(_tr('Preparing install…'))
+
+        def _install_on_ui(_dt):
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass(
+                    'org.kivy.android.PythonActivity')
+                activity = PythonActivity.mActivity
+                if not _can_install_packages(activity):
+                    label = install_label or _tr('Install')
+                    _safe_call(on_status, _tr(
+                        'Allow "Install unknown apps" for this app, '
+                        'then tap {label} again.'
+                    ).format(label=label))
+                    _open_unknown_sources_settings(activity)
+                    # Tell the caller the install path stalled on
+                    # user action — popup uses this to re-enable
+                    # buttons so the user can retry after granting
+                    # the permission. Without this the caller is
+                    # left with disabled buttons forever.
+                    _safe_call(on_user_action_needed)
+                    return
+                uri = _media_store_uri(dest, asset_filename)
+                _trigger_install(uri)
+                _safe_call(on_status, _tr('Installing…'))
+                if install_target_package:
+                    # Change-detection mode: we don't know the
+                    # version we just downloaded.
+                    _start_install_poll(install_target_package, '',
+                                        on_status, on_install_complete)
+            except Exception as ex:
+                _safe_call(on_error,
+                           _tr('Install failed: {error}').format(error=ex))
+
+        Clock.schedule_once(_install_on_ui, 0)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _start_install_poll(package_name, expected_version, on_status,
                         on_install_complete=None):
     """Poll Android's PackageManager for ``package_name``'s
-    ``versionName`` to flip to ``expected_version``. Cancels itself
-    on match or timeout; status updates flow through ``on_status``.
+    ``versionName`` to flip. Two modes, picked by
+    ``expected_version``:
 
-    Best-effort observation: while the peer is in the background
-    (e.g., the system installer Activity is in the foreground),
+    - **Pinned-version mode** (``expected_version`` truthy): poll
+      for ``installed >= expected_version``. Used by
+      ``check_for_update`` when the GitHub API path knows what
+      version it just downloaded.
+    - **Change-detection mode** (``expected_version`` empty / None):
+      snapshot the current installed versionName at start, then
+      poll for any change. Used by ``install_apk_from_url`` where
+      we downloaded a stable redirect URL and don't have version
+      metadata. Trivially detects "package became installed" when
+      the snapshot is None (uninstalled → installed).
+
+    Cancels itself on match or timeout; status updates flow
+    through ``on_status``. Best-effort observation: while the peer
+    is in the background (system installer Activity in foreground),
     Kivy's Clock pauses and polls don't fire. They resume on
-    foreground — which is fine, since the peer can also detect a
-    completed install on its next bootstrap() invocation in a fresh
+    foreground — which is fine, since the peer can also detect
+    completion on its next bootstrap() invocation in a fresh
     process. This watchdog mostly catches the case where the user
     stayed on the peer through a quick install or canceled and we
     want to surface that the install never landed.
@@ -473,6 +659,20 @@ def _start_install_poll(package_name, expected_version, on_status,
     ``on_install_complete`` if given — letting the popup auto-
     dismiss and the host re-run its compat check without requiring
     the user to relaunch."""
+
+    def _read_installed():
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass(
+                'org.kivy.android.PythonActivity')
+            pm = PythonActivity.mActivity.getPackageManager()
+            info = pm.getPackageInfo(package_name, 0)
+            return info.versionName or ''
+        except Exception:
+            # Package not installed yet or PM transient.
+            return None
+
+    initial = _read_installed() if not expected_version else None
     started_at = time.time()
     last = {'tick': 0}
 
@@ -481,19 +681,17 @@ def _start_install_poll(package_name, expected_version, on_status,
             _safe_call(on_status, _tr(
                 'Install pending. Reopen this app when finished.'))
             return False  # unschedule
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass(
-                'org.kivy.android.PythonActivity')
-            pm = PythonActivity.mActivity.getPackageManager()
-            info = pm.getPackageInfo(package_name, 0)
-            installed = (info.versionName or '').lstrip('vV')
-        except Exception:
-            # Package not installed yet or PM transient — keep
-            # polling until timeout.
-            installed = ''
-        if installed and (_version_tuple(installed)
-                          >= _version_tuple(expected_version)):
+        installed = _read_installed()
+        if expected_version:
+            # Pinned-version mode.
+            done = (installed is not None and
+                    installed.lstrip('vV') and
+                    _version_tuple(installed.lstrip('vV'))
+                    >= _version_tuple(expected_version))
+        else:
+            # Change-detection mode.
+            done = installed is not None and installed != initial
+        if done:
             _safe_call(on_status, _tr('Installed.'))
             _safe_call(on_install_complete)
             return False  # unschedule

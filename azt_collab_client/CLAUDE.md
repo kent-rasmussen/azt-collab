@@ -722,8 +722,8 @@ surface:
 # in your App class
 def on_start(self):
     ...
-    # Defer one frame so the UI is up before any popup fires.
-    Clock.schedule_once(lambda dt: self._run_bootstrap(), 0.5)
+    # Schedule for next frame so the UI is up before any popup fires.
+    Clock.schedule_once(lambda dt: self._run_bootstrap(), 0)
 
 def _run_bootstrap(self):
     # Deferred import keeps bootstrap.py + its Kivy/jnius deps out of
@@ -736,6 +736,7 @@ def _run_bootstrap(self):
         peer_asset_filename='azt_recorder.apk',
         peer_display_name=APP_NAME,
         on_status=self._log_bootstrap_status,
+        on_done=self._auto_load_last_project,
         on_error=self._log_bootstrap_status,
         font_name=_FONT_NAME,
     )
@@ -751,6 +752,14 @@ def _log_bootstrap_status(self, message):
         collab._set_log(message)
     except Exception:
         pass
+
+def _auto_load_last_project(self):
+    """Wired as bootstrap()'s on_done. Client 0.28.5+ guarantees
+    on_done fires only when the daemon is reachable, so the first
+    daemon-touching RPC needs no defensive try/except."""
+    from azt_collab_client import last_project, open_project
+    langcode = last_project()
+    ...
 ```
 
 The recorder (`azt_recorder/main.py: _run_bootstrap`,
@@ -770,9 +779,15 @@ The helper:
 2. Probes the peer's own latest release. If newer, prompts
    "Update <peer name>?" and on Yes downloads + installs the peer's
    own APK.
-3. Calls `on_done` so the host proceeds with normal startup. Every
-   branch (no-op, declined, completed install) eventually fires
-   `on_done` so the host doesn't get stuck.
+3. Calls `on_done` **only on the healthy path** (server reachable +
+   peer up to date or self-update declined/no-op). Client 0.28.5+
+   contract: the `server_unreachable` / `server_too_old` prompts
+   are terminal and do **not** fire `on_done`; the install popup
+   stays modal until the user installs (or quits), and a fresh
+   bootstrap re-enters from the install-completion chain. So
+   if `on_done` fires, the daemon is reachable — the first RPC
+   wired to `on_done` doesn't need a defensive try/except for
+   "daemon not there yet."
 
 **Buildozer requirement.** The peer's `buildozer.spec` must list
 `REQUEST_INSTALL_PACKAGES` in `android.permissions` so the install
@@ -792,7 +807,7 @@ install, so the bootstrap is a no-op outside Android.
 ## Sister-app integration recap
 
 > **Canonical client-integration checklist:**
-> [`docs/CLIENT_INTEGRATION.md`](../docs/CLIENT_INTEGRATION.md) — the
+> [`CLIENT_INTEGRATION.md`](CLIENT_INTEGRATION.md) — the
 > single contract every peer follows. Read that first; this section
 > is the older / shorter overview kept for context.
 

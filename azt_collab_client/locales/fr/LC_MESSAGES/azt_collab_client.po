@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.28.6\n"
+"Project-Id-Version: azt_collab_client 0.28.18\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -226,10 +226,10 @@ msgid "Install failed: {error}"
 msgstr "Échec de l'installation : {error}"
 
 msgid ""
-"Allow \"Install unknown apps\" for this app, then tap Update again."
+"Allow \"Install unknown apps\" for this app, then tap {label} again."
 msgstr ""
 "Autorisez « Installer des applications inconnues » pour cette "
-"application, puis appuyez à nouveau sur Mettre à jour."
+"application, puis appuyez à nouveau sur {label}."
 
 msgid "Share app"
 msgstr "Partager l'application"

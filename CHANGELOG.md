@@ -11,6 +11,270 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.28.18 + azt_collab_client 0.28.18 — move CLIENT_INTEGRATION.md into the symlinked package
+- ``CLIENT_INTEGRATION.md`` moved from ``docs/`` (canonical-repo
+  only) to ``azt_collab_client/`` (symlinked into every peer).
+  Peers now see the integration contract through their existing
+  symlink without needing a separate ``azt-collab/`` checkout.
+  Old ``docs/CLIENT_INTEGRATION.md`` is reduced to a one-line
+  redirect for anyone with the old path bookmarked.
+- Added missing section on ``on_done`` semantics (introduced in
+  0.28.5 but the doc never reflected it). Renumbered subsections
+  to fix a duplicate ``## 6`` heading. Added the
+  ``install_apk_from_url`` entry to the "what the suite does for
+  you" list (added in 0.28.10, doc never updated).
+- ``azt_collab_client/CLAUDE.md`` updated to point at the new
+  in-package location.
+
+### azt_collabd 0.28.17 + azt_collab_client 0.28.17 — peer self-update gets the same progress UI as server install
+- **Peer self-update now uses the same popup as the server case**
+  with progress visible in the body. Previously
+  ``_prompt_self_update`` showed a Yes/No popup that dismissed on
+  Update tap, then ran ``install_apk_from_url`` "in the background"
+  with status flowing only to the host's ``on_status`` sink — which
+  meant the user saw nothing until the install finished. Now
+  bootstrap calls ``install_server_apk_popup`` (parameterized for
+  the peer's own APK) so the same body-label progress (downloading
+  %, retrying status, "Installing…", "Installed.") is on screen
+  through the entire flow. Closes the user-reported "looks like
+  it's stuck — Update just means OK" symptom.
+- **``install_server_apk_popup`` is now a generic install/update
+  popup**. New parameters:
+  - ``direct_url`` — overrides the composed download URL.
+  - ``asset_filename`` — overrides the on-disk staging name +
+    MediaStore display name.
+  - ``open_page_url`` — overrides the "Open install page" target
+    so self-update points at the peer's release page instead of
+    the server's.
+  - ``dismiss_label`` — overrides the dismiss button label.
+  - ``dismiss_action`` — ``'quit'`` (default; closes app) for the
+    server case; ``'dismiss'`` for self-update where declining
+    means "stick with current version, peer keeps running".
+  - ``install_target_package=''`` — explicit "no polling" sentinel
+    for self-update where the install kills the running peer
+    process.
+- **Self-update decline records the version only on Not-now tap.**
+  Previously the decline was recorded synchronously in
+  ``_prompt_self_update``'s decline handler. The new popup-based
+  flow records on dismiss, but only when no install was started
+  — if the user tapped Update and the install kicked off, no
+  decline gets recorded (the next launch will detect the new
+  version naturally instead).
+- ``_yes_no`` helper removed; no callers left after the refactor.
+- Lock-step bump 0.28.16 → 0.28.17 with ``MIN_SERVER_VERSION``
+  raised to match (continues the user's "test the server-update
+  path" workflow — every iteration of the bump fires the
+  too-old-server prompt for a peer that bundles the new client).
+
+### azt_collabd 0.28.16 + azt_collab_client 0.28.16 — bump MIN_SERVER_VERSION to test server-update path
+- Lock-step debug bump 0.28.15 → 0.28.16 across both packages.
+- ``azt_collab_client.MIN_SERVER_VERSION`` raised 0.27.0 → 0.28.16.
+  Forces a rebuilt peer (which bundles client 0.28.16) to refuse
+  any server APK older than 0.28.16. Test path: install peer with
+  bundled 0.28.16, leave the older server APK (0.28.15 or earlier)
+  on the device, launch peer → ``check_server_compat`` returns
+  ``server_too_old`` → bootstrap fires
+  ``_prompt_server_update`` → install popup shows the
+  "Update AZT Collaboration?" body with the "Update" button label
+  and pre-filled current_server_version (so the daemon doesn't
+  redownload an identical release if there isn't actually a
+  newer one published).
+- ``MIN_CLIENT_VERSION`` (in azt_collabd) stays at 0.27.0 — this
+  bump is for testing the server-too-old path, not client-too-old.
+
+### azt_collabd 0.28.15 + azt_collab_client 0.28.15 — fix Install button stuck after "unknown apps" detour
+- **"Tap Update again" message corrected** to use the actual
+  install-button label. The popup's button is "Install" (or
+  whatever ``install_label`` the caller passed), not "Update", so
+  the previous message ("…then tap Update again") was wrong for
+  every caller except the settings-screen Update buttons. Now uses
+  ``{label}`` substitution and the popup passes its own button
+  text.
+- **New ``on_user_action_needed`` callback** in both
+  ``install_apk_from_url`` and ``check_for_update``. Fires when
+  the install path stalls because Android needs the user to flip
+  "Install unknown apps" for this peer in Settings. Without this,
+  the popup's Install button stayed disabled forever after we
+  routed the user to settings — only Quit was active. The popup
+  now wires this callback to re-enable Install + Open install
+  page so the user can come back from Settings and retry.
+- ``install_label`` parameter added to both functions so callers
+  can override the label used in the "tap {label} again"
+  message. Defaults to "Install" for ``install_apk_from_url``,
+  "Update" for ``check_for_update`` (matching their
+  conventional UX context).
+
+### azt_collabd 0.28.14 + azt_collab_client 0.28.14 — fix language-toggle inertness + URL overflow in error
+- **Language toggle in `install_server_apk_popup` now actually
+  switches.** The handler called ``popup.dismiss()`` then
+  ``install_server_apk_popup(...)`` synchronously from inside a
+  Button.on_release — Kivy silently no-ops that re-entrance in
+  some versions because the original popup is mid-dismiss. Fix:
+  defer dismiss + relaunch via ``Clock.schedule_once(..., 0)`` so
+  the touch handler returns first. Also added stderr logging at
+  every step (``[install_popup] language switch: fr``,
+  ``[install_popup] dismiss raised:`` …) so any future failure is
+  diagnosable via ``adb logcat``.
+- **Long URLs in error messages now wrap inside the popup.**
+  ``_download``'s 404-with-URL surface for a 60-character GitHub
+  asset URL was running off the body label because Kivy Labels
+  only break at whitespace and URLs have none. New
+  ``_wrappable_url(url)`` helper in ``update.py`` inserts a real
+  ``\n`` after each ``/`` (only when the URL is over 50 chars) so
+  the URL renders across multiple lines inside the popup body.
+  Display is uglier but legible — readable URLs trump pretty
+  ones for diagnosis.
+
+### azt_collabd 0.28.13 + azt_collab_client 0.28.13 — diagnostic logging + browser-like headers in download
+- ``_download`` now logs to stderr (visible in ``adb logcat``) at
+  every meaningful step: the URL it's about to GET, the redirect
+  target if any, the HTTP status, and the URL the server actually
+  served the 404 from (``HTTPError.url``). Disambiguates
+  "github.com returned 404" from "github.com 302'd to the CDN, CDN
+  returned 404" — different diagnoses (asset truly missing vs.
+  bot-pattern rejection on the CDN edge or expired-token edge
+  case).
+- Added ``Accept: */*`` and updated the User-Agent string to
+  ``'azt-collab-updater/1 (+curl-compat)'``. Some GitHub CDN edges
+  return 404 to bare-pattern UAs; mimicking curl removes that
+  variable.
+- Diagnostic-only round; the underlying 404 puzzle (browser works,
+  ``gh release view`` confirms the asset, but Python urllib gets
+  404 three times) is still being investigated. The new logging
+  should make the next reproduction definitively diagnosable.
+
+### azt_collabd 0.28.12 + azt_collab_client 0.28.12 — popup polish: language toggle, version footer, URL in error
+- **Discrete language toggle** at the top of
+  ``install_server_apk_popup``. First-install users whose device
+  locale is French (or any non-English) had no way to switch
+  language since the popup blocks the settings UI; now there's a
+  small row of language buttons (current bolded, others tappable)
+  that dismisses + re-opens the popup with the chosen language.
+  Only shown when ``i18n.available_languages()`` returns more than
+  one — desktop hosts running an English-only build won't see it.
+- **Version footer** at the bottom of the popup
+  (``client X.Y.Z``). Subtle / dim, mirrors the version strip
+  pattern from the daemon settings UI. Helps diagnose which
+  client build is actually live when reproducing UI bugs across
+  versions.
+- **Download error includes the URL we tried.** When the asset
+  download fails (404 from the well-known direct URL, or any
+  other transport error), the surfaced message now appends the
+  URL on a new line. Lets the user eyeball the URL against what
+  their browser successfully fetches — most 404s on this path
+  come from an asset-name mismatch on the GitHub release, not a
+  transport bug.
+
+### azt_collabd 0.28.11 + azt_collab_client 0.28.11 — popup button wrapping, URL composition cleanup
+- **Install popup button text wraps now.** Previously "Open install
+  page" and "Quit AZT Recorder" / "Quit AZT Viewer" got clipped on
+  narrower screens because Kivy Buttons don't wrap by default.
+  ``text_size`` is now bound to button size on all three buttons
+  (``halign='center'`` + ``valign='middle'``), and the button row
+  height bumped to dp(60) to allow two-line wraps. Popup overall
+  height also bumped from dp(280) to dp(300) to compensate.
+- **Direct-URL composition consolidated** into the install popup's
+  ``_do_install``. The hardcoded ``_DIRECT_DOWNLOAD_URL`` constant
+  in ``update.py`` is gone; the popup now composes
+  ``f'https://github.com/{_SERVER_REPO_DEFAULT}/releases/latest/download/{_SERVER_ASSET_DEFAULT}'``
+  from the same constants the package-presence probe uses
+  (``bootstrap._SERVER_REPO_DEFAULT``,
+  ``bootstrap._SERVER_ASSET_DEFAULT``). Single source of truth: a
+  fork that wants to point its server-install at a different
+  release feed only edits the bootstrap constants.
+
+### azt_collabd 0.28.10 + azt_collab_client 0.28.10 — direct-URL install for popup + peer self-update
+- **New ``install_apk_from_url(url, asset_filename, ...)``** in
+  ``azt_collab_client.ui.update``. Direct-URL alternative to
+  ``check_for_update``: GETs the URL, streams to disk, dispatches
+  Android's installer, optionally polls for completion via change-
+  detection. No GitHub API call, no JSON parsing, no asset name
+  matching, no listing-endpoint quirks. For when the caller has a
+  stable redirect URL like
+  ``releases/latest/download/<asset>`` and doesn't need version
+  comparison.
+- **`install_server_apk_popup`** now uses ``install_apk_from_url``
+  for the Install button. Closes the user-reported "install
+  comes back 404" symptom — the API path's ``_pick_asset`` step
+  was failing on edge cases (asset-name mismatch, listing
+  endpoint quirks). Direct URL bypasses the entire failure
+  surface.
+- **`bootstrap._do_self_install`** also migrated. Composes
+  ``f'https://github.com/{peer_repo}/releases/latest/download/{peer_asset_filename}'``
+  from the args bootstrap already takes. Version comparison
+  still happens earlier in ``_peer_update_with_confirm`` (which
+  needs the API for the small tag-name lookup); by the time we
+  reach the install action, the user has confirmed the prompt
+  and we just need to install whatever's at the URL. No
+  ``install_target_package`` because self-install replaces the
+  running peer process.
+- **`_start_install_poll`** now supports two modes — pinned-
+  version (used by ``check_for_update`` when it knows what
+  version it just downloaded) and change-detection (used by
+  ``install_apk_from_url`` which doesn't have version metadata).
+  Change-detection snapshots the current installed versionName at
+  start, then polls for any difference; trivially handles the
+  uninstalled→installed case.
+- **`_download`** now reads ``Content-Length`` from the response
+  headers when the caller doesn't pre-supply ``total_bytes``, so
+  progress percentages work for the direct-URL path too.
+- **Settings-screen "Update this app" buttons** (CollabUIApp +
+  PickerApp) stay on ``check_for_update`` because they want the
+  "Up to date" message when the user taps without a newer version
+  available — that's the value of the API path there.
+
+### azt_collabd 0.28.9 + azt_collab_client 0.28.9 — restore "Open install page" semantics
+- ``SERVER_APK_INSTALL_URL`` reverts to the **release page** URL
+  (``https://github.com/kent-rasmussen/azt-collab/releases/latest``),
+  not the direct-download asset URL. The popup's "Open install
+  page" button is for users who want to read release notes or
+  browse the project before installing — the page is what serves
+  that purpose. The "Install" button in the same popup is the
+  one-tap-to-install path; it discovers the asset URL via the
+  GitHub API at runtime (asset['browser_download_url']) rather
+  than from this constant.
+- Effectively reverts the 0.28.3 URL-direction change. Sole
+  consumer of ``SERVER_APK_INSTALL_URL`` is
+  ``install_server_apk_popup._open_page``; everything else (the
+  bootstrap workflow, ``check_for_update``) computes the
+  direct-download URL itself.
+
+### azt_collabd 0.28.8 + azt_collab_client 0.28.8 — fix SSL on Android urlopen
+- p4a doesn't ship system CA certs into the Android Python
+  runtime, so the new client-side ``urllib.request.urlopen`` calls
+  in ``azt_collab_client.ui.update`` (release listing, asset
+  download) fail with "unable to get local issuer certificate".
+  The daemon side has had ``azt_collabd/net.py:_ensure_ssl()`` for
+  this since forever, but the client can't import it (Hard rule 3:
+  no daemon import; the two run in different processes on Android
+  anyway).
+- New ``azt_collab_client/net.py`` mirrors the daemon's SSL patch,
+  slimmed for the client (no urllib3.PoolManager surface — the
+  client doesn't speak dulwich). ``_ensure_ssl()`` is idempotent
+  and called at the top of every urlopen site in ``update.py``.
+  Finds certifi's bundle (preferred), falls back to extracting it
+  from the bundled zip into ``$ANDROID_PRIVATE/cacert.pem``, then
+  to common system locations, then to a verification-disabled
+  context as a last resort.
+- Symptom this fixes: post-popup-open SSL error on the bootstrap
+  install flow's GitHub release probe — the "is a newer release
+  available" call (``_fetch_latest``) and the asset-binary stream
+  (``_download``) both bypassed SSL setup before this fix.
+
+### azt_collabd 0.28.7 + azt_collab_client 0.28.7 — fix ModuleNotFoundError on popup open
+- One-character relative-import bug introduced in the 0.28.4 popup
+  refactor: ``azt_collab_client/ui/popups.py:369`` had
+  ``from ..bootstrap import …`` (resolves to
+  ``azt_collab_client.bootstrap`` — doesn't exist) instead of
+  ``from .bootstrap import …`` (the correct
+  ``azt_collab_client.ui.bootstrap``). The error fired the moment
+  ``install_server_apk_popup`` was opened on a peer with no server
+  installed, which raised inside Kivy's main loop and took the
+  peer down — visible as "presplash, brief app screen, close".
+  The user-reported symptom from 0.28.4 onward; the 0.28.5 / 0.28.6
+  bootstrap fixes never had a chance to run because the popup
+  itself couldn't load.
+
 ### azt_collabd 0.28.6 + azt_collab_client 0.28.6 — auto-resume after server install
 - **Post-install continuation.** Once the install-completion poll
   watchdog confirms the new server APK is live, the popup auto-

@@ -635,88 +635,106 @@ def _prompt_server_update(ctx, current_version):
 
 
 def _prompt_self_update(ctx, latest_version):
-    title = _tr('Update {name}?').format(name=ctx.peer_display_name)
+    """Peer self-update prompt. Same popup as the server install /
+    update cases (so users see one consistent install/update UI
+    across the suite), parameterized for the peer's own APK:
+
+    - ``direct_url`` → composed from peer_repo + peer_asset_filename.
+    - ``open_page_url`` → peer's release page so the user can read
+      release notes before tapping Update.
+    - ``install_target_package=''`` → explicitly skip polling.
+      Self-install replaces the running peer process; polling our
+      own package would block forever and the popup would hang at
+      "Installing…" until the user manually closes it.
+    - ``dismiss_label='Not now'`` + ``dismiss_action='dismiss'`` →
+      the dismiss button just closes the popup (peer keeps running
+      at the current version) instead of quitting the app. Self-
+      update decline is "stick with what I have", not "I can't
+      use this app".
+
+    Records the decline on the dismiss path via the same
+    ``_record_decline`` machinery as before — wrapped via the
+    popup's normal close handler is moot since
+    ``install_server_apk_popup`` doesn't expose an on-decline
+    hook; instead we record decline up front on the
+    ``Not now`` path by wrapping the dismiss into a custom
+    callback. (See the ``on_dismiss`` Popup property below.)"""
+    from .popups import install_server_apk_popup
     body = _tr(
         'A newer version of this app ({version}) is available. '
         'Tap Update to download and install it.'
     ).format(version=latest_version)
-
-    def _decline():
-        _record_decline(ctx.peer_repo, latest_version)
-        _on_done_and_release(ctx)
-
-    _yes_no(ctx, title, body,
-            yes_label=_tr('Update'),
-            on_yes=lambda: _do_self_install(ctx),
-            on_no=_decline)
-
-
-# Note: _do_server_install was inlined into install_server_apk_popup
-# in v0.28.4 when the popup became the canonical "no server" UI for
-# both the missing-server and too-old-server cases. Bootstrap no
-# longer drives the install action directly — the popup does, with
-# its own check_for_update call carrying the same arguments.
-
-
-def _do_self_install(ctx):
-    _ui_status(ctx, _tr('Updating {name}…').format(
-        name=ctx.peer_display_name))
-
-    def _on_status(msg):
-        _safe(ctx.on_status, msg)
-
-    def _on_no_update():
-        # Race: latest changed between probe and download. Treat as
-        # done.
-        _on_done_and_release(ctx)
-
-    def _on_error(msg):
-        _safe(ctx.on_error, msg)
-        _on_done_and_release(ctx)
-
-    check_for_update(
-        repo=ctx.peer_repo,
-        current_version=ctx.peer_version,
-        asset_filename=ctx.peer_asset_filename,
-        on_status=_on_status,
-        on_no_update=_on_no_update,
-        on_error=_on_error,
+    direct_url = (
+        f'https://github.com/{ctx.peer_repo}/'
+        f'releases/latest/download/{ctx.peer_asset_filename}'
     )
+    open_page_url = (
+        f'https://github.com/{ctx.peer_repo}/releases/latest'
+    )
+
+    _release_running()
+    popup = install_server_apk_popup(
+        on_status=ctx.on_status,
+        font_name=ctx.font_name,
+        body_message=body,
+        title=_tr('Update {name}?').format(name=ctx.peer_display_name),
+        install_label=_tr('Update'),
+        direct_url=direct_url,
+        asset_filename=ctx.peer_asset_filename,
+        open_page_url=open_page_url,
+        dismiss_label=_tr('Not now'),
+        dismiss_action='dismiss',
+        # Empty string == explicitly no polling. Self-install
+        # kills the running peer process during install; polling
+        # our own package would block forever.
+        install_target_package='',
+        # No on_install_complete: when self-install finishes, the
+        # peer's process is dying anyway. Next-launch bootstrap
+        # detects the new version naturally.
+    )
+
+    # Record decline on Not-now tap. Kivy's Popup fires
+    # ``on_dismiss`` on any dismiss path (Not now button, or
+    # auto_dismiss=False back-out — though we set False so back-
+    # out doesn't fire here). We record only when the popup
+    # dismisses without an install completion having fired; if
+    # the user actually tapped Update, the install flow takes
+    # over and the dismiss-without-install never happens.
+    _state = {'install_started': False}
+
+    def _record_on_dismiss(_p):
+        if not _state['install_started']:
+            _record_decline(ctx.peer_repo, latest_version)
+        _on_done_and_release(ctx)
+
+    # Best-effort hook into Install tap — the popup doesn't
+    # currently expose this, so we monkey-patch by binding a
+    # one-shot handler on its install_btn. Looking up the button
+    # reaches into popup internals (children traversal), but it's
+    # a one-line shortcut vs. plumbing an "on_install_started"
+    # callback all the way through ``install_server_apk_popup``
+    # for this single use case.
+    try:
+        from kivy.uix.button import Button
+        def _walk(w):
+            for child in w.children:
+                if isinstance(child, Button) and child.text == _tr('Update'):
+                    return child
+                found = _walk(child)
+                if found is not None:
+                    return found
+            return None
+        install_btn = _walk(popup.content)
+        if install_btn is not None:
+            install_btn.fbind(
+                'on_release',
+                lambda *_: _state.__setitem__('install_started', True))
+    except Exception:
+        pass
+    popup.bind(on_dismiss=_record_on_dismiss)
 
 
 # ── popup primitives ───────────────────────────────────────────────────────
-
-def _yes_no(ctx, title, body, *, yes_label, on_yes, on_no):
-    """Two-button modal. Same shape across server-install /
-    server-update / self-update prompts."""
-    from . import theme
-
-    content = BoxLayout(orientation='vertical', spacing=dp(10),
-                        padding=dp(12))
-    msg = Label(text=body, halign='left', valign='top',
-                color=theme.TEXT, font_size=sp(14),
-                font_name=ctx.font_name)
-    msg.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-    content.add_widget(msg)
-
-    row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(12))
-    no_btn = Button(text=_tr('Not now'), font_size=sp(14),
-                    font_name=ctx.font_name)
-    yes_btn = Button(text=yes_label, font_size=sp(14),
-                     font_name=ctx.font_name,
-                     background_color=theme.ACCENT)
-    row.add_widget(no_btn)
-    row.add_widget(yes_btn)
-    content.add_widget(row)
-
-    popup = Popup(title=title, content=content,
-                  size_hint=(0.9, None), height=dp(260),
-                  auto_dismiss=False)
-    no_btn.bind(on_release=lambda *_: (popup.dismiss(), on_no()))
-    yes_btn.bind(on_release=lambda *_: (popup.dismiss(), on_yes()))
-    popup.open()
-    return popup
-
 
 def _show_info(ctx, body):
     """Single-button info popup for the rare client_too_old +

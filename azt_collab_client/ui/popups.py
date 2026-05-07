@@ -290,7 +290,12 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                              install_target_package=None,
                              install_label=None,
                              title=None,
-                             on_install_complete=None):
+                             on_install_complete=None,
+                             direct_url=None,
+                             asset_filename=None,
+                             open_page_url=None,
+                             dismiss_label=None,
+                             dismiss_action='quit'):
     """Single canonical popup for "the suite needs the server APK
     (or a newer one) before this app can do anything useful". Used
     for both the server-missing case and the server-too-old case
@@ -358,6 +363,35 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         the callback. Bootstrap passes a callback that re-runs its
         compat check; without it, the popup stays open showing
         "Installed." and the user has to tap Quit then relaunch.
+    direct_url : str | None
+        Override the download URL. By default we compose
+        ``https://github.com/<server-repo>/releases/latest/download/<server-asset>``
+        from the bootstrap constants — appropriate for the server
+        install / update case. Peer self-update passes its own
+        composed URL for the peer's APK. (When provided, also
+        provide ``asset_filename`` so the file lands on disk with
+        the right name.)
+    asset_filename : str | None
+        APK filename used for both the on-disk staging path and the
+        MediaStore display name. Defaults to the server APK's
+        canonical ``aztcollab.apk``. Self-update passes the peer's
+        own asset filename.
+    open_page_url : str | None
+        Override the URL the "Open install page" button opens.
+        Defaults to ``SERVER_APK_INSTALL_URL`` (the server's
+        release page). Self-update passes the peer's release page
+        so the user can browse release notes for the peer.
+    dismiss_label : str | None
+        Override the dismiss button label. Defaults to
+        ``"Quit {app}"`` for the server case. Self-update passes
+        ``"Not now"`` (and pairs with ``dismiss_action='dismiss'``).
+    dismiss_action : str
+        ``'quit'`` (default): tapping dismiss closes the popup AND
+        the host app. Right for the server case where the peer
+        can't function without the daemon. ``'dismiss'``: just
+        closes the popup, peer keeps running. Right for self-
+        update where declining means "stick with the current
+        version".
 
     Returns the Popup so callers can hold a ref. ``auto_dismiss``
     is False — the user must explicitly choose Quit / Open page /
@@ -366,13 +400,33 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     no server").
     """
     from .. import SERVER_APK_INSTALL_URL
-    from ..bootstrap import (
+    from .bootstrap import (
         _SERVER_REPO_DEFAULT, _SERVER_ASSET_DEFAULT,
         _SERVER_PACKAGE_NAME,
     )
 
+    # Resolve the URL / asset / target-package / open-page-url
+    # defaults to the server APK if the caller didn't override.
+    # Self-update flow overrides every one with peer-specific
+    # values.
+    if asset_filename is None:
+        asset_filename = _SERVER_ASSET_DEFAULT
+    if direct_url is None:
+        direct_url = (
+            f'https://github.com/{_SERVER_REPO_DEFAULT}/'
+            f'releases/latest/download/{_SERVER_ASSET_DEFAULT}'
+        )
+    if open_page_url is None:
+        open_page_url = SERVER_APK_INSTALL_URL
+    # ``install_target_package=''`` (empty string, distinguishable
+    # from None) means "explicitly no polling" — used by self-
+    # update where the install kills the running peer process and
+    # polling our own package would block forever. ``None``
+    # (default) means "use the server APK package".
     if install_target_package is None:
         install_target_package = _SERVER_PACKAGE_NAME
+    elif install_target_package == '':
+        install_target_package = None
 
     default_body = (
         _tr('The AZT collaboration service (server APK) is not installed.')
@@ -382,21 +436,114 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     )
     msg = body_message or default_body
 
-    # Quit-button label includes the host's app name so the user
-    # can see what's about to close. App.title is what the recorder
-    # / viewer set on their App subclass; falls back to a generic
-    # "Quit" if the host hasn't set one.
-    try:
-        from kivy.app import App
-        app = App.get_running_app()
-        app_title = getattr(app, 'title', '') or ''
-    except Exception:
-        app_title = ''
-    quit_label = (_tr('Quit {app}').format(app=app_title)
-                  if app_title else _tr('Quit'))
+    # Dismiss-button label. Default for the server case is
+    # "Quit {app}" because the peer can't function without the
+    # daemon. Self-update passes its own ``dismiss_label`` (and
+    # ``dismiss_action='dismiss'``) so the button reads "Not now"
+    # and just closes the popup.
+    if dismiss_label is None:
+        try:
+            from kivy.app import App
+            app = App.get_running_app()
+            app_title = getattr(app, 'title', '') or ''
+        except Exception:
+            app_title = ''
+        dismiss_label = (_tr('Quit {app}').format(app=app_title)
+                         if app_title else _tr('Quit'))
 
     content = BoxLayout(
         orientation='vertical', spacing=dp(10), padding=dp(12))
+
+    # Language toggle row at the top — subtle, but discoverable. On
+    # first install the user has no other way to switch language
+    # (settings UI lives behind this very popup). Tap a code →
+    # ``set_language`` → dismiss and re-invoke this popup with the
+    # same args so all translated strings refresh. Only shown when
+    # there's more than one language available.
+    from .. import i18n as _i18n
+    available = _i18n.available_languages()
+    current_lang = _i18n.current_language()
+
+    # Snapshot kwargs so the language toggle can re-invoke us. We
+    # store the *resolved* values (after defaults applied) so the
+    # rebuild produces an identical popup in every dimension except
+    # language.
+    _relaunch_kwargs = dict(
+        on_status=on_status,
+        font_name=font_name,
+        body_message=body_message,
+        current_server_version=current_server_version,
+        install_target_package=install_target_package or '',
+        install_label=install_label,
+        title=title,
+        on_install_complete=on_install_complete,
+        direct_url=direct_url,
+        asset_filename=asset_filename,
+        open_page_url=open_page_url,
+        dismiss_label=dismiss_label,
+        dismiss_action=dismiss_action,
+    )
+
+    if len(available) > 1:
+        lang_row = BoxLayout(
+            orientation='horizontal',
+            size_hint_y=None, height=dp(24),
+            spacing=dp(8))
+        # Stretch on the left so the language buttons sit at the
+        # right (subtle: doesn't compete with the main message).
+        lang_row.add_widget(Label(size_hint_x=1, text=''))
+
+        def _make_lang_btn(code, display, is_current):
+            lb = Button(
+                text=display,
+                size_hint_x=None, width=dp(80),
+                size_hint_y=None, height=dp(24),
+                font_size=sp(11), font_name=font_name,
+                halign='center', valign='middle',
+                bold=is_current,
+                color=((1, 1, 1, 1) if is_current
+                       else theme.TEXT_DIM),
+                background_color=(theme.ACCENT if is_current
+                                  else theme.TRANSPARENT),
+                background_normal='',
+            )
+            if not is_current:
+                def _switch(_btn, c=code):
+                    # Defer the dismiss + relaunch via Clock so the
+                    # current button's on_release returns first.
+                    # Otherwise we re-enter Popup machinery from
+                    # inside its own touch handler, which Kivy
+                    # silently no-ops in some versions.
+                    import sys as _sys
+                    print(f'[install_popup] language switch: {c}',
+                          file=_sys.stderr, flush=True)
+
+                    def _do_relaunch(_dt):
+                        try:
+                            popup.dismiss()
+                        except Exception as ex:
+                            print(f'[install_popup] dismiss raised: '
+                                  f'{ex}', file=_sys.stderr, flush=True)
+                        try:
+                            _i18n.set_language(c)
+                        except Exception as ex:
+                            print(f'[install_popup] set_language raised:'
+                                  f' {ex}', file=_sys.stderr, flush=True)
+                        try:
+                            install_server_apk_popup(**_relaunch_kwargs)
+                        except Exception as ex:
+                            print(f'[install_popup] relaunch raised: '
+                                  f'{ex}', file=_sys.stderr, flush=True)
+                    from kivy.clock import Clock as _Clock
+                    _Clock.schedule_once(_do_relaunch, 0)
+                lb.bind(on_release=_switch)
+            return lb
+
+        for code, display in available:
+            lang_row.add_widget(_make_lang_btn(
+                code, display, code == current_lang))
+        content.add_widget(lang_row)
+
     body_label = Label(
         text=msg, halign='left', valign='top',
         font_size=sp(13), color=theme.TEXT, font_name=font_name,
@@ -404,30 +551,57 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     body_label.bind(width=lambda w, val: setattr(
         w, 'text_size', (val, None)))
     content.add_widget(body_label)
+    # Tall enough to hold two lines of wrapped button text on
+    # narrow screens — "Open install page" and "Quit AZT Recorder"
+    # both want to wrap. Without text_size binding (below) Kivy
+    # Buttons just clip long labels.
     btn_row = BoxLayout(
-        size_hint_y=None, height=dp(48), spacing=dp(12))
+        size_hint_y=None, height=dp(60), spacing=dp(8))
     install_btn = Button(
         text=install_label or _tr('Install'),
         font_size=sp(14), font_name=font_name,
+        halign='center', valign='middle',
         background_color=theme.ACCENT,
     )
     open_page_btn = Button(
         text=_tr('Open install page'),
         font_size=sp(13), font_name=font_name,
+        halign='center', valign='middle',
     )
     quit_btn = Button(
-        text=quit_label,
+        text=dismiss_label,
         font_size=sp(14), font_name=font_name,
+        halign='center', valign='middle',
     )
+
+    # Bind text_size to size so labels wrap inside their button
+    # bounds rather than spilling / clipping. Apply to all three.
+    def _bind_wrap(b):
+        b.bind(size=lambda w, _v: setattr(w, 'text_size', w.size))
+    for b in (install_btn, open_page_btn, quit_btn):
+        _bind_wrap(b)
+
     btn_row.add_widget(quit_btn)
     btn_row.add_widget(open_page_btn)
     btn_row.add_widget(install_btn)
     content.add_widget(btn_row)
 
+    # Version footer — discrete, dim, helps diagnose which client
+    # build is actually live when reproducing UI bugs across
+    # versions. Mirror of the daemon settings UI's version strip.
+    from .. import __version__ as _client_version
+    content.add_widget(Label(
+        text=f'client {_client_version}',
+        size_hint_y=None, height=dp(18),
+        font_size=sp(11), font_name=font_name,
+        color=theme.TEXT_DIM,
+        halign='center', valign='middle',
+    ))
+
     popup = Popup(
         title=title or _tr('AZT collaboration service required'),
         content=content,
-        size_hint=(0.9, None), height=dp(280),
+        size_hint=(0.9, None), height=dp(360),
         auto_dismiss=False,
     )
 
@@ -445,29 +619,38 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                 pass
 
     def _do_install(*_):
-        # Reuse the suite-shared updater. Disabling the buttons
-        # while the worker runs prevents accidental double-taps.
+        # Direct-URL download path: fetch the well-known
+        # ``releases/latest/download/<asset>`` redirect rather than
+        # going through the GitHub API (which tripped over edge
+        # cases — asset-name mismatch, listing endpoint quirks,
+        # etc.). No version comparison, but the calling flow has
+        # already decided we want to install (server missing /
+        # server too old / peer self-update accepted).
         install_btn.disabled = True
         open_page_btn.disabled = True
-        from .update import check_for_update
+        from .update import install_apk_from_url
         from kivy.clock import Clock
-
-        def _on_no_update():
-            _route_status(_tr('AZT Collaboration is up to date.'))
-            install_btn.disabled = False
-            open_page_btn.disabled = False
 
         def _on_error(err):
             _route_status(_tr('Install failed: {error}').format(error=err))
             install_btn.disabled = False
             open_page_btn.disabled = False
 
+        def _on_user_action_needed():
+            # The install path stalled because the user has to flip
+            # "Install unknown apps" on for this peer in Android
+            # Settings. The status message tells them what to do;
+            # re-enable the buttons so the user can come back and
+            # retry without restarting the popup.
+            install_btn.disabled = False
+            open_page_btn.disabled = False
+
         def _on_complete():
             # Polling confirmed the new server version is live. Show
-            # the "Installed." status briefly so the user sees what
-            # happened, then dismiss the popup and call the host's
+            # "Installed." briefly so the user sees what happened,
+            # then dismiss the popup and call the host's
             # continuation (typically: re-run bootstrap's compat
-            # check and fire on_done so normal startup proceeds).
+            # check so normal startup proceeds).
             def _finish(_dt):
                 try:
                     popup.dismiss()
@@ -481,14 +664,14 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                               f'raised: {ex}')
             Clock.schedule_once(_finish, 1.0)
 
-        check_for_update(
-            repo=_SERVER_REPO_DEFAULT,
-            current_version=current_server_version,
-            asset_filename=_SERVER_ASSET_DEFAULT,
+        install_apk_from_url(
+            url=direct_url,
+            asset_filename=asset_filename,
             on_status=_route_status,
-            on_no_update=_on_no_update,
             on_error=_on_error,
+            on_user_action_needed=_on_user_action_needed,
             install_target_package=install_target_package,
+            install_label=install_label or _tr('Install'),
             on_install_complete=_on_complete,
         )
 
@@ -505,30 +688,37 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                 PythonActivity = autoclass(
                     'org.kivy.android.PythonActivity')
                 intent = Intent(Intent.ACTION_VIEW,
-                                Uri.parse(SERVER_APK_INSTALL_URL))
+                                Uri.parse(open_page_url))
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 cast('android.content.Context',
                      PythonActivity.mActivity).startActivity(intent)
             else:
                 import webbrowser
-                webbrowser.open(SERVER_APK_INSTALL_URL)
+                webbrowser.open(open_page_url)
         except Exception as ex:
             _route_status(_tr(
                 'Could not open install page: {error}').format(error=ex))
             return
-        # Don't dismiss: the user is going to install via the
-        # browser and come back; we want to remain modal so they
-        # can't proceed in the broken peer state.
+        # Don't dismiss: the user may be going to read release
+        # notes / install via the browser and come back; we want
+        # to remain modal so they can't proceed in the broken peer
+        # state (server case) or wander off without confirming
+        # (self-update case).
 
     def _quit(*_):
         popup.dismiss()
-        try:
-            from kivy.app import App
-            app = App.get_running_app()
-            if app is not None:
-                app.stop()
-        except Exception as ex:
-            print(f'[install_popup] App.stop() raised: {ex}')
+        if dismiss_action == 'quit':
+            # Server case: peer can't function, close the app.
+            try:
+                from kivy.app import App
+                app = App.get_running_app()
+                if app is not None:
+                    app.stop()
+            except Exception as ex:
+                print(f'[install_popup] App.stop() raised: {ex}')
+        # else dismiss_action == 'dismiss': popup just closes,
+        # peer keeps running. Right for self-update where
+        # declining means "stick with current version".
 
     install_btn.bind(on_release=_do_install)
     open_page_btn.bind(on_release=_open_page)

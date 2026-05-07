@@ -1,0 +1,245 @@
+05-07 11:16:02.723 32451 32470 V pythonutil: Unpacking private app
+05-07 11:16:02.724 32451 32470 V pythonutil: Data version is 337da1da3af3c845335e043a8077579ca3a32a5a
+05-07 11:16:02.724 32451 32470 V pythonutil: Unpacking /data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/lib/arm64/libpybundle app
+05-07 11:16:02.724 32451 32470 V pythonutil: Data version is 337da1da3af3c845335e043a8077579ca3a32a5a
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libSDL2.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libSDL2_ttf.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libSDL2_mixer.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libssl1.1.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libpng16.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libfreetype.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libpybundle.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libmain.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libpython3.11.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libsqlite3.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Pattern libsqlite3\.so matched file libsqlite3.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libcrypto1.1.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libffi.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libsqlite3\.so against libSDL2_image.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libSDL2.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libSDL2_ttf.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libSDL2_mixer.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libssl1.1.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libpng16.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libfreetype.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libpybundle.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libmain.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libpython3.11.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libsqlite3.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libcrypto1.1.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libffi.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Pattern libffi\.so matched file libffi.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libffi\.so against libSDL2_image.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libpng16\.so against libSDL2.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libpng16\.so against libSDL2_ttf.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libpng16\.so against libSDL2_mixer.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libpng16\.so against libssl1.1.so
+05-07 11:16:02.749 32451 32451 V pythonutil: Checking pattern libpng16\.so against libpng16.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Pattern libpng16\.so matched file libpng16.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libfreetype.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libpybundle.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libmain.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libpython3.11.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libsqlite3.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libcrypto1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libffi.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libpng16\.so against libSDL2_image.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libSDL2.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libSDL2_ttf.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libSDL2_mixer.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libssl1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Pattern libssl.*\.so matched file libssl1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libpng16.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libfreetype.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libpybundle.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libmain.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libpython3.11.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libsqlite3.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libcrypto1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libffi.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libssl.*\.so against libSDL2_image.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libSDL2.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libSDL2_ttf.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libSDL2_mixer.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libssl1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libpng16.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libfreetype.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libpybundle.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libmain.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libpython3.11.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libsqlite3.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libcrypto1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Pattern libcrypto.*\.so matched file libcrypto1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libffi.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libcrypto.*\.so against libSDL2_image.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libSDL2.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Pattern libSDL2\.so matched file libSDL2.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libSDL2_ttf.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libSDL2_mixer.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libssl1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libpng16.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libfreetype.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libpybundle.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libmain.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libpython3.11.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libsqlite3.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libcrypto1.1.so
+05-07 11:16:02.750 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libffi.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2\.so against libSDL2_image.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libSDL2.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libSDL2_ttf.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libSDL2_mixer.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libssl1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libpng16.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libfreetype.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libpybundle.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libmain.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libpython3.11.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libsqlite3.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libcrypto1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libffi.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_image\.so against libSDL2_image.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Pattern libSDL2_image\.so matched file libSDL2_image.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libSDL2.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libSDL2_ttf.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libSDL2_mixer.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Pattern libSDL2_mixer\.so matched file libSDL2_mixer.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libssl1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libpng16.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libfreetype.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libpybundle.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libmain.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libpython3.11.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libsqlite3.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libcrypto1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libffi.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_mixer\.so against libSDL2_image.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libSDL2.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libSDL2_ttf.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Pattern libSDL2_ttf\.so matched file libSDL2_ttf.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libSDL2_mixer.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libssl1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libpng16.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libfreetype.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libpybundle.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libmain.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libpython3.11.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libsqlite3.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libcrypto1.1.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libffi.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Checking pattern libSDL2_ttf\.so against libSDL2_image.so
+05-07 11:16:02.751 32451 32451 V pythonutil: Loading library: sqlite3
+05-07 11:16:02.752 32451 32451 V pythonutil: Loading library: ffi
+05-07 11:16:02.753 32451 32451 V pythonutil: Loading library: png16
+05-07 11:16:02.754 32451 32451 V pythonutil: Loading library: ssl1.1
+05-07 11:16:02.755 32451 32451 V pythonutil: Loading library: crypto1.1
+05-07 11:16:02.756 32451 32451 V pythonutil: Loading library: SDL2
+05-07 11:16:02.757 32451 32451 V pythonutil: Loading library: SDL2_image
+05-07 11:16:02.758 32451 32451 V pythonutil: Loading library: SDL2_mixer
+05-07 11:16:02.759 32451 32451 V pythonutil: Loading library: SDL2_ttf
+05-07 11:16:02.762 32451 32451 V pythonutil: Loading library: python3.5m
+05-07 11:16:02.765 32451 32451 D nativeloader: Load libpython3.5m.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.5m.so" not found
+05-07 11:16:02.765 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.5m.so" not found
+05-07 11:16:02.765 32451 32451 V pythonutil: Loading library: python3.6m
+05-07 11:16:02.766 32451 32451 D nativeloader: Load libpython3.6m.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.6m.so" not found
+05-07 11:16:02.766 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.6m.so" not found
+05-07 11:16:02.766 32451 32451 V pythonutil: Loading library: python3.7m
+05-07 11:16:02.766 32451 32451 D nativeloader: Load libpython3.7m.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.7m.so" not found
+05-07 11:16:02.766 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.7m.so" not found
+05-07 11:16:02.766 32451 32451 V pythonutil: Loading library: python3.8
+05-07 11:16:02.767 32451 32451 D nativeloader: Load libpython3.8.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.8.so" not found
+05-07 11:16:02.767 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.8.so" not found
+05-07 11:16:02.767 32451 32451 V pythonutil: Loading library: python3.9
+05-07 11:16:02.768 32451 32451 D nativeloader: Load libpython3.9.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.9.so" not found
+05-07 11:16:02.768 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.9.so" not found
+05-07 11:16:02.768 32451 32451 V pythonutil: Loading library: python3.10
+05-07 11:16:02.768 32451 32451 D nativeloader: Load libpython3.10.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): dlopen failed: library "libpython3.10.so" not found
+05-07 11:16:02.768 32451 32451 V pythonutil: Library loading error: dlopen failed: library "libpython3.10.so" not found
+05-07 11:16:02.768 32451 32451 V pythonutil: Loading library: python3.11
+05-07 11:16:02.770 32451 32451 D nativeloader: Load /data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/lib/arm64/libpython3.11.so using class loader ns clns-4 (caller=/data/app/~~FRr8wMTAR24XiKB0Phf69Q==/org.atoznback.azt_recorder-KMr4Q1Gw2AYjEoVgyrOkMQ==/base.apk): ok
+05-07 11:16:02.771 32451 32451 V pythonutil: Loading library: main
+05-07 11:16:02.771 32451 32451 V pythonutil: Loaded everything!
+05-07 11:16:02.822 32451 32480 I python  : Initializing Python for Android
+05-07 11:16:02.822 32451 32480 I python  : Setting additional env vars from p4a_env_vars.txt
+05-07 11:16:02.823 32451 32480 I python  : Changing directory to the one provided by ANDROID_ARGUMENT
+05-07 11:16:02.823 32451 32480 I python  : /data/user/0/org.atoznback.azt_recorder/files/app
+05-07 11:16:02.823 32451 32480 I python  : Preparing to initialize python
+05-07 11:16:02.823 32451 32480 I python  : _python_bundle dir exists
+05-07 11:16:02.823 32451 32480 I python  : calculated paths to be...
+05-07 11:16:02.823 32451 32480 I python  : /data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/stdlib.zip:/data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/modules
+05-07 11:16:02.823 32451 32480 I python  : set wchar paths...
+05-07 11:16:02.833 32451 32451 W SDLThread: type=1400 audit(0.0:1039867): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/zlib.cpython-311.so" dev="dm-52" ino=379306 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:02.856 32451 32480 I python  : Initialized python
+05-07 11:16:02.856 32451 32480 I python  : AND: Init threads
+05-07 11:16:02.856 32451 32480 I python  : testing python print redirection
+05-07 11:16:02.857 32451 32480 I python  : Android path ['.', '/data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/stdlib.zip', '/data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/modules', '/data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/site-packages']
+05-07 11:16:02.858 32451 32480 I python  : os.environ is environ({'PATH': '/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin', 'ANDROID_BOOTLOGO': '1', 'ANDROID_ROOT': '/system', 'ANDROID_ASSETS': '/system/app', 'ANDROID_DATA': '/data', 'ANDROID_STORAGE': '/storage', 'ANDROID_ART_ROOT': '/apex/com.android.art', 'ANDROID_I18N_ROOT': '/apex/com.android.i18n', 'ANDROID_TZDATA_ROOT': '/apex/com.android.tzdata', 'EXTERNAL_STORAGE': '/sdcard', 'ASEC_MOUNTPOINT': '/mnt/asec', 'DOWNLOAD_CACHE': '/data/cache', 'BOOTCLASSPATH': '/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system_ext/framework/mediatek-carrier-config-manager.jar:/system_ext/framework/mediatek-common.jar:/system_ext/framework/mediatek-framework.jar:/system_ext/framework/mediatek-ims-base.jar:/system_ext/framework/moto-echolocateapi.jar:/system_ext/framework/payjoy-api.jar:/apex/com.android.i18n/javalib/core-icu4j.jar:/apex/com.android.adservices/javalib/framework-adservices.jar:/apex/com.android.adservices/javalib/framework-sdksandbox.jar:/apex/com.android.appsearch/javalib/framework-appsearch.jar:/apex/com.android.btservices/javalib/framework-bluetooth.jar:/apex/com.android.configinfrastructure/javalib/framework-configinfrastructure.jar:/apex/com.android.conscrypt/javalib/conscrypt.jar:/apex/com.android.devicelock/javalib/framework-devicelock.jar:/apex/com.android.healthfitness/javalib/framework-healthfitness.jar:/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar:/apex/com.android.media/javalib/updatable-media.jar:/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar:/apex/com.android.mediaprovider/javalib/framework-pdf.jar:/apex/com.android.mediaprovider/javalib/framework-photopicker.jar:/apex/com.android.ondevicepersonalization/javalib/framework-ondevicepersonalization.jar:/apex/com.android.os.statsd/javalib/framework-statsd.jar:/apex/com.android.permission/javalib/framework-permission.jar:/apex/com.android.permission/javalib/framework-permission-s.jar:/apex/com.android.scheduling/javalib/framework-scheduling.jar:/apex/com.android.sdkext/javalib/framework-sdkextensions.jar:/apex/com.android.tethering/javalib/framework-connectivity.jar:/apex/com.android.tethering/javalib/framework-connectivity-t.jar:/apex/com.android.tethering/javalib/framework-tethering.jar:/apex/com.android.uwb/javalib/framework-uwb.jar:/apex/com.android.virt/javalib/framework-virtualization.jar:/apex/com.android.wifi/javalib/framework-wifi.jar:/apex/com.motorola.enterprise/javalib/framework-moto-enterprise.jar', 'DEX2OATBOOTCLASSPATH': '/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system_ext/framework/mediatek-carrier-config-manager.jar:/system_ext/framework/mediatek-common.jar:/system_ext/framework/mediatek-framework.jar:/system_ext/framework/mediatek-ims-base.jar:/system_ext/framework/moto-echolocateapi.jar:/system_ext/framework/payjoy-api.jar:/apex/com.android.i18n/javalib/core-icu4j.jar', 'SYSTEMSERVERCLASSPATH': '/system/framework/com.android.location.provider.jar:/system/framework/services.jar:/apex/com.android.adservices/javalib/service-adservices.jar:/apex/com.android.adservices/javalib/service-sdksandbox.jar:/apex/com.android.appsearch/javalib/service-appsearch.jar:/apex/com.android.art/javalib/service-art.jar:/apex/com.android.
+05-07 11:16:02.858 32451 32480 I python  : Android kivy bootstrap done. __name__ is __main__
+05-07 11:16:02.858 32451 32480 I python  : AND: Ran string
+05-07 11:16:02.858 32451 32480 I python  : Run user program, change dir and execute entrypoint
+05-07 11:16:02.957 32451 32451 W SDLThread: type=1400 audit(0.0:1039870): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/_opcode.cpython-311.so" dev="dm-52" ino=1152434 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.185 32451 32480 I python  : [INFO   ] [Logger      ] Record log in /data/user/0/org.atoznback.azt_recorder/files/app/.kivy/logs/kivy_26-05-07_1.txt
+05-07 11:16:03.185 32451 32480 I python  : [INFO   ] [Kivy        ] v2.3.0
+05-07 11:16:03.185 32451 32480 I python  : [INFO   ] [Kivy        ] Installed at "/data/user/0/org.atoznback.azt_recorder/files/app/_python_bundle/site-packages/kivy/__init__.pyc"
+05-07 11:16:03.185 32451 32480 I python  : [INFO   ] [Python      ] v3.11.5 (main, May  4 2026, 18:01:03) [Clang 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f0
+05-07 11:16:03.186 32451 32480 I python  : [INFO   ] [Python      ] Interpreter at ""
+05-07 11:16:03.186 32451 32480 I python  : [INFO   ] [Logger      ] Purge log fired. Processing...
+05-07 11:16:03.186 32451 32480 I python  : [INFO   ] [Logger      ] Purge finished!
+05-07 11:16:03.593 32451 32451 W SDLThread: type=1400 audit(0.0:1039884): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/_socket.cpython-311.so" dev="dm-52" ino=1165067 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.597 32451 32451 W SDLThread: type=1400 audit(0.0:1039885): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/array.cpython-311.so" dev="dm-52" ino=397428 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.601 32451 32451 W SDLThread: type=1400 audit(0.0:1039886): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/_ssl.cpython-311.so" dev="dm-52" ino=988004 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.605 32451 32451 W SDLThread: type=1400 audit(0.0:1039887): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/binascii.cpython-311.so" dev="dm-52" ino=393948 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.613 32451 32451 W SDLThread: type=1400 audit(0.0:1039888): avc:  granted  { execute } for  path="/data/data/org.atoznback.azt_recorder/files/app/_python_bundle/modules/_contextvars.cpython-311.so" dev="dm-52" ino=1197446 scontext=u:r:untrusted_app:s0:c70,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c70,c258,c512,c768 tclass=file app=org.atoznback.azt_recorder
+05-07 11:16:03.661 32451 32480 I python  : [INFO   ] [Factory     ] 195 symbols loaded
+05-07 11:16:03.831 32451 32480 I python  : [INFO   ] [Image       ] Providers: img_tex, img_dds, img_sdl2, img_pil (img_ffpyplayer ignored)
+05-07 11:16:03.867 32451 32480 I python  : [INFO   ] [Text        ] Provider: sdl2
+05-07 11:16:03.908 32451 32480 I python  : [INFO   ] [Window      ] Provider: sdl2
+05-07 11:16:03.930 32451 32480 I python  : [INFO   ] [GL          ] Using the "OpenGL ES 2" graphics system
+05-07 11:16:03.933 32451 32480 I python  : [INFO   ] [GL          ] Backend used <sdl2>
+05-07 11:16:03.933 32451 32480 I python  : [INFO   ] [GL          ] OpenGL version <b'OpenGL ES 3.2 build 1.15@6133110'>
+05-07 11:16:03.933 32451 32480 I python  : [INFO   ] [GL          ] OpenGL vendor <b'Imagination Technologies'>
+05-07 11:16:03.933 32451 32480 I python  : [INFO   ] [GL          ] OpenGL renderer <b'PowerVR B-Series BXM-8-256'>
+05-07 11:16:03.933 32451 32480 I python  : [INFO   ] [GL          ] OpenGL parsed version: 3, 2
+05-07 11:16:03.934 32451 32480 I python  : [INFO   ] [GL          ] Texture max size <16384>
+05-07 11:16:03.934 32451 32480 I python  : [INFO   ] [GL          ] Texture max units <24>
+05-07 11:16:03.952 32451 32480 I python  : [INFO   ] [Window      ] auto add sdl2 input provider
+05-07 11:16:03.953 32451 32480 I python  : [INFO   ] [Window      ] virtual keyboard not allowed, single mode, not docked
+05-07 11:16:03.998 32451 32480 I python  : [LOG] azt_recorder starting — log: /data/user/0/org.atoznback.azt_recorder/files/azt_recorder.log
+05-07 11:16:04.163 32451 32480 I python  : [WARNING] Deprecated property "<BooleanProperty name=allow_stretch>" of object "<kivy.uix.image.Image object at 0x741c19a0b0>" was accessed, it will be removed in a future version
+05-07 11:16:04.163 32451 32480 I python  : [WARNING] Deprecated property "<BooleanProperty name=keep_ratio>" of object "<kivy.uix.image.Image object at 0x741c19a0b0>" was accessed, it will be removed in a future version
+05-07 11:16:04.171 32451 32480 I python  : [INFO   ] [Loader      ] using a thread pool of 2 workers
+05-07 11:16:04.181 32451 32480 I python  : [INFO   ] [GL          ] NPOT texture support is available
+05-07 11:16:04.192 32451 32480 I python  : [WARNING] Deprecated property "<NumericProperty name=padding_x>" of object "<kivy.uix.label.Label object at 0x741c224600>" was accessed, it will be removed in a future version
+05-07 11:16:04.341 32451 32480 I python  : [insets] SDK 34 < 35, skipping
+05-07 11:16:04.373 32451 32480 E ActivityThread: Failed to find provider info for org.atoznback.aztcollab
+05-07 11:16:04.374 32451 32480 E ActivityThread: Failed to find provider info for org.atoznback.aztcollab
+05-07 11:16:04.388 32451 32480 I python  : [app] activity result listener bound
+05-07 11:16:04.491 32451 32480 I python  : [WARNING] [Base        ] Unknown <android> provider
+05-07 11:16:04.491 32451 32480 I python  : [INFO   ] [Base        ] Start application main loop
+05-07 11:16:04.749 32451 32527 E ActivityThread: Failed to find provider info for org.atoznback.aztcollab
+05-07 11:16:04.764 32451 32527 E ActivityThread: Failed to find provider info for org.atoznback.aztcollab
+05-07 11:16:04.765 32451 32480 I python  :  [bootstrap] Vérification de l'installation…
+05-07 11:16:04.776 32451 32480 I python  : [INFO   ] [Base        ] Leaving application in progress...
+05-07 11:16:04.777 32451 32480 I python  : [CRASH] Traceback (most recent call last):
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/app/main.py", line 4965, in <module>
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/app.py", line 956, in run
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/base.py", line 574, in runTouchApp
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/base.py", line 339, in mainloop
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/base.py", line 379, in idle
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/clock.py", line 733, in tick
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/clock.py", line 776, in post_idle
+05-07 11:16:04.777 32451 32480 I python  :   File "kivy/_clock.pyx", line 620, in kivy._clock.CyClockBase._process_events
+05-07 11:16:04.777 32451 32480 I python  :   File "kivy/_clock.pyx", line 653, in kivy._clock.CyClockBase._process_events
+05-07 11:16:04.777 32451 32480 I python  :   File "kivy/_clock.pyx", line 649, in kivy._clock.CyClockBase._process_events
+05-07 11:16:04.777 32451 32480 I python  :   File "kivy/_clock.pyx", line 218, in kivy._clock.ClockEvent.tick
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/app/azt_collab_client/ui/bootstrap.py", line 385, in <lambda>
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/app/azt_collab_client/ui/bootstrap.py", line 585, in _prompt_server_install
+05-07 11:16:04.777 32451 32480 I python  :   File "/home/kentr/bin/AZT/.buildozer/android/app/azt_collab_client/ui/popups.py", line 369, in install_server_apk_popup
+05-07 11:16:04.777 32451 32480 I python  : ModuleNotFoundError: No module named 'azt_collab_client.bootstrap'
+05-07 11:16:04.777 32451 32480 I python  : 
+05-07 11:16:04.777 32451 32480 I python  :  Traceback (most recent call last):
+05-07 11:16:04.777 32451 32480 I python  :    File "/home/kentr/bin/AZT/.buildozer/android/app/main.py", line 4965, in <module>
+05-07 11:16:04.777 32451 32480 I python  :    File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/app.py", line 956, in run
+05-07 11:16:04.778 32451 32480 I python  :    File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/base.py", line 574, in runTouchApp
+05-07 11:16:04.778 32451 32480 I python  :    File "/home/kentr/bin/AZT/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/python-installs/azt_recorder/arm64-v8a/kivy/base.py", line 339, in mainloop
+05-07 11:16:04.778 32451 32480 I python  :    File "/home/kentr/bin/AZT/
