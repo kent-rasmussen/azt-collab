@@ -1448,7 +1448,7 @@ class CollabUIApp(App):
         """Hand the running server APK to Android's share sheet so the
         user can send it to a teammate. No-op (with a translated
         error popup) on desktop — there's no APK to share."""
-        share_running_apk(filename='azt_collab.apk',
+        share_running_apk(filename='aztcollab.apk',
                           on_error=self._show_error)
 
     def update_app(self):
@@ -1461,7 +1461,7 @@ class CollabUIApp(App):
         check_for_update(
             repo=update_repo(),
             current_version=azt_collabd.__version__,
-            asset_filename='azt_collab.apk',
+            asset_filename='aztcollab.apk',
             on_status=self._set_update_msg,
             on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
             on_error=self._show_error,

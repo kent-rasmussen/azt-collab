@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.28.1\n"
+"Project-Id-Version: azt_collab_client 0.28.6\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -77,6 +77,13 @@ msgstr "Le service de collaboration AZT (APK serveur) n'est pas installé."
 
 msgid "Install it to enable sync, then reopen this app."
 msgstr "Installez-le pour activer la synchronisation, puis rouvrez cette application."
+
+msgid ""
+"Tap Install to download and install it. Android will ask you to "
+"confirm before the install starts."
+msgstr ""
+"Touchez Installer pour le télécharger et l'installer. Android vous "
+"demandera de confirmer avant le début de l'installation."
 
 msgid "Open install page"
 msgstr "Ouvrir la page d'installation"
@@ -184,6 +191,16 @@ msgstr "Préparation de l'installation…"
 msgid "Installing…"
 msgstr "Installation en cours…"
 
+msgid "Installed."
+msgstr "Installé."
+
+msgid "Install pending. Reopen this app when finished."
+msgstr ""
+"Installation en attente. Rouvrez cette application une fois terminé."
+
+msgid "Release in progress — retrying in {s}s…"
+msgstr "Publication en cours — nouvelle tentative dans {s} s…"
+
 msgid "APK install is only available on Android."
 msgstr "L'installation d'APK est uniquement disponible sur Android."
 
@@ -231,6 +248,22 @@ msgstr "Erreur"
 
 msgid "Dismiss"
 msgstr "Fermer"
+
+msgid "Quit"
+msgstr "Quitter"
+
+msgid "Quit {app}"
+msgstr "Quitter {app}"
+
+msgid ""
+"This app needs the AZT Collaboration service ({name}) to sync your "
+"data. Tap Install to download and install it. Android will ask you "
+"to confirm before the install starts."
+msgstr ""
+"Cette application a besoin du service AZT Collaboration ({name}) pour "
+"synchroniser vos données. Touchez Installer pour le télécharger et "
+"l'installer. Android vous demandera de confirmer avant le début de "
+"l'installation."
 
 msgid "AZT collaboration service required"
 msgstr "Service de collaboration AZT requis"

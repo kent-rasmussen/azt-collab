@@ -284,58 +284,215 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     return popup
 
 
-def install_server_apk_popup(on_status=None, font_name='Roboto'):
-    """Show a popup explaining the server APK is missing, with a button
-    that opens the install URL.
+def install_server_apk_popup(on_status=None, font_name='Roboto',
+                             body_message=None,
+                             current_server_version='0.0.0',
+                             install_target_package=None,
+                             install_label=None,
+                             title=None,
+                             on_install_complete=None):
+    """Single canonical popup for "the suite needs the server APK
+    (or a newer one) before this app can do anything useful". Used
+    for both the server-missing case and the server-too-old case
+    by varying ``body_message`` + ``current_server_version``.
 
-    On Android the button dispatches ``Intent.ACTION_VIEW`` to
-    ``SERVER_APK_INSTALL_URL`` (the GitHub release page); on desktop
-    the same URL is opened via ``webbrowser.open`` so the helper is
-    safe to call from either platform.
+    Three buttons:
 
-    ``on_status(msg)`` is called with a status string when the install
-    page can't be opened (jnius unavailable on Android, no browser on
-    desktop). Hosts can wire it into their status bar.
+    - **Quit** — closes the running peer app via
+      ``App.get_running_app().stop()``. Without the server APK the
+      peer can't function (no daemon → no sync, no project picker),
+      so dismissing without installing == quitting. The button
+      label is "Quit {app}" where ``{app}`` comes from the running
+      App's ``title`` (falls through to the literal "Quit" if the
+      host hasn't set a title).
+    - **Open install page** — opens ``SERVER_APK_INSTALL_URL`` in
+      the browser as a fallback for environments where the in-app
+      install Intent can't fire (locked-down corporate Android,
+      rooted ROM, etc.). Most users won't need it.
+    - **Install** — runs ``check_for_update`` against the suite's
+      release feed: downloads the latest ``aztcollab.apk``, streams
+      it to ``$AZT_HOME/updates/``, dispatches Android's system
+      installer, then polls ``PackageManager.getPackageInfo`` for
+      install completion (status flips to "Installed." when the
+      new package is detected).
 
-    Returns the Popup so callers can hold a ref if they want to
-    programmatically dismiss it.
+    Progress strings flow into the popup body label *and* (if
+    ``on_status`` is given) the host's status sink — the popup body
+    is the user-visible surface of record because the host's
+    progress label might not be on-screen.
+
+    Parameters
+    ----------
+    on_status : callable(str) | None
+        Optional sink for progress / state strings, in addition to
+        the popup body label. Hosts wire this into their existing
+        log surface so progress is visible there too.
+    font_name : str
+        CharisSIL or Roboto, per the host's ``register_charis()``.
+    body_message : str | None
+        Override the default "the AZT collaboration service is not
+        installed" body. Used by the bootstrap workflow's
+        server-too-old path to swap in a different lead message
+        ("a newer version is required") while keeping the same
+        button shape.
+    current_server_version : str
+        Passed through to ``check_for_update`` as ``current_version``.
+        ``'0.0.0'`` (default) for the server-missing case forces
+        "newer found" against any release. For the server-too-old
+        case, pass the daemon's actual version so a no-op release
+        feed reports "up to date" instead of double-installing.
+    install_target_package : str | None
+        Android package name to poll for install completion.
+        Defaults to ``'org.atoznback.aztcollab'`` (the canonical
+        server APK package); override only if pointing at a fork.
+    install_label : str | None
+        Override the "Install" button label (e.g. "Update" for the
+        server-too-old path).
+    title : str | None
+        Override the popup title bar.
+    on_install_complete : callable() | None
+        Optional callback fired once the polling watchdog confirms
+        the target package's version flipped to the just-installed
+        one. The popup itself dismisses ~1s after the watchdog
+        fires (so the user sees "Installed." briefly), then invokes
+        the callback. Bootstrap passes a callback that re-runs its
+        compat check; without it, the popup stays open showing
+        "Installed." and the user has to tap Quit then relaunch.
+
+    Returns the Popup so callers can hold a ref. ``auto_dismiss``
+    is False — the user must explicitly choose Quit / Open page /
+    Install. That's the modal-blocking behaviour the suite UX
+    contract wants ("user can't reach settings or picker if there's
+    no server").
     """
     from .. import SERVER_APK_INSTALL_URL
-    msg = (
+    from ..bootstrap import (
+        _SERVER_REPO_DEFAULT, _SERVER_ASSET_DEFAULT,
+        _SERVER_PACKAGE_NAME,
+    )
+
+    if install_target_package is None:
+        install_target_package = _SERVER_PACKAGE_NAME
+
+    default_body = (
         _tr('The AZT collaboration service (server APK) is not installed.')
         + '\n\n'
-        + _tr('Install it to enable sync, then reopen this app.')
-        + '\n\n' + SERVER_APK_INSTALL_URL
+        + _tr('Tap Install to download and install it. Android will '
+              'ask you to confirm before the install starts.')
     )
+    msg = body_message or default_body
+
+    # Quit-button label includes the host's app name so the user
+    # can see what's about to close. App.title is what the recorder
+    # / viewer set on their App subclass; falls back to a generic
+    # "Quit" if the host hasn't set one.
+    try:
+        from kivy.app import App
+        app = App.get_running_app()
+        app_title = getattr(app, 'title', '') or ''
+    except Exception:
+        app_title = ''
+    quit_label = (_tr('Quit {app}').format(app=app_title)
+                  if app_title else _tr('Quit'))
+
     content = BoxLayout(
         orientation='vertical', spacing=dp(10), padding=dp(12))
-    content.add_widget(Label(
+    body_label = Label(
         text=msg, halign='left', valign='top',
         font_size=sp(13), color=theme.TEXT, font_name=font_name,
-    ))
+    )
+    body_label.bind(width=lambda w, val: setattr(
+        w, 'text_size', (val, None)))
+    content.add_widget(body_label)
     btn_row = BoxLayout(
         size_hint_y=None, height=dp(48), spacing=dp(12))
-    open_btn = Button(
-        text=_tr('Open install page'),
+    install_btn = Button(
+        text=install_label or _tr('Install'),
         font_size=sp(14), font_name=font_name,
         background_color=theme.ACCENT,
     )
-    close_btn = Button(
-        text=_tr('Dismiss'),
+    open_page_btn = Button(
+        text=_tr('Open install page'),
+        font_size=sp(13), font_name=font_name,
+    )
+    quit_btn = Button(
+        text=quit_label,
         font_size=sp(14), font_name=font_name,
     )
-    btn_row.add_widget(open_btn)
-    btn_row.add_widget(close_btn)
+    btn_row.add_widget(quit_btn)
+    btn_row.add_widget(open_page_btn)
+    btn_row.add_widget(install_btn)
     content.add_widget(btn_row)
 
     popup = Popup(
-        title=_tr('AZT collaboration service required'),
+        title=title or _tr('AZT collaboration service required'),
         content=content,
-        size_hint=(0.85, None), height=dp(280),
-        auto_dismiss=True,
+        size_hint=(0.9, None), height=dp(280),
+        auto_dismiss=False,
     )
 
-    def _open(*_):
+    def _route_status(text):
+        # Surface progress in the popup body so the user always sees
+        # what's happening even if the host's status sink isn't
+        # currently visible. Keeps the lead context line so the
+        # user keeps the "what's this about" anchor.
+        body_label.text = (msg + '\n\n' + (text or '')) if msg else (
+            text or '')
+        if on_status:
+            try:
+                on_status(text)
+            except Exception:
+                pass
+
+    def _do_install(*_):
+        # Reuse the suite-shared updater. Disabling the buttons
+        # while the worker runs prevents accidental double-taps.
+        install_btn.disabled = True
+        open_page_btn.disabled = True
+        from .update import check_for_update
+        from kivy.clock import Clock
+
+        def _on_no_update():
+            _route_status(_tr('AZT Collaboration is up to date.'))
+            install_btn.disabled = False
+            open_page_btn.disabled = False
+
+        def _on_error(err):
+            _route_status(_tr('Install failed: {error}').format(error=err))
+            install_btn.disabled = False
+            open_page_btn.disabled = False
+
+        def _on_complete():
+            # Polling confirmed the new server version is live. Show
+            # the "Installed." status briefly so the user sees what
+            # happened, then dismiss the popup and call the host's
+            # continuation (typically: re-run bootstrap's compat
+            # check and fire on_done so normal startup proceeds).
+            def _finish(_dt):
+                try:
+                    popup.dismiss()
+                except Exception:
+                    pass
+                if on_install_complete is not None:
+                    try:
+                        on_install_complete()
+                    except Exception as ex:
+                        print('[install_popup] on_install_complete '
+                              f'raised: {ex}')
+            Clock.schedule_once(_finish, 1.0)
+
+        check_for_update(
+            repo=_SERVER_REPO_DEFAULT,
+            current_version=current_server_version,
+            asset_filename=_SERVER_ASSET_DEFAULT,
+            on_status=_route_status,
+            on_no_update=_on_no_update,
+            on_error=_on_error,
+            install_target_package=install_target_package,
+            on_install_complete=_on_complete,
+        )
+
+    def _open_page(*_):
         try:
             from kivy.utils import platform
         except Exception:
@@ -356,11 +513,25 @@ def install_server_apk_popup(on_status=None, font_name='Roboto'):
                 import webbrowser
                 webbrowser.open(SERVER_APK_INSTALL_URL)
         except Exception as ex:
-            if on_status:
-                on_status(f'could not open install page — {ex}')
-        popup.dismiss()
+            _route_status(_tr(
+                'Could not open install page: {error}').format(error=ex))
+            return
+        # Don't dismiss: the user is going to install via the
+        # browser and come back; we want to remain modal so they
+        # can't proceed in the broken peer state.
 
-    open_btn.bind(on_release=_open)
-    close_btn.bind(on_release=popup.dismiss)
+    def _quit(*_):
+        popup.dismiss()
+        try:
+            from kivy.app import App
+            app = App.get_running_app()
+            if app is not None:
+                app.stop()
+        except Exception as ex:
+            print(f'[install_popup] App.stop() raised: {ex}')
+
+    install_btn.bind(on_release=_do_install)
+    open_page_btn.bind(on_release=_open_page)
+    quit_btn.bind(on_release=_quit)
     popup.open()
     return popup

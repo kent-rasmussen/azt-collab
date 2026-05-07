@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.28.1"
+__version__ = "0.28.6"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -31,8 +31,16 @@ __version__ = "0.28.1"
 # lose all of these. Lock-step bump intended to flush every peer APK
 # through a rebuild.
 MIN_SERVER_VERSION = "0.27.0"
+# Direct-download URL for the latest server APK asset. Tapping
+# "Open install page" in install_server_apk_popup opens this URL,
+# which on Android triggers Chrome's download flow straight to the
+# system installer (no extra "find the asset" step on the releases
+# page). GitHub serves this stable redirect for any release that
+# uploaded an asset with this exact filename — matches what
+# azt_collab_client.ui.bootstrap fetches programmatically.
 SERVER_APK_INSTALL_URL = (
-    'https://github.com/atoznback/azt-collab/releases/latest'
+    'https://github.com/kent-rasmussen/azt-collab/'
+    'releases/latest/download/aztcollab.apk'
 )
 from . import status as S
 from .status import Status, Result

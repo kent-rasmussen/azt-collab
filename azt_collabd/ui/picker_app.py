@@ -706,7 +706,7 @@ class PickerApp(App):
         the KV's ``app.share_apk()`` resolves on either app. Reuses
         the existing ``_show_error`` modal for failures."""
         from azt_collab_client.ui import share_running_apk
-        share_running_apk(filename='azt_collab.apk',
+        share_running_apk(filename='aztcollab.apk',
                           on_error=self._show_error)
 
     def update_app(self):
@@ -720,7 +720,7 @@ class PickerApp(App):
         check_for_update(
             repo=update_repo(),
             current_version=azt_collabd.__version__,
-            asset_filename='azt_collab.apk',
+            asset_filename='aztcollab.apk',
             on_status=self._set_update_msg,
             on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
             on_error=self._show_error,

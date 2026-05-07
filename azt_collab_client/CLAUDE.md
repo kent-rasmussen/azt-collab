@@ -713,22 +713,51 @@ provisioned by the peer itself on first run.
 
 `azt_collab_client.ui.bootstrap(...)` is the single entry point that
 implements this. Each peer calls it once, early in startup
-(`App.on_start` is the natural seam):
+(`App.on_start` is the natural seam). Recommended shape: a thin
+wrapper method on your `App` subclass that supplies identity, and a
+status sink that routes progress strings into your existing logging
+surface:
 
 ```python
-# in your App.on_start (recorder, viewer, …):
-from azt_collab_client.ui import bootstrap
-bootstrap(
-    peer_repo='kent-rasmussen/azt-recorder',
-    peer_version=__version__,
-    peer_asset_filename='azt_recorder.apk',
-    peer_display_name='AZT Recorder',     # optional; used in prompts
-    on_status=self._set_status_label,     # progress / state strings
-    on_done=self._continue_normal_startup,
-    on_error=self._show_error,
-    font_name=self._font_name,
-)
+# in your App class
+def on_start(self):
+    ...
+    # Defer one frame so the UI is up before any popup fires.
+    Clock.schedule_once(lambda dt: self._run_bootstrap(), 0.5)
+
+def _run_bootstrap(self):
+    # Deferred import keeps bootstrap.py + its Kivy/jnius deps out of
+    # the import graph until the peer actually fires it.
+    from azt_collab_client.ui import bootstrap
+    from appinfo import APP_NAME
+    bootstrap(
+        peer_repo='kent-rasmussen/azt-recorder',
+        peer_version=__version__,
+        peer_asset_filename='azt_recorder.apk',
+        peer_display_name=APP_NAME,
+        on_status=self._log_bootstrap_status,
+        on_error=self._log_bootstrap_status,
+        font_name=_FONT_NAME,
+    )
+
+def _log_bootstrap_status(self, message):
+    """Surface bootstrap progress / errors through the peer's existing
+    in-app status channel. The recorder routes to its collab-screen
+    log; a viewer would route to its equivalent."""
+    print(f'[bootstrap] {message}', file=sys.stderr)
+    try:
+        sm = self.root.ids.sm
+        collab = sm.get_screen('collab')
+        collab._set_log(message)
+    except Exception:
+        pass
 ```
+
+The recorder (`azt_recorder/main.py: _run_bootstrap`,
+`_log_bootstrap_status`) is the canonical reference for this
+pattern — clone it verbatim and substitute your own
+`peer_repo` / `peer_asset_filename` / `peer_display_name` /
+status-screen lookup.
 
 The helper:
 
@@ -761,6 +790,11 @@ that ships its own service can override both.
 install, so the bootstrap is a no-op outside Android.
 
 ## Sister-app integration recap
+
+> **Canonical client-integration checklist:**
+> [`docs/CLIENT_INTEGRATION.md`](../docs/CLIENT_INTEGRATION.md) — the
+> single contract every peer follows. Read that first; this section
+> is the older / shorter overview kept for context.
 
 Setup is symlink-based, not pip-installed. From a sibling app's
 repo root (relative to `azt-collab/`):

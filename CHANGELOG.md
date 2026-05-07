@@ -11,6 +11,198 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.28.6 + azt_collab_client 0.28.6 — auto-resume after server install
+- **Post-install continuation.** Once the install-completion poll
+  watchdog confirms the new server APK is live, the popup auto-
+  dismisses (after a 1-second visual confirmation showing
+  "Installed.") and bootstrap re-enters its compat check. Daemon
+  is now reachable, so the healthy path takes over and on_done
+  fires, letting the host continue normal startup. No manual
+  Quit + relaunch needed.
+- New ``check_for_update(on_install_complete=...)`` parameter,
+  threaded through ``_start_install_poll``. Fires only on
+  confirmed completion (versionName flipped), not on the
+  watchdog timeout — that branch still leaves the user with the
+  "Install pending" message and the popup up.
+- New ``install_server_apk_popup(on_install_complete=...)``
+  parameter wires the upstream callback to (a) dismiss the popup
+  after a 1s delay and (b) call the host's continuation. Bootstrap
+  passes a continuation that schedules a 2-second daemon-warm-up
+  pause (Android lazy-spawns the ContentProvider host on first
+  call) before re-running ``_check_server``.
+- If Android kills the peer process during install (memory
+  pressure, system installer dominating), the popup + its
+  continuation chain are gone too. Re-launch triggers a fresh
+  bootstrap, which finds the daemon reachable and flows through
+  the healthy path — same outcome, just one extra user action.
+
+### azt_collabd 0.28.5 + azt_collab_client 0.28.5 — fix flash-then-die regression in 0.28.4
+- **Bootstrap no longer fires on_done before the no-server popup
+  opens.** In 0.28.4 the prompt branches called
+  ``_on_done_and_release(ctx)`` immediately, then opened the popup
+  on the next UI tick. Hosts whose ``on_done`` is wired to
+  "continue normal startup" then attempted RPCs against a daemon
+  that wasn't there yet, the failure cascaded into App.stop() (or
+  similar in the host's error handling), and the popup that was
+  about to open was killed alongside it — visible as a screen flash
+  then peer shutdown.
+- New ``_release_running()`` helper splits the guard release from
+  the on_done notification. ``_on_done_and_release`` keeps both
+  for the healthy terminal paths (server compat OK, no self-
+  update needed). The two no-server branches —
+  ``_prompt_server_install`` and ``_prompt_server_update`` —
+  release the guard but don't fire on_done, so the host stays
+  parked at whatever screen was up when ``bootstrap()`` was
+  scheduled (typically a splash). Once the user installs the
+  server APK and the peer relaunches, bootstrap re-fires from a
+  fresh process, finds the daemon reachable, and on_done flows
+  through ``_check_self`` along the healthy path.
+- The already-declined-this-version branch in
+  ``_prompt_server_update`` does still fire on_done (with the
+  caveat that the host's first RPC will surface the daemon's
+  compat error). The user explicitly chose this state by
+  declining earlier; the host should handle it gracefully.
+
+### azt_collabd 0.28.4 + azt_collab_client 0.28.4 — single canonical "no server" popup, modal blocking, Quit button, doc consolidation
+- **Single popup for "no server" / "server too old" cases.** Bootstrap's
+  `_prompt_server_install` and `_prompt_server_update` now both
+  delegate to `install_server_apk_popup` (instead of the older
+  generic Yes/No `_yes_no` helper). Result: one visual surface,
+  one set of buttons, one progress sink, one decline path. Closes
+  the user-reported bug where two popups stacked on first launch
+  ("Could not open project picker: server_apk_not_installed" + the
+  bootstrap Yes/No, OR the bootstrap Yes/No + the older
+  "AZT collaboration service required" widget).
+- **Popup is now modal-blocking** (`auto_dismiss=False`). The user
+  can't tap past it to reach a settings screen or picker that
+  would itself fail with "server_apk_not_installed". Resolves the
+  user-reported "in the client settings page, asking to Select
+  Project resulted in widget 1" — once bootstrap fires, settings is
+  unreachable until the user installs or quits.
+- **Quit button replaces "Dismiss".** Label is "Quit {App.title}"
+  (e.g. "Quit AZT Recorder") — falls back to plain "Quit" if the
+  host hasn't set a title. Tapping it dismisses the popup AND
+  calls `App.get_running_app().stop()`. Without the server APK
+  the peer can't function, so leaving it running was the wrong UX.
+- **Install button shows live progress in the popup body.** While
+  `check_for_update` runs, the body label updates with
+  "Downloading 45%…", "Release in progress — retrying in 5s…",
+  "Installing…", "Installed." (or "Install pending. Reopen this
+  app when finished." on the polling-timeout branch). The popup
+  stays open through the whole flow — no more "I tapped Install
+  and nothing happened" because the popup dismisses-and-routes-
+  elsewhere. Buttons disable while the worker runs to prevent
+  double-taps.
+- **`install_server_apk_popup` gained context parameters**
+  (`body_message`, `current_server_version`, `install_target_package`,
+  `install_label`, `title`) so the same popup serves both the
+  missing-server case (default) and the too-old-server case
+  (passed by `_prompt_server_update`). Different body text and
+  Install-button label, same machinery.
+- **Bootstrap dead code pruned.** `_do_server_install` and
+  `_quit_app` removed — both were one-call helpers absorbed into
+  the popup refactor. `_yes_no` survives for the self-update
+  prompt (different decision: peer can keep running on decline).
+- **`docs/CLIENT_INTEGRATION.md`** added — the canonical "what every
+  client must do" checklist. Sections: symlinks, buildozer.spec
+  permissions / signing / manifest extras, **bootstrap wiring +
+  the four caller invariants**, **don't roll your own server-missing
+  UI** (the source of the user-reported bugs), translation chain,
+  `App.title` for the Quit button, LIFT / audio / image access,
+  recovery, testing. `azt_collab_client/CLAUDE.md` now points to
+  it as the canonical reference.
+- Translations (fr): "Quit", "Quit {app}", and the longer
+  bootstrap-prompt body text used by the popup
+  (`This app needs the AZT Collaboration service ({name}) to sync
+  your data. Tap Install to download and install it. Android will
+  ask you to confirm before the install starts.`).
+
+### azt_collabd 0.28.3 + azt_collab_client 0.28.3 — install-popup auto-download, asset filename fix, install-completion polling, release cache, bookkeeping
+- **Asset filename fix.** Every codebase reference to the server APK
+  asset was ``azt_collab.apk`` (with underscore), but the Android
+  ``package.name = aztcollab`` in server_apk/buildozer.spec.tmpl
+  drops separators per the suite naming table — actual published
+  asset is ``aztcollab.apk``. The 5 hardcoded references —
+  ``bootstrap._SERVER_ASSET_DEFAULT``, ``CollabUIApp.share_apk`` /
+  ``update_app``, ``PickerApp.share_apk`` / ``update_app`` — all
+  fixed. The bootstrap workflow's GitHub-API asset lookup was
+  returning "no aztcollab.apk in release" 404s because of this; now
+  matches the actual release feed.
+- **`SERVER_APK_INSTALL_URL` is now a direct-download URL**
+  pointing at
+  ``https://github.com/kent-rasmussen/azt-collab/releases/latest/download/aztcollab.apk``.
+  GitHub's stable redirect serves the most recent matching asset,
+  so the URL doesn't need updating per release.
+- **`install_server_apk_popup` triggers auto-install** instead of
+  only opening the browser. Tap Install → ``check_for_update``
+  fetches the latest ``aztcollab.apk`` asset, streams it to
+  ``$AZT_HOME/updates/``, and dispatches Android's system
+  installer. The popup's "Open install page" affordance is
+  retained as a fallback for users whose Android can't trigger the
+  install intent. Progress strings flow back through the popup
+  body and the host's ``on_status`` sink.
+- **Install-completion polling** for cross-package installs
+  (server-from-peer). New ``check_for_update(install_target_package=...)``
+  parameter. After dispatching the install intent, the helper
+  polls ``PackageManager.getPackageInfo`` every 5s for up to 5min,
+  fires ``on_status('Installed.')`` when the version flips to the
+  freshly-downloaded one, and ``on_status('Install pending.
+  Reopen this app when finished.')`` on timeout. Closes the
+  long-standing UX wart where status hung at "Installing…" forever
+  after the user backed out of the system installer or the install
+  finished out-of-foreground. Self-installs (peer-from-peer) skip
+  polling — the install replaces the running peer, so polling
+  would block forever. Bootstrap passes the server's package name
+  on its server-install path; the same path is taken when the
+  ``install_server_apk_popup`` Install button fires.
+- **Per-process release cache** for ``_fetch_latest``. 5-minute TTL,
+  keyed by repo slug. Closes the rate-limit hazard where a
+  bootstrap launch + a settings-screen Update tap + multiple peers
+  behind one NAT could collectively drain the GitHub anonymous
+  60/hour budget; subsequent calls within the TTL hit the cache.
+- **Caller invariants** — the four contracts the bootstrap caller
+  must honor (asset name match, parseable tag, prerelease flag,
+  ``REQUEST_INSTALL_PACKAGES`` permission) are now consolidated as
+  a top-level "Caller invariants" section in
+  ``azt_collab_client/ui/bootstrap.py``. Each was scattered across
+  the function docstring + the client CLAUDE.md recipe + update.py
+  comments before; now a single canonical list.
+- **`p4a.sign = True` removed** from the suite's
+  ``server_apk/buildozer.spec.tmpl`` (separately from the earlier
+  ``android.signing.*`` cleanup). Confirmed empirically: this spec
+  key is also dead config; signing depends solely on the
+  ``P4A_RELEASE_KEYSTORE`` env vars. Memory feedback updated.
+- **Daemon version bump 0.27.0 → 0.28.3** (lock-step with client)
+  to signal that this round touched both packages. No wire-format
+  change; cross-floors (``MIN_CLIENT_VERSION`` /
+  ``MIN_SERVER_VERSION``) stay at 0.27.0 — older clients/servers
+  still talk to this daemon/client without issue.
+- **`docs/p4a_hook_picker_intent.md` path-leak scrub.**
+  ``/home/kentr/bin/raspy/buildozer_tweaks/p4a_hook.py`` →
+  ``$P4A_HOOK`` (the env-var-resolved path) for public-repo
+  consumption.
+- **"Not now" on server install closes the peer app.** Without
+  the server APK the peer can't function (no daemon → no sync, no
+  project picker), so dropping the user into a broken state is
+  worse than asking them to relaunch. Server-*update* decline
+  doesn't quit (peer can still work against the older server,
+  bound by ``MIN_SERVER_VERSION``); self-update decline doesn't
+  quit either (peer is fine at current version). New
+  ``_quit_app`` helper in bootstrap.py.
+- **Download retry on transient HTTP statuses** (``404, 429, 500,
+  502, 503, 504``). Load-bearing case: GitHub publishes the release
+  JSON before the asset binary finishes uploading, so
+  ``browser_download_url`` briefly 404s. Three attempts with linear
+  backoff (5s, 10s, 15s ≈ 30s total). Between attempts, the user
+  sees translated "Release in progress — retrying in Ns…" so a
+  hung worker thread is no longer a confusion. New
+  ``on_status`` parameter on ``_download``.
+- **Translations (fr)** for the new state strings: "Installed.",
+  "Install pending. Reopen this app when finished.",
+  "Release in progress — retrying in {s}s…", and
+  "Tap Install to download and install it. Android will ask you to
+  confirm before the install starts."
+
 ### azt_collab_client 0.28.1 — bootstrap hardening + first automated tests
 - **Filter prereleases** from the latest-release probe in
   `update.py:_fetch_latest`. Walks `/releases?per_page=20` for the

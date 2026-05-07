@@ -32,13 +32,92 @@ Android-only effects. Desktop hosts call ``on_done`` immediately
 thread; the version probe runs on a worker thread so first paint
 is unaffected.
 
-**Peer build requirement.** The peer's ``buildozer.spec`` must list
-``REQUEST_INSTALL_PACKAGES`` in ``android.permissions`` so the
-helper can dispatch the install intent. Without it the install
-silently no-ops and the user is stuck on the prompt. Android 8+
-also requires the user to flip the per-source "Install unknown
-apps" toggle the first time; ``check_for_update`` detects this and
-routes the user to ``Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES``.
+Caller invariants
+-----------------
+For the workflow to actually work end-to-end, the peer must honor
+four contracts. Failures here are silent at runtime — the helper
+fires its callbacks normally; the install / lookup just produces
+no useful effect — so they're worth checking up front.
+
+1. **``peer_asset_filename`` matches the published asset name
+   exactly.** No fuzzy match, no glob. If the peer starts publishing
+   versioned filenames (``azt_recorder-1.6.0.apk``), the lookup
+   breaks; stick with a stable name (the
+   ``releases/latest/download/<name>`` GitHub redirect is brittle
+   to filename changes for the same reason).
+
+2. **The release ``tag_name`` is parseable as a version.**
+   ``_version_tuple`` is forgiving — ``v1.2.3``, ``1.2.3``,
+   ``2026-05-06`` all work — but a tag like ``latest`` or ``final``
+   parses to ``(0, 0, 0)`` and the helper will treat the peer as
+   "older than 0.0.0", firing a no-update.
+
+3. **``prerelease=true`` releases are skipped.** The helper walks
+   ``/releases?per_page=20`` for the first non-prerelease,
+   non-draft entry. Beta releases pushed with ``--prerelease`` on
+   ``gh release create`` won't auto-install via this workflow; to
+   force one out, drop the prerelease flag or have users update
+   manually.
+
+4. **The peer's ``buildozer.spec`` lists ``REQUEST_INSTALL_PACKAGES``**
+   in ``android.permissions``. Without it the install intent
+   silently no-ops and the user is stuck on the "Installing…"
+   status. Android 8+ additionally requires the user to flip the
+   per-source "Install unknown apps" toggle the first time;
+   ``check_for_update`` detects this and routes the user to
+   ``Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES`` — a one-tap
+   detour, not a code-side fix.
+
+Typical peer integration
+------------------------
+Two methods on the peer's ``App`` subclass — a wrapper that supplies
+identity, and a status sink that routes progress strings into the
+peer's existing logging surface. ``App.on_start`` schedules the
+wrapper via ``Clock.schedule_once`` so the UI is up before any
+prompt fires. Direct copy-paste from ``azt_recorder/main.py``
+(the canonical peer integration; substitute your own constants):
+
+    # at the top of your App class
+    def on_start(self):
+        ...
+        Clock.schedule_once(lambda dt: self._run_bootstrap(), 0.5)
+
+    def _run_bootstrap(self):
+        from azt_collab_client.ui import bootstrap
+        from appinfo import APP_NAME
+        bootstrap(
+            peer_repo='owner/your-peer-repo',     # GitHub release feed
+            peer_version=__version__,             # main.py __version__
+            peer_asset_filename='your_peer.apk',  # asset name in release
+            peer_display_name=APP_NAME,           # shown in "Update X?" popup
+            on_status=self._log_bootstrap_status,
+            on_error=self._log_bootstrap_status,
+            font_name=_FONT_NAME,
+        )
+
+    def _log_bootstrap_status(self, message):
+        '''Surface bootstrap progress / errors. Logs to whatever
+        in-app status surface the peer has, and to stderr so
+        desktop devs and Android logcat see it too.'''
+        print(f'[bootstrap] {message}', file=sys.stderr)
+        try:
+            # adjust to your screen layout — recorder's collab screen
+            # exposes _set_log; viewer would route to its equivalent.
+            sm = self.root.ids.sm
+            collab = sm.get_screen('collab')
+            collab._set_log(message)
+        except Exception:
+            pass
+
+The deferred ``import`` inside ``_run_bootstrap`` keeps the
+bootstrap.py module (and its Kivy / jnius dependencies)
+out of the import graph until the peer actually fires it; tests
+or non-Kivy desktop tools that import ``main`` for its
+``__version__`` aren't pulled into the Kivy world.
+
+The status sink is just a callable accepting one ``str``. Routing
+to a status label, a toast, ``Logger.info``, or all three is the
+peer's call — bootstrap doesn't care.
 """
 
 import json
@@ -60,7 +139,11 @@ from .update import check_for_update
 
 
 _SERVER_REPO_DEFAULT = 'kent-rasmussen/azt-collab'
-_SERVER_ASSET_DEFAULT = 'azt_collab.apk'
+# Asset filename on the GitHub release. Matches the Android package
+# convention (``aztcollab`` — no underscore, see naming table in
+# azt-collab/CLAUDE.md). Earlier code used ``azt_collab.apk`` by
+# mistake, which 404'd against every published release.
+_SERVER_ASSET_DEFAULT = 'aztcollab.apk'
 _SERVER_PACKAGE_NAME = 'org.atoznback.aztcollab'
 
 # Module-level idempotence guard. A peer that calls bootstrap() twice
@@ -193,15 +276,27 @@ def _safe(cb, *args):
               file=sys.stderr, flush=True)
 
 
-def _on_done_and_release(ctx):
-    """Wrap the host's ``on_done`` so the module-level idempotence
-    guard releases when the workflow terminates. Without this, a
-    bootstrap that completes (or is declined) would leave
-    ``_running=True`` for the rest of the process and a host that
-    legitimately re-fires bootstrap (rare; mostly for tests) couldn't.
-    """
+def _release_running():
+    """Release the idempotence guard so bootstrap can be re-entered
+    later (rare; mostly tests + relaunch-after-install). Does NOT
+    fire the host's on_done — used when the workflow ends in a
+    user-blocking popup that's the terminal state. Firing on_done
+    in that case would let the host continue its normal startup,
+    which then fails for the obvious reason ("daemon isn't there
+    yet") and may take the app down — exactly the flash-then-die
+    bug the user reported on first launch."""
     global _running
     _running = False
+
+
+def _on_done_and_release(ctx):
+    """Release the guard *and* fire the host's on_done. Use this
+    when bootstrap reaches a healthy terminal state — server is
+    fine, peer is current, host can proceed with normal startup.
+    The blocking-popup branches (no server / server too old) use
+    ``_release_running`` instead so the host doesn't try to
+    continue."""
+    _release_running()
     _safe(ctx.on_done)
 
 
@@ -431,46 +526,112 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error):
 
 # ── prompts ────────────────────────────────────────────────────────────────
 
+def _post_install_continuation(ctx):
+    """Re-enter the bootstrap state machine after a successful
+    server APK install. Wait briefly for the freshly-installed
+    daemon to warm up (Android lazy-spawns the ContentProvider
+    host on first call), then re-probe compat. From here the
+    healthy paths take over: compat ok → ``_check_self`` → either
+    a self-update prompt or the on_done flow that lets the host
+    continue normal startup.
+
+    The 2-second delay is a safety margin for daemon warm-up; the
+    actual lazy-spawn is faster but variable. If compat still
+    reports unreachable here, the user will see the install popup
+    again — which is the right escape hatch for a botched install
+    rather than getting stuck."""
+    def _resume(_dt):
+        # Re-run the server-side branch only. Bootstrap's worker
+        # thread isn't appropriate here (we're already on the UI
+        # thread post-install); _check_server runs the same
+        # check_server_compat call and dispatches.
+        threading.Thread(target=_check_server, args=(ctx,),
+                         daemon=True).start()
+    Clock.schedule_once(_resume, 2.0)
+
+
 def _prompt_server_install(ctx):
-    title = _tr('Install AZT Collaboration?')
+    """No server APK: show the canonical install popup. The popup
+    itself owns the Quit / Open install page / Install affordances
+    and surfaces download progress in its body. Bootstrap delegates
+    completely so all "no server" code paths in the suite converge
+    on a single visual + behavioural surface.
+
+    **Does not fire on_done.** The popup is the terminal state for
+    this branch — the host can't continue normal startup without
+    the daemon. Firing on_done here would let the host's "continue
+    startup" callback run, which then fails (no daemon) and may
+    cascade into the app shutting down (= the user-reported
+    flash-then-die bug). The host stays parked at whatever screen
+    was up when ``bootstrap()`` was scheduled (typically a splash
+    or loading screen). The popup's own ``on_install_complete``
+    chain re-enters bootstrap once the install lands, so the host
+    resumes normal startup automatically when the daemon is
+    reachable — without a manual relaunch.
+
+    If Android kills the peer process during the install (memory
+    pressure, system-installer Activity dominating), the popup +
+    its on_install_complete chain are gone too. Re-launch then
+    triggers a fresh bootstrap, which finds the daemon reachable
+    and flows through ``_check_self`` → ``on_done`` from the
+    healthy path."""
+    from .popups import install_server_apk_popup
     body = _tr(
         'This app needs the AZT Collaboration service ({name}) to '
-        'sync your data. Tap Install to download and install it.'
+        'sync your data. Tap Install to download and install it. '
+        'Android will ask you to confirm before the install starts.'
     ).format(name=ctx.server_display_name)
-
-    def _decline():
-        # Server-install decline doesn't get version-pinned (we
-        # haven't probed the version yet, and a missing-package case
-        # is unconditional). Just release and continue.
-        _on_done_and_release(ctx)
-
-    _yes_no(ctx, title, body,
-            yes_label=_tr('Install'),
-            on_yes=lambda: _do_server_install(ctx),
-            on_no=_decline)
+    _release_running()
+    install_server_apk_popup(
+        on_status=ctx.on_status,
+        font_name=ctx.font_name,
+        body_message=body,
+        current_server_version='0.0.0',
+        title=_tr('Install AZT Collaboration?'),
+        on_install_complete=lambda: _post_install_continuation(ctx),
+    )
 
 
 def _prompt_server_update(ctx, current_version):
-    title = _tr('Update AZT Collaboration?')
+    """Server present but too old. Same popup shape as the missing-
+    server prompt, different body / title / Install-button label /
+    current_version (so check_for_update doesn't redownload an
+    identical release).
+
+    **Also does not fire on_done.** Same reasoning as
+    ``_prompt_server_install`` — the daemon at the existing
+    version doesn't satisfy the peer's MIN_SERVER_VERSION, so any
+    RPC the host attempts after on_done fires would fail. The
+    only exception is the already-declined branch: there we DO
+    fire on_done, because the user has explicitly chosen to
+    proceed with an old server (the peer's first RPC will get
+    ``client_too_old`` from the daemon's compat handshake; that's
+    the host's problem to handle gracefully).
+
+    On install completion the popup's continuation chain re-runs
+    the compat check, same as the missing-server case."""
+    from .popups import install_server_apk_popup
+    if current_version and _declined_version(
+            ctx.server_repo) == current_version:
+        # User explicitly declined this version earlier in a
+        # previous session. Let the host continue and surface the
+        # daemon's compat error its own way.
+        _on_done_and_release(ctx)
+        return
     body = _tr(
         'A newer version of the AZT Collaboration service ({name}) '
         'is required. Tap Update to download and install it.'
     ).format(name=ctx.server_display_name)
-
-    def _decline():
-        # Pin the decline to the current server version so the
-        # prompt stays suppressed until either the user retries
-        # explicitly OR the upstream server release moves to a
-        # different version (which would change the compat shape
-        # the daemon reports next time).
-        if current_version:
-            _record_decline(ctx.server_repo, current_version)
-        _on_done_and_release(ctx)
-
-    _yes_no(ctx, title, body,
-            yes_label=_tr('Update'),
-            on_yes=lambda: _do_server_install(ctx, current_version),
-            on_no=_decline)
+    _release_running()
+    install_server_apk_popup(
+        on_status=ctx.on_status,
+        font_name=ctx.font_name,
+        body_message=body,
+        current_server_version=current_version or '0.0.0',
+        install_label=_tr('Update'),
+        title=_tr('Update AZT Collaboration?'),
+        on_install_complete=lambda: _post_install_continuation(ctx),
+    )
 
 
 def _prompt_self_update(ctx, latest_version):
@@ -490,39 +651,11 @@ def _prompt_self_update(ctx, latest_version):
             on_no=_decline)
 
 
-def _do_server_install(ctx, current_version='0.0.0'):
-    """Drive the server APK install through ``check_for_update``.
-    Pass ``current_version='0.0.0'`` when the server isn't installed
-    so the version comparison always picks the latest as 'newer';
-    when updating, pass the running server's version so a no-op
-    release feed is reported as 'up to date' instead of double-
-    installing."""
-    _ui_status(ctx, _tr('Installing AZT Collaboration…'))
-
-    def _on_status(msg):
-        _safe(ctx.on_status, msg)
-
-    def _on_no_update():
-        # Latest release matched current; tell the user nothing
-        # changed and continue to step 2 anyway.
-        _ui_status(ctx, _tr(
-            'AZT Collaboration is up to date.'))
-        _check_self(ctx)
-
-    def _on_error(msg):
-        _safe(ctx.on_error, msg)
-        # Don't block startup on a server-install error; the host
-        # can still run with reduced functionality.
-        _on_done_and_release(ctx)
-
-    check_for_update(
-        repo=ctx.server_repo,
-        current_version=current_version,
-        asset_filename=ctx.server_asset_filename,
-        on_status=_on_status,
-        on_no_update=_on_no_update,
-        on_error=_on_error,
-    )
+# Note: _do_server_install was inlined into install_server_apk_popup
+# in v0.28.4 when the popup became the canonical "no server" UI for
+# both the missing-server and too-old-server cases. Bootstrap no
+# longer drives the install action directly — the popup does, with
+# its own check_for_update call carrying the same arguments.
 
 
 def _do_self_install(ctx):
