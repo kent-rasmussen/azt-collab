@@ -11,6 +11,201 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.28.27 + azt_collab_client 0.28.27 — 60s warmup budget + "Try again" affordance
+- ``_DAEMON_WARMUP_RETRIES`` raised again, 15 → 30 (30s → 60s).
+  User-reported: 30s wasn't enough on their device — "next boot
+  fails, the following one succeeds" — confirming Java-side cold
+  spawn time can exceed 30s after ``pm clear`` or fresh install.
+- New ``on_retry`` parameter on
+  ``install_server_apk_popup``; when supplied, adds a "Try again"
+  button to the popup. Bootstrap's
+  ``_prompt_server_unresponsive`` now passes
+  ``on_retry=_post_install_continuation`` so users on truly slow
+  hardware can keep waiting past the 60s budget without having
+  to download fresh (Install) or close the app (Quit). Tap →
+  popup dismisses → 2s warm-up wait → fresh compat probe.
+- Side effect: layouts the popup with up to 4 buttons in the
+  action row (Quit | Try again | Open install page | Install).
+  Each is text-wrap-bound so labels fit even on narrow screens.
+
+### azt_collabd 0.28.26 + azt_collab_client 0.28.26 — SHA-256 reuse check, drop the time window
+- Replaced 0.28.25's mtime-window heuristic with definitive
+  SHA-256 verification. After a successful download, ``update.py``
+  writes the file's SHA-256 to a sidecar
+  ``<asset>.sha256``. ``_has_fresh_download(path)`` now reuses
+  the staged file iff (a) the file exists, (b) the sidecar
+  exists, (c) recomputing the file's SHA matches the sidecar.
+- Eliminates the "10 minutes might not be enough for everyone"
+  concern — reuse works regardless of how long the user spent in
+  the "Install unknown apps" Settings detour, and regardless of
+  device speed.
+- Cost: SHA-256 of a typical APK takes ~1–3 seconds on phone
+  hardware. Negligible compared to the 10–30 seconds of
+  re-download it replaces, especially on slow connections.
+- Side benefit: catches APK corruption between download and
+  install. If the file gets damaged somehow (rare, but possible
+  on flaky storage), the sidecar mismatch forces a re-download
+  rather than dispatching a corrupted install Intent.
+- ``_save_download_sha(path)`` is non-fatal on failure: a
+  missing sidecar just means the next reuse check returns False
+  and we redownload, same as before this change.
+
+### azt_collabd 0.28.25 + azt_collab_client 0.28.25 — reuse a recent download instead of re-fetching
+- User reported the install flow was downloading the APK twice
+  when Android required "Install unknown apps" permission: first
+  download → permission detour → user grants → re-tap Install →
+  re-download (10–30s wasted).
+- New ``_has_fresh_download(path)`` helper checks whether the
+  staged file at ``$AZT_HOME/updates/<asset>`` was last modified
+  within ``_REUSE_DOWNLOAD_AGE_S`` (10 minutes). Both
+  ``install_apk_from_url`` and ``check_for_update``'s download
+  paths now skip the download when the file is fresh enough,
+  surfacing ``Using already-downloaded file…`` status in place
+  of the percentage progress.
+- 10-minute window is conservative: long enough to cover the
+  typical "user popped to Settings and came back" duration even
+  on slow devices; short enough that a stale APK from a
+  previous session (yesterday's launch, etc.) won't be
+  installed when there's a newer release available.
+- ``_download`` writes to ``<path>.part`` and only renames on
+  success, so a present ``<path>`` is always a complete
+  download — the freshness check doesn't need to validate
+  partial-file recovery.
+
+### azt_collabd 0.28.24 + azt_collab_client 0.28.24 — extend daemon-warm-up budget for cold starts
+- ``_DAEMON_WARMUP_RETRIES`` raised from 5 to 15 (10s → 30s
+  budget). The 503 ``daemon_not_ready`` response that fires
+  during cold starts comes from ``AZTCollabProvider.java``'s
+  ``sDispatch == null`` check, NOT from my Python sentinel
+  hook — it's the genuine "Python interpreter not yet loaded"
+  state. After ``pm clear`` or a fresh install the cold start
+  can run 15–25 seconds because the dex cache needs rebuilding,
+  and the previous 10s budget was tripping users into the
+  "AZT Collaboration not responding" popup unnecessarily.
+- Warm-cache normal launches still exit the retry loop on the
+  first compat-probe success (1–3s typical), so the longer
+  budget isn't user-visible in steady state. Cold-start users
+  see up to 30s of "Connecting to AZT Collaboration service…"
+  popup before falling through.
+- Diagnostic clarification noted in the comment block: the 503
+  has two possible sources (the test sentinel + the Java
+  provider's startup gate); when troubleshooting, check that
+  the daemon process is actually alive
+  (``adb shell ps -A | grep aztcollab``) — if not, it's the
+  Java side and the only fix is waiting longer or warming up
+  the dex cache.
+
+### azt_collabd 0.28.23 + azt_collab_client 0.28.23 — visible "Connecting…" popup during retries
+- 0.28.19 added the daemon-warm-up retry loop, but the
+  ``Connecting to AZT Collaboration service…`` status only flowed
+  to ``ctx.on_status`` (host's status sink, often invisible).
+  Result: 10s of empty-state peer UI with no feedback while the
+  retries ran.
+- New modal ``_show_connecting_popup`` opens on the first retry
+  with a centred "Connecting to AZT Collaboration service…"
+  message. ``auto_dismiss=False`` so the user can't tap past it.
+  Dismissed on every terminal branch — ``compat ok``,
+  ``server_too_old``, ``client_too_old``, retries-exhausted, or
+  raised exception — before the next branch's UI fires (so the
+  unresponsive popup doesn't stack on top of the connecting one).
+- Mutable ``connecting_popup`` slot added to ``_Ctx`` so the
+  show / dismiss helpers can find each other across the worker-
+  thread boundary without a module-level dict. Idempotent: if a
+  popup is already up, ``_show_connecting_popup`` is a no-op.
+
+### azt_collabd 0.28.22 + azt_collab_client 0.28.22 — toggle the debug-503 sentinel from settings UI
+- 0.28.21's sentinel could only be created via
+  ``adb shell run-as``, which fails on release-signed APKs
+  (``run-as`` requires the package to be debuggable).
+- New "Debug (testing)" section in the daemon settings UI
+  (``SettingsScreen``) with a toggle button that creates / removes
+  ``$AZT_HOME/_debug_force_503``. State indicator below shows
+  whether ``/v1/health`` is currently forced to 503 or responding
+  normally. Always visible — production users tapping it just see
+  "service unavailable" until they tap again.
+- Test workflow: tap the server APK launcher icon (it's an
+  installed app with its own icon) → settings UI opens directly
+  (bypasses bootstrap; settings calls don't go through
+  ``/v1/health``) → toggle Debug → close → launch peer →
+  bootstrap retries 5×2s → unresponsive popup fires. Re-open
+  server APK to toggle off when done.
+
+### azt_collabd 0.28.21 + azt_collab_client 0.28.21 — debug hook to test the "not responding" popup
+- Daemon's ``/v1/health`` (the compat handshake endpoint) now
+  returns ``503 daemon_not_ready`` when
+  ``$AZT_HOME/_debug_force_503`` exists. Toggle without restarting
+  the daemon — the file presence is checked per-request. Create
+  via ``adb shell run-as org.atoznback.aztcollab touch
+  files/azt/_debug_force_503``; remove with the equivalent ``rm``.
+- Lets the bootstrap workflow's daemon-warm-up retry path
+  (``_DAEMON_WARMUP_RETRIES = 5`` × 2s = 10s) exhaust deterministically,
+  exercising the "AZT Collaboration not responding" popup added
+  in 0.28.20. Without this, manually triggering the unresponsive
+  state required either killing the daemon mid-spawn (race-prone)
+  or breaking the install (signature mismatch — heavy).
+
+### azt_collabd 0.28.20 + azt_collab_client 0.28.20 — modal recovery popup when daemon stays unresponsive
+- 0.28.19's retry-with-backoff fixed the common case (daemon
+  warming up settles within 1–3s) but still fell through to
+  ``_check_self`` → ``on_done`` after the retry budget exhausted.
+  Result: the same bouncing-out behaviour the user originally
+  reported, just delayed by 10s. ``on_done`` fired, peer's
+  startup tried daemon RPCs, hit ``ServerUnavailable``, picker
+  fired and failed, picker emitted CANCEL, peer closed via the
+  picker-cancel rule.
+- **Real fix**: when the warm-up retries exhaust without daemon
+  response, bootstrap now shows a modal popup
+  (``_prompt_server_unresponsive``) — same canonical
+  ``install_server_apk_popup`` as the missing-server case, with
+  a body reading "AZT Collaboration is installed but did not
+  respond. It may still be starting up; wait a moment, then tap
+  Install to reinstall it, or Quit to close this app and try
+  again later." Title: "AZT Collaboration not responding".
+- The popup gives the user three explicit recovery options
+  (Reinstall, Open install page, Quit) instead of silently
+  bouncing them out of the app. Modal blocking means the peer
+  stays in the foreground until the user makes a choice, and
+  ``on_done`` is not fired (so the peer doesn't run its
+  post-bootstrap startup against a daemon that isn't there).
+- Reinstall path: standard download+install via
+  ``install_apk_from_url``; on completion the post-install
+  continuation re-runs ``_check_server`` and on_done fires from
+  the healthy path. Quit path: closes the peer cleanly so the
+  next launch starts fresh.
+
+### azt_collabd 0.28.19 + azt_collab_client 0.28.19 — retry on daemon-warm-up race at startup
+- **Symptom user reported:** opening peer A, log shows
+  ``[bootstrap] AZT Collaboration installed but unreachable.
+  Continuing offline.`` followed by ``[recent] last_project:
+  ServerUnavailable: provider HTTP 503: daemon_not_ready``, then
+  Android brings the previously-foregrounded peer B to the
+  front. Sequence: bootstrap fires ``on_done`` thinking everything
+  is fine because the server APK is installed; peer's normal
+  startup tries ``last_project()`` while the daemon is still
+  warming up; the daemon's ContentProvider returns 503; peer's
+  picker logic kicks in, fails with the same 503; picker emits
+  ``RESULT_CANCELED``; the picker-cancel rule from
+  ``CLIENT_INTEGRATION.md`` § 5 closes the peer; Android brings
+  the most-recent task forward.
+- **Fix:** ``_check_server`` now retries the compat probe with
+  backoff (``_DAEMON_WARMUP_RETRIES=5``,
+  ``_DAEMON_WARMUP_INTERVAL_S=2.0`` → 10s budget total) when the
+  server APK is installed but unreachable. Status flips to
+  ``Connecting to AZT Collaboration service…`` during retries.
+  Android lazy-spawns the server APK's Python interpreter on the
+  first ContentResolver call; this typically settles within
+  1–3 seconds, well under the budget.
+- If the retries exhaust, we still fall through to
+  ``Continuing offline.`` and ``_check_self`` (which fires
+  ``on_done``). At that point the daemon is genuinely unreachable
+  (crashed, hardware glitch, signature mismatch denied us access)
+  and bootstrap can't fix it; the peer's host code is responsible
+  for handling ``ServerUnavailable`` on its post-on_done RPCs.
+  Recommend defensive try/except around the first 1–2 RPCs the
+  host makes after ``on_done`` — already in
+  ``CLIENT_INTEGRATION.md`` § 4 ("log the failure and continue,
+  not pop their own dialog").
+
 ### azt_collabd 0.28.18 + azt_collab_client 0.28.18 — move CLIENT_INTEGRATION.md into the symlinked package
 - ``CLIENT_INTEGRATION.md`` moved from ``docs/`` (canonical-repo
   only) to ``azt_collab_client/`` (symlinked into every peer).

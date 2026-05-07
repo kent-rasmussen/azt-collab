@@ -65,6 +65,14 @@ _RELEASE_CACHE_TTL_S = 300
 _INSTALL_POLL_INTERVAL_S = 5
 _INSTALL_POLL_TIMEOUT_S = 300
 
+# Reuse a previously-downloaded APK when the user is retrying the
+# same install (e.g., they granted "Install unknown apps" and
+# tapped Install again). Verified by SHA-256 against a sidecar
+# file written after the original download — robust against
+# arbitrary delays (the mtime-based heuristic that preceded this
+# was time-bounded and not specific enough; SHA is the
+# definitive integrity check).
+
 
 def _on_ui(fn, *args):
     """Marshal a callback to the Kivy UI thread. No-op if Clock is not
@@ -158,6 +166,65 @@ def _pick_asset(release, asset_filename):
 
 _DOWNLOAD_RETRY_ATTEMPTS = 3
 _DOWNLOAD_RETRY_BACKOFF_S = 5
+def _sha256(path):
+    """Compute the SHA-256 of ``path`` and return the hex digest,
+    or ``''`` on any error. Streams through 64 KB blocks so a
+    multi-megabyte APK doesn't pin memory."""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(_DOWNLOAD_CHUNK), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ''
+
+
+def _save_download_sha(path):
+    """Compute the SHA-256 of ``path`` and write it to
+    ``<path>.sha256``. Called right after a successful download
+    so the sidecar captures the freshly-downloaded content; later
+    reuse checks recompute the SHA and verify against this
+    value. Failures are non-fatal — a missing sidecar just means
+    the next reuse check returns False and we redownload."""
+    digest = _sha256(path)
+    if not digest:
+        return
+    try:
+        with open(path + '.sha256', 'w') as f:
+            f.write(digest)
+    except OSError as ex:
+        print(f'[update] sidecar write failed: {ex}')
+
+
+def _has_fresh_download(path):
+    """True iff ``path`` exists AND its SHA-256 matches the digest
+    stored in ``<path>.sha256``. Used by the install workers to
+    skip a redundant re-download when the user comes back from
+    Android's "Install unknown apps" settings and taps Install
+    again — works regardless of how long the detour took.
+
+    Definitive integrity check (replaces the mtime-window
+    heuristic in 0.28.25): if the file on disk hashes to the
+    same value we recorded right after download, it's the same
+    file we'd have downloaded again. ``_download`` writes to
+    ``<path>.part`` and renames on success, so a present
+    ``<path>`` is always a complete download — no partial-file
+    salvage logic needed."""
+    sidecar = path + '.sha256'
+    if not (os.path.exists(path) and os.path.exists(sidecar)):
+        return False
+    try:
+        with open(sidecar) as f:
+            stored = f.read().strip()
+    except OSError:
+        return False
+    if not stored:
+        return False
+    return _sha256(path) == stored
+
+
 def _wrappable_url(url):
     """Insert soft line-breaks at path separators so a URL fits a
     narrow popup body. Kivy Labels wrap at whitespace; URLs have no
@@ -466,23 +533,30 @@ def check_for_update(*, repo, current_version, asset_filename,
             return
         dest = os.path.join(download_dir, asset_filename)
 
-        def _on_progress(pct):
-            _ui_status(_tr('Downloading {pct}%…').format(pct=pct))
+        # Reuse a recent download (e.g. user came back from
+        # granting "Install unknown apps") instead of paying for
+        # the same bytes twice.
+        if _has_fresh_download(dest):
+            _ui_status(_tr('Using already-downloaded file…'))
+        else:
+            def _on_progress(pct):
+                _ui_status(_tr('Downloading {pct}%…').format(pct=pct))
 
-        def _on_retry_status(msg):
-            # _download surfaces "retrying in Ns…" between attempts;
-            # marshal back to the UI thread the same way regular
-            # status updates do.
-            _ui_status(msg)
+            def _on_retry_status(msg):
+                # _download surfaces "retrying in Ns…" between attempts;
+                # marshal back to the UI thread the same way regular
+                # status updates do.
+                _ui_status(msg)
 
-        try:
-            _download(download_url, dest, size, _on_progress,
-                      on_status=_on_retry_status)
-        except Exception as ex:
-            _ui_error(
-                _tr('Download failed: {error}').format(error=ex)
-                + '\n' + _wrappable_url(download_url))
-            return
+            try:
+                _download(download_url, dest, size, _on_progress,
+                          on_status=_on_retry_status)
+            except Exception as ex:
+                _ui_error(
+                    _tr('Download failed: {error}').format(error=ex)
+                    + '\n' + _wrappable_url(download_url))
+                return
+            _save_download_sha(dest)
 
         _ui_status(_tr('Preparing install…'))
 
@@ -565,7 +639,6 @@ def install_apk_from_url(*, url, asset_filename, on_status,
         _on_ui(_safe_call, on_error, msg)
 
     def _worker():
-        _ui_status(_tr('Downloading…'))
         try:
             os.makedirs(download_dir, exist_ok=True)
         except OSError as ex:
@@ -574,20 +647,31 @@ def install_apk_from_url(*, url, asset_filename, on_status,
             return
         dest = os.path.join(download_dir, asset_filename)
 
-        def _on_progress(pct):
-            _ui_status(_tr('Downloading {pct}%…').format(pct=pct))
+        # If we just downloaded this file (typically: user tapped
+        # Install, finished download, granted "Install unknown
+        # apps", came back, tapped Install again), skip the
+        # download and go straight to the install Intent. Save the
+        # user 10–30s of waiting for an identical re-download.
+        if _has_fresh_download(dest):
+            _ui_status(_tr('Using already-downloaded file…'))
+        else:
+            _ui_status(_tr('Downloading…'))
 
-        def _on_retry_status(msg):
-            _ui_status(msg)
+            def _on_progress(pct):
+                _ui_status(_tr('Downloading {pct}%…').format(pct=pct))
 
-        try:
-            _download(url, dest, 0, _on_progress,
-                      on_status=_on_retry_status)
-        except Exception as ex:
-            _ui_error(
-                _tr('Download failed: {error}').format(error=ex)
-                + '\n' + _wrappable_url(url))
-            return
+            def _on_retry_status(msg):
+                _ui_status(msg)
+
+            try:
+                _download(url, dest, 0, _on_progress,
+                          on_status=_on_retry_status)
+            except Exception as ex:
+                _ui_error(
+                    _tr('Download failed: {error}').format(error=ex)
+                    + '\n' + _wrappable_url(url))
+                return
+            _save_download_sha(dest)
 
         _ui_status(_tr('Preparing install…'))
 

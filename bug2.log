@@ -1,0 +1,638 @@
+05-07 17:15:28.276  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:28.277  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:28.307  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:29.100  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:29.100  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:29.100  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:29.101  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:29.101  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:29.101  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:29.351  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:29.354  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:29.355  1326  1402 I libPowerHal: [PE] mtkpower@1.0-se update cmd:1408300, param:80
+05-07 17:15:29.358  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:29.359  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:29.385  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:29.405  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:1408300, param:100
+05-07 17:15:29.405  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:300c000, param:15
+05-07 17:15:29.405  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:2054400, param:0
+05-07 17:15:29.405  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:2c14000 param:1
+05-07 17:15:29.415  2555  2614 D ViewRootImpl: update {(0,0)(fillxfill) ty=APPLICATION_STARTING fmt=TRANSLUCENT wanim=0x1030001
+05-07 17:15:29.418  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:29.419  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:29.419  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:29.419  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:29.419  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:29.426  1977  2027 I ActivityManager: Start proc 30625:org.atoznback.azt_recorder/u0a582 for next-top-activity {org.atoznback.azt_recorder/org.kivy.android.PythonActivity}
+05-07 17:15:29.473 30625 30625 I Typeface: updateThemeFont new=Rookery-Regular;old=sans-serif;new=Rookery-Stacked;old=
+05-07 17:15:29.492  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:29.492  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:29.505 30625 30625 D ViewRootImpl: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:29.564  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327222967947042, windowName=b9d09c4 org.atoznback.azt_recorder/org.kivy.android.PythonActivity
+05-07 17:15:29.596 30625 30646 I python  : Android kivy bootstrap done. __name__ is __main__
+05-07 17:15:29.599 30625 30625 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:29.600 30625 30625 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:29.617  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_EXT_LAUNCH update cmd:2020000, param:31
+05-07 17:15:29.629 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+05-07 17:15:29.630 26239 26239 I AndroidIME: LatinIMEBase.updateInputViewCoverNavigation():322 Update input view padding, isNavbarOverInputWindow=false, bottom inset=120
+05-07 17:15:29.632 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 1, locked = false
+05-07 17:15:29.740  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:29.965  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:30.347  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:30.480 30625 30625 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:30.499 30625 30625 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:30.512  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:30.616 30625 30625 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:30.689 30625 30646 I python  :  [bootstrap] Checking installation…
+05-07 17:15:30.721  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:30.721  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:30.733  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:30.733  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:30.738  1977  2027 I ActivityManager: Start proc 30655:org.atoznback.aztcollab:provider/u0a591 for content provider {org.atoznback.aztcollab/org.atoznback.aztcollab.AZTCollabProvider}
+05-07 17:15:30.763 30655 30655 D nativeloader: Configuring clns-4 for other apk /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk. target_sdk_version=36, uses_libraries=, library_path=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64:/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk!/lib/arm64-v8a, permitted_path=/data:/mnt/expand:/data/user/0/org.atoznback.aztcollab
+05-07 17:15:30.769 30655 30655 V GraphicsEnvironment: ANGLE GameManagerService for org.atoznback.aztcollab: false
+05-07 17:15:30.769 30655 30655 V GraphicsEnvironment: org.atoznback.aztcollab is not listed in per-application setting
+05-07 17:15:30.771 30655 30655 I Typeface: updateThemeFont new=Rookery-Regular;old=sans-serif;new=Rookery-Stacked;old=
+05-07 17:15:30.816 30625 30646 I python  :  [bootstrap] Connecting to AZT Collaboration service…
+05-07 17:15:30.892  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:31.234  1326  1366 I libPowerHal: [updateFPS] pid(30625) : -1 => 90
+05-07 17:15:31.511  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:31.523  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:32.132  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:32.133  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:32.407  1326  1402 I libPowerHal: [PD] LAUNCH update cmd:2c14000 param:0
+05-07 17:15:32.500  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:32.500  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:32.684  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:32.685  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:32.685  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:32.685  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:32.685  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:32.819 30625 30646 I python  :  [bootstrap] Connecting to AZT Collaboration service…
+05-07 17:15:33.234  1326  1366 I libPowerHal: [updateFPS] pid(30625) : 90 => -1
+05-07 17:15:33.241  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:33.668  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:33.742  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:33.742  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:33.764  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:33.764  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:33.764  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:33.764  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:33.764  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:33.772  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:33.881  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:34.083  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:34.214  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:34.215  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:34.215  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:34.215  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:34.215  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:34.215  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:34.220  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:34.246  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:34.720  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:34.721  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:34.819 30625 30646 I python  :  [bootstrap] Connecting to AZT Collaboration service…
+05-07 17:15:35.287  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:35.287  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:35.287  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:35.287  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:35.287  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:35.615  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:1408300 param:40
+05-07 17:15:35.615  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:300c000 param:0
+05-07 17:15:35.616  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:1000000 param:2
+05-07 17:15:36.756  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:36.756  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:36.814 30625 30646 I python  :  [bootstrap] Connecting to AZT Collaboration service…
+05-07 17:15:38.078  1371  1394 D ccci_mdinit: (1):monitor_time_update_thread round:19477 ########
+05-07 17:15:38.389  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:38.600  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:38.709  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:38.809 30625 30646 I python  :  [bootstrap] Connecting to AZT Collaboration service…
+05-07 17:15:38.814  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:38.920  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:39.023  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:39.330  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:40.777  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:40.778  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:40.797  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:40.797  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:40.906  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:40.909  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:40.910  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:40.911  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:40.911  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:40.911  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:40.947  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:41.032  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:41.236  1326  1366 I libPowerHal: [updateFPS] pid(30625) : -1 => 90
+05-07 17:15:41.523  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:41.524  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:42.093  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:42.095  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:42.096  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:42.096  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:42.096  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:42.096  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:42.236  1326  1366 I libPowerHal: [updateFPS] pid(30625) : 90 => -1
+05-07 17:15:43.075  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:43.076  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:43.078  1326  1402 I libPowerHal: [PE] mtkpower@1.0-se update cmd:1408300, param:80
+05-07 17:15:43.080  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:43.080  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:43.098  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:43.142  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:43.179  1326  1402 I libPowerHal: [PD] mtkpower@1.0-se update cmd:1408300 param:40
+05-07 17:15:43.180  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:43.181  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:43.181  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:43.181  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:43.181  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:43.197  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327236588025812, windowName=<null>
+05-07 17:15:43.219  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327236614181581, windowName=4237a05 com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher
+05-07 17:15:43.247  2555  2591 V WindowManagerShell:  try handler com.android.wm.shell.recents.RecentsTransitionHandler@e09b5b4
+05-07 17:15:43.247  2555  2591 V ShellRecents: RecentsTransitionHandler.startAnimation: no controller found
+05-07 17:15:43.276 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+05-07 17:15:43.277 26239 26239 I AndroidIME: LatinIMEBase.updateInputViewCoverNavigation():322 Update input view padding, isNavbarOverInputWindow=false, bottom inset=120
+05-07 17:15:43.278 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 1, locked = false
+05-07 17:15:43.462  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:43.463  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1000000 param:2
+05-07 17:15:43.529  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:43.632  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:43.739  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:43.846  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:43.928  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:43.948  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:44.048  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:44.078  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:44.099  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:44.236  1326  1366 I libPowerHal: [updateFPS] pid(4681) : -1 => 90
+05-07 17:15:44.274  1977  2475 I ActivityManager: appDiedLocked: app=ProcessRecord{2f57d0 30625:org.atoznback.azt_recorder/u0a582} thread=android.os.BinderProxy@bfd256f fromBinderDied=true isKilledByAm=false reason=null
+05-07 17:15:44.274  1977  2475 I ActivityManager: Process org.atoznback.azt_recorder (pid 30625) has died: cch+15 CEM 
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:44.449  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:44.517  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:44.517  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:44.804  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:45.082  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:45.236  1326  1366 I libPowerHal: [updateFPS] pid(4681) : 90 => 120
+05-07 17:15:45.569  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:45.569  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:45.818  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:45.818  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:46.234  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:46.234  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:46.236  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:46.236  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:46.237  1326  1366 I libPowerHal: [updateFPS] pid(4681) : 120 => -1
+05-07 17:15:46.244  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:46.244  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:46.898  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:46.899  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:46.899  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:46.899  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:46.900  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:46.900  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:47.524  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:47.524  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:48.227  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:48.228  1326  1402 I libPowerHal: [PE] mtkpower@1.0-se update cmd:1408300, param:80
+05-07 17:15:48.229  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:48.230  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:48.230  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:48.248  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:48.305  1326  1402 I libPowerHal: [PD] mtkpower@1.0-se update cmd:1408300 param:40
+05-07 17:15:48.306  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:48.307  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:48.307  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:48.307  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:48.307  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:48.331  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=1:1 touchBoost=1 scroll=1:1 idle=0:0]
+05-07 17:15:48.344  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:48.357  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:48.364  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:48.365  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:48.506  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:48.577  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:48.788  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:49.002  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:49.237  1326  1366 I libPowerHal: [updateFPS] pid(4681) : -1 => 120
+05-07 17:15:49.282  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:49.347  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:49.361  1977  5574 D ActivityTaskManager: [GlobalFreeform] use default Rect(162, 162 - 1242, 1929) scale=0.7 for ActivityRecord{4a8485f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity
+05-07 17:15:49.364  1977  5574 D ActivityTaskManager: [GlobalFreeform] use default Rect(162, 162 - 1242, 1929) scale=0.7 for ActivityRecord{4a8485f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity t-1}
+05-07 17:15:49.365  1359  2350 E BufferQueueDebug: [ActivityRecord{4a8485f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity t25773}#44701](this:0xb400007e45615f08,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'ActivityRecord{4a8485f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity t25773}#44701'
+05-07 17:15:49.365  1359  2350 I BufferQueueDebug: [ActivityRecord{4a8485f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity t25773}#44701](this:0xb400007e45615f08,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.368  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:300c000, param:15
+05-07 17:15:49.368  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:2c14000 param:1
+05-07 17:15:49.372  1977  5574 I ActivityTaskManager: START u0 {act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=org.atoznback.aztcollab/org.kivy.android.PythonActivity bnds=[635,1373][833,1703]} with LAUNCH_SINGLE_TASK from uid 10305 (startActivityAsUser) (BAL_ALLOW_ALLOWLISTED_COMPONENT) result code=0
+05-07 17:15:49.373  2555  2591 V WindowManagerShell: Transition requested: android.os.BinderProxy@3860ea0 TransitionRequestInfo { type = 1, triggerTask = TaskInfo{userId=0 taskId=25773 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=org.atoznback.aztcollab/org.kivy.android.PythonActivity } baseActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} topActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} origActivity=null realActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} numActivities=1 lastActiveTime=467508688 supportsMultiWindow=true supportsGlobalFreeform=true resizeMode=1 isResizeable=true isAppLocked=false canKillAndRestart=false isShowDecorCaptionWindowRequest=false minWidth=-1 minHeight=-1 defaultMinSize=200 token=WCT{android.window.IWindowContainerToken$Stub$Proxy@8492a59} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=false launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=Rect(0, 117 - 0, 0) topActivityInfo=ActivityInfo{be4561e org.kivy.android.PythonActivity} launchCookies=[android.os.BinderProxy@ba9feff] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@b4d74cc, appThread = android.app.IApplicationThread$Stub$Proxy@b591315, debugName = QuickstepLaunch }, displayChange = null, flags = 0 }
+05-07 17:15:49.374  1977  2019 I PowerHalWrapper: amsBoostProcessCreate package:org.atoznback.aztcollab 
+05-07 17:15:49.375  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_EXT_LAUNCH update cmd:2020000 param:0
+05-07 17:15:49.381  2555  2614 D ViewRootImpl: update {(0,0)(fillxfill) ty=APPLICATION_STARTING fmt=TRANSLUCENT wanim=0x1030001
+05-07 17:15:49.382  1977  5574 I PowerHalWrapper: amsBoostNotify pid:4681,activity:com.android.launcher3.CustomizationPanelLauncher, package:com.motorola.launcher3, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:15:49.387  1359  1449 E BufferQueueDebug: [909c9f1 Splash Screen org.atoznback.aztcollab#44702](this:0xb400007e455878e8,id:-1,api:0,p:-1,c:-1) id info cannot be read from '909c9f1 Splash Screen org.atoznback.aztcollab#44702'
+05-07 17:15:49.387  1359  1449 I BufferQueueDebug: [909c9f1 Splash Screen org.atoznback.aztcollab#44702](this:0xb400007e455878e8,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.393  1977  2027 I ActivityManager: Start proc 30678:org.atoznback.aztcollab/u0a591 for next-top-activity {org.atoznback.aztcollab/org.kivy.android.PythonActivity}
+05-07 17:15:49.400  1977  3031 D CoreBackPreview: Window{909c9f1 u0 Splash Screen org.atoznback.aztcollab}: Setting back callback OnBackInvokedCallbackInfo{mCallback=android.window.IOnBackInvokedCallback$Stub$Proxy@5e9eb44, mPriority=0, mIsAnimationCallback=false}
+05-07 17:15:49.402 30678 30678 I nback.aztcollab: Using CollectorTypeCMC GC.
+05-07 17:15:49.402  1359  1449 E BufferQueueDebug: [Splash Screen org.atoznback.aztcollab#44703](this:0xb400007e45592f28,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'Splash Screen org.atoznback.aztcollab#44703'
+05-07 17:15:49.403  1359  1449 I BufferQueueDebug: [Splash Screen org.atoznback.aztcollab#44703](this:0xb400007e45592f28,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.416  1977  5574 I PowerHalWrapper: amsBoostNotify pid:30678,activity:org.kivy.android.PythonActivity, package:org.atoznback.aztcollab, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:15:49.417  1977  5574 I mtkpower_client: [Legacy][PowerHal_Wrap_notifyAppState] org.atoznback.aztcollab/org.kivy.android.PythonActivity pid=30678 state:1
+05-07 17:15:49.417  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:1, pid:30678, uid:10591, fps:120
+05-07 17:15:49.417  1326  1402 I libPowerHal: [perfNotifyAppState] foreground:org.atoznback.aztcollab, pid:30678, uid:10591
+05-07 17:15:49.418  2555  2629 D BLASTBufferQueue: [VRI[aztcollab]#2134](f:0,a:1) acquireNextBufferLocked size=1080x2400 mFrameNumber=1 applyTransaction=true mTimestamp=327242830064581(auto) mPendingTransactions.size=0 graphicBufferId=10973641463287 transform=0
+05-07 17:15:49.420  1326  1402 I UxUtility: notifyForegroundApp pack:org.atoznback.aztcollab, uid:10591
+05-07 17:15:49.420  1326  1345 I mtkpower@impl: [notifyAppState] pc:1, com.motorola.launcher3 => org.atoznback.aztcollab
+05-07 17:15:49.426 30678 30678 D nativeloader: Configuring clns-4 for other apk /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk. target_sdk_version=36, uses_libraries=, library_path=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64:/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk!/lib/arm64-v8a, permitted_path=/data:/mnt/expand:/data/user/0/org.atoznback.aztcollab
+05-07 17:15:49.426  1359  1449 E BufferQueueDebug: [a2df2ac ActivityRecordInputSink org.atoznback.aztcollab/org.kivy.android.PythonActivity#44705](this:0xb400007e45598a48,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'a2df2ac ActivityRecordInputSink org.atoznback.aztcollab/org.kivy.android.PythonActivity#44705'
+05-07 17:15:49.427  1359  1449 I BufferQueueDebug: [a2df2ac ActivityRecordInputSink org.atoznback.aztcollab/org.kivy.android.PythonActivity#44705](this:0xb400007e45598a48,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.433  1977  2016 V WindowManager: Sent Transition #3113 createdAt=05-07 17:15:49.360 via request=TransitionRequestInfo { type = 1, triggerTask = TaskInfo{userId=0 taskId=25773 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=org.atoznback.aztcollab/org.kivy.android.PythonActivity } baseActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} topActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} origActivity=null realActivity=ComponentInfo{org.atoznback.aztcollab/org.kivy.android.PythonActivity} numActivities=1 lastActiveTime=467508688 supportsMultiWindow=true supportsGlobalFreeform=true resizeMode=1 isResizeable=true isAppLocked=false canKillAndRestart=true isShowDecorCaptionWindowRequest=false minWidth=-1 minHeight=-1 defaultMinSize=200 token=WCT{RemoteToken{d6c9be5 Task{288eb75 #25773 type=standard A=10591:org.atoznback.aztcollab}}} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=false launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=Rect(0, 117 - 0, 0) topActivityInfo=ActivityInfo{6dc56ba org.kivy.android.PythonActivity} launchCookies=[android.os.BinderProxy@c19c96b] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@61b8cc8, appThread = android.app.IApplicationThread$Stub$Proxy@9501161, debugName = QuickstepLaunch }, displayChange = null, flags = 0 }
+05-07 17:15:49.434  1977  2016 V WindowManager:     info={id=3113 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{RemoteToken{d6c9be5 Task{288eb75 #25773 type=standard A=10591:org.atoznback.aztcollab}}} m=OPEN f=NONE pTaskId=-1 leash=Surface(name=Task=25773)/@0x23c77b0 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) d=0},{WCT{RemoteToken{3f3c4f5 Task{88ed765 #1 type=home}}} m=TO_BACK f=SHOW_WALLPAPER pTaskId=-1 leash=Surface(name=Task=1)/@0x91ccd63 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) d=0}]}
+05-07 17:15:49.435 30678 30678 V GraphicsEnvironment: ANGLE GameManagerService for org.atoznback.aztcollab: false
+05-07 17:15:49.435 30678 30678 V GraphicsEnvironment: org.atoznback.aztcollab is not listed in per-application setting
+05-07 17:15:49.438 30678 30678 I Typeface: updateThemeFont new=Rookery-Regular;old=sans-serif;new=Rookery-Stacked;old=
+05-07 17:15:49.449 30678 30695 D libMEOW : applied 1 plugins for [org.atoznback.aztcollab]:
+05-07 17:15:49.451 30678 30678 E nback.aztcollab: Invalid resource ID 0x00000000.
+05-07 17:15:49.464 30678 30696 V pythonutil: Unpacking /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libpybundle app
+05-07 17:15:49.466  1359  1449 D SurfaceFlinger: [SF client] NEW(0xb400007da549d110) for (30678:org.atoznback.aztcollab)
+05-07 17:15:49.471 30678 30678 D ViewRootImpl: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:49.476  1359  1449 E BufferQueueDebug: [8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity#44708](this:0xb400007e45584b58,id:-1,api:0,p:-1,c:-1) id info cannot be read from '8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity#44708'
+05-07 17:15:49.476  1359  1449 I BufferQueueDebug: [8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity#44708](this:0xb400007e45584b58,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.485 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libsqlite3.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.486 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libffi.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.486 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libssl1.1.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.487 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libcrypto1.1.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.488 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.488 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_image.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.489 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_mixer.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.491 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_ttf.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.492 30678 30678 D nativeloader: Load libpython3.5m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.5m.so" not found
+05-07 17:15:49.492 30678 30678 D nativeloader: Load libpython3.6m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.6m.so" not found
+05-07 17:15:49.493 30678 30678 D nativeloader: Load libpython3.7m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.7m.so" not found
+05-07 17:15:49.493 30678 30678 D nativeloader: Load libpython3.8.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.8.so" not found
+05-07 17:15:49.494 30678 30678 D nativeloader: Load libpython3.9.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.9.so" not found
+05-07 17:15:49.495 30678 30678 D nativeloader: Load libpython3.10.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.10.so" not found
+05-07 17:15:49.497 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libpython3.11.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.497 30678 30678 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libmain.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:49.506  1359  1449 D SurfaceFlinger: [SF client] NEW(0xb400007da5477a90) for (30678:org.atoznback.aztcollab)
+05-07 17:15:49.514  1977  5574 D CoreBackPreview: Window{8b1623f u0 org.atoznback.aztcollab/org.kivy.android.PythonActivity}: Setting back callback OnBackInvokedCallbackInfo{mCallback=android.window.IOnBackInvokedCallback$Stub$Proxy@963e35b, mPriority=0, mIsAnimationCallback=false}
+05-07 17:15:49.515  1359  1449 E BufferQueueDebug: [org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709](this:0xb400007e4552f478,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709'
+05-07 17:15:49.515  1359  1449 I BufferQueueDebug: [org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709](this:0xb400007e4552f478,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.526 30678 30693 D libMEOW : applied 1 plugins for [org.atoznback.aztcollab]:
+05-07 17:15:49.526  1359  1449 E BufferQueueDebug: [Bounds for - org.atoznback.aztcollab/org.kivy.android.PythonActivity#44714](this:0xb400007e455bda98,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'Bounds for - org.atoznback.aztcollab/org.kivy.android.PythonActivity#44714'
+05-07 17:15:49.526  1359  1449 I BufferQueueDebug: [Bounds for - org.atoznback.aztcollab/org.kivy.android.PythonActivity#44714](this:0xb400007e455bda98,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.527  1977  2020 D SurfaceComposerClient: Transaction::apply InputWindowCommands.focusRequests timestamp=327242935303735, windowName=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity
+05-07 17:15:49.528  1359  1449 E BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44715](this:0xb400007e456eb838,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44715'
+05-07 17:15:49.528  1359  1449 I BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44715](this:0xb400007e456eb838,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.528  1359  1449 E BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716'
+05-07 17:15:49.528  1359  1449 I BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.529  1359  1449 E BufferQueueDebug: [Background for SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44717](this:0xb400007e456f1358,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'Background for SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44717'
+05-07 17:15:49.529  1359  1449 I BufferQueueDebug: [Background for SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44717](this:0xb400007e456f1358,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.532  1359  1359 D SurfaceFlinger: Focus addInputWindowCommands timestamp=327242935303735, windowName=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity
+05-07 17:15:49.533  1359  1359 D SurfaceFlinger: Find Focus windowName=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity, notVisible=1
+05-07 17:15:49.533  1359  1359 D Layer   : Focus: org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709 isHiddenByPolicy s.flags&layer_state_t::eLayerHidden=1
+05-07 17:15:49.534  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327242935303735, windowName=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity
+05-07 17:15:49.535 30678 30700 V SDL     : Running main function SDL_main from library /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libmain.so
+05-07 17:15:49.536 30678 30700 I python  : /data/user/0/org.atoznback.aztcollab/files/app
+05-07 17:15:49.536 30678 30700 I python  : /data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/stdlib.zip:/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/modules
+05-07 17:15:49.546 30678 30678 W SDLThread: type=1400 audit(0.0:1084920): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/modules/zlib.cpython-311.so" dev="dm-52" ino=1094629 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:49.562 30678 30700 I python  : Android path ['.', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/stdlib.zip', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/modules', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/site-packages']
+05-07 17:15:49.562 30678 30700 I python  : Android kivy bootstrap done. __name__ is __main__
+05-07 17:15:49.578 30678 30678 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:49.579 30678 30678 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:49.579  1359  1449 E BufferQueueDebug: [Surface(name=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity)/@0xdb57b3c - animation-leash of starting_reveal#44718](this:0xb400007e455ee128,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'Surface(name=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity)/@0xdb57b3c - animation-leash of starting_reveal#44718'
+05-07 17:15:49.580  1359  1449 I BufferQueueDebug: [Surface(name=8b1623f org.atoznback.aztcollab/org.kivy.android.PythonActivity)/@0xdb57b3c - animation-leash of starting_reveal#44718](this:0xb400007e455ee128,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.581  1977  2020 I LaunchCheckinHandler: MotoDisplayed org.atoznback.aztcollab/org.kivy.android.PythonActivity,cp,ca,205
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:49.584  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:49.588  1977  2016 I ActivityTaskManager: Displayed org.atoznback.aztcollab/org.kivy.android.PythonActivity for user 0: +228ms
+05-07 17:15:49.593  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_EXT_LAUNCH update cmd:2020000, param:31
+05-07 17:15:49.594  1977  3031 I ImeTracker: org.atoznback.aztcollab:75531b2a: onRequestHide at ORIGIN_SERVER_HIDE_INPUT reason HIDE_UNSPECIFIED_WINDOW
+05-07 17:15:49.594  1977  3031 I ImeTracker: org.atoznback.aztcollab:75531b2a: onCancelled at PHASE_SERVER_SHOULD_HIDE
+05-07 17:15:49.604 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+05-07 17:15:49.605 26239 26239 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1446 onStartInput(EditorInfo{EditorInfo{packageName=org.atoznback.aztcollab, inputType=0, inputTypeString=NULL, enableLearning=false, autoCorrection=false, autoComplete=false, imeOptions=0, privateImeOptions=null, actionName=UNSPECIFIED, actionLabel=null, initialSelStart=-1, initialSelEnd=-1, initialCapsMode=0, label=null, fieldId=0, fieldName=null, extras=null, hintText=null, hintLocales=[]}}, false)
+05-07 17:15:49.606 26239 26239 I AndroidIME: LatinIMEBase.updateInputViewCoverNavigation():322 Update input view padding, isNavbarOverInputWindow=false, bottom inset=120
+05-07 17:15:49.608 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 1, locked = false
+05-07 17:15:49.609  1977  1995 W PackageConfigPersister: App-specific configuration not found for packageName: org.atoznback.aztcollab and userId: 0
+05-07 17:15:49.646 30678 30678 W SDLThread: type=1400 audit(0.0:1084922): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/modules/_ssl.cpython-311.so" dev="dm-52" ino=384705 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:49.646 30678 30678 W SDLThread: type=1400 audit(0.0:1084923): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/modules/_socket.cpython-311.so" dev="dm-52" ino=414286 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:49.658 30678 30678 W SDLThread: type=1400 audit(0.0:1084924): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/modules/math.cpython-311.so" dev="dm-52" ino=1191493 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:49.665  1977  2019 I PowerHalWrapper: amsBoostNotify pid:4681,activity:com.android.launcher3.CustomizationPanelLauncher, package:com.motorola.launcher3, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:15:49.841 30678 30700 I python  : [INFO   ] [Logger      ] Record log in /data/user/0/org.atoznback.aztcollab/files/app/.kivy/logs/kivy_26-05-07_6.txt
+05-07 17:15:49.842 30678 30700 I python  : [INFO   ] [Kivy        ] Installed at "/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/__init__.pyc"
+05-07 17:15:49.945  1359  3173 E BufferQueueDebug: [Surface(name=909c9f1 Splash Screen org.atoznback.aztcollab)/@0xd8cec1f - animation-leash of window_animation#44720](this:0xb400007e456b8418,id:-1,api:0,p:-1,c:-1) id info cannot be read from 'Surface(name=909c9f1 Splash Screen org.atoznback.aztcollab)/@0xd8cec1f - animation-leash of window_animation#44720'
+05-07 17:15:49.945  1359  3173 I BufferQueueDebug: [Surface(name=909c9f1 Splash Screen org.atoznback.aztcollab)/@0xd8cec1f - animation-leash of window_animation#44720](this:0xb400007e456b8418,id:-1,api:0,p:-1,c:-1) BufferQueue core=(1359:/system/bin/surfaceflinger)
+05-07 17:15:49.950  1977  5574 W InputManager-JNI: Input channel object '909c9f1 Splash Screen org.atoznback.aztcollab (client)' was disposed without first being removed with the input manager!
+05-07 17:15:49.954  1977  3031 D CoreBackPreview: Window{909c9f1 u0 Splash Screen org.atoznback.aztcollab EXITING}: Setting back callback null
+05-07 17:15:49.958  2555 13465 D BLASTBufferQueue: [VRI[aztcollab]#2134](f:0,a:1) destructor()
+05-07 17:15:49.958  2555 13465 D BufferQueueConsumer: [VRI[aztcollab]#2134(BLAST Consumer)2134](id:9fb00000868,api:0,p:-1,c:2555) disconnect
+05-07 17:15:50.121  1359  1359 I BufferQueueDebug: [909c9f1 Splash Screen org.atoznback.aztcollab#44702](this:0xb400007e455878e8,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:15:50.122  1359  1359 I BufferQueueDebug: [Splash Screen org.atoznback.aztcollab#44703](this:0xb400007e45592f28,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:15:50.123  1359  1359 I BufferQueueDebug: [Surface(name=909c9f1 Splash Screen org.atoznback.aztcollab)/@0xd8cec1f - animation-leash of window_animation#44720](this:0xb400007e456b8418,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:15:50.133 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libsqlite3.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.134 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libffi.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.136 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libssl1.1.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.137 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libcrypto1.1.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.139 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.140 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_image.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.141 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_mixer.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.146 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libSDL2_ttf.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.148 30655 30706 D nativeloader: Load libpython3.5m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.5m.so" not found
+05-07 17:15:50.149 30655 30706 D nativeloader: Load libpython3.6m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.6m.so" not found
+05-07 17:15:50.150 30655 30706 D nativeloader: Load libpython3.7m.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.7m.so" not found
+05-07 17:15:50.151 30655 30706 D nativeloader: Load libpython3.8.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.8.so" not found
+05-07 17:15:50.152 30655 30706 D nativeloader: Load libpython3.9.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.9.so" not found
+05-07 17:15:50.152 30655 30706 D nativeloader: Load libpython3.10.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): dlopen failed: library "libpython3.10.so" not found
+05-07 17:15:50.156 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libpython3.11.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.157 30655 30706 D nativeloader: Load /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/lib/arm64/libmain.so using class loader ns clns-4 (caller=/data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk): ok
+05-07 17:15:50.158 30655 30706 I python  : /data/user/0/org.atoznback.aztcollab/files/app
+05-07 17:15:50.158 30655 30706 I python  : /data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/stdlib.zip:/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/modules
+05-07 17:15:50.210 30655 30706 I providerhost: Android path ['.', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/stdlib.zip', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/modules', '/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/site-packages']
+05-07 17:15:50.210 30655 30706 I providerhost: Android kivy bootstrap done. __name__ is __main__
+05-07 17:15:50.237  1326  1366 I libPowerHal: [updateFPS] pid(30678) : 120 => -1
+05-07 17:15:50.237  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:5, pid:30678, uid:10591, fps:-1
+05-07 17:15:50.238  1326  1402 I UxUtility: notifyForegroundApp pack:org.atoznback.aztcollab, uid:10591
+05-07 17:15:50.532  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:50.558 30678 30678 W SDLThread: type=1400 audit(0.0:1084986): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/core/image/_img_sdl2.so" dev="dm-52" ino=950764 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:50.562 30678 30678 W SDLThread: type=1400 audit(0.0:1084987): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/graphics/fbo.so" dev="dm-52" ino=1192789 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:50.562 30678 30678 W SDLThread: type=1400 audit(0.0:1084988): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/graphics/context.so" dev="dm-52" ino=1192628 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:50.562 30678 30678 W SDLThread: type=1400 audit(0.0:1084989): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/graphics/stencil_instructions.so" dev="dm-52" ino=1193276 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=org.atoznback.aztcollab
+05-07 17:15:50.566 30655 30655 W Thread-2: type=1400 audit(0.0:1084990): avc:  granted  { execute } for  path="/data/data/org.atoznback.aztcollab/files/app/_python_bundle/modules/_datetime.cpython-311.so" dev="dm-52" ino=864777 scontext=u:r:untrusted_app:s0:c79,c258,c512,c768 tcontext=u:object_r:app_data_file:s0:c79,c258,c512,c768 tclass=file app=com.twitter.android
+05-07 17:15:50.717 30678 30678 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:50.719 30678 30700 E hidapi  : hid_init threw an exception: org.atoznback.aztcollab: One of RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED should be specified when a receiver isn't being registered exclusively for system broadcasts
+05-07 17:15:50.719 30678 30700 D libMEOW : applied 1 plugins for [org.atoznback.aztcollab]:
+05-07 17:15:50.729  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=0:0]
+05-07 17:15:50.730  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:50.737  1359  1359 I BufferQueueProducer: [org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709](this:0xb400007e4552f478,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=0.87 dur=1155.32 max=1155.32 min=1155.32
+05-07 17:15:50.742 30678 30678 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:50.750 30655 30706 E python  : [INFO   ] [Logger      ] Record log in /data/user/0/org.atoznback.aztcollab/files/app/.kivy/logs/kivy_26-05-07_7.txt
+05-07 17:15:50.751 30655 30706 E python  : [INFO   ] [Kivy        ] Installed at "/data/user/0/org.atoznback.aztcollab/files/app/_python_bundle/site-packages/kivy/__init__.pyc"
+05-07 17:15:50.756  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:50.787  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:50.788  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:50.797  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:15:50.797  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:15:50.803  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:50.804  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:50.804  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:50.804  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:50.804  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:50.904 30678 30678 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:15:51.137  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:51.210 30655 30664 E python  :  [recent] GET /v1/recent/last_project → '' (from '/data/user/0/org.atoznback.aztcollab/files/azt/config.json')
+05-07 17:15:51.211 30678 30700 I python  :  [recent] last_project → ''
+05-07 17:15:51.264  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:51.265  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:51.265  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:51.265  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:51.265  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:51.303 30678 30700 D BLASTBufferQueue: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#1](f:0,a:1) acquireNextBufferLocked size=1080x2163 mFrameNumber=1 applyTransaction=true mTimestamp=327244715756889(auto) mPendingTransactions.size=0 graphicBufferId=131761006706689 transform=0
+05-07 17:15:51.755  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:51.771  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:52.238  1326  1366 I libPowerHal: [updateFPS] pid(30678) : -1 => 90
+05-07 17:15:52.238  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:5, pid:30678, uid:10591, fps:90
+05-07 17:15:52.238  1326  1402 I UxUtility: notifyForegroundApp pack:org.atoznback.aztcollab, uid:10591
+05-07 17:15:52.370  1326  1402 I libPowerHal: [PD] LAUNCH update cmd:2c14000 param:0
+05-07 17:15:52.428  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:52.428  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:52.456  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:52.457  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:52.458  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:52.485  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:52.543  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=34.94 dur=1230.64 max=612.56 min=9.52
+05-07 17:15:52.563  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=1:1 touchBoost=1 scroll=1:1 idle=0:0]
+05-07 17:15:52.575  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:52.655  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:53.159  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=0:0]
+05-07 17:15:53.160  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:53.560  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=68.85 dur=1016.71 max=138.06 min=9.78
+05-07 17:15:53.655  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:15:53.673  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:15:53.851  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:53.953  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:54.061  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:54.167  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:54.271  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:54.375  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:54.397  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:54.553  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:54.553  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:54.698  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:54.699  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:54.699  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:54.699  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:54.699  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:54.699  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:55.108  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:55.108  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:55.109  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:55.109  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:55.109  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:55.238  1326  1366 I libPowerHal: [updateFPS] pid(30678) : 90 => -1
+05-07 17:15:55.238  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:5, pid:30678, uid:10591, fps:-1
+05-07 17:15:55.239  1326  1402 I UxUtility: notifyForegroundApp pack:org.atoznback.aztcollab, uid:10591
+05-07 17:15:55.592  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:1408300 param:40
+05-07 17:15:55.592  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:300c000 param:0
+05-07 17:15:55.592  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_PROCESS_CREATE update cmd:1000000 param:2
+05-07 17:15:56.516  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:56.517  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:56.520  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:56.520  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:56.522  1326  1402 I libPowerHal: [PE] mtkpower@1.0-se update cmd:1408300, param:80
+05-07 17:15:56.544  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:56.637  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:56.665  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=13.20 dur=3105.50 max=2605.92 min=9.79
+05-07 17:15:56.690  1326  1402 I libPowerHal: [PD] mtkpower@1.0-se update cmd:1408300 param:40
+05-07 17:15:56.690  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:56.691  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:56.691  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:56.691  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:56.691  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:56.712  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:56.903  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:56.903  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1000000 param:2
+05-07 17:15:57.136  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:57.140  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:57.140  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:57.221  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:57.246  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:57.267  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:57.279  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:57.301  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:15:57.522  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:15:57.523  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1000000 param:2
+05-07 17:15:57.879  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:15:57.879  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:15:58.136  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:15:58.138  1359  1830 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:15:58.312  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:15:58.315  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:15:58.316  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:15:58.317  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:15:58.317  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:15:58.319  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000
+05-07 17:15:58.908  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:59.017  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:59.230  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:15:59.734  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:15:59.735  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=1:0]
+05-07 17:15:59.736  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:15:59.736  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:15:59.736  1326  1402 I libPowerHal: [PE] mtkpower@1.0-se update cmd:1408300, param:80
+05-07 17:15:59.756  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:15:59.797  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=1.28 dur=3131.67 max=2513.90 min=29.11
+05-07 17:15:59.809  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:59.810  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:59.810  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:59.810  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:59.810  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:15:59.810  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:15:59.817  1326  1402 I libPowerHal: [PD] mtkpower@1.0-se update cmd:1408300 param:40
+05-07 17:15:59.818  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1404500 param:1
+05-07 17:15:59.819  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438300, param:0
+05-07 17:15:59.819  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438400, param:0
+05-07 17:15:59.819  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438600, param:0
+05-07 17:15:59.819  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1438700, param:0
+05-07 17:15:59.826  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:15:59.833  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=1:1 touchBoost=1 scroll=1:1 idle=0:0]
+05-07 17:15:59.845  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:16:00.239  1326  1366 I libPowerHal: [updateFPS] pid(30678) : -1 => 90
+05-07 17:16:00.239  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:5, pid:30678, uid:10591, fps:90
+05-07 17:16:00.240  1326  1402 I UxUtility: notifyForegroundApp pack:org.atoznback.aztcollab, uid:10591
+05-07 17:16:00.664  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:00.669  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:16:00.689  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:00.813  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:16:00.813  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:16:00.826  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 90 of group 0: [touch=0:0 touchBoost=0 scroll=1:0 idle=0:0]
+05-07 17:16:00.826  1359  1830 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:16:00.830  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:16:00.830  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=67.74 dur=1033.37 max=158.24 min=7.97
+05-07 17:16:00.878  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=1:0 idle=0:0]
+05-07 17:16:00.888  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:16:00.897  1977  1977 D EnhancedConnectivityController: updateDefaultNet:181
+05-07 17:16:00.897  1977  1977 D EnhancedConnectivityController: mayUpdateNotification: shouldShow=false,UidsBlocked=false, net info=net:181,ifName=wlan0,securityType=2,isDefault=true,ssid="rasnet_guest",notificationId=0
+05-07 17:16:01.344  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:01.577  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:16:01.670  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:80
+05-07 17:16:01.671  1326  1402 I libPowerHal: [PD] mtkpower@1.0-se update cmd:1408300 param:40
+05-07 17:16:01.757  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:16:01.832  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=53.93 dur=1001.27 max=339.74 min=8.55
+05-07 17:16:02.591  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:02.596  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:16:02.616  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:02.707  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:16:02.835  1359  1359 I BufferQueueProducer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) queueBuffer: fps=71.77 dur=1003.26 max=116.49 min=8.42
+05-07 17:16:03.222  1326  1402 I libPowerHal: [PE] fpsgo update cmd:1408300, param:100
+05-07 17:16:03.702  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=1:0 idle=1:1]
+05-07 17:16:03.703  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:16:03.711  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:16:03.711  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1000000 param:2
+05-07 17:16:03.867  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:16:03.868  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 60 to 120 of group 0: [touch=1:1 touchBoost=1 scroll=1:1 idle=1:0]
+05-07 17:16:03.871  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:16:03.872  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1000000 param:0
+05-07 17:16:03.889  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:16:03.910  1359  1359 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 90 of group 0: [touch=1:1 touchBoost=1 scroll=0:0 idle=0:0]
+05-07 17:16:03.910  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-07 17:16:03.925  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1408300 param:40
+05-07 17:16:03.964  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:16:03.972  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:1408300, param:100
+05-07 17:16:03.972  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:300c000, param:15
+05-07 17:16:03.972  1326  1402 I libPowerHal: [PE] LAUNCH update cmd:2c14000 param:1
+05-07 17:16:03.981  1977  5701 I PowerHalWrapper: amsBoostNotify pid:4681,activity:com.android.launcher3.CustomizationPanelLauncher, package:com.motorola.launcher3, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:16:03.983  1977  2019 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+05-07 17:16:03.983  4681  4681 D VRI[CustomizationPanelLauncher]: update {(0,0)(fillxfill) sim={adjust=nothing forwardNavigation} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x10302f2
+05-07 17:16:03.984  1326  1345 I mtkpower@impl: [notifyAppState] pc:0, org.atoznback.aztcollab => com.motorola.launcher3
+05-07 17:16:03.988  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327257391650198, windowName=<null>
+05-07 17:16:04.011  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327257408054813, windowName=4237a05 com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher
+05-07 17:16:04.050  2555  2591 V WindowManagerShell:  try handler com.android.wm.shell.recents.RecentsTransitionHandler@e09b5b4
+05-07 17:16:04.050  2555  2591 V ShellRecents: RecentsTransitionHandler.startAnimation: no controller found
+05-07 17:16:04.057  1977  2016 V WindowManager:     info={id=3114 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{RemoteToken{3f3c4f5 Task{88ed765 #1 type=home}}} m=TO_FRONT f=SHOW_WALLPAPER|MOVE_TO_TOP pTaskId=-1 leash=Surface(name=Task=1)/@0x91ccd63 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) d=0},{WCT{RemoteToken{d6c9be5 Task{288eb75 #25773 type=standard A=10591:org.atoznback.aztcollab}}} m=TO_BACK f=NONE pTaskId=-1 leash=Surface(name=Task=25773)/@0x23c77b0 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) d=0},{null m=TO_FRONT f=IS_WALLPAPER leash=Surface(name=WallpaperWindowToken{a10dacb token=android.os.Binder@4a9519a})/@0x8ce66b4 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) d=0}]}
+05-07 17:16:04.059  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:16:04.092  4681  4688 W orola.launcher3: ApkAssets: Deleting an ApkAssets object '<empty> and /data/app/~~av9jvStzCpQIj9nCpZ5QwA==/org.atoznback.aztcollab-ULGH288os9dfKnfL_zBrgA==/base.apk' with 1 weak references
+05-07 17:16:04.112 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+05-07 17:16:04.113 26239 26239 I AndroidIME: LatinIMEBase.updateInputViewCoverNavigation():322 Update input view padding, isNavbarOverInputWindow=false, bottom inset=120
+05-07 17:16:04.113 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 1, locked = false
+05-07 17:16:04.253  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:16:04.263  2723  2943 I bt_shim_scanner: handle_remote_properties: handle_remote_properties Update device_type=0x2 addr_type=0x0
+05-07 17:16:04.317  1977  2019 I PowerHalWrapper: amsBoostNotify pid:30678,activity:org.kivy.android.PythonActivity, package:org.atoznback.aztcollab, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:16:04.317  1977  2019 I mtkpower_client: [Legacy][PowerHal_Wrap_notifyAppState] org.atoznback.aztcollab/org.kivy.android.PythonActivity pid=30678 state:0
+05-07 17:16:04.318  1326  1402 I libPowerHal: [perfNotifyAppState] pack:org.atoznback.aztcollab, act:org.kivy.android.PythonActivity, state:0, pid:30678, uid:10591, fps:90
+05-07 17:16:04.347 30678 30678 D libMEOW : applied 1 plugins for [org.atoznback.aztcollab]:
+05-07 17:16:04.351 30678 30678 D BLASTBufferQueue: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#1](f:0,a:1) destructor()
+05-07 17:16:04.351 30678 30678 D BufferQueueConsumer: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#1(BLAST Consumer)1](id:77d600000001,api:0,p:-1,c:30678) disconnect
+05-07 17:16:04.377  1359  1359 I BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44715](this:0xb400007e456eb838,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:16:04.378  1359  1359 I BufferQueueDebug: [Background for SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity]#44717](this:0xb400007e456f1358,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:16:04.378  1359  1359 I BufferQueueDebug: [SurfaceView[org.atoznback.aztcollab/org.kivy.android.PythonActivity](BLAST)#44716](this:0xb400007e457219e8,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:16:04.388  1359  1359 I BufferQueueDebug: [org.atoznback.aztcollab/org.kivy.android.PythonActivity#44709](this:0xb400007e4552f478,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:16:04.388  1359  1359 I BufferQueueDebug: [Bounds for - org.atoznback.aztcollab/org.kivy.android.PythonActivity#44714](this:0xb400007e455bda98,id:-1,api:0,p:-1,c:1359) onDestructor()
+05-07 17:16:04.841  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:1
+05-07 17:16:04.843  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:16:04.925  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_APP_TOUCH update cmd:3408b00 param:0
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel cellMsg:  cellEnabled: false
+05-07 17:16:04.929  2555  2555 D CBR_SystemUI: CarrierLabel - : updateLabel mCellBroadcastMessage Visibility: 8
+05-07 17:16:04.949  2555  2614 D ViewRootImpl: update {(0,0)(fillxfill) ty=APPLICATION_STARTING fmt=TRANSLUCENT wanim=0x1030001
+05-07 17:16:04.952  1977  4577 I PowerHalWrapper: amsBoostNotify pid:4681,activity:com.android.launcher3.CustomizationPanelLauncher, package:com.motorola.launcher3, mProcessCreatePackorg.atoznback.aztcollab 
+05-07 17:16:04.955  1326  1402 I libPowerHal: [PD] MTKPOWER_HINT_EXT_LAUNCH update cmd:2020000 param:0
+05-07 17:16:04.968  1977  2027 I ActivityManager: Start proc 30718:org.atoznback.azt_recorder/u0a582 for next-top-activity {org.atoznback.azt_recorder/org.kivy.android.PythonActivity}
+05-07 17:16:05.017 30718 30718 I Typeface: updateThemeFont new=Rookery-Regular;old=sans-serif;new=Rookery-Stacked;old=
+05-07 17:16:05.052 30718 30718 D ViewRootImpl: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:05.113  1359  1842 D SurfaceFlinger: updateWinowInfo=1, setFocusedWindow timestamp=327258513546428, windowName=635a2db org.atoznback.azt_recorder/org.kivy.android.PythonActivity
+05-07 17:16:05.139 30718 30741 I python  : Android kivy bootstrap done. __name__ is __main__
+05-07 17:16:05.151 30718 30718 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:05.154 30718 30718 D VRI[PythonActivity]: update {(0,0)(fillxfill) sim={forwardNavigation} ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:05.173  1326  1402 I libPowerHal: [PE] MTKPOWER_HINT_EXT_LAUNCH update cmd:2020000, param:31
+05-07 17:16:05.180 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+05-07 17:16:05.181 26239 26239 I AndroidIME: LatinIMEBase.updateInputViewCoverNavigation():322 Update input view padding, isNavbarOverInputWindow=false, bottom inset=120
+05-07 17:16:05.182 26239 26239 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 1, locked = false
+05-07 17:16:05.224  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:16:05.241  1326  1366 I libPowerHal: [updateFPS] pid(30718) : 90 => -1
+05-07 17:16:05.524  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:16:05.905  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:16:06.033 30718 30718 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:06.048 30718 30718 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:06.061  1326  1402 I libPowerHal: [PE] INTERACTION update cmd:1404300, param:1
+05-07 17:16:06.169 30718 30718 D VRI[PythonActivity]: update {(0,0)(fillxfill) ty=BASE_APPLICATION wanim=0x1030001
+05-07 17:16:06.242 30718 30741 I python  :  [bootstrap] Checking installation…
+05-07 17:16:06.243  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:16:06.244  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:16:06.245  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:16:06.246  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:16:06.254  1977  1977 V UiModeManager: updateLocked: null action, mDockState=0, category=null
+05-07 17:16:06.254  1977  1977 D UiModeManager: updateConfigurationLocked: mDockState=0; mCarMode=false; mNightMode=1; mNightModeCustomType=-1; uiMode=17
+05-07 17:16:06.442  1326  1402 I libPowerHal: [PD] INTERACTION update cmd:1404300 param:0
+05-07 17:16:06.902 30655 30664 E python  :  [recent] GET /v1/recent/last_project → '' (from '/data/user/0/org.atoznback.aztcollab/files/azt/config.json')
+05-07 17:16:06.903 30718 30741 I python  :  [recent] last_project → ''
+05-07 17:16:07.060  1359  1830 I Scheduler: applyPolicy: UpdateRefreshRate 90 to 120 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=0:0]
+05-07 17:16:07.072  1359  1359 D SurfaceFlinger: MtkOverrideDuration: update vsync 120
+05-07 17:16:07.240  1326  1366 I libPowerHal: [updateFPS] pid(30718) : -1 => 90
+05-07 17:16:07.945  1326  1402 I libPowerHal: [PD] LAUNCH update cmd:2c14000 param:0
+05-07 17:16:08.096  1371  1394 D ccci_mdinit: (1):monitor_time_update_thread round:19478 ########
+05-07 17:16:08.140  1359  1836 I Scheduler: applyPolicy: UpdateRefreshRate 120 to 60 of group 0: [touch=0:0 touchBoost=0 scroll=0:0 idle=1:1]
+05-07 17:16:08.141  1359  1836 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-07 17:16:08.241  1326  1366 I libPowerHal: [updateFPS] pid(30718) : 90 => -1
+05-07 17:16:08.722  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1404500 param:0
+05-07 17:16:08.722  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438300, param:1000
+05-07 17:16:08.722  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438400, param:1000
+05-07 17:16:08.722  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438600 param:1000
+05-07 17:16:08.722  1326  1402 I libPowerHal: [PD] fpsgo update cmd:1438700 param:1000

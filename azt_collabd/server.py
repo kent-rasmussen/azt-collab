@@ -225,6 +225,26 @@ UNAUTHENTICATED_PATHS = ('/v1/health',)
 
 
 def _h_health(_body):
+    # Test hook: if ``$AZT_HOME/_debug_force_503`` exists, return
+    # 503 so the bootstrap can exercise the "AZT Collaboration not
+    # responding" popup that fires after warm-up retries exhaust.
+    # Toggle without restarting the daemon — the file presence is
+    # checked per-request, so create / remove takes effect on the
+    # next /v1/health probe.
+    #
+    # On Android (where ``$AZT_HOME`` is the server APK's private
+    # filesDir, not user-writable from outside the app), create
+    # the sentinel via adb:
+    #
+    #     adb shell run-as org.atoznback.aztcollab \
+    #         touch files/azt/_debug_force_503
+    #
+    # Remove with ``rm files/azt/_debug_force_503`` to restore
+    # normal behaviour. On desktop the sentinel lives at
+    # ``~/.local/share/azt/_debug_force_503``.
+    if os.path.exists(os.path.join(azt_home(), '_debug_force_503')):
+        return 503, {"ok": False, "error": "daemon_not_ready",
+                     "debug": "sentinel file present"}
     payload = {
         "ok": True, "version": _VERSION,
         "min_client_version": _MIN_CLIENT_VERSION,

@@ -296,43 +296,26 @@ KV_TEMPLATE = '''
                     color: T.TEXT_DIM
                     size_hint_y: None
                     height: dp(20)
-                # GitHub: Connect + Disconnect on one row, no header.
-                # Active colour swaps with connection state (Connect
-                # is green when not connected, Disconnect is green
-                # when connected) — the visually-prominent button
-                # matches the user's likely next action. Set in
-                # ``refresh()`` rather than KV so the same control
-                # path that fetches credentials_status drives the
-                # colour.
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(10)
-                    RecBtn:
-                        id: gh_connect_btn
-                        text: _('Connect to GitHub')
-                        normal_color: T.GREEN
-                        on_release: root.connect_github()
-                    RecBtn:
-                        id: gh_disconnect_btn
-                        text: _('Disconnect GitHub')
-                        normal_color: T.BTN_INACTIVE
-                        on_release: root.disconnect_github()
-                # GitLab: same shape.
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(10)
-                    RecBtn:
-                        id: gl_connect_btn
-                        text: _('Connect to GitLab')
-                        normal_color: T.GREEN
-                        on_release: app.go('gitlab')
-                    RecBtn:
-                        id: gl_disconnect_btn
-                        text: _('Disconnect GitLab')
-                        normal_color: T.BTN_INACTIVE
-                        on_release: root.disconnect_gitlab()
+                # GitHub: a single state-aware button. Connect when
+                # not connected, Disconnect when connected — only one
+                # is ever the right next action, so showing both was
+                # extra cognitive load for the SIL field-linguist user
+                # (audit doc #6). Label + action are flipped in
+                # ``refresh()`` from credentials_status.
+                RecBtn:
+                    id: gh_action_btn
+                    text: _('Connect to GitHub')
+                    normal_color: T.GREEN
+                    on_release: root.gh_action()
+                # GitLab: a single button that opens the GitLab
+                # settings screen. The connection-status detail lives
+                # below in the Status block; the form itself handles
+                # both connect and disconnect.
+                RecBtn:
+                    id: gl_action_btn
+                    text: _('GitLab')
+                    normal_color: T.SURFACE
+                    on_release: app.go('gitlab')
                 # Publish — visible only for the most-recent project
                 # when it has no remote yet AND at least one host's
                 # credentials have been confirmed. ``refresh()`` flips
@@ -375,6 +358,31 @@ KV_TEMPLATE = '''
                 Widget:
                     size_hint_y: None
                     height: dp(8)
+                # Debug section — only purpose is to let testers
+                # exercise the bootstrap "AZT Collaboration not
+                # responding" popup without a debug-signed APK
+                # (which run-as would otherwise require for
+                # planting the sentinel from adb). Toggling creates
+                # / removes ``$AZT_HOME/_debug_force_503``;
+                # ``_h_health`` returns 503 while the sentinel
+                # exists. Always visible — production users
+                # tapping it just see "service unavailable" until
+                # they tap again.
+                SectionLabel:
+                    text: _('Debug (testing)')
+                NavBtn:
+                    id: debug_503_btn
+                    text: _('Toggle "service not responding"')
+                    on_release: root.toggle_debug_503()
+                BodyLabel:
+                    id: debug_503_state
+                    text: ''
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: dp(20)
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
                 Label:
                     text: app.version_string
                     font_name: FONT
@@ -386,18 +394,14 @@ KV_TEMPLATE = '''
                     text_size: self.size
 
 <GitHubConnectScreen>:
-    # State-aware: ``on_pre_enter`` reads credentials_status and shows
-    # only the controls relevant to the current state. Three shapes:
-    #   not connected           → device-flow box visible, manage hidden;
-    #                             begin() auto-fires.
-    #   connected, not confirmed→ manage box visible with Test + Install
-    #                             (if not app_installed) + Re-auth +
-    #                             Disconnect; device-flow box hidden;
-    #                             nothing auto-fires.
-    #   connected, confirmed    → same as above plus a verified badge in
-    #                             the status line.
-    # All show/hide goes through the Kivy hide/show pattern (height: 0,
-    # opacity: 0) so a hidden section neither paints nor steals touch.
+    # Step-by-step connect flow. Pre-flight explanation + a 3-step
+    # indicator (Authorize → Install App → Verify) gates progress; a
+    # single state-aware "primary" button presents only the next
+    # action. No auto-firing — the user always taps Begin / Install
+    # GitHub App / Verify setup explicitly, so a partial setup that
+    # picks back up later resumes from where it stopped (server state
+    # owns "what's done" — connected / app_installed / confirmed).
+    # All show/hide goes through the Kivy hide/show pattern.
     canvas.before:
         Color:
             rgba: T.BG
@@ -416,17 +420,79 @@ KV_TEMPLATE = '''
                 height: self.minimum_height
                 padding: dp(20)
                 spacing: dp(14)
+                # ── Pre-flight explanation ─────────────────────────────
+                BodyLabel:
+                    id: gh_preflight
+                    text: _('GitHub is a free service for backing up your project to the cloud. You will need a free GitHub account.')
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(8)
+                    text_size: self.width, None
+                NavBtn:
+                    id: gh_signup_btn
+                    text: _('Create a GitHub account (free)')
+                    on_release: root.open_signup()
+                # ── Step indicator (1. Authorize → 2. Install → 3. Verify)
+                # State (done / current / pending) is rendered via colour +
+                # bold by ``_render_steps`` from the server-tracked flags
+                # (gh.connected / app_installed / confirmed). Visual only —
+                # the steps aren't tappable; the primary button below
+                # carries the active action.
+                BoxLayout:
+                    id: gh_steps
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: dp(84)
+                    spacing: dp(4)
+                    Label:
+                        id: gh_step1
+                        text: ''
+                        font_name: FONT
+                        font_size: sp(14)
+                        size_hint_y: None
+                        height: dp(24)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    Label:
+                        id: gh_step2
+                        text: ''
+                        font_name: FONT
+                        font_size: sp(14)
+                        size_hint_y: None
+                        height: dp(24)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    Label:
+                        id: gh_step3
+                        text: ''
+                        font_name: FONT
+                        font_size: sp(14)
+                        size_hint_y: None
+                        height: dp(24)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
                 BodyLabel:
                     id: gh_message
                     text: ''
                     size_hint_y: None
                     height: self.texture_size[1] + dp(8)
                     text_size: self.width, None
-                # ── Device-flow section ────────────────────────────────
-                # Visible while the user is mid-flow (showing the code,
-                # the Copy button, and the Begin / re-fire button).
-                # Hidden once we already have a token (the manage box
-                # below takes over).
+                # ── Primary action — Begin / Install GitHub App / Verify
+                # setup. Hidden during device-flow polling (the code box
+                # below carries that affordance) and once all three steps
+                # are done.
+                RecBtn:
+                    id: gh_primary_btn
+                    text: _('Begin')
+                    normal_color: T.GREEN
+                    on_release: root.primary_action()
+                # ── Device-flow code section ───────────────────────────
+                # Visible only while polling for user authorization on
+                # GitHub. Shows the user_code so it's still readable if
+                # the auto-paste failed and the user has to type it on
+                # the device-flow page.
                 BoxLayout:
                     id: gh_device_flow_box
                     orientation: 'vertical'
@@ -455,19 +521,11 @@ KV_TEMPLATE = '''
                             width: dp(96)
                             text: _('Copy')
                             on_release: root.copy_code()
-                    Widget:
-                        size_hint_y: None
-                        height: dp(8)
-                    RecBtn:
-                        id: gh_begin_btn
-                        text: _('Begin')
-                        normal_color: T.GREEN
-                        on_release: root.begin()
-                # ── Manage section ─────────────────────────────────────
-                # Visible only when a token is already on file. Each
-                # button is itself shown/hidden by Python state so the
-                # "Install GitHub App" CTA is only there if the user
-                # hasn't installed it yet.
+                # ── Secondary actions ──────────────────────────────────
+                # Re-authenticate + Disconnect — only when a token is on
+                # file. Re-auth restarts the device flow without first
+                # disconnecting, so a mid-flow bail leaves the existing
+                # token intact.
                 BoxLayout:
                     id: gh_manage_box
                     orientation: 'vertical'
@@ -475,20 +533,6 @@ KV_TEMPLATE = '''
                     height: 0
                     opacity: 0
                     spacing: dp(10)
-                    RecBtn:
-                        id: gh_test_btn
-                        text: _('Test connection')
-                        normal_color: T.GREEN
-                        on_release: root.test()
-                    RecBtn:
-                        id: gh_install_app_btn
-                        text: _('Install GitHub App')
-                        normal_color: T.ACCENT
-                        size_hint_y: None
-                        height: 0
-                        opacity: 0
-                        disabled: True
-                        on_release: root.install_app()
                     NavBtn:
                         text: _('Re-authenticate')
                         on_release: root.reauthenticate()
@@ -547,7 +591,7 @@ KV_TEMPLATE = '''
                     height: dp(8)
                 RecBtn:
                     id: gl_test_btn
-                    text: _('Test connection')
+                    text: _('Verify setup')
                     normal_color: T.GREEN
                     on_release: root.test()
                 NavBtn:
@@ -661,6 +705,12 @@ class SettingsScreen(Screen):
             lambda dt: setattr(sm, 'transition', old_transition), 0.1)
 
     def refresh(self):
+        # Debug-section indicator stays in sync regardless of
+        # whether status fetching succeeded.
+        try:
+            self._refresh_debug_503_state()
+        except Exception:
+            pass
         try:
             status = get_credentials_status()
             online = is_online()
@@ -671,25 +721,20 @@ class SettingsScreen(Screen):
             return
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
-        # Highlight the action the user is most likely to want:
-        # Connect when not connected, Disconnect when connected.
-        # The other button stays clickable (disconnected ↔ reconnect
-        # for token refresh remains a valid flow), just dimmed.
+        # GitHub: single state-aware button — Connect when not
+        # connected, Disconnect when connected. Tracked on the
+        # widget so ``gh_action()`` can dispatch without re-fetching
+        # credentials_status.
         gh_connected = bool(gh.get('connected'))
-        gl_connected = bool(gl.get('connected'))
-        for btn_id, fill in (
-            ('gh_connect_btn',
-             theme.BTN_INACTIVE if gh_connected else theme.GREEN),
-            ('gh_disconnect_btn',
-             theme.GREEN if gh_connected else theme.BTN_INACTIVE),
-            ('gl_connect_btn',
-             theme.BTN_INACTIVE if gl_connected else theme.GREEN),
-            ('gl_disconnect_btn',
-             theme.GREEN if gl_connected else theme.BTN_INACTIVE),
-        ):
-            btn = self.ids.get(btn_id)
-            if btn is not None:
-                btn.normal_color = fill
+        gh_btn = self.ids.get('gh_action_btn')
+        if gh_btn is not None:
+            gh_btn.text = _tr(
+                'Disconnect GitHub' if gh_connected
+                else 'Connect to GitHub')
+            gh_btn.normal_color = (
+                theme.BTN_INACTIVE if gh_connected else theme.GREEN)
+            gh_btn._action = (
+                'disconnect' if gh_connected else 'connect')
         # Contributor field — only repopulate when the user isn't
         # actively editing it, so a refresh during typing doesn't
         # clobber in-progress input.
@@ -836,14 +881,25 @@ class SettingsScreen(Screen):
             Clock.schedule_once(
                 lambda dt: setattr(msg, 'text', ''), 2.0)
 
+    def gh_action(self):
+        """Single dispatcher for the state-aware GitHub button.
+        ``refresh()`` stamps ``_action`` on the widget so we don't
+        re-fetch credentials_status here — that was just done."""
+        btn = self.ids.get('gh_action_btn')
+        action = getattr(btn, '_action', 'connect') if btn else 'connect'
+        if action == 'disconnect':
+            self.disconnect_github()
+        else:
+            self.connect_github()
+
     def connect_github(self):
         """Navigate to the GitHub connect/manage screen. The screen's
         own ``on_pre_enter`` reads ``credentials_status`` and decides
         whether to fire the device flow: only when no token is on
         file. With a token already saved (verified or not) the
-        screen renders the manage view (Test / Re-authenticate /
-        Disconnect / Install GitHub App) and waits for the user —
-        we don't re-prompt every time they land here."""
+        screen renders the manage view (Verify setup /
+        Re-authenticate / Disconnect / Install GitHub App) and waits
+        for the user — we don't re-prompt every time they land here."""
         App.get_running_app().go('github')
 
     def publish(self):
@@ -1026,29 +1082,68 @@ class SettingsScreen(Screen):
             return
         self.refresh()
 
+    # ── Debug helpers ───────────────────────────────────────────────────────
+
+    def _debug_503_path(self):
+        import os
+        from azt_collabd.paths import azt_home
+        return os.path.join(azt_home(), '_debug_force_503')
+
+    def _refresh_debug_503_state(self):
+        """Update the debug-section label to reflect whether the
+        sentinel exists. Called from on_pre_enter / refresh / after
+        toggle so the indicator stays in sync."""
+        import os
+        state_label = self.ids.get('debug_503_state')
+        if state_label is None:
+            return
+        if os.path.exists(self._debug_503_path()):
+            state_label.text = _tr(
+                '/v1/health is forced to 503 (sentinel present).')
+        else:
+            state_label.text = _tr('/v1/health responds normally.')
+
+    def toggle_debug_503(self):
+        """Create or remove ``$AZT_HOME/_debug_force_503``. Daemon's
+        ``_h_health`` checks this file per-request, so toggle takes
+        effect on the next bootstrap probe — no daemon restart
+        needed. Used to exercise the
+        ``_prompt_server_unresponsive`` recovery popup that fires
+        when bootstrap's daemon-warm-up retries exhaust."""
+        import os
+        path = self._debug_503_path()
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w') as f:
+                    f.write('')
+        except OSError as ex:
+            state_label = self.ids.get('debug_503_state')
+            if state_label is not None:
+                state_label.text = _tr(
+                    'Error: {error}').format(error=ex)
+            return
+        self._refresh_debug_503_state()
+
 
 # ── GitHub device flow ──────────────────────────────────────────────────────
 
 class GitHubConnectScreen(Screen):
-    """State-aware connect/manage screen for GitHub.
+    """Step-by-step GitHub connect/manage screen.
 
-    Three shapes, picked from ``credentials_status['github']`` in
-    ``on_pre_enter``:
-
-    - ``not connected`` (no access token on file) → device-flow box
-      visible, manage box hidden, ``begin()`` auto-fires so the user
-      doesn't have to tap twice. The previous implementation
-      auto-fired on the explicit "Connect to GitHub" tap from the
-      settings screen instead; that's gone — settings now only
-      *navigates* to this screen and lets us decide.
-    - ``connected, not confirmed`` → manage box visible (Test +
-      Install GitHub App if not installed + Re-authenticate +
-      Disconnect); device-flow box hidden; nothing auto-fires.
-      The user already has a token; they shouldn't be re-prompted
-      unconditionally — they'll either Test (which sets confirmed)
-      or Re-authenticate (which forces another device flow).
-    - ``connected, confirmed`` → same controls as above plus a
-      "(verified)" badge in the status line.
+    Pre-flight panel + a 3-step indicator (Authorize → Install App →
+    Verify) gates progress; a single state-aware "primary" button
+    presents only the next required action. ``on_pre_enter`` reads
+    ``credentials_status`` and routes the user to the next step they
+    haven't completed, so a partial setup (lost network, browser
+    bail-out, app close) resumes from where it stopped — server state
+    is the source of truth (``connected`` / ``app_installed`` /
+    ``confirmed``). Nothing auto-fires; the user always taps Begin /
+    Install GitHub App / Verify setup explicitly. The "no auto-fire"
+    rule is the audit-doc #3 directive paired with the pre-flight
+    explanation: the user reads the panel, then explicitly opts in.
 
     All show/hide goes through the Kivy hide/show pattern (height: 0,
     opacity: 0). Refer to ~/.claude-sil/CLAUDE.md for the cookbook —
@@ -1056,47 +1151,121 @@ class GitHubConnectScreen(Screen):
     when a BoxLayout starts at 0."""
 
     _user_code = ''
-    _heights = None  # captured target heights for the show/hide boxes
+    # True between ``begin()`` and the worker's terminal callback.
+    # While set, ``on_pre_enter`` skips re-rendering the message /
+    # primary button so re-entering the screen mid-flow doesn't stomp
+    # the visible code box and "Opening {uri}..." instructions.
+    _device_flow_active = False
 
     def on_pre_enter(self):
         status = self._safe_status()
         gh = (status or {}).get('github', {}) or {}
-        connected = bool(gh.get('connected'))
-        confirmed = bool(gh.get('confirmed'))
-        app_installed = bool(gh.get('app_installed'))
-        username = gh.get('username', '') or ''
+        step = self._current_step(gh)
 
-        self.ids.gh_user_code.text = ''
-        self.ids.gh_begin_btn.disabled = False
-        self._user_code = ''
+        if not self._device_flow_active:
+            self._user_code = ''
+            self.ids.gh_user_code.text = ''
+            self._hide_device_flow()
+        # While re-auth is polling, force step indicator back to 1 —
+        # the user explicitly chose to redo Authorize, even though the
+        # old token still has app_installed/confirmed flags set.
+        display_step = 1 if self._device_flow_active else step
+        self._render_steps(display_step)
+        self._render_primary(step, gh)
+        self._render_manage(gh)
+        self._render_message(step, gh)
 
-        if not connected:
-            self._show_device_flow()
-            self._hide_manage()
-            self.ids.gh_message.text = _tr('Starting device flow...')
-            # Explicit user gesture is implied by reaching this screen
-            # with no token — settings only navigates here on a tap.
-            self.begin()
+    @staticmethod
+    def _current_step(gh):
+        """1=authorize, 2=install app, 3=verify, 4=done."""
+        if not gh.get('connected'):
+            return 1
+        if not gh.get('app_installed'):
+            return 2
+        if not gh.get('confirmed'):
+            return 3
+        return 4
+
+    def _render_steps(self, current):
+        labels = (
+            (1, _tr('1. Authorize this device')),
+            (2, _tr('2. Install GitHub App')),
+            (3, _tr('3. Verify setup')),
+        )
+        widget_ids = ('gh_step1', 'gh_step2', 'gh_step3')
+        for n, text in labels:
+            widget = self.ids.get(widget_ids[n - 1])
+            if widget is None:
+                continue
+            widget.text = text
+            if current > n:
+                widget.color = theme.TEXT_DIM
+                widget.bold = False
+            elif current == n:
+                widget.color = theme.ACCENT
+                widget.bold = True
+            else:
+                widget.color = theme.TEXT
+                widget.bold = False
+
+    def _render_primary(self, step, gh):
+        btn = self.ids.gh_primary_btn
+        # Hide the primary button while polling — the device-flow code
+        # box carries the active affordance.
+        if self._device_flow_active:
+            btn.height = 0
+            btn.opacity = 0
+            btn.disabled = True
             return
+        if step == 1:
+            btn.text = _tr('Begin')
+        elif step == 2:
+            btn.text = _tr('Install GitHub App')
+        elif step == 3:
+            btn.text = _tr('Verify setup')
+        else:  # step == 4: all done
+            btn.height = 0
+            btn.opacity = 0
+            btn.disabled = True
+            return
+        btn.height = dp(52)
+        btn.opacity = 1
+        btn.disabled = False
 
-        # Connected: skip the device flow, lay out the manage view.
-        self._hide_device_flow()
-        self._show_manage(app_installed=app_installed)
-        if confirmed:
+    def _render_manage(self, gh):
+        # Re-auth + Disconnect only when a token is on file — there's
+        # nothing to re-authenticate against or disconnect from before
+        # step 1 completes. ``_device_flow_active`` covers the re-auth
+        # case where a token exists but we're mid-replacement; hide the
+        # manage box then so the user can't disconnect mid-flow.
+        if gh.get('connected') and not self._device_flow_active:
+            box = self.ids.gh_manage_box
+            box.height = dp(48) + dp(48) + dp(10)  # 2× NavBtn + 1 spacing
+            box.opacity = 1
+            box.disabled = False
+        else:
+            self._hide_manage()
+
+    def _render_message(self, step, gh):
+        if self._device_flow_active:
+            return  # don't stomp the in-flight message
+        username = gh.get('username', '') or '?'
+        if step == 1:
             self.ids.gh_message.text = _tr(
-                'Connected as {username} (verified).'
-            ).format(username=username or '?')
-        elif app_installed:
+                "Tap Begin when you are ready. We'll open GitHub in "
+                'your browser to authorize this device.')
+        elif step == 2:
             self.ids.gh_message.text = _tr(
-                'Connected as {username}. Tap Test connection to '
-                'verify.'
-            ).format(username=username or '?')
+                'Authorized as {username}. Now install the GitHub '
+                'App so the daemon can push your project.'
+            ).format(username=username)
+        elif step == 3:
+            self.ids.gh_message.text = _tr(
+                'GitHub App installed. Tap Verify setup to finish.')
         else:
             self.ids.gh_message.text = _tr(
-                'Connected as {username}. Install the GitHub App so '
-                'the daemon can push your project, then tap Test '
-                'connection.'
-            ).format(username=username or '?')
+                'Setup complete. Connected as {username}.'
+            ).format(username=username)
 
     def _safe_status(self):
         try:
@@ -1108,10 +1277,9 @@ class GitHubConnectScreen(Screen):
     # ── show / hide pattern ───────────────────────────────────────────
 
     def _show_device_flow(self):
-        # Section heights: SectionLabel(32) + dp(72) + Widget(8) +
-        # RecBtn(52) + 4×spacing(14) = 220.
+        # SectionLabel(32) + dp(72) + 1×spacing(14) = 118.
         box = self.ids.gh_device_flow_box
-        box.height = dp(220)
+        box.height = dp(118)
         box.opacity = 1
         box.disabled = False
 
@@ -1121,40 +1289,52 @@ class GitHubConnectScreen(Screen):
         box.opacity = 0
         box.disabled = True
 
-    def _show_manage(self, *, app_installed):
-        # Always show: Test (52) + 2×NavBtn(48) + 3×spacing(10) = 178.
-        # Add Install GitHub App (52 + spacing 10 = 62) when not
-        # installed.
-        install_btn = self.ids.gh_install_app_btn
-        if app_installed:
-            install_btn.height = 0
-            install_btn.opacity = 0
-            install_btn.disabled = True
-            extra = 0
-        else:
-            install_btn.height = dp(52)
-            install_btn.opacity = 1
-            install_btn.disabled = False
-            extra = dp(52) + dp(10)
-        box = self.ids.gh_manage_box
-        box.height = dp(178) + extra
-        box.opacity = 1
-        box.disabled = False
-
     def _hide_manage(self):
         box = self.ids.gh_manage_box
         box.height = 0
         box.opacity = 0
         box.disabled = True
 
+    # ── primary dispatcher ───────────────────────────────────────────
+
+    def primary_action(self):
+        """Single tap target whose action depends on the current
+        step. ``on_pre_enter`` keeps the label in sync with state, so
+        we re-fetch status here only for the dispatch decision."""
+        status = self._safe_status()
+        gh = (status or {}).get('github', {}) or {}
+        step = self._current_step(gh)
+        if step == 1:
+            self.begin()
+        elif step == 2:
+            self.install_app()
+        elif step == 3:
+            self.test()
+        # step 4: button is hidden; ignore stray taps.
+
+    def open_signup(self):
+        """Audit doc #5 — surface a path for users without a GitHub
+        account. The button is always visible (free-account creation
+        is a precondition for the whole flow); users who already have
+        an account ignore it."""
+        try:
+            webbrowser.open('https://github.com/signup')
+        except Exception:
+            pass
+
     # ── device-flow path ─────────────────────────────────────────────
 
     def begin(self):
-        # Make sure the device-flow widgets are visible — re-fired by
-        # ``reauthenticate()`` from the manage view, which had them
-        # hidden.
+        """User pressed the primary button at step 1, or chose
+        Re-authenticate from the manage box. Either way we kick the
+        device-flow worker; the manage box is hidden by ``on_pre_enter``
+        while ``_device_flow_active`` is True."""
+        self._device_flow_active = True
         self._show_device_flow()
-        self.ids.gh_begin_btn.disabled = True
+        self._hide_manage()
+        # Hide primary button + reset step indicator to 1 active.
+        self._render_primary(1, {})
+        self._render_steps(1)
         self.ids.gh_message.text = _tr('Starting device flow...')
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -1179,8 +1359,15 @@ class GitHubConnectScreen(Screen):
             resp = device_flow_start()
             user_code = resp['user_code']
             device_code = resp['device_code']
-            verify_uri = resp.get('verification_uri',
-                                  'https://github.com/login/device')
+            # Prefer ``verification_uri_complete`` (URL with the
+            # user_code prefilled) so the user lands on GitHub's
+            # "Authorize?" page directly. Fall back to the bare URL
+            # if GitHub's response shape ever changes.
+            verify_uri = (
+                resp.get('verification_uri_complete')
+                or resp.get('verification_uri')
+                or 'https://github.com/login/device'
+            )
             interval = resp.get('interval', 5)
             expires_in = resp.get('expires_in', 900)
 
@@ -1200,7 +1387,8 @@ class GitHubConnectScreen(Screen):
                 except Exception:
                     pass
                 msg = _tr(
-                    'Opening {uri}\nEnter the code on the GitHub page.'
+                    'Opening {uri}\nIf the page asks for the code, '
+                    'paste it from the box above.'
                 ).format(uri=_uri)
                 if copied_ok:
                     msg += '\n' + _tr('(code copied)')
@@ -1217,57 +1405,47 @@ class GitHubConnectScreen(Screen):
             save_github_tokens(token_data, username)
 
             # Best-effort: read app-install state
-            app_installed = False
             try:
                 info = check_app_installed(access_token)
-                app_installed = bool(info.get('installed'))
-                if app_installed:
+                if info.get('installed'):
                     mark_github_app_installed(True)
             except Exception:
                 pass
 
-            def _done(dt, _u=username, _ai=app_installed):
-                # The fresh token just had ``confirmed`` reset to
-                # False by ``set_github_tokens``; flip the screen to
-                # the manage view so the user can Test (or install
-                # the app first if needed) without re-firing the
-                # device flow.
-                self._hide_device_flow()
-                self._show_manage(app_installed=_ai)
-                if _ai:
-                    self.ids.gh_message.text = _tr(
-                        'Connected as {username}. Tap Test '
-                        'connection to verify.').format(username=_u)
-                else:
-                    self.ids.gh_message.text = _tr(
-                        'Connected as {username}. Install the GitHub '
-                        'App so the daemon can push your project, '
-                        'then tap Test connection.').format(username=_u)
-                self.ids.gh_begin_btn.disabled = False
+            def _done(dt):
+                # Token saved; set_github_tokens just reset
+                # ``confirmed`` to False (and possibly ``app_installed``
+                # to True if the probe above flipped it). Re-render the
+                # screen so the step indicator advances and the primary
+                # button label changes to whatever's next.
+                self._device_flow_active = False
+                self.on_pre_enter()
             Clock.schedule_once(_done, 0)
 
         except AuthError as ex:
             msg = translate_status(ex.status)
             def _err(dt, _m=msg):
+                self._device_flow_active = False
+                self.on_pre_enter()  # reset Begin button + steps
                 self.ids.gh_message.text = _tr(
                     'Failed: {error}').format(error=_m)
-                self.ids.gh_begin_btn.disabled = False
             Clock.schedule_once(_err, 0)
         except Exception as ex:
             def _err(dt, _e=str(ex)):
+                self._device_flow_active = False
+                self.on_pre_enter()
                 self.ids.gh_message.text = _tr(
                     'Failed: {error}').format(error=_e)
-                self.ids.gh_begin_btn.disabled = False
             Clock.schedule_once(_err, 0)
 
     # ── manage path ──────────────────────────────────────────────────
 
     def test(self):
-        """Run the live test against ``api.github.com/user``. The
-        daemon also refreshes ``app_installed`` while it has a valid
-        token in hand; we re-render the manage view so the
-        Install GitHub App row drops away if the probe found it."""
-        self.ids.gh_test_btn.disabled = True
+        """Verify setup — the live test against
+        ``api.github.com/user``. Daemon also refreshes
+        ``app_installed`` while it has a valid token in hand, which
+        lets a slightly-stale step-2-skipping flow self-correct."""
+        self.ids.gh_primary_btn.disabled = True
         self.ids.gh_message.text = _tr('Testing...')
         threading.Thread(target=self._test_worker, daemon=True).start()
 
@@ -1276,29 +1454,16 @@ class GitHubConnectScreen(Screen):
         Clock.schedule_once(lambda dt: self._test_done(info), 0)
 
     def _test_done(self, info):
-        self.ids.gh_test_btn.disabled = False
-        try:
-            status = self._safe_status()
-            gh = (status or {}).get('github', {}) or {}
-            self._show_manage(app_installed=bool(gh.get('app_installed')))
-        except Exception:
-            pass
+        # Re-render the screen against fresh status so a successful
+        # test (which flips confirmed=True) advances to step 4.
+        self.on_pre_enter()
         if not info.get('ok'):
             self.ids.gh_message.text = _tr(
                 'Server unavailable: {error}').format(
                     error=info.get('error', '?'))
             return
         if info.get('valid'):
-            user = info.get('server_username', '') or '?'
-            if info.get('app_installed'):
-                self.ids.gh_message.text = _tr(
-                    'Connected as {username} (verified). Credentials '
-                    'and app install confirmed.').format(username=user)
-            else:
-                self.ids.gh_message.text = _tr(
-                    'Connected as {username} (verified). Install the '
-                    'GitHub App to enable push.').format(username=user)
-            return
+            return  # _render_message already wrote the step-4 line
         err = info.get('error', '') or 'unknown'
         if err == 'invalid_token':
             self.ids.gh_message.text = _tr(
@@ -1313,9 +1478,10 @@ class GitHubConnectScreen(Screen):
 
     def install_app(self):
         """Open the GitHub App install page in the user's browser.
-        After they grant access on GitHub they return here and tap
-        Test connection — the daemon's test path refreshes the
-        ``app_installed`` flag automatically on success."""
+        After they grant access on GitHub they return here; the
+        primary button will read "Verify setup" once
+        ``app_installed`` is true (the daemon's test path also picks
+        it up automatically)."""
         try:
             url = github_app_install_url()
         except Exception as ex:
@@ -1326,16 +1492,15 @@ class GitHubConnectScreen(Screen):
             webbrowser.open(url)
             self.ids.gh_message.text = _tr(
                 'Opening {uri}\nWhen you finish on GitHub, return '
-                'here and tap Test connection.').format(uri=url)
+                'here and tap Verify setup.').format(uri=url)
         except Exception as ex:
             self.ids.gh_message.text = _tr(
                 'Could not open install page: {error}').format(error=ex)
 
     def reauthenticate(self):
         """User explicitly asked to re-run the device flow (token
-        expired / revoked / wrong account). Drop back into the
-        device-flow view and start it."""
-        self._hide_manage()
+        expired / revoked / wrong account). ``begin()`` hides the
+        manage box for the duration of the new device flow."""
         self.begin()
 
     def disconnect(self):
@@ -1350,8 +1515,8 @@ class GitHubConnectScreen(Screen):
             self.ids.gh_message.text = _tr(
                 'Error: {error}').format(error=ex)
             return
-        # After disconnect the screen state flips back to the
-        # not-connected shape — re-run on_pre_enter to render it.
+        # After disconnect the screen state flips back to step 1 —
+        # re-run on_pre_enter to render it.
         self.on_pre_enter()
 
 

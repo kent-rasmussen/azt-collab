@@ -248,16 +248,23 @@ def bootstrap(*, peer_repo, peer_version, peer_asset_filename,
 
 class _Ctx:
     """Bag of immutable params + callbacks. Passed through every step
-    so the workflow is plain functions instead of nested closures."""
+    so the workflow is plain functions instead of nested closures.
+
+    ``connecting_popup`` is the only mutable slot — set when the
+    daemon-warm-up retry phase opens its "Connecting…" popup, cleared
+    when that popup is dismissed (success or transition to the
+    unresponsive popup). Lives on the ctx so the retry function
+    can find it without a module-level dict."""
 
     __slots__ = ('peer_repo', 'peer_version', 'peer_asset_filename',
                  'peer_display_name', 'server_repo',
                  'server_asset_filename', 'server_display_name',
-                 'on_status', 'on_done', 'on_error', 'font_name')
+                 'on_status', 'on_done', 'on_error', 'font_name',
+                 'connecting_popup')
 
     def __init__(self, **kw):
         for k in self.__slots__:
-            setattr(self, k, kw[k])
+            setattr(self, k, kw.get(k))
 
 
 def _strip_apk(name):
@@ -394,12 +401,79 @@ def _ui_status(ctx, msg):
     _on_ui(_safe, ctx.on_status, msg)
 
 
+# ── connecting popup (daemon-warm-up retry feedback) ─────────────────────
+
+def _show_connecting_popup(ctx):
+    """Modal "Connecting to AZT Collaboration service…" popup shown
+    during the daemon-warm-up retry phase. Idempotent — if a popup
+    is already up, no-op. Without this, the user sits looking at
+    a peer UI with no daemon backing for the 10s retry window
+    (RPCs return ServerUnavailable; screens render empty); the
+    popup makes that wait visible and bounded."""
+    if ctx.connecting_popup is not None:
+        return
+    from kivy.uix.popup import Popup
+    from kivy.uix.label import Label
+    from kivy.uix.boxlayout import BoxLayout
+    from . import theme
+    content = BoxLayout(orientation='vertical', padding=dp(16),
+                        spacing=dp(8))
+    label = Label(
+        text=_tr('Connecting to AZT Collaboration service…'),
+        font_size=sp(14), color=theme.TEXT,
+        font_name=ctx.font_name,
+        halign='center', valign='middle',
+    )
+    label.bind(size=lambda w, _v: setattr(w, 'text_size', w.size))
+    content.add_widget(label)
+    popup = Popup(
+        title=_tr('Connecting…'),
+        content=content,
+        size_hint=(0.85, None), height=dp(160),
+        auto_dismiss=False,
+    )
+    popup.open()
+    ctx.connecting_popup = popup
+
+
+def _dismiss_connecting_popup(ctx):
+    """Tear down the connecting popup if up. Called from every
+    terminal branch of the retry loop (success → continue; exhaust
+    → unresponsive popup; error → fall-through)."""
+    if ctx.connecting_popup is None:
+        return
+    try:
+        ctx.connecting_popup.dismiss()
+    except Exception:
+        pass
+    ctx.connecting_popup = None
+
+
 # ── step 1: server compat ──────────────────────────────────────────────────
 
-def _check_server(ctx):
+# How many times to retry the compat probe when the server APK is
+# installed but its daemon hasn't responded yet. The 503
+# ``daemon_not_ready`` response comes from
+# ``AZTCollabProvider.java`` when the Python dispatch callback
+# isn't registered yet — i.e., the Python interpreter is still
+# loading. Warm-cache cold starts settle in 1–3 seconds; cold
+# starts after a freshly-installed APK or ``pm clear`` (where dex
+# caches need rebuilding) have been observed to run > 30s on
+# real devices (the 0.28.24 bump from 10s to 30s wasn't enough;
+# user reported "next boot fails, the following one succeeds").
+# Budget 30 × 2s = 60s to cover the worst observed cold start.
+# Warm launches exit the loop on the first attempt and never
+# feel the longer budget. Users on truly slow hardware can also
+# tap "Try again" on the unresponsive popup to extend further.
+_DAEMON_WARMUP_RETRIES = 30
+_DAEMON_WARMUP_INTERVAL_S = 2.0
+
+
+def _check_server(ctx, _warmup_attempt=0):
     try:
         compat = check_server_compat()
     except Exception as ex:
+        _on_ui(_dismiss_connecting_popup, ctx)
         _ui_status(ctx, _tr(
             'Could not check service: {error}').format(error=ex))
         # Best-effort: still try the self-update probe so the peer
@@ -409,33 +483,59 @@ def _check_server(ctx):
         return
 
     if compat.get('ok'):
+        _on_ui(_dismiss_connecting_popup, ctx)
         _check_self(ctx)
         return
 
     err = compat.get('error', '') or ''
     if err == 'server_unreachable':
-        # Disambiguate: package absent vs. network down. If the
+        # Disambiguate: package absent vs. daemon-warming-up. If the
         # server APK is installed but the daemon happens to be down
-        # (no network reaching GitHub for the install probe; OOM-
-        # killed mid-call; whatever), prompting to *install* it is
-        # wrong — it's already installed. Probe PackageManager
-        # before deciding.
+        # (lazy-spawn in progress; OOM-killed mid-call; whatever),
+        # prompting to *install* it is wrong — it's already installed.
+        # Probe PackageManager before deciding.
         if _server_package_installed():
-            # Package is there but unreachable. Skip the prompt;
-            # the host's existing ServerUnavailable handling will
-            # surface this when it next tries an RPC.
-            _ui_status(ctx, _tr(
-                'AZT Collaboration installed but unreachable. '
-                'Continuing offline.'))
-            _check_self(ctx)
+            # Package is there but daemon isn't responding. Most
+            # common reason at startup: Android is still spinning up
+            # the server APK's Python interpreter. Retry the compat
+            # probe with backoff; the daemon usually settles within
+            # a few seconds.
+            if _warmup_attempt < _DAEMON_WARMUP_RETRIES:
+                # Show the connecting popup on first retry so the
+                # user knows we're waiting (instead of staring at
+                # an empty-state peer UI for ~10s).
+                _on_ui(_show_connecting_popup, ctx)
+                _ui_status(ctx, _tr(
+                    'Connecting to AZT Collaboration service…'))
+
+                def _retry(_dt):
+                    threading.Thread(
+                        target=_check_server,
+                        args=(ctx,),
+                        kwargs={'_warmup_attempt':
+                                _warmup_attempt + 1},
+                        daemon=True).start()
+                Clock.schedule_once(_retry, _DAEMON_WARMUP_INTERVAL_S)
+                return
+            # All retries exhausted: daemon is genuinely unreachable
+            # despite being installed. Dismiss the connecting popup
+            # and show the canonical install popup with an
+            # "unresponsive" body so the user gets explicit
+            # Reinstall / Open page / Quit options instead of being
+            # silently bounced out of the app.
+            _on_ui(_dismiss_connecting_popup, ctx)
+            _on_ui(_prompt_server_unresponsive, ctx)
             return
+        _on_ui(_dismiss_connecting_popup, ctx)
         _on_ui(_prompt_server_install, ctx)
         return
     if err == 'server_too_old':
+        _on_ui(_dismiss_connecting_popup, ctx)
         _on_ui(_prompt_server_update, ctx,
                compat.get('server_version', '') or '')
         return
     if err == 'client_too_old':
+        _on_ui(_dismiss_connecting_popup, ctx)
         # The peer is the one out of date — jump straight to
         # self-update and skip the server prompt.
         _check_self(ctx, force_prompt=True)
@@ -548,6 +648,47 @@ def _post_install_continuation(ctx):
         threading.Thread(target=_check_server, args=(ctx,),
                          daemon=True).start()
     Clock.schedule_once(_resume, 2.0)
+
+
+def _prompt_server_unresponsive(ctx):
+    """Server APK is installed but didn't respond after the
+    daemon-warm-up retries. Same canonical popup as the missing-
+    server case (so the user gets one consistent install/recover
+    UI), with a body explaining the situation. Reinstall is the
+    primary recovery action — replaces the running install with
+    a fresh download, which fixes corrupt / signature-mismatched
+    / wedged daemons.
+
+    Same dismiss semantics as the missing-server case: tapping
+    Quit closes the peer (it can't function without the daemon,
+    and the daemon isn't responding). Open install page opens
+    the release page in the browser.
+
+    Does not fire on_done — the popup is terminal. If the user
+    reinstalls and the new daemon responds, the post-install
+    continuation chain re-runs ``_check_server`` and the host's
+    on_done fires from the healthy path."""
+    from .popups import install_server_apk_popup
+    body = _tr(
+        'The AZT Collaboration service ({name}) is installed but '
+        'did not respond. It may still be starting up; wait a '
+        'moment, then tap Install to reinstall it, or Quit to '
+        'close this app and try again later.'
+    ).format(name=ctx.server_display_name)
+    _release_running()
+    install_server_apk_popup(
+        on_status=ctx.on_status,
+        font_name=ctx.font_name,
+        body_message=body,
+        current_server_version='0.0.0',
+        title=_tr('AZT Collaboration not responding'),
+        on_install_complete=lambda: _post_install_continuation(ctx),
+        # User can keep waiting if 60s wasn't enough on their
+        # device. "Try again" reruns the compat probe (same code
+        # path as the post-install continuation, including the 2s
+        # daemon-warm-up pause).
+        on_retry=lambda: _post_install_continuation(ctx),
+    )
 
 
 def _prompt_server_install(ctx):

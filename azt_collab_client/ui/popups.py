@@ -295,7 +295,8 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                              asset_filename=None,
                              open_page_url=None,
                              dismiss_label=None,
-                             dismiss_action='quit'):
+                             dismiss_action='quit',
+                             on_retry=None):
     """Single canonical popup for "the suite needs the server APK
     (or a newer one) before this app can do anything useful". Used
     for both the server-missing case and the server-too-old case
@@ -573,15 +574,32 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         font_size=sp(14), font_name=font_name,
         halign='center', valign='middle',
     )
+    # Optional Retry button — only shown when caller passes
+    # ``on_retry``. Used by the unresponsive-server flow so the
+    # user can wait longer than the 60s budget without having to
+    # tap Install (which would download fresh) or Quit. Tap →
+    # popup dismisses → caller's ``on_retry`` re-runs whatever
+    # check fired the popup originally.
+    retry_btn = None
+    if on_retry is not None:
+        retry_btn = Button(
+            text=_tr('Try again'),
+            font_size=sp(13), font_name=font_name,
+            halign='center', valign='middle',
+        )
 
     # Bind text_size to size so labels wrap inside their button
-    # bounds rather than spilling / clipping. Apply to all three.
+    # bounds rather than spilling / clipping.
     def _bind_wrap(b):
         b.bind(size=lambda w, _v: setattr(w, 'text_size', w.size))
     for b in (install_btn, open_page_btn, quit_btn):
         _bind_wrap(b)
+    if retry_btn is not None:
+        _bind_wrap(retry_btn)
 
     btn_row.add_widget(quit_btn)
+    if retry_btn is not None:
+        btn_row.add_widget(retry_btn)
     btn_row.add_widget(open_page_btn)
     btn_row.add_widget(install_btn)
     content.add_widget(btn_row)
@@ -723,5 +741,13 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     install_btn.bind(on_release=_do_install)
     open_page_btn.bind(on_release=_open_page)
     quit_btn.bind(on_release=_quit)
+    if retry_btn is not None:
+        def _retry(*_):
+            popup.dismiss()
+            try:
+                on_retry()
+            except Exception as ex:
+                print(f'[install_popup] on_retry raised: {ex}')
+        retry_btn.bind(on_release=_retry)
     popup.open()
     return popup
