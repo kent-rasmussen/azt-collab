@@ -2,6 +2,7 @@ package org.atoznback.aztcollab;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
@@ -54,6 +55,32 @@ public class AZTCollabProvider extends ContentProvider {
 
     @Override
     public boolean onCreate() {
+        // ContentProvider lazy-spawn brings up the :provider host
+        // process and instantiates this Provider, but does NOT start
+        // any Service in the process. Without booting Python (which
+        // happens via AZTServiceProviderhost / PythonService), the
+        // Python dispatch + openFile callbacks never register, so
+        // every call() falls through to the "daemon_not_ready" 503
+        // branch below. The user-visible symptom is "after
+        // installing the server APK, peers can't connect unless the
+        // user opens the server APK first."
+        //
+        // Calling AZTServiceProviderhost.start() here triggers
+        // PythonService.onStartCommand → spawn Python service
+        // thread → run service.py:main() → install_callbacks() →
+        // registerCallbacks() so the static slots fill in. The
+        // boot is async: the very first call() may still race the
+        // boot and return 503; the peer's transport surfaces that
+        // as ServerUnavailable, rpc.call retries once, and the
+        // second attempt sees the populated callbacks.
+        Context ctx = getContext();
+        if (ctx != null) {
+            try {
+                AZTServiceProviderhost.start(ctx, "");
+            } catch (Throwable t) {
+                Log.e(TAG, "AZTServiceProviderhost.start failed", t);
+            }
+        }
         return true;
     }
 

@@ -11,6 +11,1114 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.31.0 + azt_collab_client 0.31.0 — minor bump for pre-distribution test
+- Lock-step minor bump on both packages, with both floors moved
+  to 0.31.0 (``MIN_CLIENT_VERSION`` on the daemon,
+  ``MIN_SERVER_VERSION`` on the client). Folds in everything
+  since 0.30.0: server-APK boot-on-lazy-spawn, sticky-bound
+  ``:provider`` host, self-update auto-exit, GitHub-connect UX
+  rewrite (state-machine + suspended-install detection +
+  Verify-setup re-test affordance), pre-install APK validation
+  (parse + signature + asset.digest cache freshness), bootstrap
+  flow with mandatory vs voluntary distinction, server→peer
+  language mirror, blocked-popup mailto link + Check-again,
+  same-tag re-upload detection via ``last_seen_digest``, install
+  poll lifecycle, suite-wide CONFIRMED-vs-CONNECTED gating, and
+  the various translation additions and Kivy touch-routing fixes.
+  Anything older talking to a 0.31 peer (or vice versa) gets a
+  clean ``client_too_old`` / ``server_too_old`` and is routed
+  through the bootstrap update flow.
+
+### azt_collab_client 0.30.47 — mandatory-mode probe always forces prompt
+- **Regression from 0.30.46.** Recording ``gh_digest`` on
+  Update-tap fixed the voluntary loop, but introduced a hole on
+  the mandatory path: if the install failed (user cancelled at
+  the Android installer screen, signature mismatch, etc.), the
+  next ``_probe`` saw ``last_seen == gh_digest`` →
+  ``digest_changed=False`` → ``needs_update=False`` →
+  ``_show_no_newer_release`` fired even though GitHub actually
+  has the right bytes (we just failed to install them).
+- **Fix.** Replaced ``legacy_mandatory_force`` (only handled
+  the first-run unknown-baseline case) with ``mandatory_force``
+  (always forces the prompt in mandatory mode when the release
+  feed returned something to download). Digest comparison is for
+  "is there something new to offer?" — irrelevant when the daemon
+  has already declared the client too old.
+- **Clarification.** The 0.30.46 changelog framing "stuck at
+  old version with no prompt" was sloppy. Voluntary install fail
+  is benign — the client was already compatible (otherwise the
+  daemon would have returned ``client_too_old`` and the mandatory
+  path would have been used). The user runs a working older
+  build and can retry via the peer's in-app Update button.
+  Mandatory path is enforced terminal — no chance of leaking the
+  user into project loading without a working daemon.
+
+### azt_collab_client 0.30.46 — record gh_digest as last_seen on Update tap
+- **Bug.** User report: "I click update on a voluntary screen,
+  and it doesn't download… because it seems to be running from
+  cache, this window keeps coming up since the digest is still
+  different from gh." Trace:
+  ``last_seen='3687f3…' gh_digest='efb3ae…'
+  version_newer=False digest_changed=True``.
+  Cache check correctly skipped the download (bytes already at
+  ``efb3ae…``), install fired, but ``_record_last_seen_digest``
+  was never called outside the first-run baseline branch — so
+  ``last_seen`` stayed at ``3687f3…`` forever. Next bootstrap
+  saw ``digest_changed=True`` and re-prompted.
+- **Fix.** ``_prompt_self_update`` now receives ``gh_digest``
+  from ``_probe`` and records it as the new ``last_seen`` baseline
+  on Update-button tap. Recording at tap time (vs. install-complete)
+  is the practical compromise: same-tag re-uploads don't flip
+  versionName, and self-installs kill our process during install,
+  so we have no reliable in-process completion signal. If the
+  install ultimately fails the user is stuck at the old version
+  with no further prompt — recoverable via the in-settings
+  Update button or a manual reinstall.
+
+### azt_collabd 0.30.45 + azt_collab_client 0.30.45 — re-bump for mandatory-update test pass
+- **Daemon ``MIN_CLIENT_VERSION`` bumped to 0.30.45** to force the
+  ``client_too_old`` path on any peer bundling an older client
+  (continuing test pass for the digest-change decline fix).
+
+### azt_collabd 0.30.44 + azt_collab_client 0.30.44 — decline-memory ignores same-tag re-uploads
+- **Daemon ``MIN_CLIENT_VERSION`` bumped to 0.30.44** to force the
+  ``client_too_old`` path on any peer bundling an older client
+  (test pass for the digest-change decline fix).
+- **Bug.** User report: "Check again doesn't currently show a new
+  apk online, despite a different sha256." Trace confirmed the
+  probe was correctly setting ``digest_changed=True``
+  (``last_seen='3687f35493c3'`` ≠ ``gh_digest='cceb3fc2ba05'``),
+  yet no prompt appeared. Cause: the decline-memory check in
+  ``_peer_update_with_confirm._probe`` only compared the version
+  tag — a previous "Not now" tap against ``1.37.24`` masked
+  every subsequent re-upload at the same tag, regardless of
+  digest. The original comment ("a re-upload of a declined
+  version still plausibly came with the user's prior decline
+  intact") turned out to be wrong: a re-upload IS a different
+  build the user has not been asked about.
+- **Fix.** Decline check now skips when ``digest_changed`` is
+  True, treating the new bytes as a fresh release. Also
+  belt-and-braces gates the check on ``not mandatory`` so the
+  ``client_too_old`` path can't be silenced by a stray decline
+  entry from an earlier voluntary cycle.
+
+### azt_collabd 0.30.43 + azt_collab_client 0.30.43 — mirror daemon UI language to peer + clearer mandatory-update wording
+- **Language sync server → peer.** User report: switching the
+  server APK's settings UI to French didn't translate any
+  bootstrap-side popups in the peer (recorder / viewer).
+  Cause: ``$AZT_HOME/config.json::ui.language`` is the
+  persistence path, but on Android ``$AZT_HOME`` is per-process
+  private (server APK has its own filesDir, each peer has its
+  own), so file-system writes from the server's settings UI
+  never reached peer disk. Fix:
+  - New daemon endpoint ``GET /v1/config/ui_language`` returns
+    the server-side persisted language (handler
+    ``_h_get_ui_language`` in ``azt_collabd/server.py``).
+  - New client wrapper ``get_server_ui_language()`` in
+    ``azt_collab_client/__init__.py``.
+  - ``bootstrap._sync_ui_language_with_daemon()`` runs at
+    ``_check_server`` entry (immediately after a successful
+    ``check_server_compat``) and applies the daemon's language
+    via ``i18n.set_language`` so all peer-side popups + status
+    text track. Best-effort: silent on RPC failure, peer
+    keeps its local pref.
+- **Mandatory-update wording.** User report: viewer at 0.8.2
+  saw "AZT Viewer 0.8.2 is required" — confusing when 0.8.2
+  is the current version (same-tag re-upload case where
+  digest changed). Now branches in
+  ``_prompt_self_update``:
+  - ``latest_version != peer_version`` (genuinely newer
+    release): "{name} {peer_v} is too old for the AZT
+    Collaboration service. Tap Update to install {name}
+    {latest}, or Quit to close this app." Both versions named.
+  - ``latest_version == peer_version`` (same-tag re-upload —
+    digest_changed=True triggered the prompt): "A new build
+    of {name} {version} is available. The current build is
+    too old for the AZT Collaboration service. Tap Update to
+    install the new build, or Quit to close this app." No
+    longer phrases the same version as both "what you have"
+    and "what's required".
+- Email-link-in-the-update-popup ask is deferred —
+  ``install_server_apk_popup``'s body Label doesn't have
+  ``markup=True`` yet, and the change isn't a one-liner.
+  Tracked separately.
+
+### azt_collabd 0.30.42 + azt_collab_client 0.30.42 — bump MIN_CLIENT_VERSION to 0.30.42
+- Final test-pass bump on the daemon (``MIN_CLIENT_VERSION =
+  "0.30.42"``) to exercise the mandatory-self-update flow now
+  that ``_prompt_self_update`` calls ``App.stop()`` on
+  install completion. Server APK rebuild required; peer at
+  0.30.41 trips ``client_too_old`` and gets the mandatory
+  Update / Quit popup.
+- Drop ``MIN_CLIENT_VERSION`` back to a real-world floor
+  before any release that ships in the public update
+  channel. Same goes for ``MIN_SERVER_VERSION`` on the client
+  side.
+
+### azt_collabd 0.30.41 + azt_collab_client 0.30.41 — close peer cleanly after a self-install
+- User report: "When I clicked update, it downloaded and
+  installed fine, but then I found myself back at the same
+  popup. I closed and restarted fine, but users shouldn't have
+  to do that." Android usually kills the running peer during a
+  self-install, but not always — on some devices the peer
+  survives, comes back to foreground after the system
+  installer dismisses, and the popup is right where it was.
+  No way to recover without a manual restart.
+- Fix: ``_prompt_self_update`` now passes the peer's own
+  package name as ``install_target_package`` (read from
+  ``PythonActivity.mActivity.getPackageName()``) so
+  ``install_apk_from_url`` runs the post-install poll loop
+  on it, and ``on_install_complete`` calls
+  ``App.get_running_app().stop()`` so the running peer exits
+  the moment ``PackageManager`` reports the new versionName.
+  Next user launch lands on the new APK; no manual restart.
+- Safe both ways: if Android kills us during install (the
+  common case), the poll thread dies with us — no leak. If
+  Android doesn't kill us, the poll fires, we self-stop. The
+  pre-0.30.41 comment about "polling our own package would
+  block forever" was wrong: while the system installer is in
+  foreground the Kivy Clock pauses, but it resumes when we
+  come back, the poll detects the change, and we exit.
+
+### azt_collabd 0.30.40 + azt_collab_client 0.30.40 — distinguish mandatory peer self-update from voluntary
+- ``_prompt_self_update`` was using the same body + dismiss
+  action for both the voluntary "newer version available" path
+  and the mandatory ``client_too_old`` path. Declining a
+  mandatory update via "Not now" silently fell through to
+  ``on_done`` and dropped the user into the peer with a daemon
+  that wouldn't talk to them.
+- New ``mandatory`` parameter on ``_prompt_self_update``
+  (forwarded from ``_check_self`` via
+  ``_peer_update_with_confirm``):
+  - **Voluntary** (``mandatory=False``, default): existing body
+    "A newer version of this app ({version}) is available." —
+    Update button + Not now (dismiss). Decline memory still
+    applies so we don't re-prompt for the same version.
+  - **Mandatory** (``mandatory=True``, the ``client_too_old`` +
+    newer-version-exists path): body "{name} {version} is
+    required to use the AZT Collaboration service. Tap Update
+    to download and install it, or Quit to close this app." —
+    Update button + Quit (action=``'quit'``, peer
+    ``App.stop()``). No decline memory: a mandatory update
+    can't usefully be remembered as "declined".
+- Net effect: declining a mandatory update closes the app,
+  matching the ``_show_release_too_old`` /
+  ``_show_no_newer_release`` Quit semantics. Symmetric with
+  ``_prompt_server_update``'s "Update" button + the existing
+  install popup's Quit button on the server-side path.
+
+### azt_collabd 0.30.39 + azt_collab_client 0.30.39 — bump MIN_CLIENT_VERSION to 0.30.39
+- ``MIN_CLIENT_VERSION`` raised again on the daemon (now 0.30.39)
+  so a peer at 0.30.38 paired with this server APK trips
+  ``client_too_old``. Continues exercising the new
+  digest-aware probe + version-anchor popup from 0.30.37/.38.
+- Server APK rebuild required to pick up the new floor; peer
+  stays at 0.30.38 to actually trigger client_too_old.
+- Drop back to a real-world floor before any release that ships
+  in the public update channel.
+
+### azt_collabd 0.30.38 + azt_collab_client 0.30.38 — detect same-tag re-uploads via asset digest persistence
+- Per maintainer ask: the version-tuple "any newer release"
+  probe in ``_peer_update_with_confirm._probe`` couldn't see a
+  re-uploaded asset on the same release tag. Common in dev
+  iteration (push fix, keep tag), and unavoidable when a tag
+  is hot-fixed in place. The new branch catches it via a
+  digest-change check.
+- ``_last_seen_digest(repo)`` and
+  ``_record_last_seen_digest(repo, digest)`` persist the
+  GitHub ``asset.digest`` per peer repo via the existing
+  ``peer_pref`` / ``set_peer_pref`` store
+  (``peer_prefs.last_seen_digests`` dict, keyed by
+  ``owner/repo``).
+- ``_probe`` now reads ``asset.digest`` from the latest
+  release JSON, compares against the persisted last-seen, and
+  treats EITHER a newer version tag OR a changed digest as
+  "newer available". A trace line ``[bootstrap] _probe …
+  version_newer=… digest_changed=…`` prints both signals so
+  flaky cases are diagnosable from logcat.
+- First-run baseline: if no digest is on file for ``repo``,
+  the current GitHub digest gets recorded as the starting
+  point so subsequent probes can detect change. Misses the
+  perverse "re-uploaded between install and first launch"
+  edge case but covers the dev-iteration use case cleanly.
+- Storage scope: ``peer_prefs`` writes to whatever
+  ``$AZT_HOME/config.json`` resolves to in the calling peer's
+  process (peer-private on Android, shared on desktop), which
+  is correct — each peer tracks its own repo independently.
+
+### azt_collabd 0.30.37 + azt_collab_client 0.30.37 — fix client_too_old popup: version anchors + drop nonsensical pre-flight + Check-again tracing
+- User report: "Recorder is too old" popup gave no version
+  information either on screen or in the email body, and Check
+  again seemed to do nothing.
+- **Drop the pre-flight comparison in ``_check_self`` for the
+  client_too_old path.** ``required_min`` from the daemon refers
+  to the **client library** version (``azt_collab_client.
+  __version__``), not the peer-app version. The recorder peer
+  bumps its own version (1.34.0, …) independently of the client
+  lib, so comparing recorder release tags to client-lib version
+  numbers is meaningless — recorder 1.34.0 vs lib 0.30.36 has no
+  defined order. The pre-flight either trivially passed or
+  trivially failed depending on which way the major-version
+  numbers happened to land. Replaced with the simpler "is there
+  ANY newer peer release available" check that
+  ``_peer_update_with_confirm`` already performs. We can't
+  inspect a remote APK's bundled client-lib version without
+  downloading it, so any-newer-version is the only honest signal.
+- **Version anchors in the popup body and email.**
+  ``_show_no_newer_release`` now takes ``required_client_lib``
+  and ``bundled_client_lib`` and surfaces all four version
+  values: peer name + peer version, bundled client lib (this
+  build), and required client lib (from the daemon's compat
+  handshake). Body reads e.g. "Recorder 1.34.0 is too old for
+  the AZT Collaboration service. This build bundles client
+  library 0.30.35; the service requires 0.30.36 or newer. No
+  newer Recorder release is published yet." Email body lists
+  the same anchors as labelled lines so the maintainer has the
+  full mismatch in one read.
+- **Check again tracing.** ``[bootstrap] Check again pressed —
+  invalidating release cache + re-entering _check_server`` now
+  prints when the button fires; ``_check_server`` is wrapped in
+  try/except so any exception during the retry surfaces in
+  logcat instead of silently dying in the worker thread. Lets
+  us tell apart "Check again ran but result is the same"
+  (visible re-render) from "Check again failed silently" (no
+  trace lines after).
+
+### azt_collabd 0.30.36 + azt_collab_client 0.30.36 — bump MIN_CLIENT_VERSION to 0.30.36
+- ``MIN_CLIENT_VERSION`` raised to 0.30.36 (peer wandered to
+  0.30.35, so we need to stay one ahead). Server APK rebuild
+  required to pick up the new floor; peer at 0.30.35 trips
+  ``client_too_old`` against this daemon.
+- Drop back to a real-world floor before any release that ships
+  in the public update channel.
+
+### azt_collabd 0.30.35 + azt_collab_client 0.30.35 — bump MIN_CLIENT_VERSION to 0.30.35
+- ``MIN_CLIENT_VERSION`` raised again on the daemon (now 0.30.35)
+  so a peer at 0.30.34 paired with this server APK trips
+  ``client_too_old``. Lets us exercise the new
+  ``_show_no_newer_release`` popup (parity with
+  ``_show_release_too_old``: Check again + mailto + Quit, no
+  fall-through to ``on_done``).
+- Server APK rebuild required to pick up the new floor; peer
+  stays at 0.30.34 so the test triggers cleanly.
+- Drop back to a real-world floor before any release that ships
+  in the public update channel.
+
+### azt_collabd 0.30.34 + azt_collab_client 0.30.34 — Update-needed popup parity + don't drop into client on dismiss
+- ``_show_info`` (the "Update needed" single-button popup that
+  fired on the ``client_too_old`` + no-newer-release branch) had
+  two problems:
+  1. UI didn't match ``_show_release_too_old``: only an OK
+     button, no mailto link, no Check-again.
+  2. After the user tapped OK, ``_check_self`` fell through to
+     ``_on_done_and_release`` — host loaded a project, daemon
+     refused subsequent RPCs, user stuck in a half-broken UI.
+- Refactor: extracted the popup body into
+  ``_show_update_blocked_popup(ctx, body_text, mailto_subject,
+  mailto_body)``. Two callers — the existing
+  ``_show_release_too_old`` and a new
+  ``_show_no_newer_release`` — share the same Check-again /
+  Quit / ``[ref=email]`` mailto-link UI vocabulary. The "Update
+  needed" / OK / fall-through popup is gone.
+- ``_check_self``'s on_no_update force_prompt branch now
+  surfaces ``_show_no_newer_release`` and **does not** call
+  ``_on_done_and_release``. Popup is terminal — Quit stops the
+  app via ``App.stop()`` (no half-broken UI), Check again
+  invalidates the release cache + re-runs ``_check_server``.
+
+### azt_collabd 0.30.33 + azt_collab_client 0.30.33 — bump MIN_CLIENT_VERSION to 0.30.33
+- ``MIN_CLIENT_VERSION`` raised again on the daemon (now 0.30.33)
+  so any peer at 0.30.32 or earlier paired with a 0.30.33 server
+  APK trips ``client_too_old`` in ``check_server_compat()``.
+  Continues exercising the symmetric self-update flow now that
+  the bootstrap install-cache fix is in.
+- Server APK rebuild required to pick up the new floor; peer
+  can stay at 0.30.32 (or older) to actually trigger
+  client_too_old when it talks to the new daemon.
+- Drop back to a real-world floor before any release that ships
+  in the public update channel.
+
+### azt_collabd 0.30.32 + azt_collab_client 0.30.32 — install_apk_from_url: validate cache against GitHub digest
+- User report: bootstrap reused a cached 0.30.28 server APK
+  instead of downloading the published 0.30.29, then Android
+  rejected the install with "package appears to be invalid"
+  (downgrade attempt). Root cause: ``install_apk_from_url``
+  is the direct-URL path (called from
+  ``install_server_apk_popup`` which bootstrap dispatches),
+  with no GitHub-API cross-check. ``_has_fresh_download`` ran
+  in sidecar mode — cached file matched its sidecar SHA, so
+  reused — but sidecar mode can't tell "intact bytes" from
+  "intact-but-stale-version bytes". ``check_for_update`` got
+  the digest-mode fix in 0.30.22; ``install_apk_from_url``
+  was still on the old path.
+- Fix: new optional ``repo`` parameter on
+  ``install_apk_from_url``. When supplied, the worker fetches
+  the GitHub release JSON, finds the matching asset's
+  ``digest`` (sha256:hex), and threads it through to
+  ``_has_fresh_download`` as ``expected_sha256``. Stale
+  caches with the right SHA-vs-sidecar but wrong SHA-vs-
+  GitHub now fall through to a fresh download. Failure of
+  the metadata fetch (network glitch) falls back to sidecar
+  mode rather than blocking the install.
+- ``install_server_apk_popup`` accepts and forwards the
+  ``repo`` parameter; bootstrap's four call sites
+  (_prompt_server_install / _prompt_server_update /
+  _prompt_server_unresponsive / _prompt_self_update) all
+  pass ``ctx.server_repo`` or ``ctx.peer_repo`` as
+  appropriate.
+- Net: the same digest-driven cache-freshness story that
+  applies to settings-screen "Update this app" now also
+  applies to bootstrap's "Install / Update AZT
+  Collaboration" popup and to peer self-update from the
+  bootstrap path.
+
+### azt_collabd 0.30.31 + azt_collab_client 0.30.31 — log SHA check result in _has_fresh_download
+- ``_has_fresh_download`` ran the cache integrity check
+  (digest-mode against GitHub's asset digest, sidecar mode
+  otherwise) but did so silently — user reported "no SHA log
+  line, is this a regression?" against 0.30.28. Test was
+  running, just invisible.
+- Added a single ``[update] _has_fresh_download: ...`` print
+  per call that names the mode (digest / sidecar), shows the
+  truncated file SHA + expected SHA, and the boolean match
+  result. Also prints early-exit reasons (file missing, hash
+  failed, sidecar missing, sidecar empty, sidecar read
+  error) so a False return tells you *why*. No behavior
+  change.
+
+### azt_collabd 0.30.30 + azt_collab_client 0.30.30 — bump MIN_CLIENT_VERSION to 0.30.30
+- ``MIN_CLIENT_VERSION`` raised to 0.30.30 on the daemon so any
+  peer running 0.30.29 or earlier paired with a 0.30.30 server
+  APK trips ``client_too_old`` in ``check_server_compat()``.
+  Lets us exercise the symmetric ``_check_self`` /
+  release-too-old / Check-again flow on the *peer* side
+  (which previously we'd only proven for the server-too-old
+  direction).
+- Server APK rebuild required to pick up this floor change;
+  peer can stay at 0.30.29 (or older) to actually trigger the
+  client_too_old branch when it talks to the new daemon.
+- Drop back to a real-world floor before any release that ships
+  in the public update channel.
+
+### azt_collabd 0.30.29 + azt_collab_client 0.30.29 — bump MIN_SERVER_VERSION to 0.30.28
+- ``MIN_SERVER_VERSION`` raised to 0.30.28 so the latest peer
+  build keeps triggering ``server_too_old`` against any server
+  APK at 0.30.27 or earlier (continuing the testing thread for
+  the release-too-old / Check-again flow).
+- Drop back to a real-world floor before any release that
+  ships in the public update channel.
+
+### azt_collabd 0.30.28 + azt_collab_client 0.30.28 — debug rebuild
+- No code change; bump for a fresh peer APK to retest the
+  Check-again cache invalidation on the device.
+
+### azt_collabd 0.30.27 + azt_collab_client 0.30.27 — invalidate release cache on Check again
+- 0.30.26's Check again button re-ran ``_check_server`` but the
+  per-process release-JSON cache (5-minute TTL on
+  ``_release_cache``) returned the stale "too old" entry, so
+  the popup re-rendered immediately against the same data and
+  the user saw no change. Closing/reopening the peer wiped the
+  cache and worked.
+- Fix: new ``invalidate_release_cache(repo=None)`` helper in
+  ``azt_collab_client/ui/update.py``. Bootstrap's Check-again
+  handler drops both ``ctx.server_repo`` and ``ctx.peer_repo``
+  entries before re-running ``_check_server`` so the next
+  probe re-fetches GitHub.
+
+### azt_collabd 0.30.26 + azt_collab_client 0.30.26 — release-too-old popup: mailto link + Check again
+- "Or build from source" was unhelpful for the SIL field-
+  linguist user base — they're not going to. Replaced with
+  "or [send the developer an Email]" rendered as a Kivy-
+  markup ``[ref=email]`` link styled with underline + accent
+  blue. Tapping it opens the user's MUA via ``mailto:`` with
+  a pre-filled subject ("{name}: required version not yet
+  released") and body containing the version mismatch info.
+  No-MUA degradation is graceful — Android shows the standard
+  "no app to handle this" toast.
+- New ``azt_collab_client.MAINTAINER_EMAIL`` constant
+  (``kent_rasmussen@sil.org``) so forks can override in their
+  own client build (no env-var hook yet — change at the
+  source line, rebuild). Matches the address in
+  ``SECURITY.md``.
+- Added a "Check again" button alongside Quit. Dismisses the
+  popup and re-enters ``_check_server`` on a worker thread —
+  same code path as bootstrap's compat probe, so a
+  freshly-published release that meets the floor flows
+  through to the install popup without the user having to
+  restart the peer.
+
+### azt_collabd 0.30.25 + azt_collab_client 0.30.25 — pre-flight release version vs required minimum + clearer body text
+- User reported: bootstrap got server_too_old, popped the
+  "Update AZT Collaboration?" dialog, the user tapped Update,
+  and the latest published release was *also* too old to
+  satisfy ``MIN_SERVER_VERSION``. Result: download succeeds,
+  install succeeds, peer hits ``server_too_old`` again. Wasted
+  bandwidth + a confused user.
+- Fix in ``azt_collab_client/ui/bootstrap.py``:
+  - ``_release_meets_minimum(repo, required_min)`` fetches
+    GitHub's latest tag for the given release feed and
+    compares to the required floor. Returns ``(ok, latest,
+    error)``.
+  - ``_show_release_too_old(...)`` is a new one-button popup
+    that surfaces "{name} {required} or newer is required, but
+    the latest available release is {latest}. Wait for an
+    update or build from source." with a Quit affordance.
+    Replaces the install popup when the upstream release feed
+    can't satisfy the floor.
+  - ``_prompt_server_update`` now takes ``min_required``,
+    pre-flights the server APK release feed, and surfaces the
+    "release too old" popup instead of opening the install
+    popup if upstream can't help. Body text on the install
+    popup itself now reads "{name} {required} or newer is
+    required (you have {current})" — replaces the redundant
+    "AZT Collaboration service (AZT Collaboration)" wording
+    the user flagged.
+  - Symmetric pre-flight on the ``client_too_old`` path:
+    ``_check_self`` accepts ``required_min`` (forwarded from
+    the daemon's compat response) and runs the same release-
+    feed check before going into ``_peer_update_with_confirm``.
+    A peer running ahead of GitHub's latest publish gets the
+    same "wait for an update" popup instead of a useless
+    download.
+- Client-only rebuild needed to exercise this — bootstrap
+  runs in the peer's process. Server APK can stay at whatever
+  older version is on the device (that's what triggers
+  ``server_too_old`` in the first place).
+
+### azt_collabd 0.30.24 + azt_collab_client 0.30.24 — debug rebuild + MIN_SERVER_VERSION = 0.30.24 to exercise old-server flow
+- ``MIN_SERVER_VERSION`` bumped to 0.30.24 deliberately, so a
+  peer carrying this client paired with a server APK at 0.30.23
+  or earlier hits ``check_server_compat()`` →
+  ``server_too_old``. Lets us walk the bootstrap "Update AZT
+  Collaboration?" prompt end-to-end without backdating any real
+  wire-format change. **Drop back to a real-world floor before
+  any release that ships in the public update channel.**
+- No other code change; daemon and client are otherwise identical
+  to 0.30.23.
+
+### azt_collabd 0.30.23 + azt_collab_client 0.30.23 — debug rebuild
+- No code change; bump for a fresh APK to retest the
+  ``asset.digest``-driven cache-freshness check on the device.
+
+### azt_collabd 0.30.22 + azt_collab_client 0.30.22 — verify cached APK against GitHub's authoritative ``asset.digest``
+- 0.30.21 caught stale-version caches via versionName parsing.
+  Per maintainer suggestion: GitHub's REST release-asset
+  metadata exposes a SHA-256 ``digest`` field
+  (``"digest": "sha256:<hex>"``, added 2025-06-03), so we can
+  do an authoritative cache-freshness check without paying for
+  a re-download.
+- ``_has_fresh_download`` now takes an optional
+  ``expected_sha256`` arg. When supplied (asset has a digest),
+  it's the strong check — file SHA must equal the GitHub
+  digest to reuse. When not (legacy assets pre-2025-06), it
+  falls back to the existing sidecar self-consistency check.
+- ``_worker`` parses ``asset.digest`` (strips the ``sha256:``
+  prefix) and threads it through. Catches three failure modes
+  in one place:
+  - same-version-different-bytes (re-uploaded asset),
+  - corrupted on-disk cache,
+  - stale-version cache from a previous Update cycle.
+  The versionName check from 0.30.21 is kept as a belt-and-
+  braces layer for legacy assets where the digest is null and
+  the SHA fallback can't tell same-bytes-different-version
+  from a normal cache hit.
+
+### azt_collabd 0.30.21 + azt_collab_client 0.30.21 — invalidate cached APK when versionName ≠ latest
+- User repro: tapped Update on 0.30.19 → cache reused → install
+  ran but version stayed at 0.30.19 (the cached APK was from
+  the previous update cycle). ``_has_fresh_download`` only
+  validates that the cached file's bytes match the sidecar's
+  SHA — i.e. on-disk integrity. It does NOT check that the
+  cached file is the version we're now trying to install.
+- Fix: in ``check_for_update``'s ``_worker``, after the
+  fresh-download check passes, ``_apk_parse_info`` reads the
+  cached APK's ``versionName`` and compares it to ``latest``.
+  Mismatch → remove the cached file + sidecar so the
+  download branch runs and we fetch the right version.
+- Diagnostic line ``[update] cache stale: cached_version=...
+  != latest=...; discarding ...`` prints when the discard
+  fires, so future repros are visible in logcat.
+- Why not also fix this in ``install_apk_from_url``: that
+  path doesn't know the "expected version" (URL is
+  redirect-style and opaque); peers using it typically run
+  install-once via bootstrap, so cache staleness is much less
+  of a problem.
+
+### azt_collabd 0.30.20 + azt_collab_client 0.30.20 — log parse_info + signature_matches result
+- 0.30.18's pre-install validation didn't tell us which check
+  outcome we got — user reports "same invalid response" against
+  0.30.18 + 0.30.19. Did the parse pass? Did signature compare
+  match? Returned None? We can't tell from logcat without an
+  explicit print at each point.
+- Added two trace lines:
+  - ``[update] parse_info: ok pkg=... versionName=... path=...``
+    (or ``parse_info: None path=...``) right after
+    ``_apk_parse_info`` runs. Surfaces the APK's actual package
+    name and version so we can spot manifest-level mismatches
+    (e.g. wrong ``packageName``).
+  - ``[update] signature_matches_installed: True/False/None``
+    right after ``_signature_matches_installed`` runs. ``True``
+    = match (install should succeed signature-wise),
+    ``False`` = mismatch (we'd surface our error and abort),
+    ``None`` = couldn't determine (off Android, app not
+    installed, jnius unavailable, exception path).
+- No behavior change.
+
+### azt_collabd 0.30.19 + azt_collab_client 0.30.19 — debug rebuild
+- No code change; bump for a fresh APK to retest 0.30.18's
+  pre-install validation + suspended-messaging on the device.
+
+### azt_collabd 0.30.18 + azt_collab_client 0.30.18 — pre-install validation + step-by-step suspended messaging
+- **Pre-install APK validation in ``check_for_update`` and
+  ``install_apk_from_url``.** Before firing the install Intent
+  we now run two checks via ``PackageManager``:
+  - ``getPackageArchiveInfo(dest, GET_SIGNATURES)`` to confirm
+    the downloaded APK is parseable. A null result means the
+    download was truncated / corrupted; the cached file +
+    sidecar are removed and the user gets a "could not be
+    parsed; try again to re-download" error rather than the
+    bare Android "package appears to be invalid" complaint
+    after dispatching the Intent.
+  - ``signature_matches_installed(dest, package)`` —
+    compares the APK's signing certificate against the
+    currently-installed app's certificate. On mismatch we
+    surface "Downloaded APK is signed with a different key
+    than the installed app... Uninstall first, then tap
+    Update again — or rebuild from source with the matching
+    keystore." That replaces the cryptic "App not installed
+    as package appears to be invalid" Android error and
+    points the user at both fixes.
+  - Helpers (``_apk_parse_info``,
+    ``_signature_matches_installed``,
+    ``_installed_version_name``,
+    ``_android_package_manager``) live alongside the existing
+    install-Intent code in ``update.py``. All three return
+    ``None`` off Android / when pyjnius is unavailable so the
+    desktop / non-Android paths short-circuit cleanly.
+- **Diagnostic line** at the start of ``_install_on_ui``:
+  ``[update] pre-install check: pkg=... installed_version=...
+  running_version=... latest=...``. Tells us whether the
+  device-installed version diverges from the running code's
+  ``__version__``. They should match in normal use; diverging
+  values are a hot-patch / dev workflow signal.
+- **Suspended-state messaging.** Old "Resume it at {url}"
+  was unhelpful — gave a URL but no idea what to do on the
+  page. ``GitHubConnectScreen`` now stashes the
+  ``installation_id`` from the Verify-setup probe and:
+  - ``install_app`` opens
+    ``settings/installations/<installation_id>`` (the
+    install's configure page directly) instead of the
+    generic install URL.
+  - The accompanying message reads "Tap 'Install GitHub App'
+    below to open the install's configure page on GitHub,
+    then scroll to the bottom and tap 'Unsuspend'." —
+    walks the user through the actual GitHub UI flow.
+  - ``_render_message`` and ``_test_done`` both branch on
+    ``_suspended_installation_id`` so the message survives
+    re-renders (language change, screen re-entry).
+- ``S.APP_SUSPENDED`` translation (used by sync 403 path,
+  which doesn't have the in-screen "Install GitHub App
+  below" affordance) updated to the same self-contained
+  step-by-step shape: "GitHub App installation is suspended
+  at {url}. Open it, scroll to the bottom, and tap
+  'Unsuspend'."
+
+### azt_collabd 0.30.17 + azt_collab_client 0.30.17 — restore Share icon
+- 0.30.11's Share/Update simplification dropped the
+  share-icon Image. Restoring per user preference: the
+  ``SHARE_ICON`` KV macro and ``icon_path('share_dark')``
+  format-arg are back, with the Image positioned as a
+  left-overlay (``x: self.parent.x + dp(12)``) inside the
+  half-width Share button. Text "Share" stays centered; no
+  ``padding: [dp(52), 0]`` needed since a single-word label
+  doesn't collide with the icon.
+
+### azt_collabd 0.30.16 + azt_collab_client 0.30.16 — Android back button pops sub-screens to settings
+- ``CollabUIApp`` (the standalone server APK settings host)
+  didn't bind Android's hardware back button, so a back-press
+  from GitHubConnectScreen / GitLabFormScreen fell through to
+  ``App.stop`` and closed the app — losing the user's settings
+  session mid-setup. Picker_app already had this hook;
+  CollabUIApp didn't.
+- Added ``CollabUIApp.on_start`` to bind
+  ``Window.on_keyboard`` and ``_on_back_button`` to consume
+  key 27 by popping ``sm.current = 'settings'`` from any
+  sub-screen. Settings-screen back returns False to let Kivy
+  / Android close the app the normal way.
+
+### azt_collabd 0.30.15 + azt_collab_client 0.30.15 — swap primary button to "Verify setup" after install_app
+- User report: at step 2, ``install_app`` opens the browser
+  with a message that says "return here and tap Verify
+  setup", but the primary button still reads "Install GitHub
+  App" — there's no Verify setup button to tap. The user
+  comes back from GitHub, reads the instruction, can't find
+  the button it names, gets stuck.
+- Fix: ``install_app()`` now flips ``gh_primary_btn``'s
+  ``text`` to "Verify setup" and ``_action`` to ``verify``
+  right after opening the browser, so the affordance the
+  message promises actually exists. If the user returns
+  without installing (cancelled, navigated away),
+  ``test_github_credentials`` reports
+  ``app_installed=False`` and ``_test_done`` re-runs
+  ``on_pre_enter`` which puts the button back to "Install
+  GitHub App" — they can retry without screen drift.
+- Auto-polling for install completion was considered and
+  rejected for v1: poll cadence vs. GitHub-API quota is a
+  real trade-off, and the swap-and-tap workflow is bounded
+  by user attention anyway. Easy to add later if needed.
+
+### azt_collabd 0.30.14 + azt_collab_client 0.30.14 — log account.login on /user/installations + per-account install matching
+- 0.30.13's trace showed three azt-collaboration installs in
+  ``/user/installations`` while the user said they only ever
+  saw one at ``github.com/settings/installations``. We don't
+  yet know who owns the other two — could be orgs the user
+  belongs to, could be stale state, could be something else
+  GitHub is doing. ``check_app_installed`` now logs
+  ``account.login`` alongside the existing fields so the next
+  probe answers "whose installs are these?" directly.
+- ``check_app_installed`` gained an optional
+  ``account_login`` parameter that narrows the match to the
+  installation whose ``account.login`` matches (case-
+  insensitive). When omitted, the legacy "first match by
+  app_slug" behavior is preserved.
+- ``test_github_credentials`` now passes
+  ``server_username`` (the user's own GitHub login) as
+  ``account_login`` so Verify setup checks for the install
+  on the user's own account, not "any install we can see."
+  This fixes a real bug observed: user uninstalled their
+  personal install but was still a member of orgs that had
+  ``azt-collaboration`` installed; the unscoped match
+  reported ``installed=True`` against an org install and
+  the screen continued to show "Setup complete." With this
+  change, Verify setup correctly returns
+  ``installed=False`` once the personal install is gone,
+  and the screen regresses to step 2.
+- ``diagnose_403`` (sync 403 path) does NOT yet take the
+  repo's owner into account; that's the next change once we
+  see the per-account data and confirm the matching strategy
+  is right. Currently still uses the legacy unscoped
+  ``check_app_installed``, so this release narrows just the
+  Verify-setup path.
+
+### azt_collabd 0.30.13 + azt_collab_client 0.30.13 — log raw /user/installations to diagnose stuck suspended state
+- 0.30.12 still showed "Setup Complete" against a suspended
+  install on the user's device, even though both server APK
+  and client are 0.30.12. So the suspended-detection code is
+  running but either ``inst.suspended_at`` isn't being set on
+  the install we're looking at, or the slug match isn't
+  hitting the entry. Need data to disambiguate.
+- ``check_app_installed`` now logs:
+  - All ``(app_slug, id, suspended_at)`` tuples returned by
+    ``/user/installations`` so we can see whether the user's
+    install is in the list at all and what GitHub is reporting
+    for ``suspended_at``.
+  - The matched entry (if any) with its suspended_at and
+    repository_selection.
+  - The final ``result`` dict.
+  - HTTPError / general Exception (was silently caught).
+- ``_h_test_github`` now logs the test_github_credentials
+  return value (valid / app_installed / app_suspended /
+  installation_id) plus what it actually wrote to the store.
+- Pure tracing — no behavior change. Build, retry Verify
+  setup against the suspended install, and the next logcat
+  will tell us whether the suspended detection is firing or
+  whether GitHub is reporting the install as not-suspended
+  for some reason.
+
+### azt_collabd 0.30.12 + azt_collab_client 0.30.12 — fix suspended-state message overwrite race
+- 0.30.11 set the suspended-message ``gh_message.text``
+  immediately in ``_test_done``, but ``self.on_pre_enter()``
+  on the line above schedules ``_refresh_state`` for the next
+  frame, and ``_render_message`` there overwrites the field
+  with the step-N default ("Setup complete..." / "Now install
+  the GitHub App..."). User report: Verify setup against a
+  suspended install kept showing "Setup Complete, connected
+  as ...".
+- Same defer-past-render dance the AuthError handler uses.
+  Suspended message now goes through a second
+  ``Clock.schedule_once`` so it lands after ``_refresh_state``
+  completes.
+- Note: this fix requires the server APK to ALSO be running
+  0.30.11+ (or this 0.30.12). Older daemons' ``check_app_installed``
+  matches solely on ``app_slug`` and reports
+  ``installed=True`` for any installation, so a suspended
+  install never gets the ``app_suspended=True`` flag and the
+  client never enters the suspended-message branch. If you
+  see "Setup Complete" after rebuilding the recorder but not
+  the server APK, that's why — rebuild + reinstall the server
+  APK and Verify setup again.
+
+### azt_collabd 0.30.11 + azt_collab_client 0.30.11 — detect suspended GitHub App installs + simpler Share/Update buttons
+- **Suspended-install detection.** User repro: paused the
+  azt-collaboration App installation in their GitHub settings,
+  the connect screen still showed "Setup complete (App
+  installed)", and sync silently failed with codes
+  ``['NOTHING_TO_COMMIT', 'REPO_NOT_AUTHORIZED']`` because the
+  daemon's ``check_app_installed`` only matched on
+  ``app_slug`` and reported ``installed=True`` for any
+  installation including suspended ones. Fix:
+  ``check_app_installed`` now reads ``inst.suspended_at`` —
+  ``installed=True`` requires the install to be active, and a
+  new ``suspended=True`` field is set when the App is on file
+  but paused. ``installation_id`` is also returned in the
+  suspended case so the UI can construct the resume URL
+  (``settings/installations/<id>``) instead of the generic
+  install page.
+- **New status code ``S.APP_SUSPENDED``** plus translation:
+  "GitHub App installation is suspended. Resume it at {url}."
+  ``diagnose_403`` returns this for sync 403s when the install
+  is suspended; ``test_github_credentials`` exposes
+  ``app_suspended`` + ``installation_id`` alongside
+  ``app_installed`` so the connect screen's Verify setup path
+  surfaces a precise message and link instead of regressing
+  silently to the step-2 "Install" prompt.
+- **Connect screen ``_test_done`` handles suspended.** When
+  Verify setup runs against a suspended install, the message
+  becomes "GitHub App installation is suspended. Resume it at
+  github.com/settings/installations/<id>." — the user can tap
+  the URL or open it manually, resume on GitHub, and re-run
+  Verify setup to confirm.
+- **Wire format change.**
+  ``POST /v1/credentials/github/test`` response now carries
+  ``app_suspended`` and ``installation_id`` alongside the
+  existing ``app_installed`` field. Older clients ignore the
+  extras; newer clients against older daemons see ``False`` /
+  ``None`` defaults (which is the correct
+  "no-suspended-state-known" reading).
+- **Settings: simpler Share / Update.** Two stacked
+  full-width "Share this app" / "Update this app" buttons
+  collapsed into one half-width row labelled just "Share" and
+  "Update". Drops the share icon (one less asset to ship and
+  less visual noise; the action is obvious from the label).
+  ``SHARE_ICON`` KV macro and the ``share_icon=icon_path(...)``
+  format-arg removed; ``icon_path`` import dropped.
+
+### azt_collabd 0.30.10 + azt_collab_client 0.30.10 — keep "Verify setup" available after setup completes
+- Once the user reached step 4 (everything verified),
+  ``_render_primary`` was hiding ``gh_primary_btn`` entirely —
+  forcing them to Re-authenticate (which means re-typing the
+  8-field code) just to confirm the connection is still
+  healthy. User asked for a non-destructive "test settings"
+  affordance from the verified state.
+- Fix: ``_render_primary`` now keeps the button visible at step
+  4 with the same ``Verify setup`` label and ``verify`` action
+  that step 3 uses. ``test()`` is idempotent (just hits
+  ``api.github.com/user`` with the saved token); a successful
+  re-test stays at step 4, a failure surfaces by regressing the
+  screen state to step 2 / step 1 / "Token rejected" — a single
+  tap that doubles as a diagnostic.
+- Step-4 message updated to "Setup complete. Connected as
+  {username}. Tap Verify setup any time to re-test." so users
+  notice the affordance is intentional.
+
+### azt_collabd 0.30.9 + azt_collab_client 0.30.9 — detach publish_row children to free the GitLab button
+- User report: "GitLab button still doesn't respond until 10-12
+  clicks" while the adjacent GitHub button works fine. Same root
+  cause as the earlier ``gh_primary_btn`` issue: ``publish_row``
+  is the next BoxLayout below ``gl_action_btn`` and stays at
+  ``height=0`` for users with no project. BoxLayout's
+  ``_do_layout`` still positions ``publish_btn`` (a RecBtn with
+  ``on_press``) at its explicit ``dp(52)`` height under the
+  collapsed parent, and Kivy's dispatch loop visits every child
+  regardless. The combination intermittently swallows touches
+  near gl_action_btn. (Why "intermittent" rather than "always":
+  the touch points hover near the bottom edge of gl_action_btn /
+  spacing area, where Kivy's hit-test math is sensitive to the
+  exact tap coordinate.)
+- Fix: ``SettingsScreen._refresh_publish_row`` now detaches
+  ``publish_row``'s children when hiding the row (via
+  ``_detach_publish_children`` / ``_reattach_publish_children``,
+  matching the pattern used in ``GitHubConnectScreen`` for
+  ``gh_manage_box`` / ``gh_device_flow_box``). A parent with no
+  children cannot dispatch on_touch_down to anything, so the
+  hidden publish_btn can no longer eat taps meant for the
+  GitLab button. Idempotent on both sides.
+- The detach is keyed off the same condition that hides the
+  row, so users with an active publishable project (the
+  "should-show-publish" case) keep the row's full functionality.
+
+### azt_collabd 0.30.8 + azt_collab_client 0.30.8 — Connect-button gating + Disconnect inside settings + web-flow plan
+- **Settings GitHub/GitLab buttons gated on ``confirmed``, not
+  ``connected``.** User reported the canonical footgun: install
+  failed midway, gh.connected stayed True (token was saved),
+  refresh() flipped the button to "Disconnect GitHub", and
+  the only tap available was the one that wiped the partial
+  work. ``refresh()`` now reads ``gh.confirmed`` /
+  ``gl.confirmed`` and renders:
+  - Not verified → ``Connect to GitHub`` / ``Connect to GitLab``
+    in green; tap navigates to the connect screen which
+    auto-resumes from the user's current step (server state is
+    the source of truth).
+  - Verified → ``GitHub Settings`` / ``GitLab Settings`` in the
+    neutral surface color; tap opens the same screen, now
+    showing the manage view.
+- **Disconnect moved inside each screen.** GitHubConnectScreen
+  already had Disconnect in its manage box;
+  ``GitLabFormScreen`` gained one in this release (visible via
+  ``gl_manage_box`` only when a token is on file). Rationale: a
+  fat-finger Disconnect from the main settings has a real cost —
+  re-auth on GitHub means re-typing the 8-field code, re-auth
+  on GitLab means re-pasting a PAT. Audit doc #6 + #7 updated
+  to reflect this.
+- **Removed** ``SettingsScreen.gh_action`` /
+  ``connect_github`` / ``disconnect_github`` /
+  ``disconnect_gitlab``. The KV buttons call ``app.go(...)``
+  directly; the disconnect helpers live on each respective
+  screen instead.
+- **Web-flow migration plan** drafted at
+  ``docs/web_flow_migration_plan.md``. Research finding: GitHub
+  Apps' OAuth web flow accepts PKCE but still requires
+  ``client_secret`` on the token exchange (per
+  github.blog/changelog 2025-07-14 + community/discussions
+  #15752), so a pure-PKCE mobile-safe flow is not legal. The
+  plan documents (a) a Phase-1 ``tests/probe_pkce.py`` that
+  validates this finding against the live API, (b) a web-flow
+  architecture using embedded ``client_secret`` in the server
+  APK only, with PKCE as defense-in-depth and device flow as
+  the universal fallback, and (c) the open decision points
+  (embed-secret tradeoff, fork story, sunset window for device
+  flow). Not yet approved for implementation.
+- **PKCE probe script.** ``tests/probe_pkce.py`` (intentionally
+  not auto-collected by pytest — no ``test_`` prefix). Walks
+  the user through up to three browser authorizations and
+  validates the four cases laid out in the plan: PKCE param
+  acceptance, PKCE-no-secret rejection, PKCE-with-secret
+  success, secret-only-no-PKCE success. Exits non-zero on any
+  deviation, so it doubles as a regression check if GitHub
+  later changes its stance.
+
+### azt_collabd 0.30.7 + azt_collab_client 0.30.7 — revert bogus URL prefill (audit doc #1 was based on a false premise)
+- Audit doc #1 assumed GitHub's OAuth Device Flow returns
+  ``verification_uri_complete`` (RFC 8628 §3.2) or at least
+  honors ``https://github.com/login/device?user_code=ABCD-1234``
+  to prefill the code field. After actually researching this:
+  - GitHub's documented response is exactly
+    ``device_code, user_code, verification_uri, expires_in,
+    interval`` — ``verification_uri_complete`` is OPTIONAL per
+    the spec and GitHub omits it. The canonical ``cli/oauth``
+    Go reference impl and ``octokit/auth-oauth-device.js``
+    both parse the field defensively for spec compliance but
+    receive empty strings against github.com.
+  - GitHub's ``/login/device`` page silently ignores the
+    ``?user_code=...`` query parameter. No prefill happens.
+  - A Jan-2024 GitHub change adds a "select Continue on an
+    account" confirmation step in front of the code form
+    unconditionally, even for single-account users. The user
+    confirmed seeing this with one account.
+- Reverted 0.30.5's URL-suffix construction. The fallback chain
+  is now defensive only: use ``verification_uri_complete`` if a
+  future GitHub change starts returning it, otherwise the bare
+  ``verification_uri``. No more constructed query strings.
+- ``docs/github_connect_ux_audit.md`` #1 updated with the
+  research finding and links to the canonical references so the
+  next person doesn't rediscover the false premise.
+- The user-visible flow against the current GitHub: the user
+  taps Begin → user_code displayed in our app + auto-copied to
+  clipboard → bare ``/login/device`` URL opens in browser →
+  GitHub's account-confirmation step → 8-field code form (no
+  paste support either) → user types each digit → authorize.
+  Polling worker picks up the resulting authorization within
+  ~5s. Not a great UX, but it's the only path GitHub provides.
+
+### azt_collabd 0.30.6 + azt_collab_client 0.30.6 — worker tracing + fix message overwrite
+- Detach fix from 0.30.4 worked: ``gh_primary_btn`` now receives
+  touches and ``primary_action: action='begin'`` fires correctly.
+- New diagnostics in ``_worker``: trace device_flow_start,
+  device_flow_poll completion, save_github_tokens success,
+  app_installed probe result, _done firing, and AuthError /
+  Exception paths. Intent: pin down why the screen doesn't
+  advance to step 2 after the user authorizes — currently we
+  can't tell if polling stalled, save failed silently, or _done
+  ran but credentials_status didn't reflect.
+- Bug fix: error handlers (AuthError / generic Exception) called
+  ``self.on_pre_enter()`` (which schedules ``_refresh_state``)
+  *then* set ``gh_message.text = 'Failed: ...'``. The deferred
+  ``_refresh_state`` ran on the next frame and overwrote the
+  message with step-1's "Tap Begin..." default. Now the
+  Failed message is set via a second ``Clock.schedule_once``
+  so it lands after ``_refresh_state`` and survives. Implication
+  for the user: when polling actually times out, they'll
+  finally see why instead of silently bouncing to step 1.
+
+### azt_collabd 0.30.5 + azt_collab_client 0.30.5 — build the prefilled device-flow URL ourselves
+- Audit doc #1 (the "Manual code-copy step in browser" win) was
+  betting on GitHub returning ``verification_uri_complete`` in the
+  device-flow response. Per RFC 8628 that field is OPTIONAL and
+  GitHub elects to omit it for OAuth Device Flow — confirmed
+  by the user landing on the bare code-entry page after Begin.
+- Fix: when ``verification_uri_complete`` isn't in the response,
+  build the prefilled URL ourselves by appending
+  ``?user_code=<user_code>`` to the bare URL. GitHub's
+  ``/login/device`` page reads the query parameter and prefills
+  the code field, so the user still lands on "Authorize?"
+  directly. If a future GitHub change starts returning
+  ``verification_uri_complete`` we use it as-is and skip the
+  suffix.
+
+### azt_collabd 0.30.4 + azt_collab_client 0.30.4 — detach hidden box children so they can't intercept touches
+- 0.30.3's diagnostics confirmed it: when the user taps inside
+  ``gh_primary_btn``'s content y-range (Window y=1013-1070
+  mapped to content y=305-362, well inside the button's
+  pos=275 / top=405 range), the Window touch fires but
+  ``gh_primary_btn``'s ``on_touch_down`` probe never does. So a
+  sibling earlier in dispatch order is silently consuming the
+  touch before the Begin button gets a chance — even though
+  ``Widget.on_touch_down`` should have short-circuited via
+  ``self.disabled and self.collide_point(...)`` on the hidden
+  ``gh_manage_box`` / ``gh_device_flow_box``.
+- Suspect: ``BoxLayout._do_layout`` keeps positioning children at
+  their explicit heights even when the parent's ``height=0``, so
+  Re-auth NavBtn (in the hidden manage box) lives at content
+  y=85-205 with disabled=True. The disabled-eats-touch contract
+  is supposed to handle this, but in this layout it didn't —
+  some children were intercepting touches and others weren't,
+  inconsistently. The mechanism's failure mode is opaque enough
+  that fighting it with more flags (``disabled``, ``opacity``,
+  ``height``) just shifts which configurations break.
+- Fix: hide-by-detach. ``_hide_device_flow`` / ``_hide_manage``
+  now call ``remove_widget`` on each child of the box; show
+  re-adds them in original order from a per-box snapshot. A
+  parent with no children cannot dispatch ``on_touch_down`` to
+  anything, so there's no way for a hidden manage/device-flow
+  child to intercept touches that should reach Begin /
+  Install GitHub App / Verify setup. The snapshot stays
+  strong-ref'd while detached so widgets don't GC.
+- Idempotent: re-detach is a no-op if already detached;
+  re-attach is a no-op if the snapshot is empty.
+
+### azt_collabd 0.30.3 + azt_collab_client 0.30.3 — deeper Begin button diagnostics
+- 0.30.2 told us the button is at ``pos=[50, 275]
+  size=[980, 130] disabled=False opacity=1.0`` — sane — but
+  ``state`` never flips on tap, so touch_down isn't reaching the
+  button. Sibling NavBtns (Back, Create-account) in the same
+  ScrollView work fine, so this isn't a global ScrollView /
+  ButtonBehavior thing.
+- Added two more probes:
+  - ``btn.bind(on_touch_down=...)`` on the primary button so we
+    log whether the button receives the dispatched event from
+    its parent BoxLayout (with ``inside=collide_point(touch)``).
+  - ``Window.bind(on_touch_down=...)`` so we log every raw touch
+    Kivy receives, with the touch's reported position. Lets us
+    correlate "where the user actually touched" against the
+    button's pos and confirm whether the touch even arrives at
+    the Window level.
+- Expected next-run output on a tap:
+  ``WINDOW touch_down: pos=(X, Y) inside_primary_btn=True/False``
+  followed (or not) by ``gh_primary_btn on_touch_down: ...
+  inside=...``. The combination tells us whether the touch
+  arrives at all, whether it's at the right position, and
+  whether the parent dispatches it to the button.
+
+### azt_collabd 0.30.2 + azt_collab_client 0.30.2 — Begin button diagnostics
+- 0.30.1's ``on_press`` switch did not help the Begin button:
+  user reports ``_refresh_state`` still fires but neither
+  ``primary_action`` nor any state log appears on tap, while the
+  sibling Back / Create-account buttons (also inside the same
+  ScrollView) work fine. So it isn't ScrollView vs. on_release —
+  it's something specific to ``gh_primary_btn``.
+- Added two diagnostics that will fire on the next attempt:
+  - ``_render_primary`` logs the button's resolved ``pos`` /
+    ``size`` / ``disabled`` / ``opacity`` after the render
+    finishes. We need this to confirm the button is at the
+    coordinates the user is tapping.
+  - One-shot bind on the button's ``state`` property so every
+    'normal' → 'down' transition surfaces in logcat. Button's
+    state machine flips on touch_down regardless of whether the
+    on_press / on_release events fire — so this lets us tell
+    apart the two failure modes:
+      * State changes but no ``primary_action`` log → event
+        dispatch broken (binding lost?).
+      * State never changes → touches aren't reaching the button
+        (layout / hit-test problem; e.g. a hidden sibling box
+        overlaps the touch zone).
+
+### azt_collabd 0.30.1 + azt_collab_client 0.30.1 — switch settings/connect-screen action buttons to on_press
+- User-reported: Begin (device-flow start) "still does nothing"
+  even after the layout / id-resolution fixes in 0.29.1. The
+  ``[github-connect] _refresh_state`` trace fires on screen
+  entry, confirming the button is rendered with ``_action='begin'``
+  and ``disabled=False``, but no ``primary_action`` log appears
+  on tap.
+- Diagnosis: classic Kivy ScrollView vs. Button issue. ScrollView
+  records every touch_down for scroll-distance evaluation; if the
+  user's finger jiggles even ~dp(20) during the press (easy on a
+  touchscreen), ScrollView grabs the touch on touch_up and the
+  child Button's state machine never fires ``on_release``. The
+  user's previous complaint that the GitLab settings button
+  "resists pressing in most cases. if I hit it randomly for
+  awhile, it does eventually activate" is the same root cause —
+  the rare clean tap was the one without enough movement.
+- Fix: switch every action button inside a scrolled region from
+  ``on_release`` to ``on_press`` so the dispatch fires on
+  touch_down, before ScrollView decides whether to claim the
+  touch. Affected sites: SettingsScreen Back / Share / Update /
+  Publish / GitHub action / GitLab action / Refresh / Debug-503;
+  GitHubConnectScreen primary / signup / Copy / Re-authenticate /
+  Disconnect / Back; GitLabFormScreen Verify / Back; the dynamic
+  language-selector buttons. Trade-off: actions can no longer be
+  cancelled by sliding off the button before lifting the finger —
+  fine for these recoverable flows (every button either
+  navigates, opens the browser, or kicks off an RPC the daemon
+  treats idempotently). Popups and modals are not affected;
+  they're not inside a ScrollView.
+
+### azt_collabd 0.30.0 + azt_collab_client 0.30.0 — boot Python on ContentProvider lazy-spawn; auto-exit on self-update
+- **Server APK couldn't be reached after fresh install unless the
+  user opened it manually.** ``AZTCollabProvider.onCreate()`` was a
+  one-line ``return true`` — Android's ContentProvider lazy-spawn
+  brought up the ``:provider`` host process and instantiated the
+  Provider, but did not start any Service in that process, so
+  Python never booted, ``install_callbacks()`` never ran, and the
+  ``sDispatch`` slot stayed null. Every ``call()`` then fell
+  through to the existing ``daemon_not_ready`` 503 fallback. The
+  user's repro: install server APK → open recorder → recorder
+  can't reach daemon → user opens server APK launcher → daemon
+  finally boots → recorder works on the next attempt.
+  ``onCreate()`` now calls ``AZTServiceProviderhost.start(ctx,
+  "")`` so PythonService is started alongside the Provider on the
+  same lazy-spawn. The boot is async (Python service thread
+  spawns separately); the very first peer call may still race
+  the boot and surface ``daemon_not_ready``, but ``rpc.call``'s
+  existing transport-level retry sees the populated callbacks on
+  the second attempt — the user no longer has to babysit the
+  install.
+- **Auto-exit on self-update.**
+  ``azt_collabd.android_cp.service`` now snapshots the package's
+  ``PackageManager.lastUpdateTime`` at ``install_callbacks()``
+  time and re-reads it after every dispatch. If it has advanced,
+  we schedule an ``os._exit(0)`` 500 ms later, so the in-flight
+  binder reply has time to land and the next peer
+  ContentResolver call lazy-spawns the freshly-installed code.
+  Belt-and-braces: Android's package installer normally kills
+  the upgraded process for us, but custom-ROM battery savers and
+  ``adb pm install -r`` can leave the old daemon running with
+  stale code while the new APK is on disk — that produced the
+  "after updating, peer connects to old daemon until I
+  force-stop the server APK" symptom. Adds one PackageManager
+  call per dispatch (cheap; cached by Android in the same
+  process).
+- Lock-step minor bump because the Provider Java change requires
+  a full server-APK rebuild — peers that update without the
+  matching server-APK rebuild will still hit the daemon-boot
+  race on lazy-spawn and have to open the server APK manually.
+
+### azt_collabd 0.29.2 + azt_collab_client 0.29.2 — fix server-APK crash on KV format
+- ``register_kv`` was raising ``KeyError: 'uri'`` from
+  ``KV_TEMPLATE.format(font_name=..., share_icon=...)`` because a
+  comment I added in 0.29.1 quoted ``"Opening {uri}\n..."`` as
+  prose inside the KV string. Python's ``str.format`` reads
+  ``{uri}`` as a substitution placeholder regardless of whether
+  it sits inside a KV comment. The peer's "Could not open
+  project picker: unexpected_cancel" + ``KeyError: 'uri'`` in
+  ``register_kv`` traceback is the symptom — the server APK
+  crashes during start-up, the picker activity returns
+  RESULT_CANCELED with data, peer treats it as the picker
+  anomaly retry path and gives up.
+- Comment now spells the placeholder as "URL" without braces; the
+  same risk applies to any ``{name}``-shaped token in KV
+  comments, which is documented in the comment for the next
+  editor.
+
 ### azt_collabd 0.29.1 + azt_collab_client 0.29.1 — fix unresponsive Begin / GitLab buttons after 0.29.0 restructure
 - **GitHubConnectScreen "Begin" did nothing.** Two compounding
   causes, both shipped fixes:

@@ -106,6 +106,7 @@ _HANDLERS = {
 
     S.AUTH_REQUIRED:          lambda p: _tr('Not connected to GitHub. Go to Setup > Connect to GitHub.'),
     S.APP_NOT_INSTALLED:      lambda p: _fmt(_tr('App not installed. Visit {url} and select "All repositories".'), p),
+    S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),
     S.ACCESS_DENIED:          lambda p: _fmt(_tr('Access denied (403). Check app permissions at {url}'), p),
 

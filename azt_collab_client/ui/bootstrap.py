@@ -362,6 +362,228 @@ def _record_decline(repo, version):
               file=sys.stderr, flush=True)
 
 
+# ── release-meets-minimum probe ───────────────────────────────────────────
+
+def _release_version(repo):
+    """Fetch the GitHub release-feed's ``latest`` tag and return it
+    as a bare version string (``v`` / ``V`` prefix stripped). Returns
+    ``''`` on any fetch failure — caller treats that as "couldn't
+    check" rather than "too old"."""
+    from .. import _version_tuple  # noqa: F401 — keep import warm
+    from .update import _fetch_latest
+    try:
+        release = _fetch_latest(repo)
+    except Exception as ex:
+        print(f'[bootstrap] _release_version({repo!r}) fetch '
+              f'failed: {ex}', file=sys.stderr, flush=True)
+        return ''
+    return (release.get('tag_name') or '').lstrip('vV')
+
+
+def _release_meets_minimum(repo, required_min):
+    """Return ``(ok, latest_version, error)`` for the GitHub release
+    feed at ``repo``:
+
+    - ``ok=True``: latest >= required_min — safe to offer download.
+    - ``ok=False, error='too_old'``: GitHub's latest is older than
+      the version this peer requires. Don't bother downloading; tell
+      the user to wait or build from source.
+    - ``ok=False, error='fetch_failed'``: couldn't reach GitHub /
+      no tag in latest. Caller should fall through to the normal
+      install path (the user might have a cache or working network
+      by the time they tap Install)."""
+    from .. import _version_tuple
+    if not required_min:
+        # No floor specified — every release is acceptable.
+        return True, '', ''
+    latest = _release_version(repo)
+    if not latest:
+        return False, '', 'fetch_failed'
+    if _version_tuple(latest) < _version_tuple(required_min):
+        return False, latest, 'too_old'
+    return True, latest, ''
+
+
+def _show_update_blocked_popup(ctx, body_text, mailto_subject,
+                               mailto_body):
+    """Shared "we can't proceed and it's not the user's fault" popup
+    body. Two known callers:
+
+    - ``_show_release_too_old`` — release feed exists but its latest
+      tag is below the required floor.
+    - ``_show_no_newer_release`` — release feed is at parity / above
+      what we need but the daemon still won't let us through (rare
+      edge case — version-namespace mismatch between peer-app
+      version and client-library version, or the peer was rebuilt
+      without bumping a tag).
+
+    Identical UI shape: a markup body with a ``[ref=email]`` link
+    routing to a pre-filled mailto: (subject + body parametrized by
+    the caller), Check again to drop the release-cache and re-run
+    ``_check_server``, Quit to stop the app via ``App.stop()``.
+    Terminal — does **not** fire on_done."""
+    import urllib.parse
+    import webbrowser
+    from kivy.metrics import dp, sp
+    from kivy.uix.modalview import ModalView
+    from kivy.uix.boxlayout import BoxLayout
+    from kivy.uix.label import Label
+    from kivy.uix.button import Button
+    from kivy.app import App as _App
+    from .. import MAINTAINER_EMAIL
+
+    def _open_mailto(*_):
+        url = (
+            f'mailto:{MAINTAINER_EMAIL}'
+            f'?subject={urllib.parse.quote(mailto_subject)}'
+            f'&body={urllib.parse.quote(mailto_body)}'
+        )
+        try:
+            webbrowser.open(url)
+        except Exception as ex:
+            print(f'[bootstrap] mailto open failed: {ex}',
+                  file=sys.stderr, flush=True)
+
+    view = ModalView(size_hint=(0.85, None), height=dp(280),
+                     auto_dismiss=False)
+    box = BoxLayout(orientation='vertical', padding=dp(16),
+                    spacing=dp(12))
+    body = Label(text=body_text, markup=True, size_hint_y=1,
+                 font_name=ctx.font_name, font_size=sp(14),
+                 halign='left', valign='top')
+    body.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    body.bind(on_ref_press=lambda _w, _ref: _open_mailto())
+    box.add_widget(body)
+
+    btn_row = BoxLayout(orientation='horizontal', size_hint_y=None,
+                        height=dp(48), spacing=dp(8))
+    check_btn = Button(text=_tr('Check again'), font_name=ctx.font_name,
+                       font_size=sp(15))
+    quit_btn = Button(text=_tr('Quit'), font_name=ctx.font_name,
+                      font_size=sp(15))
+
+    def _do_check_again(*_):
+        # Dismiss the popup, drop the per-process release cache
+        # (``_fetch_latest`` keeps results for 5 minutes; without
+        # this drop, Check-again would just re-render against the
+        # same stale release entry — real user-reported bug), and
+        # re-enter the bootstrap state machine on a worker thread.
+        # Trace lines bracket the path so a "Check again doesn't
+        # work" report shows up in logcat with a clear before/
+        # after pair (or the absence of "after" if something
+        # raised silently in the worker).
+        print('[bootstrap] Check again pressed — invalidating '
+              'release cache + re-entering _check_server',
+              file=sys.stderr, flush=True)
+        view.dismiss()
+        from .update import invalidate_release_cache
+        invalidate_release_cache(ctx.server_repo)
+        invalidate_release_cache(ctx.peer_repo)
+
+        def _retry():
+            try:
+                _check_server(ctx)
+            except Exception as ex:
+                print(f'[bootstrap] Check again _check_server '
+                      f'raised: {type(ex).__name__}: {ex}',
+                      file=sys.stderr, flush=True)
+        threading.Thread(target=_retry, daemon=True).start()
+
+    def _do_quit(*_):
+        view.dismiss()
+        try:
+            app = _App.get_running_app()
+            if app is not None:
+                app.stop()
+        except Exception:
+            pass
+
+    check_btn.bind(on_press=_do_check_again)
+    quit_btn.bind(on_press=_do_quit)
+    btn_row.add_widget(check_btn)
+    btn_row.add_widget(quit_btn)
+    box.add_widget(btn_row)
+    view.add_widget(box)
+    view.open()
+
+
+def _show_release_too_old(ctx, latest_seen, required_min,
+                         display_name):
+    """Release feed has a latest tag, but it's below the floor we
+    need. Build a body explaining the version mismatch with a
+    mailto link to the maintainer."""
+    body_text = _tr(
+        '{name} {required} or newer is required, but the latest '
+        'available release is {latest}. Wait for an update or '
+        '[ref=email][color=4ea1ff][u]send the developer an Email'
+        '[/u][/color][/ref].'
+    ).format(name=display_name, required=required_min,
+             latest=latest_seen or '?')
+    subject = (
+        f'{display_name}: required version not yet released')
+    msg_body = (
+        f'{display_name} {required_min} or newer is required, '
+        f'but the latest available release is '
+        f'{latest_seen or "?"}.\n\n'
+        f'(Sent from the in-app "send the developer an Email" '
+        f'link.)'
+    )
+    _show_update_blocked_popup(ctx, body_text, subject, msg_body)
+
+
+def _show_no_newer_release(ctx, display_name, peer_version,
+                            required_client_lib='',
+                            bundled_client_lib=''):
+    """The ``client_too_old`` + ``force_prompt`` + no-newer-release
+    branch. Daemon says we're too old, but ``_peer_update_with_confirm``
+    found nothing newer on the peer's release feed.
+
+    Body and email surface all four version anchors so the user
+    and the maintainer can see the actual mismatch:
+
+    - peer name + peer version (the recorder version the user can
+      see in their device's app list),
+    - bundled client library version (from ``azt_collab_client.
+      __version__`` in this peer build),
+    - required client library version (``min_required`` from the
+      daemon's compat handshake).
+
+    The peer-app version and the client-library version live in
+    separate version namespaces (recorder bumps independently of
+    client lib). The maintainer needs both to know where the gap
+    is and what release to cut. Without these anchors the email
+    is "the recorder is broken" with no actionable info.
+
+    Shape mirrors ``_show_release_too_old`` (Check again + Quit +
+    mailto link). Terminal — replaces the old single-button OK
+    popup that silently dropped through to ``on_done`` and let
+    the user load a project the daemon would refuse to serve."""
+    body_text = _tr(
+        '{name} {peer_v} is too old for the AZT Collaboration '
+        'service.\nThis build bundles client library {bundled}; '
+        'the service requires {required} or newer.\nNo newer '
+        '{name} release is published yet. Check back later or '
+        '[ref=email][color=4ea1ff][u]send the developer an Email'
+        '[/u][/color][/ref].'
+    ).format(name=display_name, peer_v=peer_version or '?',
+             bundled=bundled_client_lib or '?',
+             required=required_client_lib or '?')
+    subject = (
+        f'{display_name} {peer_version}: still too old for the '
+        f'AZT Collaboration service')
+    msg_body = (
+        f'{display_name} version: {peer_version}\n'
+        f'Bundled azt_collab_client: '
+        f'{bundled_client_lib or "(unknown)"}\n'
+        f'Required client library:  '
+        f'{required_client_lib or "(unknown)"}\n\n'
+        f'No newer {display_name} release is published yet.\n\n'
+        f'(Sent from the in-app "send the developer an Email" '
+        f'link.)'
+    )
+    _show_update_blocked_popup(ctx, body_text, subject, msg_body)
+
+
 # ── package-presence probe (Android) ──────────────────────────────────────
 
 def _server_package_installed():
@@ -482,6 +704,20 @@ def _check_server(ctx, _warmup_attempt=0):
         _check_self(ctx)
         return
 
+    # Mirror the daemon's UI language locally so peer-side
+    # popups (the ones that fire below) respect the language
+    # picked in the server APK's settings UI. On Android,
+    # ``$AZT_HOME/config.json`` is per-process private, so the
+    # server's language pref doesn't reach the peer file-system
+    # side. Daemon endpoint ``/v1/config/ui_language`` exposes
+    # the canonical value; we apply it via ``i18n.set_language``
+    # which both updates the active translator and persists to
+    # the peer's own config.json so subsequent popups within
+    # this same session keep the language even if the daemon
+    # goes away. Best-effort: any failure is silent and
+    # bootstrap continues in the local-default language.
+    _sync_ui_language_with_daemon()
+
     if compat.get('ok'):
         _on_ui(_dismiss_connecting_popup, ctx)
         _check_self(ctx)
@@ -532,13 +768,18 @@ def _check_server(ctx, _warmup_attempt=0):
     if err == 'server_too_old':
         _on_ui(_dismiss_connecting_popup, ctx)
         _on_ui(_prompt_server_update, ctx,
-               compat.get('server_version', '') or '')
+               compat.get('server_version', '') or '',
+               compat.get('min_required', '') or '')
         return
     if err == 'client_too_old':
         _on_ui(_dismiss_connecting_popup, ctx)
         # The peer is the one out of date — jump straight to
-        # self-update and skip the server prompt.
-        _check_self(ctx, force_prompt=True)
+        # self-update and skip the server prompt. Pass the
+        # daemon's required min_client_version so _check_self can
+        # confirm the latest peer release on GitHub actually
+        # satisfies it before offering the user a download.
+        _check_self(ctx, force_prompt=True,
+                    required_min=compat.get('min_required', '') or '')
         return
 
     # Unknown error — log and try self-update anyway.
@@ -549,25 +790,52 @@ def _check_server(ctx, _warmup_attempt=0):
 
 # ── step 2: self-update ────────────────────────────────────────────────────
 
-def _check_self(ctx, *, force_prompt=False):
+def _check_self(ctx, *, force_prompt=False, required_min=''):
     """Probe the peer's own release feed. If a newer version exists,
     prompt the user; otherwise fire ``on_done``.
 
     ``force_prompt=True`` skips the no-update branch and always
     prompts even when versions match — used on the
     ``client_too_old`` path so the user sees actionable text rather
-    than a silent ``on_done``."""
+    than a silent ``on_done``.
+
+    ``required_min`` (set on the ``client_too_old`` path) is the
+    daemon's ``min_client_version`` — and that's the **client
+    library** version, not the peer-app's version. For the
+    recorder peer (or any cross-namespace peer) those numbers
+    aren't comparable: recorder 1.34.0 vs client_lib 0.30.36 has
+    no meaningful order. So we DON'T pre-flight ``required_min``
+    against the peer's release feed here — the comparison would
+    either trivially pass (peer major > client major) or
+    trivially fail. Instead we rely on
+    ``_peer_update_with_confirm`` to find a newer peer release
+    if one exists; if none, ``_show_no_newer_release`` surfaces
+    all four version anchors (peer name + peer version + bundled
+    client lib + required client lib) so the user / maintainer
+    can see exactly which way the mismatch goes.
+
+    The pre-flight that DOES still apply lives in
+    ``_prompt_server_update`` — server APK and client library
+    share a versioning namespace (locked-step releases), so
+    comparing release tags to ``MIN_SERVER_VERSION`` is
+    meaningful there."""
 
     def _on_status(msg):
         _safe(ctx.on_status, msg)
 
     def _on_no_update():
         if force_prompt:
-            _on_ui(_show_info, ctx, _tr(
-                'This app is too old for the AZT Collaboration '
-                'service, but no newer version is published yet. '
-                'Please check back later.'))
-            _on_done_and_release(ctx)
+            # client_too_old + nothing newer to install. Don't
+            # fall through to ``on_done`` — the daemon won't talk
+            # to this peer, so the host loading a project after
+            # this point would just hit RPC errors. Surface the
+            # blocked popup with all four version anchors and
+            # let the user pick Check again / Quit.
+            import azt_collab_client as _client_pkg
+            _on_ui(_show_no_newer_release, ctx,
+                   ctx.peer_display_name, ctx.peer_version,
+                   required_min,
+                   getattr(_client_pkg, '__version__', ''))
             return
         _on_done_and_release(ctx)
 
@@ -579,15 +847,110 @@ def _check_self(ctx, *, force_prompt=False):
     # gets to decide. To make that happen, we use a low-level
     # version probe path: pass the helper as-is; it reports progress
     # via on_status. The Yes/No is built into a wrapper.
+    #
+    # ``mandatory`` flips the prompt's body text + dismiss action.
+    # Voluntary (force_prompt=False): "A newer version is available
+    # — Update / Not now". Mandatory (force_prompt=True, i.e. the
+    # client_too_old branch): "this version is required —
+    # Update / Quit". Without this, declining a mandatory update
+    # silently dropped the user into the peer with a daemon they
+    # can't talk to.
     _peer_update_with_confirm(
         ctx,
         on_status=_on_status,
         on_no_update=_on_no_update,
         on_error=_on_error,
+        required_min=required_min,
+        mandatory=force_prompt,
     )
 
 
-def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error):
+# ── language mirror (server pref → peer pref) ────────────────────────────
+
+def _sync_ui_language_with_daemon():
+    """Pull the daemon's persisted UI language and apply it
+    locally so peer-side popups (bootstrap dialogs, status
+    strings) honour the language picked in the server APK's
+    settings UI. On Android, ``$AZT_HOME/config.json`` is
+    per-process private; the file-system path doesn't propagate
+    a preference across processes, so we have to ask the daemon.
+    Best-effort: any failure is silent and the peer keeps using
+    its local default."""
+    try:
+        import azt_collab_client as _client_pkg
+    except Exception:
+        return
+    try:
+        srv_lang = _client_pkg.get_server_ui_language()
+    except Exception as ex:
+        print(f'[bootstrap] _sync_ui_language_with_daemon RPC '
+              f'failed: {ex}', file=sys.stderr, flush=True)
+        return
+    if not srv_lang:
+        return
+    try:
+        from .. import i18n
+        if srv_lang == i18n.language_pref():
+            return
+        i18n.set_language(srv_lang)
+        print(f'[bootstrap] mirrored UI language from daemon: '
+              f'{srv_lang!r}',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[bootstrap] _sync_ui_language_with_daemon apply '
+              f'failed: {ex}', file=sys.stderr, flush=True)
+
+
+# ── re-upload detection (same-tag, different digest) ──────────────────────
+#
+# ``_peer_update_with_confirm._probe`` originally only compared
+# ``latest_tag`` to ``peer_version`` via tuple ordering. That misses
+# the case where a maintainer pushes a fix to the *same release tag*
+# (re-uploads the asset on the existing release) — common in dev
+# iteration and unavoidable when a tag is hot-fixed in place.
+# GitHub's release-asset metadata has carried a ``digest``
+# (``sha256:<hex>``) since 2025-06; we persist the last digest we saw
+# for each peer repo and treat a change as "newer available" even
+# when the tag is identical.
+#
+# Storage: ``peer_prefs.last_seen_digests`` dict, keyed by ``owner/
+# repo``. ``peer_prefs`` writes to whatever ``$AZT_HOME/config.json``
+# resolves to in the calling peer's process (peer-private on Android,
+# shared on desktop), which is the right scope — each peer tracks
+# its own repo independently.
+#
+# Baseline: on first run for a given repo (no entry) we record the
+# current GitHub digest as a starting point. We can't reconstruct
+# what was actually installed; what matters is detecting *change
+# going forward*, not the absolute historical value. The single
+# perverse case this misses — maintainer overwrites the asset
+# *between* install and first launch — is rare enough to accept.
+
+def _last_seen_digest(repo):
+    """Return the last GitHub asset digest we recorded for
+    ``repo``, or ``''`` if never recorded."""
+    from .. import peer_pref
+    state = (peer_pref('last_seen_digests', {}) or {})
+    return state.get(repo, '')
+
+
+def _record_last_seen_digest(repo, digest):
+    """Persist ``digest`` as the last-seen GitHub asset digest for
+    ``repo``. No-op for empty digest. Called from ``_probe`` when
+    we observe a digest from GitHub (either as the first-run
+    baseline or as the new value after a detected change)."""
+    if not digest:
+        return
+    from .. import peer_pref, set_peer_pref
+    state = dict(peer_pref('last_seen_digests', {}) or {})
+    if state.get(repo) == digest:
+        return  # idempotent — avoids needless config.json rewrites
+    state[repo] = digest
+    set_peer_pref('last_seen_digests', state)
+
+
+def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
+                              required_min='', mandatory=False):
     """Two-stage self-update: probe latest release on a worker
     thread, prompt the user on the UI thread, then on Yes invoke
     ``check_for_update`` for the download+install. Splits the probe
@@ -596,11 +959,23 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error):
 
     Reuses ``update._fetch_latest`` so the prerelease-skipping policy
     stays in one place (rather than duplicating the listing walk
-    here)."""
+    here).
+
+    ``required_min`` is forwarded into the confirm-popup body when
+    set, so a ``client_too_old`` flow tells the user *which* version
+    the daemon needs them to install (not just "newer is
+    available").
+
+    ``mandatory=True`` (set on the ``client_too_old`` path) flips
+    the popup wording from "newer is available — Update / Not now"
+    to "required — Update / Quit". Declining a mandatory update
+    closes the app instead of dropping the user into a peer the
+    daemon refuses to talk to."""
     from .update import _fetch_latest
     from .. import _version_tuple
 
     def _probe():
+        from .update import _pick_asset
         try:
             release = _fetch_latest(ctx.peer_repo)
         except Exception as ex:
@@ -609,17 +984,86 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error):
             _on_ui(on_no_update)
             return
         latest = (release.get('tag_name') or '').lstrip('vV')
-        if not latest or _version_tuple(latest) <= _version_tuple(
-                ctx.peer_version):
+
+        # Pull GitHub's authoritative ``asset.digest`` so we can
+        # compare against the last-seen digest — same-tag re-uploads
+        # (maintainer pushes a fix to the existing release without
+        # bumping the version) flip this without flipping the tag,
+        # and a tag-only check would silently skip the install.
+        gh_digest = ''
+        asset = _pick_asset(release, ctx.peer_asset_filename)
+        if asset is not None:
+            raw = asset.get('digest') or ''
+            if raw.startswith('sha256:'):
+                gh_digest = raw[len('sha256:'):].strip()
+        last_seen = _last_seen_digest(ctx.peer_repo)
+
+        version_newer = bool(
+            latest and _version_tuple(latest)
+            > _version_tuple(ctx.peer_version)
+        )
+        digest_changed = bool(
+            gh_digest and last_seen and gh_digest != last_seen
+        )
+        # First-run case: no last_seen recorded yet. We can't
+        # introspect the installed APK's bundled digest to baseline
+        # against, so digest_changed alone can't tell us anything.
+        unknown_baseline = bool((not last_seen) and gh_digest)
+        # Mandatory-mode override. The daemon has already told us
+        # the running client is too old; the probe's job here is
+        # just to find a target to install, not to second-guess
+        # whether one is needed. Always prompt as long as the
+        # release feed gave us *something* to download — covers
+        # the unknown-baseline case (first run) AND the post-tap
+        # case where last_seen was just recorded by Update-tap
+        # but the install failed (otherwise the next probe would
+        # see digest_changed=False and silently fall through to
+        # _show_no_newer_release, hiding a real update).
+        mandatory_force = bool(mandatory and latest)
+        print(f'[bootstrap] _probe peer={ctx.peer_repo!r} '
+              f'latest={latest!r} peer_v={ctx.peer_version!r} '
+              f'gh_digest={gh_digest[:12]!r}… '
+              f'last_seen={last_seen[:12]!r}… '
+              f'version_newer={version_newer} '
+              f'digest_changed={digest_changed} '
+              f'mandatory={mandatory} '
+              f'mandatory_force={mandatory_force}',
+              file=sys.stderr, flush=True)
+
+        needs_update = (
+            version_newer or digest_changed or mandatory_force)
+
+        if not needs_update:
+            # Quiet path. Take the first-run baseline now so the
+            # NEXT probe can detect a real change. Only do this on
+            # the no-prompt branch — recording before a prompt
+            # would let a "Quit" decline silently re-baseline and
+            # mask the pending update on next launch.
+            if unknown_baseline:
+                _record_last_seen_digest(ctx.peer_repo, gh_digest)
             _on_ui(on_no_update)
             return
         # Decline memory: if the user already said "Not now" for
         # this exact version, skip the prompt. A new version moves
         # us off the recorded value automatically.
-        if _declined_version(ctx.peer_repo) == latest:
+        #
+        # Two carve-outs to the silent skip:
+        # - ``mandatory``: declines never apply on the
+        #   ``client_too_old`` path. The popup's only dismiss
+        #   action there is Quit (no decline is ever recorded
+        #   anyway, but belt-and-braces).
+        # - ``digest_changed``: same-tag re-upload. The "decline"
+        #   was against the previous bytes — those bytes no
+        #   longer exist on GitHub. Treat the new digest as a
+        #   fresh release the user hasn't been asked about. This
+        #   matches the user-reported case: "Check again doesn't
+        #   currently show a new apk online, despite a different
+        #   sha256."
+        if (not mandatory and not digest_changed
+                and _declined_version(ctx.peer_repo) == latest):
             _on_ui(on_no_update)
             return
-        _on_ui(_prompt_self_update, ctx, latest)
+        _on_ui(_prompt_self_update, ctx, latest, mandatory, gh_digest)
 
     threading.Thread(target=_probe, daemon=True).start()
 
@@ -688,6 +1132,7 @@ def _prompt_server_unresponsive(ctx):
         # path as the post-install continuation, including the 2s
         # daemon-warm-up pause).
         on_retry=lambda: _post_install_continuation(ctx),
+        repo=ctx.server_repo,
     )
 
 
@@ -730,14 +1175,25 @@ def _prompt_server_install(ctx):
         current_server_version='0.0.0',
         title=_tr('Install AZT Collaboration?'),
         on_install_complete=lambda: _post_install_continuation(ctx),
+        repo=ctx.server_repo,
     )
 
 
-def _prompt_server_update(ctx, current_version):
+def _prompt_server_update(ctx, current_version, min_required=''):
     """Server present but too old. Same popup shape as the missing-
     server prompt, different body / title / Install-button label /
     current_version (so check_for_update doesn't redownload an
     identical release).
+
+    **Pre-flight version check.** If ``min_required`` is set (the
+    daemon's compat response carries it on the ``server_too_old``
+    branch), we fetch GitHub's latest server release and confirm
+    it's >= min_required before opening the install popup. If the
+    latest release is *also* too old to satisfy the peer, the
+    install would land us right back at ``server_too_old`` — so
+    instead we surface a one-button "Wait for an update or build
+    from source" popup. Saves a useless download and a confused
+    user.
 
     **Also does not fire on_done.** Same reasoning as
     ``_prompt_server_install`` — the daemon at the existing
@@ -759,10 +1215,30 @@ def _prompt_server_update(ctx, current_version):
         # daemon's compat error its own way.
         _on_done_and_release(ctx)
         return
-    body = _tr(
-        'A newer version of the AZT Collaboration service ({name}) '
-        'is required. Tap Update to download and install it.'
-    ).format(name=ctx.server_display_name)
+    # Pre-flight: does the upstream release feed have a build that
+    # would actually satisfy our floor?
+    if min_required:
+        ok, latest_seen, why = _release_meets_minimum(
+            ctx.server_repo, min_required)
+        if (not ok) and why == 'too_old':
+            _show_release_too_old(ctx, latest_seen, min_required,
+                                  ctx.server_display_name)
+            return
+        # ``fetch_failed`` falls through — user might have a
+        # working connection by the time they tap Install, and
+        # check_for_update inside the popup re-fetches anyway.
+    body = (
+        _tr(
+            '{name} {required} or newer is required (you have '
+            '{current}). Tap Update to download and install it.'
+        ).format(name=ctx.server_display_name,
+                 required=min_required, current=current_version)
+        if min_required
+        else _tr(
+            'A newer version of {name} is required. '
+            'Tap Update to download and install it.'
+        ).format(name=ctx.server_display_name)
+    )
     _release_running()
     install_server_apk_popup(
         on_status=ctx.on_status,
@@ -772,39 +1248,90 @@ def _prompt_server_update(ctx, current_version):
         install_label=_tr('Update'),
         title=_tr('Update AZT Collaboration?'),
         on_install_complete=lambda: _post_install_continuation(ctx),
+        repo=ctx.server_repo,
     )
 
 
-def _prompt_self_update(ctx, latest_version):
+def _prompt_self_update(ctx, latest_version, mandatory=False,
+                        gh_digest=''):
     """Peer self-update prompt. Same popup as the server install /
     update cases (so users see one consistent install/update UI
-    across the suite), parameterized for the peer's own APK:
+    across the suite), parameterized for the peer's own APK.
 
+    ``gh_digest`` is the SHA-256 of the GitHub asset that's about
+    to be offered. When the user taps Update we record it as the
+    new baseline via ``_record_last_seen_digest`` so the same-tag
+    re-upload loop can break: without this, the next bootstrap
+    probe still sees ``digest_changed=True`` (last_seen is stale)
+    and re-prompts forever, even after a successful install.
+    Recording at tap time (rather than at install-complete) is
+    the practical compromise — for self-update we can't reliably
+    detect install completion (versionName doesn't flip on a
+    same-tag re-upload, and our process gets killed by Android
+    during install so we lose the in-process poll). If the install
+    ultimately fails the user is stuck at the old version with no
+    further prompt, which they can recover from via the
+    in-settings Update button or a manual reinstall.
+
+    Two flavours, picked by ``mandatory``:
+
+    - **Voluntary** (``mandatory=False``, the normal newer-release-
+      detected path): body reads "A newer version of this app
+      ({version}) is available." Dismiss button is "Not now",
+      action is ``'dismiss'`` — peer keeps running at the current
+      version, decline is recorded via ``_record_decline`` so we
+      don't re-prompt for the same version next launch.
+    - **Mandatory** (``mandatory=True``, the ``client_too_old`` +
+      newer-version-exists path): body reads
+      "{name} {version} is required to use the AZT Collaboration
+      service." Dismiss button is "Quit", action is ``'quit'`` —
+      peer can't function without the daemon agreeing to talk to
+      it, so declining means closing the app rather than dropping
+      the user into a half-broken UI. No decline memory: we
+      can't usefully remember a decline of a mandatory update;
+      next launch just re-asks.
+
+    Common bits in both:
     - ``direct_url`` → composed from peer_repo + peer_asset_filename.
-    - ``open_page_url`` → peer's release page so the user can read
-      release notes before tapping Update.
+    - ``open_page_url`` → peer's release page.
     - ``install_target_package=''`` → explicitly skip polling.
       Self-install replaces the running peer process; polling our
-      own package would block forever and the popup would hang at
-      "Installing…" until the user manually closes it.
-    - ``dismiss_label='Not now'`` + ``dismiss_action='dismiss'`` →
-      the dismiss button just closes the popup (peer keeps running
-      at the current version) instead of quitting the app. Self-
-      update decline is "stick with what I have", not "I can't
-      use this app".
-
-    Records the decline on the dismiss path via the same
-    ``_record_decline`` machinery as before — wrapped via the
-    popup's normal close handler is moot since
-    ``install_server_apk_popup`` doesn't expose an on-decline
-    hook; instead we record decline up front on the
-    ``Not now`` path by wrapping the dismiss into a custom
-    callback. (See the ``on_dismiss`` Popup property below.)"""
+      own package would block forever."""
     from .popups import install_server_apk_popup
-    body = _tr(
-        'A newer version of this app ({version}) is available. '
-        'Tap Update to download and install it.'
-    ).format(version=latest_version)
+    if mandatory:
+        # Two flavours of "mandatory update available":
+        # - latest > peer: a genuinely newer peer release.
+        # - latest == peer: same-tag re-upload (digest_changed
+        #   was True in _probe). User is at the latest tag but
+        #   bytes differ. Phrasing "{name} 0.8.2 is required"
+        #   read confusingly when the user was already at 0.8.2;
+        #   distinguish the two cases so the body actually
+        #   describes what's about to happen.
+        if str(latest_version) == str(ctx.peer_version):
+            body = _tr(
+                'A new build of {name} {version} is available. '
+                'The current build is too old for the AZT '
+                'Collaboration service. Tap Update to install '
+                'the new build, or Quit to close this app.'
+            ).format(name=ctx.peer_display_name,
+                     version=latest_version)
+        else:
+            body = _tr(
+                '{name} {peer_v} is too old for the AZT '
+                'Collaboration service. Tap Update to install '
+                '{name} {latest}, or Quit to close this app.'
+            ).format(name=ctx.peer_display_name,
+                     peer_v=ctx.peer_version,
+                     latest=latest_version)
+        dismiss_label = _tr('Quit')
+        dismiss_action = 'quit'
+    else:
+        body = _tr(
+            'A newer version of this app ({version}) is available. '
+            'Tap Update to download and install it.'
+        ).format(version=latest_version)
+        dismiss_label = _tr('Not now')
+        dismiss_action = 'dismiss'
     direct_url = (
         f'https://github.com/{ctx.peer_repo}/'
         f'releases/latest/download/{ctx.peer_asset_filename}'
@@ -812,6 +1339,39 @@ def _prompt_self_update(ctx, latest_version):
     open_page_url = (
         f'https://github.com/{ctx.peer_repo}/releases/latest'
     )
+
+    # Self-install: poll our own package for a versionName flip, and
+    # call ``App.stop()`` when it does. The pre-0.30.41 code skipped
+    # polling on the assumption that Android would always kill our
+    # process during the install — but on some devices /
+    # configurations the running peer survives the install, comes
+    # back to foreground, and re-renders the same popup. User
+    # observed: "downloaded and installed fine, but then I found
+    # myself back at the same popup." Polling + explicit App.stop()
+    # closes us cleanly so the next launch picks up the new APK.
+    # Safe in both cases:
+    # - Android kills us during install → poll thread dies with us,
+    #   no harm.
+    # - Android doesn't kill us → poll detects the version change,
+    #   we stop ourselves, user re-launches into the new code.
+    peer_pkg = ''
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        activity = PythonActivity.mActivity
+        if activity is not None:
+            peer_pkg = activity.getPackageName() or ''
+    except Exception:
+        pass
+
+    def _on_self_install_complete():
+        try:
+            from kivy.app import App as _App
+            app = _App.get_running_app()
+            if app is not None:
+                app.stop()
+        except Exception:
+            pass
 
     _release_running()
     popup = install_server_apk_popup(
@@ -823,15 +1383,11 @@ def _prompt_self_update(ctx, latest_version):
         direct_url=direct_url,
         asset_filename=ctx.peer_asset_filename,
         open_page_url=open_page_url,
-        dismiss_label=_tr('Not now'),
-        dismiss_action='dismiss',
-        # Empty string == explicitly no polling. Self-install
-        # kills the running peer process during install; polling
-        # our own package would block forever.
-        install_target_package='',
-        # No on_install_complete: when self-install finishes, the
-        # peer's process is dying anyway. Next-launch bootstrap
-        # detects the new version naturally.
+        dismiss_label=dismiss_label,
+        dismiss_action=dismiss_action,
+        install_target_package=peer_pkg,
+        on_install_complete=_on_self_install_complete,
+        repo=ctx.peer_repo,
     )
 
     # Record decline on Not-now tap. Kivy's Popup fires
@@ -844,6 +1400,13 @@ def _prompt_self_update(ctx, latest_version):
     _state = {'install_started': False}
 
     def _record_on_dismiss(_p):
+        # Decline memory only applies to the voluntary path.
+        # Mandatory dismiss = quit (the popup's own dismiss_action
+        # closes the app), so there's nothing to "remember" — and
+        # ``_on_done_and_release`` would drop the user back into
+        # the peer with a daemon that won't talk to them.
+        if mandatory:
+            return
         if not _state['install_started']:
             _record_decline(ctx.peer_repo, latest_version)
         _on_done_and_release(ctx)
@@ -867,35 +1430,29 @@ def _prompt_self_update(ctx, latest_version):
             return None
         install_btn = _walk(popup.content)
         if install_btn is not None:
-            install_btn.fbind(
-                'on_release',
-                lambda *_: _state.__setitem__('install_started', True))
+            def _on_install_tap(*_):
+                _state['install_started'] = True
+                # Break the same-tag re-upload loop. Without this,
+                # last_seen stays at the pre-install digest forever
+                # and every bootstrap re-prompts because digest_changed
+                # remains True even after install completes
+                # (versionName doesn't flip on same-tag re-uploads, so
+                # we can't condition on a successful install). User
+                # report 0.30.45: "this window keeps coming up since
+                # the digest is still different from gh."
+                if gh_digest:
+                    _record_last_seen_digest(ctx.peer_repo, gh_digest)
+            install_btn.fbind('on_release', _on_install_tap)
     except Exception:
         pass
     popup.bind(on_dismiss=_record_on_dismiss)
 
 
-# ── popup primitives ───────────────────────────────────────────────────────
-
-def _show_info(ctx, body):
-    """Single-button info popup for the rare client_too_old +
-    no-newer-release branch."""
-    from . import theme
-
-    content = BoxLayout(orientation='vertical', spacing=dp(10),
-                        padding=dp(12))
-    msg = Label(text=body, halign='left', valign='top',
-                color=theme.TEXT, font_size=sp(14),
-                font_name=ctx.font_name)
-    msg.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-    content.add_widget(msg)
-    btn = Button(text=_tr('OK'), size_hint_y=None, height=dp(48),
-                 font_size=sp(14), font_name=ctx.font_name,
-                 background_color=theme.ACCENT)
-    content.add_widget(btn)
-    popup = Popup(title=_tr('Update needed'), content=content,
-                  size_hint=(0.9, None), height=dp(240),
-                  auto_dismiss=False)
-    btn.bind(on_release=lambda *_: popup.dismiss())
-    popup.open()
-    return popup
+# ``_show_info`` was deleted in 0.30.34 — the only caller (the
+# client_too_old + no-newer-release branch) now uses
+# ``_show_no_newer_release`` for parity with
+# ``_show_release_too_old``: same Check-again + Quit + mailto-link
+# UI. The old single-button OK popup silently dropped through to
+# ``on_done`` after the user dismissed it, which was the cause of
+# the user-reported "user lands in the client with a loaded
+# project but the daemon won't talk to them" bug.

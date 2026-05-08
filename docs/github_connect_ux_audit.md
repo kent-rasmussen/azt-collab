@@ -11,33 +11,43 @@ trail of what was learned stays visible.
 
 ## Highest-impact (worth fixing first)
 
-### 1. ~~Manual code-copy step in browser~~ — done
+### 1. ~~Manual code-copy step in browser~~ — not possible against GitHub
 
-GitHub's device-flow response includes both ``verification_uri``
-(bare URL — ``https://github.com/login/device``) and
-``verification_uri_complete`` (URL with the code prefilled —
-``https://github.com/login/device?user_code=ABCD-1234``). The
-current implementation in
-``azt_collabd/ui/app.py:GitHubConnectScreen._worker`` uses the
-bare URL:
+This audit item assumed GitHub's OAuth Device Flow returns
+``verification_uri_complete`` per RFC 8628, or at minimum that
+``https://github.com/login/device?user_code=ABCD-1234`` would
+prefill the code field. Both turn out to be false:
 
-```python
-verify_uri = resp.get('verification_uri',
-                      'https://github.com/login/device')
-```
+- GitHub's documented response shape (per
+  ``docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow``)
+  is exactly ``device_code, user_code, verification_uri,
+  expires_in, interval`` — RFC 8628 §3.2 marks
+  ``verification_uri_complete`` OPTIONAL, and GitHub elects to
+  omit it. Confirmed against the canonical ``cli/oauth`` Go
+  reference impl and ``octokit/auth-oauth-device.js``: both parse
+  the field defensively for spec compliance but receive empty
+  strings against github.com.
+- GitHub's ``/login/device`` page silently ignores
+  ``?user_code=...`` query parameters. No prefill happens.
+- A Jan-2024 GitHub change adds a "select Continue on an
+  account" confirmation step in front of the code-entry form,
+  unconditionally — even single-account users see it. So even
+  if the prefill query param worked, the redirect through the
+  account-confirmation step would strip it.
 
-So the user lands on the code-entry page and has to paste/retype.
-Switching to ``verification_uri_complete`` (with bare-URL fallback)
-makes the device-page show "Authorize?" directly, code already
-filled in.
+The only path forward is to display the code prominently in our
+app (already done), put it on the system clipboard (already
+done — though GitHub's 8-field code input ignores paste anyway),
+and ask the user to type it. There is no one-tap UX available
+through GitHub's hosted device-flow page.
 
-**One-line fix; eliminates the most error-prone step in the flow.**
-``device_flow_start()`` in ``azt_collabd/auth.py`` already returns
-the field; just plumb it through.
-
-**Implemented:** ``_worker`` now prefers
-``verification_uri_complete`` and falls back to ``verification_uri``
-then the bare URL.
+**Implemented (and reverted):** 0.29.0 plumbed through
+``verification_uri_complete``. 0.30.5 added a manual
+``?user_code=`` suffix on the bare URL. 0.30.7 reverts both —
+neither accomplishes anything against github.com, and pretending
+they do mis-leads the next maintainer. The fallback chain is
+now defensive only: use ``verification_uri_complete`` if a
+future GitHub change starts returning it.
 
 ### 2. ~~"Connected" message overstates progress~~ — done
 
@@ -137,10 +147,29 @@ not) at a time, and GitLab really is just settings, so simplify
 button to "GitLab"; connection status is shown below.
 
 **Implemented:** SettingsScreen now shows a single state-aware
-GitHub button (label flips Connect↔Disconnect from
-``credentials_status``) and a single ``GitLab`` button that
-opens the GitLab settings form. Connection details for both
-hosts remain in the Status block below.
+GitHub button and a single state-aware GitLab button.
+Originally (0.29.0) the GitHub button flipped Connect ↔
+Disconnect from ``gh.connected``, but that surfaced
+"Disconnect" during a half-finished setup (token saved, App
+not yet installed) and a user with a stuck install only had
+Disconnect to tap and lost their partial work. **0.30.8**
+changes the gating to ``gh.confirmed`` (and ``gl.confirmed``)
+so the button reads:
+
+- Not verified: ``Connect to GitHub`` / ``Connect to GitLab``
+  (tap resumes the step the user stopped on).
+- Verified:    ``GitHub Settings`` / ``GitLab Settings`` (tap
+  opens the same screen, which renders the manage view).
+
+Disconnect now lives **inside** each respective screen
+(``GitHubConnectScreen`` already had it in the manage box;
+``GitLabFormScreen`` gained one in 0.30.8) so a fat-finger from
+the main menu can't blow away a working setup. Re-auth on
+GitHub costs the user the 8-field code-typing dance, and
+re-typing a GitLab PAT is a similar friction; making the
+destructive step take an extra navigation tap matches the
+maintainer-stated preference (audit doc #7) over a confirmation
+popup.
 
 
 ### 7. ~~Disconnect button is one tap from prominent~~ — declined

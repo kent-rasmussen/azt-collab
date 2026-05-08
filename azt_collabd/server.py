@@ -275,6 +275,32 @@ def _h_set_contributor(body):
     return 200, {"ok": True, "contributor": store.get_contributor()}
 
 
+def _h_get_ui_language(_body):
+    """Return the daemon-side UI language persisted in
+    ``$AZT_HOME/config.json::ui.language``.
+
+    Why this needs to be a daemon endpoint: ``$AZT_HOME`` resolves
+    to the calling process's *private* filesDir on Android (server
+    APK has its own, each peer has its own). The language picker
+    lives in the server APK's settings UI, which writes to the
+    *server's* config.json. Peers reading their own config.json
+    never see that value, so peer-side dialogs (bootstrap popups,
+    in-particular) stay in English even when the user has picked
+    French in the server UI. This endpoint exposes the canonical
+    server-side preference so peers can mirror at startup."""
+    import json
+    import os
+    from . import paths
+    cfg_path = os.path.join(paths.azt_home(), 'config.json')
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f) or {}
+    except (OSError, ValueError):
+        return 200, {"ok": True, "language": ''}
+    lang = ((cfg.get('ui') or {}).get('language', '') or '')
+    return 200, {"ok": True, "language": str(lang)}
+
+
 def _h_github_install_url(_body):
     """Return the configured GitHub App install URL (canonical source is
     azt_collabd.config). Peers use this so they don't have to import
@@ -473,6 +499,13 @@ def _h_test_github(body):
                      "app_installed": False,
                      "error": "missing_token"}
     info = _auth.test_github_credentials(token)
+    import sys
+    print(f'[_h_test_github] test_github_credentials returned: '
+          f'valid={info.get("valid")} '
+          f'app_installed={info.get("app_installed")} '
+          f'app_suspended={info.get("app_suspended")} '
+          f'installation_id={info.get("installation_id")}',
+          file=sys.stderr, flush=True)
     if info.get('valid'):
         # Refresh username if the user renamed on GitHub since last
         # connect; harmless on the typical "name unchanged" path.
@@ -484,6 +517,9 @@ def _h_test_github(body):
             )
         store.set_github_app_installed(bool(info.get('app_installed')))
         store.set_github_confirmed(True)
+        print(f'[_h_test_github] saved: app_installed='
+              f'{bool(info.get("app_installed"))!r} confirmed=True',
+              file=sys.stderr, flush=True)
     else:
         store.set_github_confirmed(False)
     return 200, {"ok": True, **info}
@@ -1041,6 +1077,8 @@ def dispatch(method, path, body):
                 return _h_github_device_flow_status(parts[5], body)
         if path == '/v1/recent/last_project':
             return _h_get_last_project(body)
+        if path == '/v1/config/ui_language':
+            return _h_get_ui_language(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):

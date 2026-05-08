@@ -26,6 +26,7 @@ the process again via Android's provider lazy-spawn contract.
 
 import json
 import os
+import sys
 import threading
 import time
 
@@ -39,6 +40,18 @@ _installed = False
 _state_lock = threading.Lock()
 _last_touch_monotonic = time.monotonic()
 _bound_count = 0
+
+# Recorded once at ``install_callbacks()`` time; used by
+# ``_check_self_updated()`` to detect that the running APK was
+# replaced underneath us. Android's package installer normally kills
+# the process being upgraded, but custom-ROM battery savers and
+# adb-side ``pm install -r`` can leave the old daemon running with
+# stale code while the new APK is on disk. Without the auto-exit,
+# peers keep talking to the old code and the only fix is for the
+# user to force-stop the server APK by hand. milliseconds since
+# epoch (Java conventions); ``None`` off Android or before
+# ``install_callbacks`` is invoked.
+_initial_pkg_update_time = None
 
 
 def touch():
@@ -100,10 +113,86 @@ def _is_android():
         return False
 
 
+def _android_context():
+    """Return the running Android Context (Service preferred, Activity
+    as fallback) or ``None`` if neither is available. The server APK's
+    daemon lives in the ``:provider`` service process where
+    ``PythonService.mService`` is set; the standalone settings UI runs
+    as an Activity where ``PythonActivity.mActivity`` is set instead.
+    Either is sufficient for ``getPackageManager()``."""
+    try:
+        from jnius import autoclass
+    except ImportError:
+        return None
+    for cls_name, attr in (
+        ('org.kivy.android.PythonService', 'mService'),
+        ('org.kivy.android.PythonActivity', 'mActivity'),
+    ):
+        try:
+            cls = autoclass(cls_name)
+            ctx = getattr(cls, attr, None)
+            if ctx is not None:
+                return ctx
+        except Exception:
+            continue
+    return None
+
+
+def _pkg_last_update_time():
+    """Read ``PackageManager.getPackageInfo(...).lastUpdateTime`` for
+    the running APK. Returns the timestamp (ms since epoch) or
+    ``None`` if anything goes wrong (off Android, no context, JNI
+    blow-up). The caller must treat ``None`` as "no signal" — never
+    as "unchanged"."""
+    ctx = _android_context()
+    if ctx is None:
+        return None
+    try:
+        pm = ctx.getPackageManager()
+        pi = pm.getPackageInfo(ctx.getPackageName(), 0)
+        return int(pi.lastUpdateTime)
+    except Exception as ex:
+        print(f'[android_cp] _pkg_last_update_time failed: {ex}',
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _check_self_updated():
+    """``True`` iff the running APK's ``lastUpdateTime`` has advanced
+    since this process started. Cheap (single PackageManager call)
+    and side-effect-free; the caller decides what to do (typically
+    schedule a clean exit so the next ContentResolver call lazy-
+    spawns the freshly-installed code)."""
+    if _initial_pkg_update_time is None:
+        return False
+    current = _pkg_last_update_time()
+    if current is None:
+        return False
+    return current > _initial_pkg_update_time
+
+
+_exit_scheduled = False
+
+
+def _schedule_exit_for_update():
+    """Fire ``os._exit(0)`` on a short delay so the in-flight binder
+    response has time to return to the peer. Idempotent — once
+    scheduled, repeated dispatches don't pile up exit timers."""
+    global _exit_scheduled
+    if _exit_scheduled:
+        return
+    _exit_scheduled = True
+    print('[android_cp] APK was updated — exiting so the next '
+          'peer call lazy-spawns the new code',
+          file=sys.stderr, flush=True)
+    threading.Timer(0.5, lambda: os._exit(0)).start()
+
+
 def install_callbacks():
     """Register the Python dispatch + openFile callbacks with the Java
     AZTCollabProvider class. Idempotent. No-op off Android."""
     global _installed, _dispatch_cb, _openfile_cb
+    global _initial_pkg_update_time
     if _installed:
         return
     if not _is_android():
@@ -112,6 +201,12 @@ def install_callbacks():
         from jnius import autoclass, PythonJavaClass, java_method
     except ImportError:
         return
+
+    # Snapshot the package's lastUpdateTime so we can detect a
+    # subsequent in-place upgrade. Done before any callbacks are
+    # wired so a stale process never sees a "self-updated" reading
+    # against an uninitialised baseline.
+    _initial_pkg_update_time = _pkg_last_update_time()
 
     Provider = autoclass(
         'org.atoznback.aztcollab.AZTCollabProvider')
@@ -144,6 +239,12 @@ def install_callbacks():
                 b.putString('json', json.dumps(response))
             except Exception:
                 b.putString('json', '{"ok":false,"error":"unserializable"}')
+            # Self-update auto-exit. Done *after* response is built
+            # so the binder return carries this last reply before
+            # the process goes down. Next peer call hits Android's
+            # provider lazy-spawn contract and gets the new code.
+            if _check_self_updated():
+                _schedule_exit_for_update()
             return b
 
     class _OpenFile(PythonJavaClass):

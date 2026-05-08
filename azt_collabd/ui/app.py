@@ -239,38 +239,41 @@ KV_TEMPLATE = '''
                     height: dp(48) if root.back_to else 0
                     opacity: 1 if root.back_to else 0
                     disabled: not root.back_to
-                    on_release: app.go(root.back_to) if root.back_to else None
-                # ── Share this app ─────────────────────────────────────
-                # No-op on desktop (share_running_apk surfaces a
-                # translated "Android only" message via on_error); on
-                # Android this shares the running server APK so a user
-                # can hand it to a teammate that needs the daemon.
-                RecBtn:
-                    text: _('Share this app')
-                    halign: 'left'
-                    padding: [dp(52), 0]
-                    text_size: self.size
-                    valign: 'middle'
-                    normal_color: T.SURFACE
-                    on_release: app.share_apk()
-                    Image:
-                        source: SHARE_ICON
-                        size_hint: None, None
-                        size: dp(24), dp(24)
-                        x: self.parent.x + dp(16)
-                        center_y: self.parent.center_y
-                # ── Update this app ────────────────────────────────────
-                # Polls the configured GitHub repo for a newer release
-                # asset and triggers the system installer on Android.
-                # Status messages flow through update_msg below.
-                RecBtn:
-                    text: _('Update this app')
-                    halign: 'left'
-                    padding: [dp(52), 0]
-                    text_size: self.size
-                    valign: 'middle'
-                    normal_color: T.SURFACE
-                    on_release: app.update_app()
+                    on_press: app.go(root.back_to) if root.back_to else None
+                # ── Share + Update ─────────────────────────────────────
+                # Two utility actions on one row, half-width each.
+                # Share is a no-op on desktop (surfaces a translated
+                # "Android only" message); on Android it shares the
+                # running APK so a user can hand it to a teammate.
+                # Update polls the configured GitHub repo for a newer
+                # release asset and triggers the system installer on
+                # Android. Status messages flow through update_msg
+                # below.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(10)
+                    RecBtn:
+                        text: _('Share')
+                        normal_color: T.SURFACE
+                        on_press: app.share_apk()
+                        # Icon as a left-overlay; the button keeps
+                        # its centered "Share" text. Half-width
+                        # geometry means we don't need
+                        # ``padding: [dp(52), 0]`` to clear room —
+                        # the icon at ``x: self.parent.x + dp(12)``
+                        # sits inside the bounds without colliding
+                        # with the short single-word label.
+                        Image:
+                            source: SHARE_ICON
+                            size_hint: None, None
+                            size: dp(24), dp(24)
+                            x: self.parent.x + dp(12)
+                            center_y: self.parent.center_y
+                    RecBtn:
+                        text: _('Update')
+                        normal_color: T.SURFACE
+                        on_press: app.update_app()
                 BodyLabel:
                     id: update_msg
                     text: ''
@@ -296,26 +299,31 @@ KV_TEMPLATE = '''
                     color: T.TEXT_DIM
                     size_hint_y: None
                     height: dp(20)
-                # GitHub: a single state-aware button. Connect when
-                # not connected, Disconnect when connected — only one
-                # is ever the right next action, so showing both was
-                # extra cognitive load for the SIL field-linguist user
-                # (audit doc #6). Label + action are flipped in
-                # ``refresh()`` from credentials_status.
+                # GitHub: a single state-aware button. ``refresh()``
+                # flips the label between "Connect to GitHub" (until
+                # verified) and "GitHub Settings" (once verified).
+                # Both states navigate to the same screen, which
+                # renders step-by-step setup or the manage view based
+                # on credentials_status — Disconnect lives inside
+                # there, not here, because re-auth costs the user the
+                # 8-field code-typing dance and a fat-finger Disconnect
+                # next to the main settings button has bitten people.
+                # ``on_press`` (not ``on_release``) because ScrollView's
+                # touch-grab heuristic ate every ``on_release`` here;
+                # see the matching note on gh_primary_btn in
+                # <GitHubConnectScreen>.
                 RecBtn:
                     id: gh_action_btn
                     text: _('Connect to GitHub')
                     normal_color: T.GREEN
-                    on_release: root.gh_action()
-                # GitLab: a single button that opens the GitLab
-                # settings screen. The connection-status detail lives
-                # below in the Status block; the form itself handles
-                # both connect and disconnect.
+                    on_press: app.go('github')
+                # GitLab: same shape. Label flipped in refresh() from
+                # gl.confirmed; GitLabFormScreen owns Disconnect now.
                 RecBtn:
                     id: gl_action_btn
-                    text: _('GitLab')
-                    normal_color: T.SURFACE
-                    on_release: app.go('gitlab')
+                    text: _('Connect to GitLab')
+                    normal_color: T.GREEN
+                    on_press: app.go('gitlab')
                 # Publish — visible only for the most-recent project
                 # when it has no remote yet AND at least one host's
                 # credentials have been confirmed. ``refresh()`` flips
@@ -333,7 +341,7 @@ KV_TEMPLATE = '''
                         id: publish_btn
                         text: _('Publish data')
                         normal_color: T.GREEN
-                        on_release: root.publish()
+                        on_press: root.publish()
                     BodyLabel:
                         id: publish_msg
                         text: ''
@@ -354,7 +362,7 @@ KV_TEMPLATE = '''
                     height: self.texture_size[1] + dp(8)
                 NavBtn:
                     text: _('Refresh Status')
-                    on_release: root.refresh()
+                    on_press: root.refresh()
                 Widget:
                     size_hint_y: None
                     height: dp(8)
@@ -373,7 +381,7 @@ KV_TEMPLATE = '''
                 NavBtn:
                     id: debug_503_btn
                     text: _('Toggle "service not responding"')
-                    on_release: root.toggle_debug_503()
+                    on_press: root.toggle_debug_503()
                 BodyLabel:
                     id: debug_503_state
                     text: ''
@@ -434,10 +442,13 @@ KV_TEMPLATE = '''
                     size_hint_y: None
                     height: dp(80)
                     text_size: self.width, None
+                # See the ``on_press``-vs-``on_release`` rationale on
+                # gh_primary_btn below: ScrollView ate on_release for
+                # both buttons in testing. Same fix applies here.
                 NavBtn:
                     id: gh_signup_btn
                     text: _('Create a GitHub account (free)')
-                    on_release: root.open_signup()
+                    on_press: root.open_signup()
                 # ── Step indicator (1. Authorize → 2. Install → 3. Verify)
                 # State (done / current / pending) is rendered via colour +
                 # bold by ``_render_steps`` from the server-tracked flags
@@ -481,9 +492,9 @@ KV_TEMPLATE = '''
                         valign: 'middle'
                         text_size: self.size
                 # Same fixed-height treatment as gh_preflight: 4 lines
-                # of body text covers every message we set (longest is
-                # the multi-line "Opening {uri}\n..." block). Stops the
-                # button below from migrating mid-tap.
+                # of body text covers every message we set (the
+                # multi-line "Opening URL ..." block is the longest).
+                # Stops the button below from migrating mid-tap.
                 BodyLabel:
                     id: gh_message
                     text: ''
@@ -494,11 +505,20 @@ KV_TEMPLATE = '''
                 # setup. Hidden during device-flow polling (the code box
                 # below carries that affordance) and once all three steps
                 # are done.
+                # ``on_press`` (not ``on_release``) because ScrollView's
+                # touch-grab heuristic ate every ``on_release`` here:
+                # the touch reached the button (state went to 'down'),
+                # but on touch_up ScrollView claimed it as a tiny
+                # scroll attempt and the Button's state machine never
+                # got to fire on_release. ``on_press`` runs at
+                # touch_down — before ScrollView has a chance to
+                # claim — so the action triggers regardless of how
+                # ScrollView resolves the gesture.
                 RecBtn:
                     id: gh_primary_btn
                     text: _('Begin')
                     normal_color: T.GREEN
-                    on_release: root.primary_action()
+                    on_press: root.primary_action()
                 # ── Device-flow code section ───────────────────────────
                 # Visible only while polling for user authorization on
                 # GitHub. Shows the user_code so it's still readable if
@@ -531,7 +551,7 @@ KV_TEMPLATE = '''
                             size_hint_x: None
                             width: dp(96)
                             text: _('Copy')
-                            on_release: root.copy_code()
+                            on_press: root.copy_code()
                 # ── Secondary actions ──────────────────────────────────
                 # Re-authenticate + Disconnect — only when a token is on
                 # file. Re-auth restarts the device flow without first
@@ -546,13 +566,13 @@ KV_TEMPLATE = '''
                     spacing: dp(10)
                     NavBtn:
                         text: _('Re-authenticate')
-                        on_release: root.reauthenticate()
+                        on_press: root.reauthenticate()
                     NavBtn:
                         text: _('Disconnect')
-                        on_release: root.disconnect()
+                        on_press: root.disconnect()
                 NavBtn:
                     text: _('Back')
-                    on_release: app.go('settings')
+                    on_press: app.go('settings')
 
 <GitLabFormScreen>:
     canvas.before:
@@ -604,10 +624,27 @@ KV_TEMPLATE = '''
                     id: gl_test_btn
                     text: _('Verify setup')
                     normal_color: T.GREEN
-                    on_release: root.test()
+                    on_press: root.test()
+                # Disconnect lives here, not on the SettingsScreen,
+                # so a fat-finger from the main menu can't blow away
+                # a working PAT — the user has to navigate INTO the
+                # GitLab page first. Visible only when ``connected``,
+                # so the form acts as the connect surface for
+                # not-yet-connected users without an out-of-place
+                # Disconnect cluttering the layout.
+                BoxLayout:
+                    id: gl_manage_box
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: 0
+                    opacity: 0
+                    spacing: dp(10)
+                    NavBtn:
+                        text: _('Disconnect')
+                        on_press: root.disconnect()
                 NavBtn:
                     text: _('Back')
-                    on_release: app.go('settings')
+                    on_press: app.go('settings')
 '''
 
 
@@ -682,7 +719,10 @@ class SettingsScreen(Screen):
                 background_normal='',
                 color=theme.TEXT,
             )
-            btn.bind(on_release=lambda b, c=code: self._set_ui_language(c))
+            # ``on_press`` (not ``on_release``) for the same
+            # ScrollView-eats-on_release reason documented on the
+            # KV-side action buttons.
+            btn.bind(on_press=lambda b, c=code: self._set_ui_language(c))
             row.add_widget(btn)
 
     def _set_ui_language(self, lang_code):
@@ -732,20 +772,40 @@ class SettingsScreen(Screen):
             return
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
-        # GitHub: single state-aware button — Connect when not
-        # connected, Disconnect when connected. Tracked on the
-        # widget so ``gh_action()`` can dispatch without re-fetching
-        # credentials_status.
-        gh_connected = bool(gh.get('connected'))
+        # GitHub: single state-aware button. We gate on ``confirmed``
+        # rather than ``connected`` because a half-finished setup
+        # (token saved but App not yet installed / Verify not yet
+        # tapped) still needs the user to *finish connecting*, not
+        # disconnect. Surfacing "Disconnect" in that intermediate
+        # state was a real footgun — a user who couldn't finish the
+        # install only had a Disconnect button to tap and ended up
+        # blowing away the partial work. Now: not-confirmed → "Connect
+        # to GitHub" (resumes the step where they stopped); confirmed
+        # → "GitHub Settings" (opens the same screen which renders
+        # the manage view with Disconnect / Re-auth inside).
+        gh_confirmed = bool(gh.get('confirmed'))
         gh_btn = self.ids.get('gh_action_btn')
         if gh_btn is not None:
-            gh_btn.text = _tr(
-                'Disconnect GitHub' if gh_connected
-                else 'Connect to GitHub')
-            gh_btn.normal_color = (
-                theme.BTN_INACTIVE if gh_connected else theme.GREEN)
-            gh_btn._action = (
-                'disconnect' if gh_connected else 'connect')
+            if gh_confirmed:
+                gh_btn.text = _tr('GitHub Settings')
+                gh_btn.normal_color = theme.SURFACE
+            else:
+                gh_btn.text = _tr('Connect to GitHub')
+                gh_btn.normal_color = theme.GREEN
+        # GitLab: same pattern — "Connect to GitLab" until verified,
+        # "GitLab Settings" once verified. Disconnect lives inside
+        # the GitLab form (same rationale as GitHub: re-auth means
+        # re-typing the PAT, not something we want users doing on a
+        # mistap).
+        gl_confirmed = bool(gl.get('confirmed'))
+        gl_btn = self.ids.get('gl_action_btn')
+        if gl_btn is not None:
+            if gl_confirmed:
+                gl_btn.text = _tr('GitLab Settings')
+                gl_btn.normal_color = theme.SURFACE
+            else:
+                gl_btn.text = _tr('Connect to GitLab')
+                gl_btn.normal_color = theme.GREEN
         # Contributor field — only repopulate when the user isn't
         # actively editing it, so a refresh during typing doesn't
         # clobber in-progress input.
@@ -797,11 +857,16 @@ class SettingsScreen(Screen):
         if row is None or btn is None:
             return
         # Reset to hidden by default; the rest flips it back on only
-        # if every condition holds.
+        # if every condition holds. Detach children so the
+        # publish_btn (a RecBtn with on_press) can't intercept
+        # touches that should reach gl_action_btn just above it —
+        # same hide-by-detach pattern used in
+        # GitHubConnectScreen.
         row.height = 0
         row.opacity = 0
         if msg is not None:
             msg.text = ''
+        self._detach_publish_children()
         project = self._pick_publish_candidate()
         if project is None:
             return
@@ -836,6 +901,49 @@ class SettingsScreen(Screen):
         # Heights: button + message (BodyLabel is dp(20)) + spacing.
         row.height = dp(52) + dp(8) + dp(20)
         row.opacity = 1
+        # Restore the children that ``_detach_publish_children`` may
+        # have removed if the row was previously hidden during this
+        # screen's lifetime. Idempotent if they're already attached.
+        self._reattach_publish_children()
+
+    # ── publish_row child detach (anti-touch-intercept) ──────────────
+    #
+    # ``publish_row`` defaults to ``height=0`` and sits directly under
+    # ``gl_action_btn``. Even with the parent collapsed, BoxLayout's
+    # ``_do_layout`` keeps positioning the inner ``publish_btn`` (a
+    # RecBtn with on_press) at its explicit dp(52) height — far enough
+    # below ``gl_action_btn`` not to overlap on paper, but Kivy's
+    # touch dispatch loop visits every child regardless and the
+    # combination has produced "GitLab button doesn't respond until
+    # 10-12 clicks" reports. Same hide-by-detach pattern that fixed
+    # the equivalent ``gh_primary_btn`` issue in
+    # GitHubConnectScreen.
+
+    _publish_detached = None  # list[Widget] | None — strong ref while detached
+
+    def _detach_publish_children(self):
+        row = self.ids.get('publish_row')
+        if row is None:
+            return
+        if self._publish_detached is not None:
+            return  # already detached; idempotent
+        kids = list(row.children)  # reverse-add order
+        # Restore order on reattach is "first-added first," so capture
+        # via reversed().
+        self._publish_detached = list(reversed(kids))
+        for c in kids:
+            row.remove_widget(c)
+
+    def _reattach_publish_children(self):
+        row = self.ids.get('publish_row')
+        if row is None:
+            return
+        kids = self._publish_detached
+        if not kids:
+            return  # nothing to restore (already attached, or never detached)
+        self._publish_detached = None
+        for c in kids:
+            row.add_widget(c)
 
     def _pick_publish_candidate(self):
         """Return the Project the daemon last touched, or ``None`` if
@@ -909,26 +1017,11 @@ class SettingsScreen(Screen):
         msg.text = _tr('Saved.')
         Clock.schedule_once(lambda dt: setattr(msg, 'text', ''), 2.0)
 
-    def gh_action(self):
-        """Single dispatcher for the state-aware GitHub button.
-        ``refresh()`` stamps ``_action`` on the widget so we don't
-        re-fetch credentials_status here — that was just done."""
-        btn = self.ids.get('gh_action_btn')
-        action = getattr(btn, '_action', 'connect') if btn else 'connect'
-        if action == 'disconnect':
-            self.disconnect_github()
-        else:
-            self.connect_github()
-
-    def connect_github(self):
-        """Navigate to the GitHub connect/manage screen. The screen's
-        own ``on_pre_enter`` reads ``credentials_status`` and decides
-        whether to fire the device flow: only when no token is on
-        file. With a token already saved (verified or not) the
-        screen renders the manage view (Verify setup /
-        Re-authenticate / Disconnect / Install GitHub App) and waits
-        for the user — we don't re-prompt every time they land here."""
-        App.get_running_app().go('github')
+    # ``gh_action`` / ``connect_github`` removed in 0.30.8: the KV
+    # button now just calls ``app.go('github')`` directly. Disconnect
+    # logic lives inside ``GitHubConnectScreen`` (and inside
+    # ``GitLabFormScreen`` for GitLab); the settings screen is purely
+    # a navigation hub now.
 
     def publish(self):
         """Create a remote repo on a confirmed git host for the
@@ -1088,27 +1181,12 @@ class SettingsScreen(Screen):
         if msg is not None:
             msg.text = text or ''
 
-    def disconnect_github(self):
-        # Wipe by overwriting with empty token (server.store.clear_github
-        # would be cleaner; expose later).
-        try:
-            save_github_tokens({'access_token': '', 'refresh_token': ''},
-                               username='')
-            mark_github_app_installed(False)
-        except Exception as ex:
-            self.ids.status_label.text = _tr(
-                'Error: {error}').format(error=ex)
-            return
-        self.refresh()
-
-    def disconnect_gitlab(self):
-        try:
-            save_gitlab_credentials('', '')
-        except Exception as ex:
-            self.ids.status_label.text = _tr(
-                'Error: {error}').format(error=ex)
-            return
-        self.refresh()
+    # ``disconnect_github`` / ``disconnect_gitlab`` were removed in
+    # 0.30.8 along with their settings-screen entry points.
+    # ``GitHubConnectScreen.disconnect`` and
+    # ``GitLabFormScreen.disconnect`` are the canonical paths now —
+    # both reachable from the corresponding "* Settings" entry on
+    # SettingsScreen.
 
     # ── Debug helpers ───────────────────────────────────────────────────────
 
@@ -1184,6 +1262,14 @@ class GitHubConnectScreen(Screen):
     # primary button so re-entering the screen mid-flow doesn't stomp
     # the visible code box and "Opening {uri}..." instructions.
     _device_flow_active = False
+    # Set to the installation_id when the last Verify setup detected
+    # a suspended install. Drives the "tap Install → Configure →
+    # Unsuspend" path: the primary button at step 2 opens the
+    # installation-specific configure page (settings/installations/
+    # <id>) instead of the generic install URL, and the message
+    # walks the user through the GitHub UI. Cleared on the next
+    # Verify setup that detects a healthy install.
+    _suspended_installation_id = None
 
     def on_pre_enter(self):
         # Defer to next frame so the KV rule has finished instantiating
@@ -1256,12 +1342,22 @@ class GitHubConnectScreen(Screen):
                 widget.bold = False
 
     def _render_primary(self, step, gh):
+        import sys
         btn = self.ids.get('gh_primary_btn')
         if btn is None:
+            print('[github-connect] _render_primary: gh_primary_btn '
+                  'NOT IN ids', file=sys.stderr, flush=True)
             return
-        # Hide the primary button while polling — the device-flow code
-        # box carries the active affordance.
-        if self._device_flow_active or step == 4:
+        # Hide the primary button only while polling — the
+        # device-flow box carries the active affordance there. Once
+        # everything's verified (step 4) we keep "Verify setup"
+        # available so the user can re-confirm without going through
+        # device flow again. The test path is idempotent (hits
+        # ``api.github.com/user``); a successful re-test stays at
+        # step 4, a failure surfaces via the screen regressing to
+        # step 2 / step 1 / "Token rejected" — all useful diagnostics
+        # from a single tap.
+        if self._device_flow_active:
             btn.height = 0
             btn.opacity = 0
             btn.disabled = True
@@ -1273,12 +1369,56 @@ class GitHubConnectScreen(Screen):
         elif step == 2:
             btn.text = _tr('Install GitHub App')
             btn._action = 'install'
-        elif step == 3:
+        else:
+            # step 3 (initial verify) or step 4 (re-verify) both
+            # land here — same label, same action.
             btn.text = _tr('Verify setup')
             btn._action = 'verify'
         btn.height = dp(52)
         btn.opacity = 1
         btn.disabled = False
+        # Diagnostics. The state-change probe + Window touch tracer
+        # together tell us whether the issue is event dispatch or
+        # touch routing. If the Window sees touches at the button's
+        # pos but ``state`` never flips, something between Window and
+        # the button is eating the touch. Bound once per instance so
+        # we don't pile up handlers across re-renders.
+        if not getattr(btn, '_state_probe_bound', False):
+            btn._state_probe_bound = True
+
+            def _on_state(_b, value):
+                print(f'[github-connect] gh_primary_btn state→{value} '
+                      f'pos={btn.pos} size={btn.size} '
+                      f'disabled={btn.disabled} opacity={btn.opacity}',
+                      file=sys.stderr, flush=True)
+            btn.bind(state=_on_state)
+
+            def _on_touch_down(_b, touch):
+                inside = btn.collide_point(*touch.pos)
+                print(f'[github-connect] gh_primary_btn '
+                      f'on_touch_down: touch.pos={touch.pos} '
+                      f'btn.pos={btn.pos} btn.size={btn.size} '
+                      f'inside={inside}',
+                      file=sys.stderr, flush=True)
+            btn.bind(on_touch_down=_on_touch_down)
+
+            try:
+                from kivy.core.window import Window
+
+                def _window_touch(_w, touch):
+                    inside = btn.collide_point(*touch.pos)
+                    print(f'[github-connect] WINDOW touch_down: '
+                          f'touch.pos={touch.pos} '
+                          f'inside_primary_btn={inside}',
+                          file=sys.stderr, flush=True)
+                Window.bind(on_touch_down=_window_touch)
+            except Exception as ex:
+                print(f'[github-connect] window probe bind '
+                      f'failed: {ex}', file=sys.stderr, flush=True)
+        print(f'[github-connect] _render_primary: text={btn.text!r} '
+              f'pos={btn.pos} size={btn.size} disabled={btn.disabled} '
+              f'opacity={btn.opacity}',
+              file=sys.stderr, flush=True)
 
     def _render_manage(self, gh):
         # Re-auth + Disconnect only when a token is on file — there's
@@ -1286,17 +1426,10 @@ class GitHubConnectScreen(Screen):
         # step 1 completes. ``_device_flow_active`` covers the re-auth
         # case where a token exists but we're mid-replacement; hide the
         # manage box then so the user can't disconnect mid-flow.
-        box = self.ids.get('gh_manage_box')
-        if box is None:
-            return
         if gh.get('connected') and not self._device_flow_active:
-            box.height = dp(48) + dp(48) + dp(10)  # 2× NavBtn + 1 spacing
-            box.opacity = 1
-            box.disabled = False
+            self._show_manage_box()
         else:
-            box.height = 0
-            box.opacity = 0
-            box.disabled = True
+            self._hide_manage()
 
     def _render_message(self, step, gh):
         if self._device_flow_active:
@@ -1310,16 +1443,23 @@ class GitHubConnectScreen(Screen):
                 "Tap Begin when you are ready. We'll open GitHub in "
                 'your browser to authorize this device.')
         elif step == 2:
-            msg.text = _tr(
-                'Authorized as {username}. Now install the GitHub '
-                'App so the daemon can push your project.'
-            ).format(username=username)
+            # If the last test detected a suspended install on this
+            # account, surface the unsuspend instructions instead of
+            # the generic "now install" line.
+            if self._suspended_installation_id:
+                msg.text = self._suspended_message_text()
+            else:
+                msg.text = _tr(
+                    'Authorized as {username}. Now install the '
+                    'GitHub App so the daemon can push your project.'
+                ).format(username=username)
         elif step == 3:
             msg.text = _tr(
                 'GitHub App installed. Tap Verify setup to finish.')
         else:
             msg.text = _tr(
-                'Setup complete. Connected as {username}.'
+                'Setup complete. Connected as {username}. '
+                'Tap Verify setup any time to re-test.'
             ).format(username=username)
 
     def _safe_status(self):
@@ -1331,14 +1471,28 @@ class GitHubConnectScreen(Screen):
 
     # ── show / hide pattern ───────────────────────────────────────────
 
+    # Hide-by-detach pattern. Setting only ``height=0`` on a
+    # BoxLayout doesn't collapse its children's hit-test bounds —
+    # ``BoxLayout._do_layout`` still positions them at their
+    # explicit heights starting from ``self.top``, so a "hidden"
+    # box with NavBtn children leaves the NavBtns at non-degenerate
+    # y-ranges and they can swallow touches that *should* reach
+    # ``gh_primary_btn``. ``disabled=True`` should make the swallow
+    # safe via Widget.on_touch_down's "disabled+collide → return
+    # True" short-circuit, but in this layout it didn't help —
+    # touches in the Begin button's content y-range never reached
+    # ``gh_primary_btn``. Detaching children entirely avoids the
+    # layout-positioning interaction altogether: a parent with no
+    # children cannot dispatch on_touch_down to anything.
     def _show_device_flow(self):
-        # SectionLabel(32) + dp(72) + 1×spacing(14) = 118.
         box = self.ids.get('gh_device_flow_box')
         if box is None:
             return
+        # SectionLabel(32) + dp(72) + 1×spacing(14) = 118.
         box.height = dp(118)
         box.opacity = 1
         box.disabled = False
+        self._reattach_children('gh_device_flow_box')
 
     def _hide_device_flow(self):
         box = self.ids.get('gh_device_flow_box')
@@ -1347,6 +1501,7 @@ class GitHubConnectScreen(Screen):
         box.height = 0
         box.opacity = 0
         box.disabled = True
+        self._detach_children('gh_device_flow_box')
 
     def _hide_manage(self):
         box = self.ids.get('gh_manage_box')
@@ -1355,6 +1510,59 @@ class GitHubConnectScreen(Screen):
         box.height = 0
         box.opacity = 0
         box.disabled = True
+        self._detach_children('gh_manage_box')
+
+    def _show_manage_box(self):
+        box = self.ids.get('gh_manage_box')
+        if box is None:
+            return
+        box.height = dp(48) + dp(48) + dp(10)
+        box.opacity = 1
+        box.disabled = False
+        self._reattach_children('gh_manage_box')
+
+    # ── detach / reattach helpers ────────────────────────────────────
+    #
+    # We snapshot the original children list once per box (lazily, on
+    # first detach). On detach we ``remove_widget`` each child; on
+    # reattach we ``add_widget`` them back in original order so the
+    # KV-defined IDs / properties are preserved (Kivy holds strong
+    # refs via the snapshot list, so the widgets aren't GC'd while
+    # detached).
+
+    _detached = None  # box_id -> list[Widget]
+
+    def _detached_dict(self):
+        if self._detached is None:
+            self._detached = {}
+        return self._detached
+
+    def _detach_children(self, box_id):
+        box = self.ids.get(box_id)
+        if box is None:
+            return
+        store = self._detached_dict()
+        if box_id in store:
+            return  # already detached
+        # Capture in display order (top → bottom) so reattach
+        # restores the same stacking. Kivy's children list is
+        # reverse-add; iterate over a copy because remove_widget
+        # mutates it.
+        kids = list(box.children)
+        store[box_id] = list(reversed(kids))
+        for c in kids:
+            box.remove_widget(c)
+
+    def _reattach_children(self, box_id):
+        box = self.ids.get(box_id)
+        if box is None:
+            return
+        store = self._detached_dict()
+        kids = store.pop(box_id, None)
+        if not kids:
+            return
+        for c in kids:
+            box.add_widget(c)
 
     # ── primary dispatcher ───────────────────────────────────────────
 
@@ -1434,23 +1642,42 @@ class GitHubConnectScreen(Screen):
 
     def _worker(self):
         # Direct-import — UI process runs in the same package as the daemon
+        import sys
         from azt_collabd.auth import (
             device_flow_start, device_flow_poll,
             get_github_username, check_app_installed,
         )
+        print('[github-connect] worker: device_flow_start ...',
+              file=sys.stderr, flush=True)
         try:
             resp = device_flow_start()
             user_code = resp['user_code']
             device_code = resp['device_code']
-            # Prefer ``verification_uri_complete`` (URL with the
-            # user_code prefilled) so the user lands on GitHub's
-            # "Authorize?" page directly. Fall back to the bare URL
-            # if GitHub's response shape ever changes.
-            verify_uri = (
-                resp.get('verification_uri_complete')
-                or resp.get('verification_uri')
-                or 'https://github.com/login/device'
-            )
+            print(f'[github-connect] worker: got user_code={user_code!r}, '
+                  f'polling for token (interval={resp.get("interval", 5)}s, '
+                  f'expires_in={resp.get("expires_in", 900)}s)',
+                  file=sys.stderr, flush=True)
+            # GitHub omits ``verification_uri_complete`` (RFC 8628
+            # §3.2 marks it OPTIONAL; GitHub returns only the bare
+            # ``verification_uri``). Constructing a prefilled URL
+            # ourselves doesn't help: the ``/login/device`` page
+            # silently ignores ``?user_code=...`` (verified against
+            # docs.github.com, the cli/oauth Go reference impl, and
+            # octokit/auth-oauth-device.js — none send a prefilled
+            # form, and github.com makes no such handler available).
+            # Plus a Jan-2024 account-confirmation step ("select
+            # Continue on an account") sits in front of the code
+            # form unconditionally, even for single-account users.
+            # So we just open the bare URL; the user has to type
+            # the code into GitHub's 8-field input. Best UX we can
+            # offer in-app is the auto-clipboard copy below — but
+            # GitHub's input doesn't accept clipboard paste either,
+            # so it's mostly a fallback for scrollback / sharing.
+            # If a future GitHub change starts returning
+            # ``verification_uri_complete`` we'll use it.
+            verify_uri = (resp.get('verification_uri_complete')
+                          or resp.get('verification_uri')
+                          or 'https://github.com/login/device')
             interval = resp.get('interval', 5)
             expires_in = resp.get('expires_in', 900)
 
@@ -1483,17 +1710,29 @@ class GitHubConnectScreen(Screen):
                 pass
 
             token_data = device_flow_poll(device_code, interval, expires_in)
+            print(f'[github-connect] worker: device_flow_poll '
+                  f'returned, fetching username',
+                  file=sys.stderr, flush=True)
             access_token = token_data['access_token']
             username = get_github_username(access_token) or 'unknown'
+            print(f'[github-connect] worker: saving tokens for '
+                  f'username={username!r}',
+                  file=sys.stderr, flush=True)
             save_github_tokens(token_data, username)
+            print('[github-connect] worker: tokens saved',
+                  file=sys.stderr, flush=True)
 
             # Best-effort: read app-install state
             try:
                 info = check_app_installed(access_token)
-                if info.get('installed'):
+                installed = bool(info.get('installed'))
+                print(f'[github-connect] worker: app_installed probe = '
+                      f'{installed}', file=sys.stderr, flush=True)
+                if installed:
                     mark_github_app_installed(True)
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f'[github-connect] worker: app_installed probe '
+                      f'failed: {ex}', file=sys.stderr, flush=True)
 
             def _done(dt):
                 # Token saved; set_github_tokens just reset
@@ -1501,24 +1740,46 @@ class GitHubConnectScreen(Screen):
                 # to True if the probe above flipped it). Re-render the
                 # screen so the step indicator advances and the primary
                 # button label changes to whatever's next.
+                print('[github-connect] worker: _done fired',
+                      file=sys.stderr, flush=True)
                 self._device_flow_active = False
                 self.on_pre_enter()
             Clock.schedule_once(_done, 0)
 
         except AuthError as ex:
+            print(f'[github-connect] worker: AuthError {ex.status!r}',
+                  file=sys.stderr, flush=True)
             msg = translate_status(ex.status)
+
             def _err(dt, _m=msg):
+                # Set the Failed message AFTER the deferred
+                # _refresh_state runs, otherwise its step-1 default
+                # message overwrites our error.
                 self._device_flow_active = False
-                self.on_pre_enter()  # reset Begin button + steps
-                self.ids.gh_message.text = _tr(
-                    'Failed: {error}').format(error=_m)
+                self.on_pre_enter()  # schedules _refresh_state
+
+                def _set_msg(_dt2):
+                    msg_lbl = self.ids.get('gh_message')
+                    if msg_lbl is not None:
+                        msg_lbl.text = _tr(
+                            'Failed: {error}').format(error=_m)
+                Clock.schedule_once(_set_msg, 0)
             Clock.schedule_once(_err, 0)
         except Exception as ex:
+            print(f'[github-connect] worker: Exception '
+                  f'{type(ex).__name__}: {ex}',
+                  file=sys.stderr, flush=True)
+
             def _err(dt, _e=str(ex)):
                 self._device_flow_active = False
                 self.on_pre_enter()
-                self.ids.gh_message.text = _tr(
-                    'Failed: {error}').format(error=_e)
+
+                def _set_msg(_dt2):
+                    msg_lbl = self.ids.get('gh_message')
+                    if msg_lbl is not None:
+                        msg_lbl.text = _tr(
+                            'Failed: {error}').format(error=_e)
+                Clock.schedule_once(_set_msg, 0)
             Clock.schedule_once(_err, 0)
 
     # ── manage path ──────────────────────────────────────────────────
@@ -1546,7 +1807,41 @@ class GitHubConnectScreen(Screen):
                     error=info.get('error', '?'))
             return
         if info.get('valid'):
-            return  # _render_message already wrote the step-4 line
+            # Token works against api.github.com/user. Two
+            # sub-cases now matter:
+            # - app_suspended=True: the App is installed but the
+            #   user paused the install on GitHub. Push will 403.
+            #   Stash the installation_id so ``install_app``
+            #   opens the installation-specific configure page
+            #   (and the message can give precise step-by-step
+            #   instructions for the unsuspend path).
+            # - otherwise: clear any stale suspended-id from a
+            #   previous test, and let on_pre_enter's deferred
+            #   ``_refresh_state`` write the right step line.
+            if info.get('app_suspended'):
+                self._suspended_installation_id = (
+                    info.get('installation_id'))
+                # ``on_pre_enter`` above scheduled
+                # ``_refresh_state`` for the next frame, which
+                # would overwrite ``gh_message`` with the step-2
+                # default ("Now install the GitHub App..."). Run
+                # our suspended message AFTER _refresh_state via a
+                # second Clock.schedule_once so it survives the
+                # render. ``_render_message`` also branches on
+                # ``_suspended_installation_id`` so subsequent
+                # re-renders (language change, screen re-entry)
+                # surface the same suspended copy without a
+                # re-test — but we still set it explicitly here
+                # so the user sees the message immediately after
+                # the verify they just tapped.
+                def _set_suspended_msg(_dt):
+                    msg = self.ids.get('gh_message')
+                    if msg is not None:
+                        msg.text = self._suspended_message_text()
+                Clock.schedule_once(_set_suspended_msg, 0)
+            else:
+                self._suspended_installation_id = None
+            return
         err = info.get('error', '') or 'unknown'
         if err == 'invalid_token':
             self.ids.gh_message.text = _tr(
@@ -1560,25 +1855,71 @@ class GitHubConnectScreen(Screen):
             'Test failed: {error}').format(error=err)
 
     def install_app(self):
-        """Open the GitHub App install page in the user's browser.
-        After they grant access on GitHub they return here; the
-        primary button will read "Verify setup" once
-        ``app_installed`` is true (the daemon's test path also picks
-        it up automatically)."""
-        try:
-            url = github_app_install_url()
-        except Exception as ex:
+        """Open the GitHub App install (or, when suspended, configure)
+        page in the user's browser. After they grant access / unsuspend
+        on GitHub they return here and tap the button — which we swap
+        to "Verify setup" right after opening the browser, so the
+        affordance the message promises actually exists.
+
+        If the user returns without installing (cancelled, navigated
+        away, etc.), tapping Verify setup runs the test, which
+        reports ``app_installed=False`` and ``_test_done`` plus
+        ``_render_primary`` regress the button back to
+        "Install GitHub App" so the user can retry.
+
+        For a known-suspended install, prefer the installation-specific
+        page (``settings/installations/<id>``) over the generic install
+        URL so the user lands directly on Configure with the Unsuspend
+        button reachable from one scroll."""
+        url = self._install_or_configure_url()
+        if not url:
             self.ids.gh_message.text = _tr(
-                'Could not open install page: {error}').format(error=ex)
+                'Could not determine the GitHub URL.')
             return
         try:
             webbrowser.open(url)
-            self.ids.gh_message.text = _tr(
-                'Opening {uri}\nWhen you finish on GitHub, return '
-                'here and tap Verify setup.').format(uri=url)
+            if self._suspended_installation_id:
+                self.ids.gh_message.text = _tr(
+                    "Opening {uri}\nOn that page, scroll to the "
+                    "bottom and tap 'Unsuspend'. Then come back "
+                    "here and tap Verify setup."
+                ).format(uri=url)
+            else:
+                self.ids.gh_message.text = _tr(
+                    'Opening {uri}\nWhen you finish on GitHub, '
+                    'return here and tap Verify setup.'
+                ).format(uri=url)
+            btn = self.ids.get('gh_primary_btn')
+            if btn is not None:
+                btn.text = _tr('Verify setup')
+                btn._action = 'verify'
         except Exception as ex:
             self.ids.gh_message.text = _tr(
                 'Could not open install page: {error}').format(error=ex)
+
+    def _install_or_configure_url(self):
+        """Pick the right GitHub URL for the user's situation:
+        installation-specific (configure page) when we know about a
+        suspended install on this account, generic install URL
+        otherwise."""
+        inst_id = self._suspended_installation_id
+        if inst_id:
+            return f'https://github.com/settings/installations/{inst_id}'
+        try:
+            return github_app_install_url() or ''
+        except Exception:
+            return ''
+
+    def _suspended_message_text(self):
+        """Step-by-step guidance for the Unsuspend path. The user
+        complained that "Resume it at {url}" was unhelpful — they
+        get a URL but no idea what to do on the page. Walk them
+        through the actual GitHub UI."""
+        return _tr(
+            "GitHub App installation is suspended. Tap "
+            "'Install GitHub App' below to open the install's "
+            "configure page on GitHub, then scroll to the "
+            "bottom and tap 'Unsuspend'.")
 
     def reauthenticate(self):
         """User explicitly asked to re-run the device flow (token
@@ -1609,11 +1950,56 @@ class GitLabFormScreen(Screen):
     def on_pre_enter(self):
         try:
             status = get_credentials_status()
-            self.ids.gl_user.text = status.get('gitlab', {}).get('username', '')
+            gl = (status or {}).get('gitlab', {}) or {}
         except Exception:
-            pass
-        self.ids.gl_token.text = ''
-        self.ids.gl_msg.text = ''
+            gl = {}
+        user_inp = self.ids.get('gl_user')
+        if user_inp is not None:
+            user_inp.text = gl.get('username', '') or ''
+        tok_inp = self.ids.get('gl_token')
+        if tok_inp is not None:
+            tok_inp.text = ''
+        msg_lbl = self.ids.get('gl_msg')
+        if msg_lbl is not None:
+            msg_lbl.text = ''
+        # Reveal the Disconnect block only once a token is on file.
+        # Pre-disconnect, this is purely a connect form; surfacing
+        # Disconnect there would be confusing (nothing to
+        # disconnect from).
+        if gl.get('connected'):
+            self._show_manage()
+        else:
+            self._hide_manage()
+
+    def _show_manage(self):
+        box = self.ids.get('gl_manage_box')
+        if box is None:
+            return
+        box.height = dp(48)  # one NavBtn
+        box.opacity = 1
+        box.disabled = False
+
+    def _hide_manage(self):
+        box = self.ids.get('gl_manage_box')
+        if box is None:
+            return
+        box.height = 0
+        box.opacity = 0
+        box.disabled = True
+
+    def disconnect(self):
+        """Wipe the GitLab credentials block. On success, reload
+        the screen state — the user lands on an empty connect form
+        again with the Disconnect block hidden."""
+        try:
+            save_gitlab_credentials('', '')
+        except Exception as ex:
+            msg_lbl = self.ids.get('gl_msg')
+            if msg_lbl is not None:
+                msg_lbl.text = _tr(
+                    'Error: {error}').format(error=ex)
+            return
+        self.on_pre_enter()
 
     def test(self):
         """Save the entered credentials and immediately validate them
@@ -1688,6 +2074,29 @@ class CollabUIApp(App):
         register_kv(font_name)
         self.sm = RootSM(transition=SlideTransition())
         return self.sm
+
+    def on_start(self):
+        """Bind Android's hardware back button so it pops sub-screens
+        back to settings instead of closing the app. Without this,
+        a back-press from GitHubConnectScreen / GitLabFormScreen
+        falls through to the default ``App.stop`` path and the user
+        loses the whole settings session — particularly painful
+        from inside the connect flow where they're mid-setup."""
+        from kivy.core.window import Window
+        Window.bind(on_keyboard=self._on_back_button)
+
+    def _on_back_button(self, _window, key, *_args):
+        """Android key 27 = hardware back. Returns True to consume.
+        Settings-screen back closes the app (default Kivy behavior);
+        any other screen pops to settings."""
+        if key != 27:
+            return False
+        if not hasattr(self, 'sm'):
+            return False
+        if self.sm.current == 'settings':
+            return False  # let the OS close the app
+        self.sm.current = 'settings'
+        return True
 
     def go(self, name):
         self.sm.current = name

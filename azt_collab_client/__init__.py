@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.29.1"
+__version__ = "0.31.0"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -30,7 +30,12 @@ __version__ = "0.29.1"
 # langcode. A 0.25 client against a pre-0.25 daemon would silently
 # lose all of these. Lock-step bump intended to flush every peer APK
 # through a rebuild.
-MIN_SERVER_VERSION = "0.28.17"
+# 0.30.28 floor: deliberate bump (no underlying wire-format
+# requirement) to keep exercising the ``server_too_old`` bootstrap
+# path against the latest peer build. Drop back to a real-world
+# floor before any release that ships in the public update
+# channel.
+MIN_SERVER_VERSION = "0.31.0"
 # Public release page for the server APK. Tapping "Open install
 # page" in ``install_server_apk_popup`` opens this URL in the
 # browser so the user can read release notes / browse the project
@@ -42,6 +47,14 @@ MIN_SERVER_VERSION = "0.28.17"
 SERVER_APK_INSTALL_URL = (
     'https://github.com/kent-rasmussen/azt-collab/releases/latest'
 )
+# Maintainer contact for the suite. Surfaced from
+# ``_show_release_too_old`` (and other in-app "this needs human
+# attention" surfaces) as a mailto: link so users can email when
+# the release feed can't satisfy their version requirement, or
+# when they want to report a problem they hit in production.
+# Forks should override this in their own build of the client
+# (no env-var hook yet — change here, rebuild the peer APK).
+MAINTAINER_EMAIL = 'kent_rasmussen@sil.org'
 from . import status as S
 from .status import Status, Result
 from .projects import Project, ProjectStatus
@@ -639,6 +652,28 @@ def set_contributor(name):
         pass
 
 
+def get_server_ui_language():
+    """Return the daemon-side persisted UI language (BCP-47 code,
+    e.g. ``'fr'``) or ``''`` on RPC failure.
+
+    Lets peers mirror the language choice picked in the server
+    APK's settings UI. On Android, ``$AZT_HOME`` is per-process
+    private (server's filesDir vs. peer's filesDir), so the
+    language preference doesn't propagate via the file system —
+    each peer has to ask the daemon. Bootstrap calls this on
+    entry; if the value is non-empty and differs from the peer's
+    local pref, it applies via ``i18n.set_language`` so all peer
+    UI (popups, status text, KV strings) tracks the daemon's
+    choice."""
+    try:
+        resp = call('GET', '/v1/config/ui_language', timeout=5)
+    except ServerUnavailable:
+        return ''
+    if not resp.get('ok'):
+        return ''
+    return str(resp.get('language', '') or '')
+
+
 def github_app_install_url():
     """Return the configured GitHub App install URL (string) or '' if the
     server is unreachable / the App identity isn't configured. The URL
@@ -757,13 +792,22 @@ def test_github_credentials():
         resp = call('POST', '/v1/credentials/github/test', {})
     except ServerUnavailable as ex:
         return {'ok': False, 'valid': False, 'server_username': '',
-                'app_installed': False,
+                'app_installed': False, 'app_suspended': False,
+                'installation_id': None,
                 'error': f'server_unavailable: {ex}'}
     return {
         'ok': bool(resp.get('ok')),
         'valid': bool(resp.get('valid')),
         'server_username': resp.get('server_username', '') or '',
         'app_installed': bool(resp.get('app_installed')),
+        # 0.30.11+: surfaces a suspended (paused-via-GitHub-UI)
+        # install separately so the connect screen can route the
+        # user to settings/installations/<id> for resume rather than
+        # the generic install page. Older daemons return missing
+        # keys; ``False`` / ``None`` defaults match the
+        # "not suspended" interpretation.
+        'app_suspended': bool(resp.get('app_suspended')),
+        'installation_id': resp.get('installation_id'),
         'error': resp.get('error', '') or '',
     }
 

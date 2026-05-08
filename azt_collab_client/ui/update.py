@@ -55,6 +55,18 @@ _DOWNLOAD_CHUNK = 65536
 _release_cache = {}
 _RELEASE_CACHE_TTL_S = 300
 
+
+def invalidate_release_cache(repo=None):
+    """Drop the per-process cache for ``repo`` (or every entry when
+    called with no arg) so the next ``_fetch_latest`` re-probes
+    GitHub. Used by bootstrap's "Check again" button so a freshly-
+    published release is visible immediately rather than waiting for
+    the 5-minute TTL to expire."""
+    if repo is None:
+        _release_cache.clear()
+        return
+    _release_cache.pop(repo, None)
+
 # Install-completion polling. After dispatching the install intent
 # we don't get a callback when Android finishes (or the user backs
 # out of the system installer). For installs whose target is a
@@ -198,31 +210,71 @@ def _save_download_sha(path):
         print(f'[update] sidecar write failed: {ex}')
 
 
-def _has_fresh_download(path):
-    """True iff ``path`` exists AND its SHA-256 matches the digest
-    stored in ``<path>.sha256``. Used by the install workers to
-    skip a redundant re-download when the user comes back from
-    Android's "Install unknown apps" settings and taps Install
-    again — works regardless of how long the detour took.
+def _has_fresh_download(path, expected_sha256=''):
+    """True iff ``path`` exists AND hashes to a known-good value.
 
-    Definitive integrity check (replaces the mtime-window
-    heuristic in 0.28.25): if the file on disk hashes to the
-    same value we recorded right after download, it's the same
-    file we'd have downloaded again. ``_download`` writes to
-    ``<path>.part`` and renames on success, so a present
-    ``<path>`` is always a complete download — no partial-file
-    salvage logic needed."""
+    Two modes, depending on whether ``expected_sha256`` is provided:
+
+    - **Authoritative mode** (``expected_sha256`` non-empty): the
+      file's SHA-256 must equal the supplied digest. Used when the
+      GitHub release JSON carries an ``asset.digest`` field
+      (added 2025-06; format ``sha256:<hex>``). This is the strong
+      check — matches mean the cached bytes are exactly what GitHub
+      serves *right now*, so reusing is safe even if the asset was
+      re-uploaded since our cache was filled. A re-uploaded asset
+      with the same name but different bytes (e.g. a fix release
+      reusing the old tag, or a same-version-different-rebuild
+      situation) flips the digest and the cache gets re-fetched.
+    - **Self-consistency mode** (``expected_sha256`` empty / not
+      provided): falls back to the sidecar that ``_save_download_sha``
+      writes after a successful download — i.e. confirms the cached
+      bytes haven't been corrupted on disk since we wrote them, but
+      can't tell us if GitHub is now serving different bytes. Used
+      when the release asset doesn't expose a digest (legacy assets
+      uploaded pre-rollout) or when the caller doesn't have one at
+      hand.
+
+    ``_download`` writes to ``<path>.part`` and renames on success,
+    so a present ``<path>`` is always a complete download — no
+    partial-file salvage logic needed."""
+    if not os.path.exists(path):
+        print(f'[update] _has_fresh_download: {path} not present',
+              file=sys.stderr, flush=True)
+        return False
+    file_sha = _sha256(path)
+    if not file_sha:
+        print(f'[update] _has_fresh_download: could not hash {path}',
+              file=sys.stderr, flush=True)
+        return False
+    if expected_sha256:
+        match = file_sha == expected_sha256
+        print(f'[update] _has_fresh_download: digest mode '
+              f'file={file_sha[:16]}… expected={expected_sha256[:16]}… '
+              f'match={match}',
+              file=sys.stderr, flush=True)
+        return match
     sidecar = path + '.sha256'
-    if not (os.path.exists(path) and os.path.exists(sidecar)):
+    if not os.path.exists(sidecar):
+        print(f'[update] _has_fresh_download: no sidecar at {sidecar}',
+              file=sys.stderr, flush=True)
         return False
     try:
         with open(sidecar) as f:
             stored = f.read().strip()
-    except OSError:
+    except OSError as ex:
+        print(f'[update] _has_fresh_download: sidecar read failed: '
+              f'{ex}', file=sys.stderr, flush=True)
         return False
     if not stored:
+        print('[update] _has_fresh_download: sidecar empty',
+              file=sys.stderr, flush=True)
         return False
-    return _sha256(path) == stored
+    match = file_sha == stored
+    print(f'[update] _has_fresh_download: sidecar mode '
+          f'file={file_sha[:16]}… stored={stored[:16]}… '
+          f'match={match}',
+          file=sys.stderr, flush=True)
+    return match
 
 
 def _wrappable_url(url):
@@ -418,6 +470,123 @@ def _trigger_install(uri):
     activity.startActivity(intent)
 
 
+# ── Pre-install validation: APK parse + signature compare ─────────────────
+#
+# When the install fails with "App not installed as package appears to be
+# invalid" or "You can't install this app on your device", Android's
+# message is unhelpful. The two most common causes we can detect from the
+# Python side BEFORE firing the Intent:
+#
+# 1. The downloaded APK is corrupted or malformed —
+#    ``getPackageArchiveInfo`` returns null.
+# 2. The downloaded APK is signed with a different keystore than the
+#    currently-installed app of the same package — Android refuses to
+#    overwrite, surfacing the "package appears to be invalid" message.
+#    Common in dev workflows where the upstream release uses one key and
+#    a local rebuild uses another (or in fork situations).
+#
+# Both checks use ``PackageManager.GET_SIGNATURES`` (deprecated since API
+# 28 in favor of ``GET_SIGNING_CERTIFICATES``) because GET_SIGNATURES is
+# universally available on our minSdk 26+ floor; GET_SIGNING_CERTIFICATES
+# would be cleaner but adds a branch we don't need yet.
+
+_PM_GET_SIGNATURES = 64  # PackageManager.GET_SIGNATURES
+
+
+def _android_package_manager():
+    """Return ``(pm, ctx)`` or ``(None, None)`` if pyjnius / Activity
+    aren't available."""
+    try:
+        from jnius import autoclass
+    except ImportError:
+        return None, None
+    try:
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        ctx = PythonActivity.mActivity
+        if ctx is None:
+            try:
+                PythonService = autoclass('org.kivy.android.PythonService')
+                ctx = PythonService.mService
+            except Exception:
+                return None, None
+        if ctx is None:
+            return None, None
+        return ctx.getPackageManager(), ctx
+    except Exception:
+        return None, None
+
+
+def _installed_version_name(package_name):
+    """Return the device-installed APK's ``versionName`` for
+    ``package_name``, or ``''`` if not installed / not Android.
+
+    Distinct from the running process's ``__version__``: the running
+    code is whatever Python loaded from disk at process start. If the
+    APK on disk has been replaced since (rare; only happens during a
+    self-update install) or the Python source was hot-patched without
+    a rebuild (dev workflow), they can diverge — so logging both lets
+    the next "why is Update checking against the wrong version?"
+    report be answered from the trace alone."""
+    pm, _ctx = _android_package_manager()
+    if pm is None:
+        return ''
+    try:
+        info = pm.getPackageInfo(package_name, 0)
+        return info.versionName or ''
+    except Exception:
+        return ''
+
+
+def _apk_parse_info(apk_path):
+    """Return ``PackageInfo`` for the APK at ``apk_path`` with
+    GET_SIGNATURES requested, or ``None`` if the APK can't be
+    parsed (corrupted / truncated / wrong magic) or we're off
+    Android."""
+    pm, _ctx = _android_package_manager()
+    if pm is None:
+        return None
+    try:
+        return pm.getPackageArchiveInfo(apk_path, _PM_GET_SIGNATURES)
+    except Exception:
+        return None
+
+
+def _signature_matches_installed(apk_path, package_name):
+    """Compare the signing certificate of ``apk_path`` against the
+    installed app's certificate for ``package_name``. Returns:
+
+    - ``True`` if signatures match (install will succeed signature-wise).
+    - ``False`` if signatures differ (install will fail with the
+      "App not installed as package appears to be invalid" Android
+      error).
+    - ``None`` if we can't determine — APK unparseable, no current
+      install (so signature mismatch isn't a concern; first-install
+      path), pyjnius unavailable, or any unexpected exception."""
+    pm, _ctx = _android_package_manager()
+    if pm is None:
+        return None
+    try:
+        archive_info = pm.getPackageArchiveInfo(
+            apk_path, _PM_GET_SIGNATURES)
+        if archive_info is None:
+            return None  # APK unparseable
+        try:
+            installed_info = pm.getPackageInfo(
+                package_name, _PM_GET_SIGNATURES)
+        except Exception:
+            return None  # not installed → fresh install, no clash
+        archive_sigs = archive_info.signatures or []
+        installed_sigs = installed_info.signatures or []
+        if not archive_sigs or not installed_sigs:
+            return None
+        # Apps typically have one signature; compare the canonical
+        # toCharsString() for an exact byte-for-byte match.
+        return (archive_sigs[0].toCharsString()
+                == installed_sigs[0].toCharsString())
+    except Exception:
+        return None
+
+
 def check_for_update(*, repo, current_version, asset_filename,
                      on_status, on_no_update=None, on_error=None,
                      download_dir=None, install_target_package=None,
@@ -521,6 +690,14 @@ def check_for_update(*, repo, current_version, asset_filename,
 
         download_url = asset.get('browser_download_url') or ''
         size = int(asset.get('size') or 0)
+        # GitHub's REST API exposes an authoritative ``digest`` on
+        # release assets since 2025-06. Format: ``sha256:<hex>``.
+        # Older assets (pre-rollout) may have ``null``; we fall back
+        # to the sidecar self-consistency check in that case.
+        digest_field = asset.get('digest') or ''
+        expected_sha = ''
+        if digest_field.startswith('sha256:'):
+            expected_sha = digest_field[len('sha256:'):].strip()
         if not download_url:
             _ui_error(_tr('Update check failed: asset has no download URL'))
             return
@@ -533,10 +710,46 @@ def check_for_update(*, repo, current_version, asset_filename,
             return
         dest = os.path.join(download_dir, asset_filename)
 
-        # Reuse a recent download (e.g. user came back from
-        # granting "Install unknown apps") instead of paying for
-        # the same bytes twice.
-        if _has_fresh_download(dest):
+        # Cache-staleness check. Two layers:
+        #
+        # 1. SHA against GitHub's authoritative digest (when the
+        #    asset has one). Catches re-uploaded assets, corrupted
+        #    cache, and the "previous Update cycle left an older
+        #    version's APK behind" scenario in one go — if the
+        #    cached bytes don't hash to what GitHub serves *right
+        #    now*, we re-download. Subsumes most of what the
+        #    versionName check below catches when the digest is
+        #    available.
+        # 2. versionName fallback. For legacy assets without a
+        #    digest, ``_has_fresh_download`` falls back to the
+        #    sidecar (self-consistency only — bytes match what we
+        #    saved, but can't tell if GitHub is now serving
+        #    something different). The versionName comparison
+        #    covers the "stale cache, no digest available" case so
+        #    we don't accidentally re-install an older version.
+        if _has_fresh_download(dest, expected_sha256=expected_sha):
+            cached_info = _apk_parse_info(dest)
+            cached_version = ''
+            if cached_info is not None:
+                try:
+                    cached_version = cached_info.versionName or ''
+                except Exception:
+                    cached_version = ''
+            if cached_version and cached_version != latest:
+                print(f'[update] cache stale: cached_version='
+                      f'{cached_version!r} != latest={latest!r}; '
+                      f'discarding {dest}',
+                      file=sys.stderr, flush=True)
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                try:
+                    os.remove(dest + '.sha256')
+                except OSError:
+                    pass
+
+        if _has_fresh_download(dest, expected_sha256=expected_sha):
             _ui_status(_tr('Using already-downloaded file…'))
         else:
             def _on_progress(pct):
@@ -559,6 +772,76 @@ def check_for_update(*, repo, current_version, asset_filename,
             _save_download_sha(dest)
 
         _ui_status(_tr('Preparing install…'))
+
+        # Pre-install validation. ``check_pkg`` is the package whose
+        # signature must match — install_target_package for cross-
+        # package installs (peer pushing the server APK), our own
+        # for self-updates. Diagnostic line lets us see in logcat
+        # whether the device's installed version diverges from the
+        # running code's ``current_version`` (rare but useful when
+        # diagnosing "Update keeps checking against the wrong
+        # version").
+        check_pkg = install_target_package or ''
+        if not check_pkg:
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass(
+                    'org.kivy.android.PythonActivity')
+                _act = PythonActivity.mActivity
+                check_pkg = _act.getPackageName() if _act else ''
+            except Exception:
+                check_pkg = ''
+        installed_v = _installed_version_name(check_pkg) if check_pkg else ''
+        print(f'[update] pre-install check: pkg={check_pkg!r} '
+              f'installed_version={installed_v!r} '
+              f'running_version={current_version!r} '
+              f'latest={latest!r}',
+              file=sys.stderr, flush=True)
+
+        archive_info = _apk_parse_info(dest)
+        if archive_info is None:
+            print(f'[update] parse_info: None path={dest}',
+                  file=sys.stderr, flush=True)
+        else:
+            try:
+                _pkg = archive_info.packageName
+                _ver = archive_info.versionName
+            except Exception:
+                _pkg = '?'
+                _ver = '?'
+            print(f'[update] parse_info: ok pkg={_pkg!r} '
+                  f'versionName={_ver!r} path={dest}',
+                  file=sys.stderr, flush=True)
+        if archive_info is None:
+            _ui_error(_tr(
+                'Downloaded APK could not be parsed. Try Update '
+                'again to re-download.'))
+            try:
+                # Toss the cached file + sidecar so the next attempt
+                # actually re-downloads instead of reusing the same
+                # broken bytes.
+                os.remove(dest)
+            except OSError:
+                pass
+            sidecar = dest + '.sha256'
+            try:
+                os.remove(sidecar)
+            except OSError:
+                pass
+            return
+        if check_pkg:
+            sig_ok = _signature_matches_installed(dest, check_pkg)
+            print(f'[update] signature_matches_installed: {sig_ok!r} '
+                  f'(True=match / False=mismatch / None=unknown)',
+                  file=sys.stderr, flush=True)
+            if sig_ok is False:
+                _ui_error(_tr(
+                    "Downloaded APK is signed with a different key "
+                    "than the installed app. Android won't replace "
+                    "the install. Uninstall the current version "
+                    "first, then tap Update again — or rebuild from "
+                    "source with the matching keystore."))
+                return
 
         # MediaStore insert + install intent must run on the UI thread:
         # PythonActivity.mActivity touches the main Looper, and starting
@@ -598,10 +881,23 @@ def install_apk_from_url(*, url, asset_filename, on_status,
                          on_user_action_needed=None,
                          install_target_package=None,
                          install_label=None,
-                         download_dir=None):
-    """Direct-URL install path. Skips the GitHub API entirely —
+                         download_dir=None,
+                         repo=None):
+    """Direct-URL install path. Skips the GitHub API for *download* —
     just GETs the URL, hands the bytes to Android's installer,
     optionally polls for install completion via change-detection.
+
+    ``repo`` (optional, ``'owner/repo'``) opts in to a one-call
+    GitHub release lookup for **cache freshness** only — the
+    download itself still uses the supplied direct URL. Without
+    it, ``_has_fresh_download`` runs in sidecar mode (cached SHA
+    matches what we recorded post-download), which can't tell
+    "the bytes are intact" from "the bytes are intact but two
+    versions stale." With it, we fetch the release JSON, find the
+    asset's ``digest`` (sha256:hex, populated since 2025-06), and
+    compare against the cached file's SHA. Mismatch → drop cache
+    and re-download. Caller gets fresh bytes against the URL it
+    already trusted to be the canonical download.
 
     Use for stable redirect URLs like
     ``https://github.com/<owner>/<repo>/releases/latest/download/<asset>``
@@ -647,12 +943,41 @@ def install_apk_from_url(*, url, asset_filename, on_status,
             return
         dest = os.path.join(download_dir, asset_filename)
 
+        # When ``repo`` is supplied, fetch the release JSON to get
+        # GitHub's authoritative ``asset.digest``. We use it ONLY
+        # for cache freshness — the download still goes through the
+        # caller-supplied direct ``url``. Without this, a previous-
+        # version cache + matching sidecar look fresh to
+        # ``_has_fresh_download`` and we'd silently install the
+        # stale bytes (real bug: bootstrap reused 0.30.28 against a
+        # 0.30.29 latest because direct-URL mode has no way to
+        # cross-check).
+        expected_sha = ''
+        if repo:
+            try:
+                rel = _fetch_latest(repo)
+                asset = _pick_asset(rel, asset_filename)
+                if asset is not None:
+                    digest = asset.get('digest') or ''
+                    if digest.startswith('sha256:'):
+                        expected_sha = digest[len('sha256:'):].strip()
+            except Exception as ex:
+                # Don't fail the install just because the metadata
+                # call hiccupped — fall through to sidecar mode.
+                # User experience is "cache might be stale" vs
+                # "Install button doesn't work at all", and the
+                # signature / parse checks still defend the install
+                # against a corrupted cache.
+                print(f'[update] install_apk_from_url: digest fetch '
+                      f'failed for {repo!r}: {ex}',
+                      file=sys.stderr, flush=True)
+
         # If we just downloaded this file (typically: user tapped
         # Install, finished download, granted "Install unknown
         # apps", came back, tapped Install again), skip the
         # download and go straight to the install Intent. Save the
         # user 10–30s of waiting for an identical re-download.
-        if _has_fresh_download(dest):
+        if _has_fresh_download(dest, expected_sha256=expected_sha):
             _ui_status(_tr('Using already-downloaded file…'))
         else:
             _ui_status(_tr('Downloading…'))
@@ -674,6 +999,35 @@ def install_apk_from_url(*, url, asset_filename, on_status,
             _save_download_sha(dest)
 
         _ui_status(_tr('Preparing install…'))
+
+        # Pre-install validation. Same parse + signature check as
+        # check_for_update, see helper docstrings for rationale.
+        check_pkg = install_target_package or ''
+        archive_info = _apk_parse_info(dest)
+        if archive_info is None:
+            _ui_error(_tr(
+                'Downloaded APK could not be parsed. Try Install '
+                'again to re-download.'))
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            sidecar = dest + '.sha256'
+            try:
+                os.remove(sidecar)
+            except OSError:
+                pass
+            return
+        if check_pkg:
+            sig_ok = _signature_matches_installed(dest, check_pkg)
+            if sig_ok is False:
+                _ui_error(_tr(
+                    "Downloaded APK is signed with a different key "
+                    "than the installed app. Android won't replace "
+                    "the install. Uninstall the current version "
+                    "first, then tap Install again — or rebuild "
+                    "from source with the matching keystore."))
+                return
 
         def _install_on_ui(_dt):
             try:

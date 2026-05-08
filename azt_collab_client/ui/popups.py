@@ -296,7 +296,8 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                              open_page_url=None,
                              dismiss_label=None,
                              dismiss_action='quit',
-                             on_retry=None):
+                             on_retry=None,
+                             repo=None):
     """Single canonical popup for "the suite needs the server APK
     (or a newer one) before this app can do anything useful". Used
     for both the server-missing case and the server-too-old case
@@ -691,6 +692,11 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
             install_target_package=install_target_package,
             install_label=install_label or _tr('Install'),
             on_install_complete=_on_complete,
+            # Forwarded so install_apk_from_url can fetch the
+            # release's authoritative ``asset.digest`` for cache
+            # validation. Without this, a stale cached APK from
+            # a previous Update cycle is silently reused.
+            repo=repo,
         )
 
     def _open_page(*_):
