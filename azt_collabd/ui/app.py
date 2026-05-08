@@ -421,11 +421,18 @@ KV_TEMPLATE = '''
                 padding: dp(20)
                 spacing: dp(14)
                 # ── Pre-flight explanation ─────────────────────────────
+                # Fixed height keeps the BoxLayout's ``minimum_height``
+                # stable across frames so buttons below don't shift
+                # position after the texture re-wraps. Growing
+                # ``texture_size[1]``-based heights cause the buttons
+                # below to migrate as the BodyLabel resizes, leaving
+                # the user tapping "where the button used to be" while
+                # hit-testing checks "where the button is now."
                 BodyLabel:
                     id: gh_preflight
                     text: _('GitHub is a free service for backing up your project to the cloud. You will need a free GitHub account.')
                     size_hint_y: None
-                    height: self.texture_size[1] + dp(8)
+                    height: dp(80)
                     text_size: self.width, None
                 NavBtn:
                     id: gh_signup_btn
@@ -473,11 +480,15 @@ KV_TEMPLATE = '''
                         halign: 'left'
                         valign: 'middle'
                         text_size: self.size
+                # Same fixed-height treatment as gh_preflight: 4 lines
+                # of body text covers every message we set (longest is
+                # the multi-line "Opening {uri}\n..." block). Stops the
+                # button below from migrating mid-tap.
                 BodyLabel:
                     id: gh_message
                     text: ''
                     size_hint_y: None
-                    height: self.texture_size[1] + dp(8)
+                    height: dp(80)
                     text_size: self.width, None
                 # ── Primary action — Begin / Install GitHub App / Verify
                 # setup. Hidden during device-flow polling (the code box
@@ -864,22 +875,39 @@ class SettingsScreen(Screen):
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the
         trimmed value to the server (config.json :: collab.contributor)
-        and shows a transient confirmation."""
+        and shows a transient confirmation.
+
+        Runs the RPC on a worker thread so a focus-loss triggered by
+        tapping a sibling button (e.g. GitLab) doesn't block the UI
+        thread mid-tap — that produced a "button resists pressing"
+        symptom where the user had to tap several times because the
+        first taps landed during the synchronous RPC window."""
         inp = self.ids.get('contributor_input')
-        msg = self.ids.get('contributor_msg')
         if inp is None:
             return
         name = (inp.text or '').strip()
+        threading.Thread(
+            target=self._save_contributor_worker,
+            args=(name,), daemon=True).start()
+
+    def _save_contributor_worker(self, name):
         try:
             set_contributor(name)
+            err = None
         except Exception as ex:
-            if msg is not None:
-                msg.text = _tr('Error: {error}').format(error=ex)
+            err = str(ex)
+        Clock.schedule_once(
+            lambda dt: self._save_contributor_done(err), 0)
+
+    def _save_contributor_done(self, err):
+        msg = self.ids.get('contributor_msg')
+        if msg is None:
             return
-        if msg is not None:
-            msg.text = _tr('Saved.')
-            Clock.schedule_once(
-                lambda dt: setattr(msg, 'text', ''), 2.0)
+        if err is not None:
+            msg.text = _tr('Error: {error}').format(error=err)
+            return
+        msg.text = _tr('Saved.')
+        Clock.schedule_once(lambda dt: setattr(msg, 'text', ''), 2.0)
 
     def gh_action(self):
         """Single dispatcher for the state-aware GitHub button.
@@ -1158,13 +1186,32 @@ class GitHubConnectScreen(Screen):
     _device_flow_active = False
 
     def on_pre_enter(self):
+        # Defer to next frame so the KV rule has finished instantiating
+        # nested children and ``self.ids`` is fully populated. Without
+        # this, accessing ``self.ids.gh_user_code`` from a partial
+        # paint pass would raise on Kivy 2.3, leaving the screen in
+        # the KV-default "Begin"/visible state with no ``_action``
+        # tagged on the primary button — i.e., taps would be silently
+        # no-op'd by the dispatcher.
+        Clock.schedule_once(lambda dt: self._refresh_state(), 0)
+
+    def _refresh_state(self):
         status = self._safe_status()
         gh = (status or {}).get('github', {}) or {}
         step = self._current_step(gh)
+        import sys
+        print(f'[github-connect] _refresh_state: step={step} '
+              f'device_flow_active={self._device_flow_active} '
+              f'gh.connected={gh.get("connected")} '
+              f'gh.app_installed={gh.get("app_installed")} '
+              f'gh.confirmed={gh.get("confirmed")}',
+              file=sys.stderr, flush=True)
 
         if not self._device_flow_active:
             self._user_code = ''
-            self.ids.gh_user_code.text = ''
+            user_code_label = self.ids.get('gh_user_code')
+            if user_code_label is not None:
+                user_code_label.text = ''
             self._hide_device_flow()
         # While re-auth is polling, force step indicator back to 1 —
         # the user explicitly chose to redo Authorize, even though the
@@ -1209,25 +1256,26 @@ class GitHubConnectScreen(Screen):
                 widget.bold = False
 
     def _render_primary(self, step, gh):
-        btn = self.ids.gh_primary_btn
+        btn = self.ids.get('gh_primary_btn')
+        if btn is None:
+            return
         # Hide the primary button while polling — the device-flow code
         # box carries the active affordance.
-        if self._device_flow_active:
+        if self._device_flow_active or step == 4:
             btn.height = 0
             btn.opacity = 0
             btn.disabled = True
+            btn._action = None
             return
         if step == 1:
             btn.text = _tr('Begin')
+            btn._action = 'begin'
         elif step == 2:
             btn.text = _tr('Install GitHub App')
+            btn._action = 'install'
         elif step == 3:
             btn.text = _tr('Verify setup')
-        else:  # step == 4: all done
-            btn.height = 0
-            btn.opacity = 0
-            btn.disabled = True
-            return
+            btn._action = 'verify'
         btn.height = dp(52)
         btn.opacity = 1
         btn.disabled = False
@@ -1238,32 +1286,39 @@ class GitHubConnectScreen(Screen):
         # step 1 completes. ``_device_flow_active`` covers the re-auth
         # case where a token exists but we're mid-replacement; hide the
         # manage box then so the user can't disconnect mid-flow.
+        box = self.ids.get('gh_manage_box')
+        if box is None:
+            return
         if gh.get('connected') and not self._device_flow_active:
-            box = self.ids.gh_manage_box
             box.height = dp(48) + dp(48) + dp(10)  # 2× NavBtn + 1 spacing
             box.opacity = 1
             box.disabled = False
         else:
-            self._hide_manage()
+            box.height = 0
+            box.opacity = 0
+            box.disabled = True
 
     def _render_message(self, step, gh):
         if self._device_flow_active:
             return  # don't stomp the in-flight message
+        msg = self.ids.get('gh_message')
+        if msg is None:
+            return
         username = gh.get('username', '') or '?'
         if step == 1:
-            self.ids.gh_message.text = _tr(
+            msg.text = _tr(
                 "Tap Begin when you are ready. We'll open GitHub in "
                 'your browser to authorize this device.')
         elif step == 2:
-            self.ids.gh_message.text = _tr(
+            msg.text = _tr(
                 'Authorized as {username}. Now install the GitHub '
                 'App so the daemon can push your project.'
             ).format(username=username)
         elif step == 3:
-            self.ids.gh_message.text = _tr(
+            msg.text = _tr(
                 'GitHub App installed. Tap Verify setup to finish.')
         else:
-            self.ids.gh_message.text = _tr(
+            msg.text = _tr(
                 'Setup complete. Connected as {username}.'
             ).format(username=username)
 
@@ -1278,19 +1333,25 @@ class GitHubConnectScreen(Screen):
 
     def _show_device_flow(self):
         # SectionLabel(32) + dp(72) + 1×spacing(14) = 118.
-        box = self.ids.gh_device_flow_box
+        box = self.ids.get('gh_device_flow_box')
+        if box is None:
+            return
         box.height = dp(118)
         box.opacity = 1
         box.disabled = False
 
     def _hide_device_flow(self):
-        box = self.ids.gh_device_flow_box
+        box = self.ids.get('gh_device_flow_box')
+        if box is None:
+            return
         box.height = 0
         box.opacity = 0
         box.disabled = True
 
     def _hide_manage(self):
-        box = self.ids.gh_manage_box
+        box = self.ids.get('gh_manage_box')
+        if box is None:
+            return
         box.height = 0
         box.opacity = 0
         box.disabled = True
@@ -1298,19 +1359,36 @@ class GitHubConnectScreen(Screen):
     # ── primary dispatcher ───────────────────────────────────────────
 
     def primary_action(self):
-        """Single tap target whose action depends on the current
-        step. ``on_pre_enter`` keeps the label in sync with state, so
-        we re-fetch status here only for the dispatch decision."""
-        status = self._safe_status()
-        gh = (status or {}).get('github', {}) or {}
-        step = self._current_step(gh)
-        if step == 1:
-            self.begin()
-        elif step == 2:
-            self.install_app()
-        elif step == 3:
+        """Single tap target whose action depends on the current step.
+
+        Dispatch off the button's ``_action`` attribute (stamped by
+        ``_render_primary``) instead of re-fetching credentials_status
+        — the freshly-rendered label is the one the user just tapped,
+        so the stamped action is what they meant. Falls back to the
+        button's ``text`` (and finally to ``begin()``) so a late /
+        racy ``on_pre_enter`` that didn't tag ``_action`` doesn't
+        leave the button silently no-opping."""
+        import sys
+        btn = self.ids.get('gh_primary_btn')
+        action = getattr(btn, '_action', None) if btn else None
+        label = btn.text if btn else ''
+        print(f'[github-connect] primary_action: action={action!r} '
+              f'label={label!r}', file=sys.stderr, flush=True)
+        if action == 'verify':
             self.test()
-        # step 4: button is hidden; ignore stray taps.
+        elif action == 'install':
+            self.install_app()
+        elif action == 'begin':
+            self.begin()
+        elif label == _tr('Verify setup'):
+            self.test()
+        elif label == _tr('Install GitHub App'):
+            self.install_app()
+        else:
+            # Default — matches the KV-default "Begin" label and is
+            # the right call when ``_render_primary`` hasn't run yet
+            # (e.g., id-resolution race on first paint).
+            self.begin()
 
     def open_signup(self):
         """Audit doc #5 — surface a path for users without a GitHub
@@ -1329,13 +1407,18 @@ class GitHubConnectScreen(Screen):
         Re-authenticate from the manage box. Either way we kick the
         device-flow worker; the manage box is hidden by ``on_pre_enter``
         while ``_device_flow_active`` is True."""
+        import sys
+        print('[github-connect] begin: starting device flow',
+              file=sys.stderr, flush=True)
         self._device_flow_active = True
         self._show_device_flow()
         self._hide_manage()
         # Hide primary button + reset step indicator to 1 active.
         self._render_primary(1, {})
         self._render_steps(1)
-        self.ids.gh_message.text = _tr('Starting device flow...')
+        msg = self.ids.get('gh_message')
+        if msg is not None:
+            msg.text = _tr('Starting device flow...')
         threading.Thread(target=self._worker, daemon=True).start()
 
     def copy_code(self):

@@ -11,6 +11,106 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.29.1 + azt_collab_client 0.29.1 — fix unresponsive Begin / GitLab buttons after 0.29.0 restructure
+- **GitHubConnectScreen "Begin" did nothing.** Two compounding
+  causes, both shipped fixes:
+  1. ``primary_action`` was re-fetching credentials_status to pick
+     a step every tap. If the freshly-rendered button label said
+     "Begin" but the daemon's status said the user was already at
+     step 4 (stale from a prior session), the dispatcher fell
+     through every elif and silently no-op'd. ``_render_primary``
+     now stamps an ``_action`` attribute (``begin`` / ``install`` /
+     ``verify``) on the button each time it renders; the
+     dispatcher uses that, with a label-based fallback, and
+     finally defaults to ``begin()`` so a button labelled "Begin"
+     always begins.
+  2. ``on_pre_enter`` accessed ``self.ids.gh_user_code`` and
+     similar directly. On Kivy ≥ 2.3 the rule's nested children
+     can lag a frame after the screen is added, so the early
+     accesses raised an ``ObservableDict`` AttributeError mid-
+     setup, leaving the screen in KV-default state with no
+     ``_action`` tagged. ``on_pre_enter`` now defers via
+     ``Clock.schedule_once`` (matches what ``SettingsScreen`` was
+     already doing); every helper uses ``self.ids.get(...)`` so a
+     genuinely-missing widget no longer takes the whole pass
+     down.
+- **GitLab/GitHub action buttons "resisted pressing"** in the
+  settings screen: tapping the sibling RecBtn fired
+  ``contributor_input.on_focus``, which called
+  ``save_contributor()`` synchronously — the RPC blocked the UI
+  thread for a few hundred ms during which Kivy still received
+  the touch but couldn't dispatch the on_release until the RPC
+  returned. ``save_contributor`` now runs the ``set_contributor``
+  call on a worker thread; the "Saved." flash flips through
+  ``Clock.schedule_once`` on the UI thread.
+- **Layout-shift fix.** The new ``gh_preflight`` and ``gh_message``
+  ``BodyLabel`` widgets used the
+  ``height: self.texture_size[1] + dp(8)`` growing pattern; on first
+  paint the texture is computed against width=0, so the label
+  starts ~30 dp tall and grows as the layout settles, pushing
+  every button below it down. Replaced with explicit
+  ``height: dp(80)`` so the BoxLayout's ``minimum_height`` is
+  stable from frame 0 — no more "tap where the button used to
+  be" misses.
+- **Tracing.** Added ``[github-connect]`` print lines on
+  ``primary_action`` / ``begin`` / ``_refresh_state`` so a flaky
+  field repro can be diagnosed from logcat without rebuilding
+  with extra logging. Cheap.
+
+### azt_collabd 0.29.0 + azt_collab_client 0.29.0 — GitHub connect-flow UX restructure (audit doc #1–#7)
+- **#1 ``verification_uri_complete``**:
+  ``GitHubConnectScreen._worker`` now prefers GitHub's
+  ``verification_uri_complete`` (URL with the user_code prefilled)
+  over the bare ``verification_uri``. Users land on GitHub's
+  Authorize? page directly instead of the code-entry detour.
+  Falls back to ``verification_uri`` then the bare URL if
+  GitHub's response shape ever changes.
+- **#2 + #3 step-indicator + pre-flight + no auto-fire**: the
+  GitHub connect screen is now organised as three explicit
+  stages — *1. Authorize this device* → *2. Install GitHub App*
+  → *3. Verify setup* — rendered as a colour/bold-coded
+  indicator. A single state-aware "primary" button presents
+  only the next required action; ``on_pre_enter`` derives the
+  current step from server flags
+  (``connected`` / ``app_installed`` / ``confirmed``), so a
+  partial setup that picks back up later resumes from where it
+  stopped (lost network, browser bail-out, app close all
+  recoverable). Pre-flight body text explains what GitHub is and
+  that a free account is required; the device flow is never
+  auto-fired — the user always taps *Begin* / *Install GitHub
+  App* / *Verify setup* explicitly. ``_render_message`` /
+  ``_render_steps`` / ``_render_primary`` / ``_render_manage``
+  handle the four screen shapes.
+- **#4 "Verify setup" rename**: both GitHub and GitLab
+  "Test connection" buttons are relabelled "Verify setup" — the
+  old label sounded like an optional diagnostic but is actually
+  the gate that flips ``confirmed=True``. Status messages
+  referencing "Test connection" are updated to match.
+- **#5 create-account link**: a "Create a GitHub account
+  (free)" NavBtn just below the pre-flight panel opens
+  ``https://github.com/signup`` in the user's browser. Pre-flight
+  body text also names the account-required precondition so the
+  user isn't surprised by GitHub's sign-in/up page.
+- **#6 simplified host buttons**: ``SettingsScreen`` now shows a
+  single state-aware GitHub button (label flips Connect ↔
+  Disconnect from ``credentials_status``) instead of two
+  parallel buttons, and a single ``GitLab`` button that opens
+  the GitLab settings form. Connection details for both hosts
+  remain in the Status block below.
+- **#7 declined**: no "Are you sure?" disconnect popup —
+  per-maintainer preference; with #1 landed an accidental
+  Disconnect costs one tap to redo, and the GitHub App on the
+  GitHub account is untouched, so re-Authorize is the only step
+  needed. Audit doc records the rationale.
+- French .po updated with the new strings; old "Test
+  connection" / "Tap Test connection" entries left in place
+  (translation-coverage drift detector only flags missing
+  msgids, not orphans).
+- Lock-step minor bump because the connect-flow restructure
+  changes a daemon-side UI subprocess that peers spawn through
+  ``open_server_ui()`` — version-string display in the settings
+  footer flags the cut.
+
 ### azt_collabd 0.28.27 + azt_collab_client 0.28.27 — 60s warmup budget + "Try again" affordance
 - ``_DAEMON_WARMUP_RETRIES`` raised again, 15 → 30 (30s → 60s).
   User-reported: 30s wasn't enough on their device — "next boot

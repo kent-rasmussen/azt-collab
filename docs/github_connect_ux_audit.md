@@ -11,7 +11,7 @@ trail of what was learned stays visible.
 
 ## Highest-impact (worth fixing first)
 
-### 1. Manual code-copy step in browser
+### 1. ~~Manual code-copy step in browser~~ — done
 
 GitHub's device-flow response includes both ``verification_uri``
 (bare URL — ``https://github.com/login/device``) and
@@ -35,7 +35,11 @@ filled in.
 ``device_flow_start()`` in ``azt_collabd/auth.py`` already returns
 the field; just plumb it through.
 
-### 2. "Connected" message overstates progress
+**Implemented:** ``_worker`` now prefers
+``verification_uri_complete`` and falls back to ``verification_uri``
+then the bare URL.
+
+### 2. ~~"Connected" message overstates progress~~ — done
 
 After device flow completes, the message reads:
 
@@ -58,7 +62,16 @@ an account, the internet needs to work; lots of failure possibilities.
 So when we enter this page, the next step in the process is what 
 happens (maybe with "Continue" button?)
 
-### 3. No pre-flight explanation
+**Implemented:** ``GitHubConnectScreen`` now renders a 3-step
+indicator (1. Authorize → 2. Install GitHub App → 3. Verify
+setup) plus a single state-aware "primary" button whose label
+matches the current step. Step state is derived from server
+flags (``connected`` / ``app_installed`` / ``confirmed``), so a
+partial setup that picks back up later resumes from where it
+stopped. "Setup complete" replaces "Connected" as the
+all-done message.
+
+### 3. ~~No pre-flight explanation~~ — done
 
 Tapping "Connect to GitHub" jumps directly into device flow — code,
 browser, polling. A field linguist might not know what GitHub
@@ -74,13 +87,21 @@ there are no settings. But this pre-flight text means we probably
 should always wait for the user to click "begin" (and tell him 
 "click 'begin' when you're ready").
 
-### 4. "Test connection" button doesn't say what it tests
+**Implemented:** screen now opens with the pre-flight body text
+and never auto-fires the device flow. The primary button label
+("Begin" / "Install GitHub App" / "Verify setup") gates each
+step; the user always opts in explicitly.
+
+### 4. ~~"Test connection" button doesn't say what it tests~~ — done
 
 The current label sounds like an optional diagnostic; it's
 actually the gate that flips ``confirmed=True``. Better label:
 "Verify setup"
 
-### 5. No path for users without a GitHub account
+**Implemented:** both GitHub and GitLab "Test connection"
+buttons are now labelled "Verify setup".
+
+### 5. ~~No path for users without a GitHub account~~ — done
 
 If the user doesn't have an account, the device-flow page asks
 them to sign in or sign up — but our flow gives no warning that
@@ -94,9 +115,14 @@ can risk a user bailing on the signup. But it would be good to
 pre-flight instruct the user that signing up if they don't have 
 an account will be part of the deal.
 
+**Implemented:** a "Create a GitHub account (free)" link lives
+just below the pre-flight panel and opens
+``https://github.com/signup`` in the browser. Pre-flight text
+also names the account-required precondition.
+
 ## Medium-impact
 
-### 6. GitHub vs. GitLab choice is unexplained
+### 6. ~~GitHub vs. GitLab choice is unexplained~~ — done
 
 Two equally-prominent buttons on the settings screen; non-
 technical user has no basis for choosing. **Recommendation:** pick
@@ -110,8 +136,14 @@ relevant (i.e., connection settings have been verified or
 not) at a time, and GitLab really is just settings, so simplify 
 button to "GitLab"; connection status is shown below.
 
+**Implemented:** SettingsScreen now shows a single state-aware
+GitHub button (label flips Connect↔Disconnect from
+``credentials_status``) and a single ``GitLab`` button that
+opens the GitLab settings form. Connection details for both
+hosts remain in the Status block below.
 
-### 7. Disconnect button is one tap from prominent
+
+### 7. ~~Disconnect button is one tap from prominent~~ — declined
 
 No "Are you sure?" confirmation. Easy to fat-finger; consequences
 (re-auth required, potentially losing project access) are non-
@@ -120,6 +152,11 @@ obvious. Wrap in a Yes/No popup before action.
 Answer: I personally detest those popups. If we can eliminate the
 code pasting, uninstall would be a simple click to fix --given that
 uninstall doesn't uninstall the github app from the github account.
+
+**Resolution:** declined per maintainer preference. With #1
+landed (no code paste), an accidental Disconnect costs one tap
+to redo; the GitHub App on the GitHub account is untouched, so
+re-Authorize is the only step needed. No popup added.
 
 ### 8. Re-authenticate has the same problem
 
