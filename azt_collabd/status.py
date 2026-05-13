@@ -108,6 +108,15 @@ NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 # ``set_contributor`` (typically through the daemon settings UI).
 CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 
+# Transport-failure codes. Mirror of the client-side constants
+# (the daemon doesn't emit these — they're produced by the
+# client wrappers' transport-failure branches — but keeping the
+# mirror complete avoids divergence between the two ``status``
+# modules and lets any daemon-internal code that walks status
+# codes recognise them as known constants.
+SERVER_UNAVAILABLE = 'SERVER_UNAVAILABLE'
+SERVER_ERROR = 'SERVER_ERROR'
+
 
 @dataclass
 class Status:

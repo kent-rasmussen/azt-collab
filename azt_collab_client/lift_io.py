@@ -809,7 +809,19 @@ def _open_content_uri(uri, mode):
     resolver = activity.getContentResolver()
     java_uri = Uri.parse(uri)
     java_mode = 'r' if 'r' in mode else 'w'
-    pfd = resolver.openFileDescriptor(java_uri, java_mode)
+    from ._debug import first_try_log
+    first_try_log('lift_io.openFileDescriptor.pre',
+                  uri=uri, mode=java_mode)
+    try:
+        pfd = resolver.openFileDescriptor(java_uri, java_mode)
+    except Exception as ex:
+        first_try_log('lift_io.openFileDescriptor.raised',
+                      uri=uri, mode=java_mode,
+                      exc_type=type(ex).__name__, exc=str(ex))
+        raise
+    first_try_log('lift_io.openFileDescriptor.post',
+                  uri=uri, mode=java_mode,
+                  pfd_null=pfd is None)
     if pfd is None:
         raise IOError(f'openFileDescriptor returned null for {uri!r} '
                       f'(mode={java_mode!r})')

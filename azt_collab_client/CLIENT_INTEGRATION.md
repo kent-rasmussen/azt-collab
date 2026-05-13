@@ -381,6 +381,31 @@ filesystem paths. **Don't** cache to a peer-side directory and
 work from the cache; that breaks the single-source-of-truth
 contract.
 
+**Atomic writes for LIFT.** Use ``handle.atomic_open_write()``
+(not ``open_write``) for any LIFT save that may race a sync's
+merge-output write or another peer:
+
+```python
+with handle.atomic_open_write() as f:
+    tree.write(f, encoding='utf-8', xml_declaration=True)
+```
+
+The wrapper handles routing internally: filesystem paths use a
+sibling-tempfile + ``os.replace``; ``content://`` URIs use the
+daemon's two-phase FD + finalize protocol (peer ships bytes
+through a ``ContentResolver.openFileDescriptor`` write to a
+per-token scratch file, then calls ``atomic_finalize`` to rename
+under ``project_lock``). Peer code stays the same on both paths.
+
+**Rebuild bundles the FD-write path.** Pre-0.41.7 clients
+shipped bytes via base64 in the JSON-RPC body, which on Android
+hit Binder's ~1 MB per-transaction cap and silently failed for
+LIFT files larger than ~700 KB (the save-audio-recording flow
+is the most common trip). Peers rebuilding against 0.41.7+
+pick up the new two-phase write transparently — no code
+change, just rebuild. Pre-0.41.7 daemons get the legacy
+single-RPC path as a fallback (works for small payloads).
+
 ## 9. Audio / image references
 
 For audio recording:
@@ -945,6 +970,88 @@ project, a daemon-restart notice, a future `MERGED_REMOTE`
 status. The user's anchor stays; the content under it
 refreshes; nothing else moves.
 
+## 14b. Sharing text / email / log-file helpers
+
+Peers that need to dispatch a string or log file through
+Android's share sheet — diagnostic dump, status report, log
+attachment, etc. — should use the shared helpers in
+``azt_collab_client.ui.share`` rather than inlining
+``ACTION_SEND`` JNI plumbing per peer.
+
+Three flavours:
+
+```python
+from azt_collab_client.ui.share import (
+    share_text, email_text, share_log_file)
+
+# 1. Generic text/plain share sheet (email, messaging, cloud-
+#    paste, file-saver all accept). EXTRA_TEXT body — limited
+#    to Android Intent's ~1 MB extras ceiling. Best for short
+#    diagnostic dumps and snapshots.
+share_text(
+    text=some_short_dump,
+    subject=_('Diagnostic snapshot'),
+    chooser_title=_('Share snapshot'),
+    on_error=self._show_error,
+)
+
+# 2. Email-only picker (mailto: URI scheme; ACTION_SENDTO).
+#    Restricts the share sheet to email apps — better UX when
+#    the user's intent is specifically "send this to the
+#    developer". ``to=''`` lets the user pick a recipient.
+#    Body lives in the URI's ``body`` query — practical
+#    kilobyte limit; large payloads should prefer share_log_file.
+email_text(
+    text=some_short_dump,
+    to='',
+    subject=_('Diagnostic snapshot'),
+    on_error=self._show_error,
+)
+
+# 3. File-based log share with optional previous-session
+#    bundling. Inserts into MediaStore Downloads to get a real
+#    content:// URI, attaches as EXTRA_STREAM. Receivers can
+#    save as a file rather than read inline. Use for log
+#    sharing where the payload may exceed text-extras limits.
+share_log_file(
+    log_path='/sdcard/azt_recorder.log',
+    prev_path='/sdcard/azt_recorder.log.prev',  # optional
+    on_error=self._show_error,
+    # display_name='azt_log_20260513.log',     # optional
+)
+```
+
+All three are Android-only — non-Android platforms invoke
+``on_error`` with a translated message; same shape as
+``share_running_apk``. All return ``bool`` indicating dispatch
+success.
+
+**Picking between the three.** Short text (< 100 KB) → either
+``share_text`` (broad picker) or ``email_text`` (email only).
+Larger payloads or anything you want to bundle with a previous
+session log → ``share_log_file``. The daemon UI uses
+``share_log_file`` to ship its ``$AZT_HOME/daemon.log`` blob.
+
+**Bundled blob shape (``share_log_file``).**::
+
+    === previous session (<prev_path>) ===
+    <prev contents>
+
+    === current session (<log_path>) ===
+    <current contents>
+
+Section breaks let the receiver scroll to the relevant
+session.
+
+**Why peer-shared.** Four+ surfaces need to dispatch through
+the share sheet (recorder log, daemon log, recorder status
+snapshot, future viewer diagnostic). Each was about to
+re-derive ~30-50 lines of jnius autoclass + Intent
+construction + MediaStore plumbing + error translation.
+Extracted into ``ui/share.py`` alongside ``share_running_apk``
+so every peer + the daemon UI uses the same code path, and a
+future tightening of Android share APIs is one fix instead of N.
+
 ## 15. Recovery
 
 The single peer-visible recovery surface is
@@ -1009,6 +1116,135 @@ If you ship a new peer, run the harness once before tagging
 your first release; if its `peer wait` interval is consistently
 > 5 s on the slow-tablet target, wire ``prewarm()`` and re-measure
 before tagging.
+
+## 17. Routing on sync results
+
+How peers MUST respond to ``sync_project`` / ``request_sync``
+result codes. Future peers (viewer, next sister app) match the
+recorder's existing behaviour by following this section —
+without it, every peer reverse-engineers the routing from
+recorder source and the behaviours drift.
+
+> **For the rationale** (what each code *means*, why
+> auto-sync must be silent, the pre-0.34.1 anti-pattern this
+> contract closes) — see ``CLAUDE.md`` "Peer contract: routing
+> on sync results". This section is the *contract*.
+
+**Two contexts, two contracts.** The same ``Result`` reaches
+the peer from two different triggers and they need different
+responses:
+
+1. **Auto-sync** — the peer fires ``request_sync`` itself,
+   without a user gesture: project-select, project-load,
+   background periodic, post-edit debounce. The user did NOT
+   ask to sync.
+2. **User-initiated sync** — the user tapped a sync icon /
+   "Sync now" button. The user explicitly asked.
+
+Auto-sync MUST be silent on configuration-class failures.
+User-initiated sync routes to whatever fixes the problem.
+
+### Routing table
+
+| Status code | Auto-sync | User-initiated sync |
+|---|---|---|
+| ``S.NOT_A_REPO`` | **Silent.** Log; project keeps working. | Route to publish / collaboration settings. |
+| ``S.NO_REMOTE`` | **Silent.** Log; project keeps working. | Same — route to publish settings. |
+| ``S.AUTH_REQUIRED`` | **Silent.** Log; sync doesn't happen until creds configured. | Route to GitHub Connect flow. |
+| ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` / ``S.REPO_NOT_AUTHORIZED`` | **Silent.** Log; project still usable. | Open the ``url`` param the Status carries. |
+| ``S.CONTRIBUTOR_UNSET`` | **Silent.** Log; sync refused until name set. | Route to daemon settings UI's contributor field. |
+| ``S.JOB_INTERRUPTED`` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails. |
+| ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` | **Silent.** Log; daemon will be reachable next time. | Transient-error toast. DO NOT route to settings — no user-fixable config here. |
+| ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
+| Everything else (``PUSHED``, ``PULLED``, ``NOTHING_TO_COMMIT``, ``CONFLICTS``, …) | Translate to status line. | Translate to status line. |
+
+### Code shape — both contexts
+
+```python
+# Auto-sync (post-load, post-edit, background) — silent on
+# configuration-class AND transport-class failures; never derail
+# whatever the user was doing.
+def _auto_sync(self, langcode):
+    result = sync_project(langcode)
+    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE,
+                      S.AUTH_REQUIRED, S.CONTRIBUTOR_UNSET,
+                      S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
+                      S.REPO_NOT_AUTHORIZED,
+                      S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
+                      S.AUTH_REFRESH_STALE):
+        print(f'[auto-sync] {langcode}: '
+              f'{result.codes()!r} (silenced)',
+              file=sys.stderr)
+        return
+    if result.has(S.JOB_INTERRUPTED):
+        return self._auto_sync_retry_once(langcode)
+    self.show_status(translate_result(result))  # PUSHED, etc.
+
+
+# User-initiated sync — the user just tapped Sync; route to
+# whatever fixes the problem, or surface the success line.
+def do_sync(self, langcode):
+    result = sync_project(langcode)
+
+    # AUTH_REFRESH_STALE piggybacks on whatever primary code the
+    # sync returned. Surface it BEFORE the routing branches
+    # consume the result so the deadline warning isn't dropped
+    # on the way to a settings page.
+    stale = next((s for s in result.statuses
+                  if s.code == S.AUTH_REFRESH_STALE), None)
+    if stale is not None:
+        self.show_toast(translate_status(stale))
+
+    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE):
+        self.open_publish_settings(langcode)
+    elif result.has(S.CONTRIBUTOR_UNSET):
+        self.open_sync_settings()
+    elif result.has(S.AUTH_REQUIRED):
+        self.open_github_connect()
+    elif result.has_any(S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
+                        S.REPO_NOT_AUTHORIZED):
+        url = next((s.params.get('url', '')
+                    for s in result.statuses
+                    if s.code in (S.APP_NOT_INSTALLED,
+                                  S.APP_SUSPENDED,
+                                  S.REPO_NOT_AUTHORIZED)),
+                   '')
+        self.open_url(url) if url else self.open_github_connect()
+    elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
+        # Transient — no user-fixable config; just say so.
+        self.show_toast(translate_result(result))
+    elif result.has(S.JOB_INTERRUPTED):
+        ...  # retry; transient-error toast if retry fails
+    else:
+        # PUSHED / PULLED / NOTHING_TO_COMMIT / CONFLICTS / etc.
+        self.show_status(translate_result(result))
+```
+
+### Constants
+
+The status codes referenced above are module-level constants
+in ``azt_collab_client.status`` (re-exported as ``S`` from the
+package root). All available since 0.41.13:
+
+```python
+from azt_collab_client import S
+S.NOT_A_REPO              # 'NOT_A_REPO'
+S.NO_REMOTE               # 'NO_REMOTE'
+S.AUTH_REQUIRED           # 'AUTH_REQUIRED'
+S.AUTH_REFRESH_STALE      # 'AUTH_REFRESH_STALE'
+S.APP_NOT_INSTALLED       # 'APP_NOT_INSTALLED'
+S.APP_SUSPENDED           # 'APP_SUSPENDED'
+S.REPO_NOT_AUTHORIZED     # 'REPO_NOT_AUTHORIZED'
+S.CONTRIBUTOR_UNSET       # 'CONTRIBUTOR_UNSET'
+S.JOB_INTERRUPTED         # 'JOB_INTERRUPTED'
+S.SERVER_UNAVAILABLE      # 'SERVER_UNAVAILABLE'  ← 0.41.13+
+S.SERVER_ERROR            # 'SERVER_ERROR'        ← 0.41.13+
+S.PUSHED / S.PULLED / S.NOTHING_TO_COMMIT / S.CONFLICTS / ...
+```
+
+Use the constants, not string literals. Substring-matching the
+translated message (``if 'publish' in msg: route_to_settings``)
+is the regression this section exists to avoid.
 
 ## What the suite does *for* you (keep code shareable)
 

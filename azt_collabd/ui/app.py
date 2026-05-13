@@ -44,6 +44,7 @@ from azt_collabd.status import AuthError
 from azt_collab_client import (
     S,
     cawl_cache_status,
+    get_daemon_log,
     get_contributor,
     get_credentials_status,
     github_app_install_url,
@@ -58,9 +59,11 @@ from azt_collab_client import (
     test_github_credentials,
     test_gitlab_credentials,
     set_contributor,
+    set_daemon_log_to_file,
     translate_result,
     translate_status,
 )
+from azt_collab_client._debug import first_try_log
 
 
 _tr = _client_i18n._
@@ -608,6 +611,41 @@ KV_TEMPLATE = '''
                 NavBtn:
                     text: _('Refresh Status')
                     on_press: root.refresh()
+                # Diagnostic log capture — off by default. When on,
+                # the daemon mirrors its stderr to
+                # ``$AZT_HOME/daemon.log`` and the Share button
+                # below dispatches the contents through an Android
+                # share intent. Used when a tester reproduces a
+                # bug on a device that doesn't have adb access.
+                SectionLabel:
+                    text: _('Diagnostic log')
+                RecBtn:
+                    id: daemon_log_toggle_btn
+                    text: _('Save daemon log to file')
+                    size_hint_y: None
+                    height: dp(52)
+                    normal_color: T.SURFACE
+                    on_press: root.toggle_daemon_log_to_file()
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(10)
+                    RecBtn:
+                        id: daemon_log_share_btn
+                        text: _('Share daemon log')
+                        normal_color: T.SURFACE
+                        on_press: root.share_daemon_log()
+                    RecBtn:
+                        id: daemon_log_email_btn
+                        text: _('Email daemon log')
+                        normal_color: T.SURFACE
+                        on_press: root.email_daemon_log()
+                BodyLabel:
+                    id: daemon_log_status
+                    text: ''
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(4)
                 Widget:
                     size_hint_y: None
                     height: dp(8)
@@ -952,6 +990,8 @@ class SettingsScreen(Screen):
 
     _cawl_cache_event = None
 
+    _cawl_cache_langcode = ''
+
     def _start_cawl_cache_poll(self):
         """Begin polling the daemon's CAWL cache_status endpoint so
         the in-flight prefetch progress is visible alongside the
@@ -966,11 +1006,18 @@ class SettingsScreen(Screen):
         increment per image fetch, no per-poll os.walk), so 1 Hz
         polling is near-zero CPU."""
         self._stop_cawl_cache_poll()
+        # Resolve the langcode ONCE at poll start; the user
+        # doesn't switch projects while sitting on the settings
+        # screen, and polling ``last_project()`` per tick was
+        # adding two RPCs and two log lines per second.
+        self._cawl_cache_langcode = (last_project() or '').strip()
         self._tick_cawl_cache_status()  # immediate first read
         self._cawl_cache_event = Clock.schedule_interval(
             lambda _dt: self._tick_cawl_cache_status(), 1.0)
 
     def _stop_cawl_cache_poll(self):
+        first_try_log('settings.stop_cawl_cache_poll',
+                      had_event=self._cawl_cache_event is not None)
         if self._cawl_cache_event is not None:
             try:
                 self._cawl_cache_event.cancel()
@@ -981,9 +1028,16 @@ class SettingsScreen(Screen):
     def _tick_cawl_cache_status(self):
         banner = self.ids.get('cawl_cache_status_banner')
         label = self.ids.get('cawl_cache_status_label')
+        first_try_log(
+            'settings.cawl_tick',
+            current_screen=(self.manager.current
+                            if self.manager else None),
+            has_banner=banner is not None,
+            has_label=label is not None,
+            cached_langcode=self._cawl_cache_langcode)
         if banner is None or label is None:
             return
-        langcode = (last_project() or '').strip()
+        langcode = self._cawl_cache_langcode
         if not langcode:
             self._hide_cawl_cache_banner(banner, label)
             return
@@ -1076,6 +1130,10 @@ class SettingsScreen(Screen):
         # whether status fetching succeeded.
         try:
             self._refresh_debug_503_state()
+        except Exception:
+            pass
+        try:
+            self._refresh_daemon_log_state()
         except Exception:
             pass
         try:
@@ -1260,6 +1318,122 @@ class SettingsScreen(Screen):
             langcode=project.langcode,
             font_name=App.get_running_app().font_name,
         )
+
+    def toggle_daemon_log_to_file(self):
+        """Flip the "Save daemon log to file" toggle. Takes effect
+        immediately in the running daemon (the RPC installs /
+        removes the stderr tee in-process); no restart required."""
+        status = self.ids.get('daemon_log_status')
+        new_state = not self._daemon_log_enabled_state()
+        result = set_daemon_log_to_file(new_state)
+        if result is None:
+            if status is not None:
+                status.text = _tr('Failed to update logging setting.')
+            return
+        self._daemon_log_enabled = result['enabled']
+        if status is not None:
+            if result['enabled']:
+                status.text = _tr(
+                    'Daemon log is being saved to {path}').format(
+                        path=result['log_path'])
+            else:
+                status.text = _tr('Daemon log capture is off.')
+        self._refresh_daemon_log_buttons()
+
+    def _daemon_log_enabled_state(self):
+        return bool(getattr(self, '_daemon_log_enabled', False))
+
+    def _refresh_daemon_log_state(self):
+        """Read the daemon's current toggle state. Called from
+        ``refresh()`` so the button label is correct on screen
+        entry."""
+        data = get_daemon_log()
+        if data is None:
+            return
+        self._daemon_log_enabled = data['enabled']
+        self._refresh_daemon_log_buttons()
+        status = self.ids.get('daemon_log_status')
+        if status is None:
+            return
+        if data['enabled']:
+            status.text = _tr(
+                'Daemon log is being saved to {path} '
+                '({bytes_n} bytes).').format(
+                    path=data['log_path'], bytes_n=data['bytes'])
+        else:
+            status.text = ''
+
+    def _refresh_daemon_log_buttons(self):
+        enabled = self._daemon_log_enabled_state()
+        toggle = self.ids.get('daemon_log_toggle_btn')
+        if toggle is not None:
+            toggle.text = (_tr('Stop saving daemon log')
+                           if enabled
+                           else _tr('Save daemon log to file'))
+        for btn_id in ('daemon_log_share_btn',
+                       'daemon_log_email_btn'):
+            btn = self.ids.get(btn_id)
+            if btn is not None:
+                btn.disabled = not enabled
+                btn.opacity = 1.0 if enabled else 0.4
+
+    def share_daemon_log(self):
+        """Dispatch the daemon log through Android's share sheet —
+        any app that handles ``text/plain`` (email, messaging,
+        file-saver, cloud-paste) accepts it."""
+        self._dispatch_daemon_log('share')
+
+    def email_daemon_log(self):
+        """Open the user's email composer pre-filled with the
+        daemon log. ``ACTION_SENDTO`` restricts the picker to
+        email apps only — better UX than the generic share sheet
+        when the user's intent is specifically "send this to the
+        developer". No recipient pre-filled; user picks."""
+        self._dispatch_daemon_log('email')
+
+    def _dispatch_daemon_log(self, channel):
+        """Shared scaffolding for share/email of the daemon log.
+        Pulls the log path + content + state via RPC, validates
+        the toggle is on + there's content, then delegates to
+        the appropriate share helper in
+        ``azt_collab_client.ui.share``.
+
+        Channel ``'share'`` uses ``share_log_file`` (MediaStore
+        + ``EXTRA_STREAM``, supports arbitrarily large logs and
+        attaches as a real file). Channel ``'email'`` uses
+        ``email_text`` (``mailto:`` URI body — kilobyte limit,
+        but the email-only picker is the right UX for "send to
+        the developer")."""
+        status = self.ids.get('daemon_log_status')
+        data = get_daemon_log()
+        if data is None:
+            if status is not None:
+                status.text = _tr('Daemon log unreachable.')
+            return
+        if not data['log']:
+            if status is not None:
+                status.text = _tr(
+                    'Daemon log is empty — turn on saving '
+                    'first, then reproduce the issue.')
+            return
+
+        def _on_err(msg):
+            if status is not None:
+                status.text = msg
+
+        if channel == 'email':
+            from azt_collab_client.ui.share import email_text
+            ok = email_text(text=data['log'], to='',
+                            subject=_tr('AZT daemon log'),
+                            on_error=_on_err)
+        else:
+            from azt_collab_client.ui.share import share_log_file
+            ok = share_log_file(log_path=data['log_path'],
+                                on_error=_on_err)
+        if ok and status is not None:
+            status.text = _tr(
+                'Sending {bytes_n} bytes of daemon log…'
+            ).format(bytes_n=data['bytes'])
 
     def _set_project_actions_msg(self, text):
         msg = self.ids.get('project_actions_msg')

@@ -385,6 +385,36 @@ def _save_config_file(d):
     os.replace(tmp, p)
 
 
+def get_daemon_log_to_file():
+    """True when the daemon should mirror its stderr to
+    ``$AZT_HOME/daemon.log``.
+
+    Configured via the daemon settings UI's "Save daemon log to
+    file" toggle. The on-disk file accumulates daemon-side
+    diagnostic output (``[boot-trace-daemon]``, ``[cawl]``,
+    ``[recent]``, ``[first-try]`` from the daemon UI / picker
+    subprocess) that would otherwise only land in logcat. Useful
+    when a remote tester reproduces a bug on a device that
+    doesn't have adb access — the daemon UI's "Share daemon log"
+    button can dispatch the file through any sharing app.
+
+    Default: False. Off until the user explicitly turns it on,
+    so we don't accumulate a log file on devices that don't
+    need it."""
+    cfg = _load_config_file()
+    val = (cfg.get('logging') or {}).get('daemon_log_to_file', False)
+    return bool(val)
+
+
+def set_daemon_log_to_file(enabled):
+    """Persist the daemon-log-to-file toggle. Takes effect on the
+    next daemon process start — the stderr tee can't be installed
+    or removed from outside the daemon's own process."""
+    cfg = _load_config_file()
+    cfg.setdefault('logging', {})['daemon_log_to_file'] = bool(enabled)
+    _save_config_file(cfg)
+
+
 def get_contributor():
     """Stored display name for ``git log``. Empty string if unset.
 

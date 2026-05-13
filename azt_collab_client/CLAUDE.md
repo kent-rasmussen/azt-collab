@@ -274,190 +274,94 @@ from inside the client.
 
 ### Peer contract: routing on sync results
 
-This section codifies how peers MUST respond to `sync_project` /
-`request_sync` result codes, so future peers (viewer, next sister
-app) match the recorder's existing behaviour without
-reverse-engineering it from the recorder source.
+> **For the conformity contract** — the routing table, code
+> shape for auto-sync vs. user-initiated sync, and the `S.*`
+> constant reference — see `CLIENT_INTEGRATION.md` § 17. This
+> section is the *why*: per-code meanings, the pre-0.34.1
+> anti-pattern this rule closes, and the architectural reason
+> the auto/user distinction lives peer-side.
 
-**Two contexts, two contracts.** The same `Result` reaches the
-peer from two different triggers and they need different
-responses:
-
-1. **Auto-sync** — the peer fires `request_sync` itself, without
-   a user gesture: project-select, project-load, background
-   periodic, post-edit debounce. The user did NOT ask to sync.
-2. **User-initiated sync** — the user tapped a sync icon /
-   "Sync now" button / similar deliberate gesture. The user
-   explicitly asked.
-
-Auto-sync MUST be silent on configuration-class failures. The
-user is in the middle of doing something else (opening a project,
-finishing an edit); a sync popup / forced settings navigation /
-modal error in that moment is a regression: it derails the flow
-the user was in, sometimes visibly enough to look like project
-selection itself "failed" or "fell back to the old project." Log
-to stderr/logcat for diagnostics; don't surface to the user; let
-whatever the user was doing complete.
-
-User-initiated sync, by contrast, IS the gesture — the user
-asked to sync and they want to know what happened. If the
-project isn't publishable yet (`NOT_A_REPO`, `NO_REMOTE`) or auth
-is broken (`AUTH_REQUIRED`, etc.), route them to the place
-where they can fix it.
-
-| Status code         | Auto-sync                                      | User-initiated sync                                                                                                                |
-|---------------------|------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `S.NOT_A_REPO`      | **Silent.** Log; project keeps working.        | Route to **publish / collaboration settings** for this project. ("Not a git repo. Publish first.") |
-| `S.NO_REMOTE`       | **Silent.** Log; project keeps working.        | Same — route to publish settings.                                                                                                  |
-| `S.AUTH_REQUIRED`   | **Silent.** Log; sync just doesn't happen until creds are configured. | Route to **GitHub Connect** flow.                                                                            |
-| `S.APP_NOT_INSTALLED` / `S.APP_SUSPENDED` / `S.REPO_NOT_AUTHORIZED` | **Silent.** Log; sync didn't go through but the project is still usable. | Open the `url` param the Status carries.                                  |
-| `S.JOB_INTERRUPTED` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails.                                                                |
-| `S.SERVER_UNAVAILABLE` / `S.SERVER_ERROR` | **Silent.** Log; daemon will be reachable again next time. | Surface a transient-error toast ("Service unavailable, try again in a moment"). DO NOT route to settings — there's no user-fixable config here, just a daemon that's currently down. |
-| `S.AUTH_REFRESH_STALE` | **Silent.** Log; the access token is still valid until its 8h cliff, so don't derail the auto-sync flow. (Peers MAY show a non-intrusive banner on a settings-screen entry — this code is also visible via `get_credentials_status()` → `github.refresh_broken`.) | Surface the translated toast — `translate_status` renders "GitHub session needs re-authentication — current access expires {deadline}. Open GitHub Connect and tap Re-authenticate." `params['expires_at']` is the unix timestamp at which the access token expires (token_time + 8h); `translate._format_deadline` converts it to a relative phrase ("in 47 minutes", "in 3 hours") so the user knows how much runway they have. DO NOT route to settings here — the toast text already names GitHub Connect as the next step; routing would steal control from a user who's mid-sync. |
-| Everything else (`PUSHED`, `PULLED`, `NOTHING_TO_COMMIT`, `CONFLICTS`, …) | Translate to status line. | Translate to status line.                                                                            |
+**Two contexts, two contracts.** ``sync_project`` /
+``request_sync`` results reach the peer from two different
+triggers and they need different responses. Auto-sync (peer-
+initiated, no gesture: project-select, post-edit debounce,
+background periodic) MUST be silent on configuration-class
+failures because the user is mid-flow doing something else;
+a sync popup / forced settings navigation in that moment
+*derails the flow they're in*, sometimes visibly enough to
+look like project selection itself "failed". User-initiated
+sync (the user tapped Sync) IS the gesture, so it routes to
+whatever fixes the problem — that's what the user asked for.
 
 The peer is the only party that knows which trigger fired the
-sync — the daemon sees an `RPC: sync` and answers truthfully
-either way. So the auto/user distinction lives on the peer
-side, typically as a flag passed alongside the contributor
-name or distinguishing methods (`do_sync()` vs.
-`_auto_sync_on_load()`).
+sync — the daemon sees an ``RPC: sync`` and answers truthfully
+either way. So the auto/user distinction has to live on the
+peer side, typically as distinguishing methods (``do_sync()``
+vs. ``_auto_sync_on_load()``).
 
 **Pre-0.34.1 anti-pattern, fixed by following this contract.**
 Treating every sync failure as a user-facing error in the
 auto-sync path manifested intermittently as "I selected
 project B but ended up back on project A": the auto-sync on
-project-load returned `NOT_A_REPO`, the peer's error path
-caused the project-load flow to bail / revert / show a
-dialog the user couldn't see while a screen transition was
-mid-animation, and the user landed on whatever project the
-peer had been showing before. This is a peer-side bug, not a
-daemon or picker bug — but it has a daemon-side mitigation
-*by contract* (this section). Silent auto-sync failures keep
-the user in the project they actually selected.
+project-load returned ``NOT_A_REPO``, the peer's error path
+caused the project-load flow to bail / revert / show a dialog
+the user couldn't see while a screen transition was mid-
+animation, and the user landed on whatever project the peer
+had been showing before. Peer-side bug; daemon-side mitigation
+*by contract*. Silent auto-sync failures keep the user in the
+project they actually selected.
 
-Status-code meanings, for the table above:
+**Per-code meanings:**
 
-- `S.NOT_A_REPO` — project working dir is not a git repo
+- ``S.NOT_A_REPO`` — project working dir is not a git repo
   (never published).
-- `S.NO_REMOTE` — working dir is a git repo but has no
-  `remote.origin.url`.
-- `S.AUTH_REQUIRED` — no GitHub / GitLab credentials configured
-  for this remote host.
-- `S.APP_NOT_INSTALLED` / `S.APP_SUSPENDED` /
-  `S.REPO_NOT_AUTHORIZED` — credentials present but the
+- ``S.NO_REMOTE`` — working dir is a git repo but has no
+  ``remote.origin.url``.
+- ``S.AUTH_REQUIRED`` — no GitHub / GitLab credentials
+  configured for this remote host.
+- ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` /
+  ``S.REPO_NOT_AUTHORIZED`` — credentials present but the
   GitHub-side install is missing / suspended / doesn't cover
-  this repo. Each carries a `url` param pointing at the page
-  that fixes it.
-- `S.JOB_INTERRUPTED` — async job's worker thread died
-  (daemon respawned mid-job).
-- `S.SERVER_UNAVAILABLE` / `S.SERVER_ERROR` — daemon was
+  this repo. Each carries a ``url`` param pointing at the
+  page that fixes it.
+- ``S.CONTRIBUTOR_UNSET`` — user hasn't entered their display
+  name yet; commit-issuing endpoints refuse rather than
+  fall back to a placeholder (0.40.0 strict-daemon-owned).
+- ``S.JOB_INTERRUPTED`` — async job's worker thread died
+  (daemon respawned mid-job). Transient; retry.
+- ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` — daemon was
   unreachable or returned a transport-level error. Wrappers
-  translate every transport failure (`ServerUnavailable`,
-  non-`ok` response) into one of these codes, so peers never
-  see a raw exception from a query-shaped wrapper. Distinct
-  from the config-class codes: there's no user-facing
-  configuration that fixes a daemon that's currently down.
-- `S.AUTH_REFRESH_STALE` — the daemon's last attempt to refresh
-  the GitHub access token failed (typically
-  `incorrect_client_credentials` from the OAuth endpoint). The
-  current access token is still valid until its 8h-from-issuance
-  expiry, so sync keeps working in this session — but the
-  refresh path can't mint a replacement, so once the access
-  token expires every authenticated git op will start failing
-  with no user-visible warning unless this code is surfaced.
-  Carries `params['expires_at']` (unix timestamp of the access
-  token cliff) so `translate_status` can render the relative
-  deadline ("in 47 minutes", "in 3 hours") in the toast. Also
-  surfaced via `get_credentials_status()` →
-  `github.refresh_broken` / `github.access_token_expires_at`
-  for peers that want a startup-time banner. Cleared when the
-  user completes a fresh device flow at GitHub Connect (which
-  calls `set_github_tokens` daemon-side; that function clears
-  `refresh_broken` atomically with the token write).
+  translate every transport failure (``ServerUnavailable``,
+  non-``ok`` response) into one of these codes, so peers
+  never see a raw exception from a query-shaped wrapper.
+  Distinct from the config-class codes: there's no user-
+  facing configuration that fixes a daemon that's currently
+  down. Constants exported from
+  ``azt_collab_client.status`` since 0.41.13.
+- ``S.AUTH_REFRESH_STALE`` — the daemon's last attempt to
+  refresh the GitHub access token failed (typically
+  ``incorrect_client_credentials`` from the OAuth endpoint).
+  The current access token is still valid until its 8 h-from-
+  issuance expiry, so sync keeps working in this session —
+  but the refresh path can't mint a replacement, so once the
+  access token expires every authenticated git op will start
+  failing with no user-visible warning unless this code is
+  surfaced. Carries ``params['expires_at']`` (unix timestamp
+  of the access token cliff) so ``translate_status`` can
+  render the relative deadline ("in 47 minutes", "in 3
+  hours") in the toast. Also surfaced via
+  ``get_credentials_status()`` → ``github.refresh_broken`` /
+  ``github.access_token_expires_at`` for peers that want a
+  startup-time banner. Cleared when the user completes a
+  fresh device flow at GitHub Connect (``set_github_tokens``
+  daemon-side, which clears ``refresh_broken`` atomically
+  with the token write).
 
-The general shape — both contexts:
-
-```python
-# Auto-sync (post-load, post-edit, background) — silent on
-# configuration-class AND transport-class failures; never derail
-# whatever the user was doing.
-def _auto_sync(self, langcode):
-    result = sync_project(langcode)
-    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE,
-                      S.AUTH_REQUIRED, S.CONTRIBUTOR_UNSET,
-                      S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
-                      S.REPO_NOT_AUTHORIZED,
-                      S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
-                      S.AUTH_REFRESH_STALE):
-        # Log only; sync just didn't happen (or it did but a
-        # warning piggybacked), project keeps working, user
-        # keeps working. The AUTH_REFRESH_STALE deadline warning
-        # is surfaced in do_sync below, not here.
-        print(f'[auto-sync] {langcode}: '
-              f'{result.codes()!r} (silenced)',
-              file=sys.stderr)
-        return
-    if result.has(S.JOB_INTERRUPTED):
-        # One silent retry; on second failure, log and move on.
-        return self._auto_sync_retry_once(langcode)
-    self.show_status(translate_result(result))  # PUSHED, etc.
-
-# User-initiated sync — the user just tapped Sync; route to
-# whatever fixes the problem, or surface the success line.
-def do_sync(self, langcode):
-    result = sync_project(langcode)
-
-    # AUTH_REFRESH_STALE piggybacks on whatever primary code the
-    # sync returned (PUSHED + STALE while the access token is
-    # still valid; NOT_A_REPO + STALE if the user has both a
-    # publish gap AND a broken refresh, etc.). Always surface
-    # it BEFORE the routing branches consume the result, so the
-    # deadline warning isn't silently dropped on the way to
-    # the publish-settings page. ``translate_status`` renders
-    # just the AUTH_REFRESH_STALE message — the primary code is
-    # handled separately below.
-    stale = next((s for s in result.statuses
-                  if s.code == S.AUTH_REFRESH_STALE), None)
-    if stale is not None:
-        self.show_toast(translate_status(stale))
-
-    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE):
-        self.open_publish_settings(langcode)
-    elif result.has(S.CONTRIBUTOR_UNSET):
-        # User hasn't entered their name yet; route to the
-        # daemon settings UI's contributor field. Same shape
-        # as AUTH_REQUIRED — actionable on user-initiated sync,
-        # silent on auto-sync (handled above).
-        self.open_sync_settings()
-    elif result.has(S.AUTH_REQUIRED):
-        self.open_github_connect()
-    elif result.has_any(S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
-                        S.REPO_NOT_AUTHORIZED):
-        # Each of these statuses carries the actionable URL in
-        # ``params['url']``. Pull from the first matching status.
-        url = next((s.params.get('url', '') for s in result.statuses
-                    if s.code in (S.APP_NOT_INSTALLED,
-                                  S.APP_SUSPENDED,
-                                  S.REPO_NOT_AUTHORIZED)),
-                   '')
-        self.open_url(url) if url else self.open_github_connect()
-    elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
-        # Transient — no user-fixable config here; just say so
-        # and let the user retry.
-        self.show_toast(translate_result(result))
-    elif result.has(S.JOB_INTERRUPTED):
-        # Retry; surface a transient-error toast if retry fails.
-        ...
-    else:
-        # PUSHED / PULLED / NOTHING_TO_COMMIT / CONFLICTS / etc.
-        self.show_status(translate_result(result))
-```
-
-This is the part of the daemon → peer contract that "status code,
-not translated string" exists for. Substring-matching the
-translated message ("if 'publish' in msg: route_to_settings") is
-the regression to avoid.
+**Why "status code, not translated string".** Substring-
+matching the translated message
+(``if 'publish' in msg: route_to_settings``) is the
+regression this contract exists to avoid. Translations change
+per locale; codes don't.
 
 ## Internationalization (i18n)
 
@@ -1071,6 +975,87 @@ The recorder's KV currently uses relative `'icons/<name>.png'` strings
 that resolve in its own cwd — that's fine, no migration required; the
 client-first rule applies to *new* shared-shape assets and to any
 asset whose move-to-shared is forced by a second consumer.
+
+### Share helpers — `share.py`
+
+> **For the conformity contract** — what peers call, signatures,
+> error-handling shape — see ``CLIENT_INTEGRATION.md`` § 14b
+> (Sharing text / email helpers). This section is the *why*.
+
+Three Android Intent dispatches live in
+``azt_collab_client.ui.share``:
+
+- ``share_running_apk`` — share the host APK's own .apk via
+  MediaStore + ``ACTION_SEND``. Generic "share this app"
+  affordance every peer wants.
+- ``share_text`` — share a string via ``ACTION_SEND`` +
+  ``EXTRA_TEXT``. Used by the daemon UI's "Share daemon log"
+  button and any peer that needs a generic text-share affordance.
+- ``email_text`` — open an email composer via
+  ``ACTION_SENDTO`` + ``mailto:`` URI. Restricts the picker to
+  email apps only.
+
+**Why centralised.** Each share dispatch is ~30 lines of jnius
+autoclass + Intent construction + error translation. Three
+surfaces would otherwise re-derive the same code (daemon UI,
+recorder status snapshot, future viewer). A peer-side
+divergence would also mean a peer can subtly break the share
+flow without anyone noticing until a user reports "share
+button does nothing on the viewer".
+
+**Why ACTION_SEND vs. ACTION_SENDTO.** ``ACTION_SEND`` opens
+the generic share sheet — every text-handling app accepts
+(email, messaging, cloud-paste, file-saver). ``ACTION_SENDTO``
+with a ``mailto:`` URI scopes the picker to email apps only.
+The "Email log" button uses the latter because the user's
+intent there is specifically "send to a developer"; the
+generic share sheet would clutter with non-email targets the
+user has to navigate past.
+
+**Size constraints, not enforced here.** Android Intent extras
+have a practical ~1 MB ceiling per transaction. Callers
+sharing > 256 KB should truncate first. Documented in the
+contract; not asserted in the helper because the helper
+doesn't know the caller's payload semantics (truncate head?
+tail? sample?). The daemon-log producer truncates to last
+256 KB at the source (``_h_get_daemon_log`` in server.py).
+
+### Diagnostic-log capture — `daemon_log_to_file`
+
+The daemon's stderr goes to logcat by default. Logcat is
+fine for local development but useless when a remote tester
+reproduces a bug on a device the developer doesn't have
+adb access to — the diagnostic output is lost.
+
+``set_daemon_log_to_file(True)`` (POST
+``/v1/logging/daemon_log_to_file``) flips a config toggle AND
+installs a ``sys.stderr`` tee in the running daemon process.
+Stderr now goes to BOTH logcat AND
+``$AZT_HOME/daemon.log``. ``get_daemon_log()`` (GET
+``/v1/logging/daemon_log``) returns the file contents, the
+current toggle state, and the file path.
+
+**Hot-toggle.** The original draft of this feature required a
+daemon restart for the tee to take effect. That's the wrong
+shape when the user just enabled the toggle because they
+want to capture the *next* event — they don't want to also
+restart the daemon and lose the state they were
+investigating. Module-level state
+(``_stderr_tee_installed``, ``_stderr_tee_original``,
+``_stderr_tee_file``) holds the swap so the toggle can flip
+either way without restart.
+
+**Truncation policy.** ``open(path, 'w')`` truncates on each
+install — one log file per "session" the user opens. Trade:
+shorter capture window vs. file-size growth without bounds.
+Testers typically want "the log around the crash I just had",
+which is the truncate-on-enable shape. If a longer history
+becomes needed, the seam to add periodic rotation is the
+file open in ``install_stderr_tee``.
+
+**Off by default.** No daemon.log is created until the user
+flips the toggle. Most installs never want this — it's a
+diagnostic-only surface, opt-in.
 
 ### Self-update — `check_for_update`
 

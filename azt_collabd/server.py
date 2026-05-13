@@ -867,10 +867,13 @@ def _touch_project(langcode):
 
 
 def _h_get_last_project(_body):
+    # No success log here — peers poll this at high frequency
+    # (the daemon UI's cache-status indicator reads
+    # ``last_project()`` every second to know which project to
+    # query), and a per-call log floods logcat. The setter
+    # (``_h_set_last_project``) still logs because it's a real
+    # state change, not a poll.
     val = store.get_last_langcode()
-    print(f'[recent] GET /v1/recent/last_project → {val!r} '
-          f'(from {store._config_path()!r})',
-          file=sys.stderr, flush=True)
     return 200, {"ok": True, "langcode": val}
 
 
@@ -1621,6 +1624,73 @@ def _h_cawl_cache_status(langcode, _body):
                  "cached": cached, "total": total}
 
 
+def _h_set_daemon_log_to_file(body):
+    """``POST /v1/logging/daemon_log_to_file`` — flip the
+    stderr-to-file mirror live.
+
+    Body: ``{"enabled": true|false}``. Persists the toggle to
+    ``$AZT_HOME/config.json`` AND installs / removes the tee in
+    the running daemon process, so the change takes effect
+    immediately without a daemon restart. Idempotent in both
+    directions.
+
+    Returns ``{"ok": True, "enabled": <bool>, "log_path":
+    "<path>"}``. ``log_path`` is the absolute path of the file
+    being written to (useful for desktop hosts that want to
+    open the directory)."""
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    enabled = bool(body.get('enabled'))
+    store.set_daemon_log_to_file(enabled)
+    if enabled:
+        ok = install_stderr_tee()
+        if not ok:
+            return 500, {"ok": False,
+                         "error": "stderr_tee_install_failed"}
+    else:
+        uninstall_stderr_tee()
+    return 200, {"ok": True, "enabled": enabled,
+                 "log_path": daemon_log_path()}
+
+
+def _h_get_daemon_log(_body):
+    """``GET /v1/logging/daemon_log`` — read the daemon log file
+    contents as text. Used by the daemon UI's "Share daemon log"
+    button to attach the log to an Android share intent.
+
+    Returns ``{"ok": True, "log": "<text>", "log_path":
+    "<path>", "bytes": <int>}``. Empty ``log`` (with bytes=0)
+    when the file doesn't exist yet (toggle never enabled, or
+    enabled but no output yet). Truncated to the last 256 KB if
+    larger — typical share-intent payloads have practical size
+    limits, and the recent tail is where diagnostic value lives."""
+    path = daemon_log_path()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 200, {"ok": True, "log": "", "log_path": path,
+                     "bytes": 0}
+    MAX = 256 * 1024
+    try:
+        with open(path, 'r', encoding='utf-8',
+                  errors='replace') as f:
+            if size > MAX:
+                f.seek(size - MAX)
+                # Discard up to the next newline so the truncation
+                # doesn't land mid-line — easier to read.
+                f.readline()
+                head_note = (f'[log truncated: showing last '
+                             f'{MAX} bytes of {size}-byte file]\n')
+                text = head_note + f.read()
+            else:
+                text = f.read()
+    except OSError as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "log": text, "log_path": path,
+                 "bytes": size,
+                 "enabled": store.get_daemon_log_to_file()}
+
+
 def _h_project_atomic_finalize(langcode, body):
     """POST /v1/projects/<lang>/atomic_finalize
 
@@ -1786,6 +1856,8 @@ def dispatch(method, path, body):
                 return _h_github_device_flow_status(parts[5], body)
         if path == '/v1/recent/last_project':
             return _h_get_last_project(body)
+        if path == '/v1/logging/daemon_log':
+            return _h_get_daemon_log(body)
         if path == '/v1/config/ui_language':
             return _h_get_ui_language(body)
         if path == '/v1/projects':
@@ -1829,6 +1901,8 @@ def dispatch(method, path, body):
             return _h_test_github(body)
         if path == '/v1/credentials/migrate_from_prefs':
             return _h_migrate_from_prefs(body)
+        if path == '/v1/logging/daemon_log_to_file':
+            return _h_set_daemon_log_to_file(body)
         if path == '/v1/recent/last_project':
             return _h_set_last_project(body)
         if path == '/v1/projects/register':
@@ -1975,6 +2049,126 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn,
     allow_reuse_address = True
 
 
+def daemon_log_path():
+    """Absolute path to the daemon's persisted stderr log when the
+    "Save daemon log to file" toggle is enabled. Used by the
+    settings-UI share button to attach / dump the log."""
+    return os.path.join(azt_home(), 'daemon.log')
+
+
+class _StderrTee:
+    """File-like that mirrors writes to the original stderr (logcat /
+    terminal) AND to an on-disk log file. Used by
+    ``_maybe_install_stderr_tee`` to capture daemon diagnostics for
+    a remote tester who can't run logcat.
+
+    Writes go through best-effort — a failure to write to the file
+    (rotated, disk full) doesn't break the original stderr path.
+    """
+
+    def __init__(self, original, file_obj):
+        self._orig = original
+        self._file = file_obj
+
+    def write(self, data):
+        try:
+            self._orig.write(data)
+        except Exception:
+            pass
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except Exception:
+            pass
+        return len(data) if isinstance(data, str) else 0
+
+    def flush(self):
+        try:
+            self._orig.flush()
+        except Exception:
+            pass
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+
+    # Pass-through attributes some libraries probe for (isatty, etc.)
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+# Module-level state for hot-toggle. Lets the daemon install /
+# remove the tee without a process restart in response to the
+# settings-UI toggle.
+_stderr_tee_installed = False
+_stderr_tee_original = None
+_stderr_tee_file = None
+
+
+def install_stderr_tee():
+    """Begin mirroring ``sys.stderr`` to ``daemon_log_path()``.
+    Idempotent: a second call while a tee is already installed
+    is a no-op. Truncates the log file so it reflects one
+    session's worth of output (typically what a tester sharing
+    "the log around the crash I just had" wants).
+
+    Safe to call from outside the daemon's main thread — replaces
+    the global ``sys.stderr`` atomically, and concurrent writes
+    end up on the original-stderr branch of the tee (best-effort
+    write-through) until the swap completes."""
+    global _stderr_tee_installed, _stderr_tee_original, _stderr_tee_file
+    if _stderr_tee_installed:
+        return True
+    path = daemon_log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        log_file = open(path, 'w', buffering=1, encoding='utf-8',
+                        errors='replace')
+    except OSError as ex:
+        print(f'[daemon-log] cannot open {path!r}: {ex}',
+              file=sys.__stderr__, flush=True)
+        return False
+    _stderr_tee_original = sys.stderr
+    _stderr_tee_file = log_file
+    sys.stderr = _StderrTee(_stderr_tee_original, log_file)
+    _stderr_tee_installed = True
+    print(f'[daemon-log] mirroring stderr to {path!r}',
+          file=sys.stderr, flush=True)
+    return True
+
+
+def uninstall_stderr_tee():
+    """Stop mirroring stderr to the daemon log file. Restores the
+    original ``sys.stderr``. Idempotent."""
+    global _stderr_tee_installed, _stderr_tee_original, _stderr_tee_file
+    if not _stderr_tee_installed:
+        return
+    print('[daemon-log] stopping stderr mirror',
+          file=sys.stderr, flush=True)
+    sys.stderr = _stderr_tee_original
+    try:
+        if _stderr_tee_file is not None:
+            _stderr_tee_file.close()
+    except Exception:
+        pass
+    _stderr_tee_original = None
+    _stderr_tee_file = None
+    _stderr_tee_installed = False
+
+
+def _maybe_install_stderr_tee():
+    """Called at daemon startup. Installs the tee iff the user's
+    persisted toggle is on. No-op when off. The toggle can be
+    flipped live without a daemon restart via the
+    ``/v1/logging/daemon_log_to_file`` endpoint."""
+    try:
+        if store.get_daemon_log_to_file():
+            install_stderr_tee()
+    except Exception:
+        # store might not be initialised yet — bail quietly.
+        return
+
+
 def run(host='127.0.0.1', port=0):
     """Start the server. Blocks until interrupted. Writes server.json on
     bind and removes it on shutdown. Exits non-zero if another
@@ -1982,6 +2176,11 @@ def run(host='127.0.0.1', port=0):
     global _server_lock_fd
     home = azt_home()
     os.makedirs(home, exist_ok=True)
+
+    # Install the daemon-log-to-file tee before anything else so
+    # we capture the boot trace. Idempotent and silent when the
+    # toggle is off.
+    _maybe_install_stderr_tee()
 
     # Single-instance guard — flock on $AZT_HOME/server.lock
     lock_path = os.path.join(home, 'server.lock')

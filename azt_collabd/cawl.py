@@ -126,15 +126,25 @@ def _repo_cache_dir(repo):
     return os.path.join(cache_root(), repo)
 
 
-# In-memory memoisation for the no-prefetch-active branch of
+# Memoisation for the no-prefetch-active branch of
 # cache_status. When a peer has driven a ``start_prefetch`` call
 # the daemon uses per-job state for accurate progress reporting
 # (see ``_prefetch_state`` below). Outside that, ``cache_status``
-# falls back to "on-disk count vs. index image-count", which the
-# memos here keep cheap at poll frequency.
+# falls back to "on-disk count vs. index image-count".
+#
+# The on-disk count uses a short-TTL ``os.walk`` cache rather
+# than a counter + lazy-seed: the previous incremental approach
+# had subtle race conditions (when does the seed walk happen
+# relative to in-flight ``_note_image_cached`` increments?), and
+# when it went wrong it failed silently with a wrong-looking
+# total in the UI. A TTL'd ``os.walk`` is accurate by
+# construction — at the cost of one walk every ``_WALK_TTL``
+# seconds. For the canonical 1700-image set that's ~50 ms; at
+# 0.5s TTL with 1 Hz polling, half the polls hit the cache and
+# the other half walk. Comfortable on a phone.
+_WALK_TTL_SECONDS = 0.5
 _cache_status_lock = threading.Lock()
-_cached_image_count = {}       # repo -> int (count under images_dir)
-_cached_count_seeded = set()   # repos that have been os.walk-ed once
+_walk_cache = {}    # repo -> (timestamp, count)
 _total_count_cache = {}        # repo -> (mtime, count)
 
 
@@ -299,31 +309,31 @@ def _count_index_images(repo):
 
 
 def _walk_image_count(repo):
-    """Count of cached image files on disk via ``os.walk``. Used
-    once per repo to seed the in-memory counter; subsequent calls
-    use ``_note_image_cached`` to increment. ~50-100 ms for the
-    canonical 1700-image set; only paid on cold start."""
+    """Count of cached image files on disk via ``os.walk``,
+    cached for ``_WALK_TTL_SECONDS``. ~50-100 ms uncached on the
+    canonical 1700-image set; at 0.5 s TTL with 1 Hz polling
+    roughly half the polls hit the cache. Accurate-by-
+    construction (no event-based bookkeeping that can drift)."""
+    now = time.monotonic()
+    with _cache_status_lock:
+        cached_entry = _walk_cache.get(repo)
+        if (cached_entry is not None
+                and (now - cached_entry[0]) < _WALK_TTL_SECONDS):
+            return cached_entry[1]
+    # Walk outside the lock so concurrent calls don't serialize
+    # on a long os.walk.
     images_dir = os.path.join(_repo_cache_dir(repo), 'images')
     if not os.path.isdir(images_dir):
-        return 0
-    count = 0
-    for _root, _dirs, files_in_dir in os.walk(images_dir):
-        count += sum(
-            1 for fn in files_in_dir
-            if fn.lower().endswith(('.png', '.jpg', '.jpeg')))
-    return count
-
-
-def _note_image_cached(repo):
-    """Called from ``get_image_path`` after a successful fetch +
-    cache write. Increments the in-memory counter so subsequent
-    ``cache_status`` polls see the new count without an
-    ``os.walk``."""
+        count = 0
+    else:
+        count = 0
+        for _root, _dirs, files_in_dir in os.walk(images_dir):
+            count += sum(
+                1 for fn in files_in_dir
+                if fn.lower().endswith(('.png', '.jpg', '.jpeg')))
     with _cache_status_lock:
-        if repo not in _cached_count_seeded:
-            return  # not yet seeded; lazy seed will pick this up
-        _cached_image_count[repo] = (
-            _cached_image_count.get(repo, 0) + 1)
+        _walk_cache[repo] = (now, count)
+    return count
 
 
 def cache_status(repo):
@@ -364,13 +374,7 @@ def cache_status(repo):
         # short of total" rather than "100% with silent
         # failures".
         return pf['completed'], pf['requested']
-    total = _count_index_images(repo)
-    with _cache_status_lock:
-        if repo not in _cached_count_seeded:
-            _cached_image_count[repo] = _walk_image_count(repo)
-            _cached_count_seeded.add(repo)
-        cached_count = _cached_image_count.get(repo, 0)
-    return cached_count, total
+    return _walk_image_count(repo), _count_index_images(repo)
 
 
 def index_path(repo):
@@ -777,16 +781,24 @@ def get_image_path(repo, rel_path):
         return None
     # Canonicalize flat basename → nested path via the index,
     # so subsequent operations (cache target, fetch URL) all
-    # use the path GitHub actually has the file at.
-    rel_path = _resolve_basename_via_index(repo, rel_path)
-    if rel_path != original_rel_path:
-        print(f'[cawl] get_image_path: resolved basename '
-              f'{original_rel_path!r} → {rel_path!r}',
-              file=sys.stderr, flush=True)
-    else:
-        print(f'[cawl] get_image_path: no index-resolution for '
-              f'{original_rel_path!r} (cache miss or not in index)',
-              file=sys.stderr, flush=True)
+    # use the path GitHub actually has the file at. Already-
+    # nested paths pass through unchanged — no log needed for
+    # the common case where the peer sends the canonical path
+    # straight through (which is what the prefetch worker does
+    # and what stage-2 peers do).
+    if '/' not in rel_path:
+        rel_path = _resolve_basename_via_index(repo, rel_path)
+        if rel_path != original_rel_path:
+            print(f'[cawl] get_image_path: resolved basename '
+                  f'{original_rel_path!r} → {rel_path!r}',
+                  file=sys.stderr, flush=True)
+        elif _read_cached_index(repo) is not None:
+            # Peer sent a flat basename, we tried the index, no
+            # match. Log because this is a real "not found in
+            # index" case the peer may want to know about.
+            print(f'[cawl] get_image_path: flat basename not in '
+                  f'index: {original_rel_path!r}',
+                  file=sys.stderr, flush=True)
     if not _looks_safe_rel_path(rel_path):
         print(f'[cawl] get_image_path: post-resolve unsafe '
               f'rel_path={rel_path!r}',
@@ -839,7 +851,4 @@ def get_image_path(repo, rel_path):
                   f'{target!r}: {type(ex).__name__}: {ex}',
                   file=sys.stderr, flush=True)
             return None
-        # Bump the in-memory cache counter so cache_status polls
-        # see the new count without an os.walk.
-        _note_image_cached(repo)
         return target

@@ -38,6 +38,11 @@ def last_project() -> str:
     """Return the daemon-tracked last-opened project langcode, or
     ``''`` when the server is unreachable / no project has been
     touched yet."""
+    # No success log here — callers poll this at high frequency
+    # (the daemon UI's cache-status indicator reads it every
+    # second to know which project to query), and a per-call log
+    # floods the host's stderr. Error paths still log because
+    # they're rare and useful.
     try:
         resp = call('GET', '/v1/recent/last_project')
     except ServerUnavailable as ex:
@@ -48,10 +53,7 @@ def last_project() -> str:
         print(f'[recent] last_project: not ok, resp={resp!r}',
               file=sys.stderr, flush=True)
         return ''
-    val = (resp.get('langcode', '') or '').strip()
-    print(f'[recent] last_project → {val!r}',
-          file=sys.stderr, flush=True)
-    return val
+    return (resp.get('langcode', '') or '').strip()
 
 
 def set_last_project(langcode: str) -> None:

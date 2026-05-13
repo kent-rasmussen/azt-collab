@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.41.11"
+__version__ = "0.41.20"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1557,6 +1557,49 @@ def atomic_commit_bytes(langcode, rel_path, data):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
+def set_daemon_log_to_file(enabled):
+    """Toggle the daemon's stderr-to-file mirror. Takes effect
+    immediately in the running daemon process — no restart
+    required. Returns ``{'enabled': bool, 'log_path': str}`` on
+    success, ``None`` on transport failure."""
+    try:
+        resp = call('POST',
+                    '/v1/logging/daemon_log_to_file',
+                    {'enabled': bool(enabled)})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return {
+        'enabled': bool(resp.get('enabled')),
+        'log_path': resp.get('log_path') or '',
+    }
+
+
+def get_daemon_log():
+    """Return the daemon's persisted stderr log as
+    ``{'log': str, 'log_path': str, 'bytes': int,
+    'enabled': bool}``. ``log`` is truncated daemon-side to the
+    last ~256 KB if the file is larger. ``enabled`` reflects the
+    current state of the "Save daemon log to file" toggle —
+    useful for the settings UI to seed its button label without
+    a separate getter call. Empty ``log`` (with ``bytes=0``)
+    when the toggle hasn't been enabled / no output accumulated
+    yet. Returns ``None`` on transport failure."""
+    try:
+        resp = call('GET', '/v1/logging/daemon_log')
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return {
+        'log': resp.get('log') or '',
+        'log_path': resp.get('log_path') or '',
+        'bytes': int(resp.get('bytes') or 0),
+        'enabled': bool(resp.get('enabled')),
+    }
+
+
 def atomic_finalize_pending(langcode, rel_path, token):
     """Phase 2 of the two-phase atomic write: rename the daemon's
     scratch file at ``<working_dir>/.azt_atomic_pending/<token>``
@@ -1683,6 +1726,7 @@ __all__ = [
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'request_sync', 'poll_job',
     'atomic_commit_bytes', 'atomic_finalize_pending',
+    'set_daemon_log_to_file', 'get_daemon_log',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
     'set_cawl_image_repo', 'set_repo_slug',
     'record_project_sync_time', 'grant_collaborator',

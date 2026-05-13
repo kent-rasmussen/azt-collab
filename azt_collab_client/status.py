@@ -78,6 +78,20 @@ NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 # now and unset state surfaces explicitly.
 CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 
+# Transport-failure codes. The client wrappers' ``except
+# ServerUnavailable`` / non-``ok`` response branches (see
+# ``sync_project``, ``project_status``, etc. in ``__init__.py``)
+# already emit ``Status('SERVER_UNAVAILABLE', …)`` /
+# ``Status('SERVER_ERROR', …)`` as string literals, so the
+# values land on results correctly. Exporting the constants
+# here so peer code can route via
+# ``result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR)`` per
+# CLAUDE.md's "Peer contract: routing on sync results" table
+# without inlining the string literal and losing the typing
+# aid.
+SERVER_UNAVAILABLE = 'SERVER_UNAVAILABLE'
+SERVER_ERROR = 'SERVER_ERROR'
+
 
 @dataclass
 class Status:

@@ -84,6 +84,51 @@ public class AZTCollabProvider extends ContentProvider {
         return true;
     }
 
+    // Wait up to this many ms for the Python callbacks to register
+    // after a fresh process spawn. Android lazy-spawns the provider's
+    // process on demand; binder threads handling incoming peer calls
+    // can land before Python's ``install_callbacks()`` finishes its
+    // setup work. Returning "daemon_not_ready" immediately forces the
+    // peer to crash on the first call after a respawn (the
+    // "first-try-fails-second-try-works" pattern). Polling here for a
+    // few seconds lets the first call queue behind Python init and
+    // succeed normally; on a true daemon-down state the timeout
+    // expires and the call surfaces the same error it did before.
+    private static final long CALLBACK_WAIT_MS = 3000;
+    private static final long CALLBACK_POLL_MS = 50;
+
+    private static DispatchCallback awaitDispatch() {
+        DispatchCallback cb = sDispatch;
+        if (cb != null) return cb;
+        long deadline = System.currentTimeMillis() + CALLBACK_WAIT_MS;
+        while (cb == null && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(CALLBACK_POLL_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            cb = sDispatch;
+        }
+        return cb;
+    }
+
+    private static OpenFileCallback awaitOpenFile() {
+        OpenFileCallback cb = sOpenFile;
+        if (cb != null) return cb;
+        long deadline = System.currentTimeMillis() + CALLBACK_WAIT_MS;
+        while (cb == null && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(CALLBACK_POLL_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            cb = sOpenFile;
+        }
+        return cb;
+    }
+
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         // method maps to the HTTP verb; arg is the path; extras["body"]
@@ -96,7 +141,7 @@ public class AZTCollabProvider extends ContentProvider {
             b.putString("json", "{\"ok\":true,\"transport\":\"android_cp\"}");
             return b;
         }
-        DispatchCallback cb = sDispatch;
+        DispatchCallback cb = awaitDispatch();
         if (cb == null) {
             Bundle b = new Bundle();
             b.putInt("status", 503);
@@ -120,7 +165,7 @@ public class AZTCollabProvider extends ContentProvider {
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode)
             throws FileNotFoundException {
-        OpenFileCallback cb = sOpenFile;
+        OpenFileCallback cb = awaitOpenFile();
         if (cb == null) {
             throw new FileNotFoundException("daemon_not_ready");
         }

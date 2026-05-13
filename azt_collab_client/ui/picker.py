@@ -164,6 +164,13 @@ class ProjectPickerScreen(Screen):
     host App methods (see module docstring for the contract)."""
 
     def on_enter(self):
+        from .._debug import first_try_log
+        import time as _time
+        self._pick_t0 = _time.monotonic()
+        first_try_log('picker.on_enter',
+                      sm_current=(self.manager.current
+                                  if self.manager else None),
+                      ids_ready=bool(self.ids))
         # Defer one frame: Kivy >= 2.3 fires on_enter before KV ids
         # have attached on the first screen entry, so a synchronous
         # ``self.ids.get('project_list')`` returns None and the
@@ -173,6 +180,13 @@ class ProjectPickerScreen(Screen):
         Clock.schedule_once(lambda *_: self._populate_projects(), 0)
 
     def _populate_projects(self):
+        from .._debug import first_try_log
+        import time as _time
+        dt = _time.monotonic() - getattr(self, '_pick_t0',
+                                          _time.monotonic())
+        first_try_log('picker.populate_projects',
+                      dt_since_enter=f'{dt:.3f}s',
+                      ids_ready=bool(self.ids))
         box = self.ids.get('project_list')
         if not box:
             print('[picker] _populate_projects: project_list id '
@@ -187,6 +201,9 @@ class ProjectPickerScreen(Screen):
                   flush=True)
             return
         projects = app.list_projects() or []
+        first_try_log('picker.list_projects_returned',
+                      n=len(projects),
+                      dt_total=f'{_time.monotonic() - self._pick_t0:.3f}s')
         print(f'[picker] _populate_projects: rendering '
               f'{len(projects)} button(s)', flush=True)
         if not projects:

@@ -11,6 +11,280 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.41.20 / azt_collab_client 0.41.20 — docs: routing table moves to contract; atomic_open_write note added
+
+Docs-only release closing two long-standing gaps between
+``CLAUDE.md`` (philosophy / rationale) and
+``CLIENT_INTEGRATION.md`` (conformity contract). Per the
+docs-separation rule, conformity material belongs in the
+contract; rationale belongs in CLAUDE.md.
+
+**Sync-result routing table moved to contract** as new
+``CLIENT_INTEGRATION.md`` § 17 (Routing on sync results). Full
+table of status codes × auto-sync vs. user-initiated sync
+behaviour, the canonical code shape for both contexts, and an
+explicit ``S.*`` constant reference noting which constants
+shipped in 0.41.13 (``SERVER_UNAVAILABLE`` /
+``SERVER_ERROR``). The CLAUDE.md "Peer contract: routing on
+sync results" section now carries only the rationale (per-
+code meanings, the pre-0.34.1 anti-pattern, why the auto/user
+distinction lives peer-side) and points to the contract for
+the actual table + code.
+
+**``atomic_open_write`` FD-path documented in § 8** of the
+contract. Pre-0.41.7 the URI form of ``atomic_open_write``
+shipped LIFT bytes as base64 inside the JSON-RPC body and hit
+Binder's ~1 MB per-transaction cap on Android — silent
+failure for LIFT > ~700 KB. Peers rebuilding against 0.41.7+
+pick up the two-phase FD-write + finalize protocol
+transparently; the contract now notes the rebuild-for-large-
+LIFTs implication so peer maintainers know it's a free
+correctness win.
+
+No code changes in this release; docs only.
+
+### azt_collabd 0.41.19 / azt_collab_client 0.41.19 — `share_log_file` + French translations + docs
+
+Follow-on to 0.41.18 in response to recorder 1.41.24's filing
+(NOTES_TO_DAEMON.md 2026-05-13). Two changes:
+
+**``share_log_file(log_path, prev_path=None, ...)`` helper**
+added to ``azt_collab_client/ui/share.py``. Reads a log file
+(plus optional previous-session log) from disk, bundles into
+one ``text/plain`` blob with section breaks, inserts into
+MediaStore Downloads to get a real ``content://`` URI, and
+dispatches an ``Intent.ACTION_SEND`` with ``EXTRA_STREAM``.
+
+Unlike ``share_text``, this attaches as a real file (receivers
+can save it; payload size isn't bounded by Intent extras), and
+unlike ``share_running_apk`` it handles two source files +
+sets a sensible default ``display_name``. Mirrors the
+MediaStore-insert pattern from ``share_running_apk`` so the
+underlying jnius dance is shared at the call-site level.
+
+Recorder will replace its peer-side stand-in with one
+``share_log_file(log_path=_LOG_PATH, prev_path=…)`` call once
+it picks up 0.41.19.
+
+**Daemon UI's "Share daemon log" migrates to
+``share_log_file``** (reading ``$AZT_HOME/daemon.log`` from
+disk directly — both daemon-UI and daemon-proper processes
+share filesDir on Android, so file-based access works without
+an additional RPC for the bytes). Email button still uses
+``email_text`` since ``ACTION_SENDTO`` with a ``mailto:`` URI
+restricts the picker to email apps.
+
+**French translations** added for all 0.41.17-0.41.19 strings:
+"Diagnostic log", "Save daemon log to file", "Stop saving
+daemon log", "Share daemon log", "Email daemon log", and
+related status / error messages. Plus the helper-side
+``Share log`` / ``AZT log`` / ``Could not share log`` /
+``Log file is empty`` / ``Log file: {path}`` strings.
+
+**Docs.** ``CLIENT_INTEGRATION.md`` § 14b now lists all three
+share helpers (``share_text``, ``email_text``,
+``share_log_file``) with picking-between guidance.
+``azt_collab_client/CLAUDE.md`` carries the rationale for the
+share-module extraction and the daemon-log toggle's
+hot-toggle design.
+
+### azt_collabd 0.41.18 / azt_collab_client 0.41.18 — share helpers extracted + email-log button
+
+Follow-on to 0.41.17. Two changes:
+
+**``share_text`` and ``email_text`` extracted into
+``azt_collab_client/ui/share.py``** alongside the existing
+``share_running_apk``. Both reusable by any peer:
+
+- ``share_text(text, subject='', chooser_title='', on_error=None)``
+  — ``Intent.ACTION_SEND`` with ``EXTRA_TEXT``. Any
+  ``text/plain``-handling share target accepts it.
+- ``email_text(text, to='', subject='', on_error=None)`` —
+  ``Intent.ACTION_SENDTO`` with a ``mailto:`` URI. Restricts the
+  picker to email apps only.
+
+The daemon UI's "Share daemon log" button now delegates to
+``share_text`` instead of inlining the JNI dance.
+
+**"Email daemon log" button** added to the Diagnostic log
+section alongside "Share daemon log". Uses ``email_text`` for
+the email-only picker affordance — better UX than the generic
+share sheet when the user's intent is specifically "send this
+to the developer".
+
+### azt_collabd 0.41.17 / azt_collab_client 0.41.17 — daemon-log-to-file toggle + share button
+
+Remote tester can't run logcat, so daemon-side diagnostic
+output (``[boot-trace-daemon]``, ``[cawl]``, ``[recent]``,
+``[first-try]`` from the daemon UI / picker subprocess) was
+unreachable. Added:
+
+- **Config knob** ``logging.daemon_log_to_file`` in
+  ``$AZT_HOME/config.json``. Default off.
+- **Stderr tee** in the daemon. When the toggle is on,
+  ``sys.stderr`` is wrapped to mirror writes to the original
+  destination (logcat) AND to ``$AZT_HOME/daemon.log``. Tee
+  is hot-installable / hot-removable — no daemon restart
+  needed.
+- **Endpoints.** ``POST /v1/logging/daemon_log_to_file`` (set
+  toggle, install/remove tee in-process); ``GET
+  /v1/logging/daemon_log`` (returns log contents + current
+  toggle state + file path).
+- **Settings UI.** New "Diagnostic log" section with two
+  buttons: "Save daemon log to file" (toggle) and "Share
+  daemon log" (Android ``Intent.ACTION_SEND`` with the log
+  content as ``EXTRA_TEXT``). Status line under shows current
+  state + file size.
+- **Client wrappers.** ``set_daemon_log_to_file(enabled)`` /
+  ``get_daemon_log()``.
+
+The share intent uses ``EXTRA_TEXT`` (text/plain) rather than a
+file-URI attachment so any text-handling share target accepts
+it — email composers, messaging apps, file savers. Daemon
+truncates to the last 256 KB to fit comfortably in an intent
+extra; the diagnostic value lives in the tail anyway.
+
+### azt_collabd 0.41.16 / azt_collab_client 0.41.16 — first-try probes always-on for this build
+
+Remote tester can't run logcat (the device they have access
+to isn't local). The previous env-var gate
+(``AZT_DEBUG_FIRST_TRY=1``) was the wrong shape — they have
+no way to set env vars on the device. Flipping the
+``first_try_log`` gate to always-on for this build so the
+probes write to peer stderr (which lands in
+``/sdcard/azt_recorder.log``) without the tester having to
+configure anything.
+
+Restore the env gate after the crash is diagnosed; the gate's
+``if not os.environ.get('AZT_DEBUG_FIRST_TRY'): return`` is
+preserved in the module docstring for easy reinstatement.
+
+### azt_collabd 0.41.15 — ContentProvider waits for Python callbacks (H5 defensive fix)
+
+The "first-try-fails, second-try-works" pattern reported on
+the Tecno KN4 (Helio G81, 4 GB RAM, Android 16) is most likely
+Android killing the daemon's ``:provider`` process during a
+user's brief navigation away (settings screen, etc.) and then
+lazy-spawning it on the next peer call. The respawn race:
+Android creates the AZTCollabProvider Java object and routes
+the incoming peer call to it on a binder thread, while
+Python's ``install_callbacks()`` is still initializing on
+SDLThread. The provider sees ``sDispatch == null`` /
+``sOpenFile == null`` and returns ``daemon_not_ready``, which
+the peer surfaces as a crash. Second tap: Python is now
+initialized, callbacks registered, call succeeds.
+
+Defensive fix in ``AZTCollabProvider.java``: ``call()`` and
+``openFile()`` now wait up to 3 seconds (50 ms polling) for
+the Python callback to register before returning the
+"daemon_not_ready" error. On a healthy respawn, Python
+finishes ``install_callbacks()`` in well under a second and
+the first peer call queues briefly behind it instead of
+failing. On a truly-down daemon, the 3 s timeout still fires
+and the failure surfaces the same as before.
+
+Harmless if the bug wasn't H5: the wait loop only runs while
+the callbacks are null, which is the respawn window only.
+``ping`` requests (used by discovery probes) still bypass the
+wait so transport-discovery latency is unaffected.
+
+### azt_collabd 0.41.14 / azt_collab_client 0.41.14 — env-gated first-try-fails diagnostics
+
+User reported a transient crash on the SettingsScreen →
+"select new project" path: first try crashes, second works.
+Nothing in logcat suggests a cause. Added probes for five
+hypotheses, all gated behind ``AZT_DEBUG_FIRST_TRY=1`` so
+they're inert when the env var isn't set. New helper
+``azt_collab_client/_debug.py`` provides ``first_try_log``.
+Probes:
+
+- H1 (cache poll leaks past screen leave): in
+  ``SettingsScreen._stop_cawl_cache_poll`` and
+  ``_tick_cawl_cache_status`` — logs Clock event lifecycle
+  + current screen at every tick.
+- H2 (picker cold-start race): in
+  ``ProjectPickerScreen.on_enter`` and ``_populate_projects``
+  + ``picker_app.main`` — timestamps each phase.
+- H3 (subprocess invocation): in ``picker_app.main`` entry
+  + return — argv + dt.
+- H4 (URI grant not propagated): in
+  ``lift_io._open_content_uri`` — wraps
+  ``openFileDescriptor`` with explicit exception logging
+  so any swallowed ``SecurityException`` surfaces.
+- H5 (daemon respawn drops the call): in
+  ``transports.android_cp.call`` — logs bundle-null on
+  return.
+
+Enable with ``adb shell setprop … AZT_DEBUG_FIRST_TRY 1``
+or by setting the env var in the launch path. When set,
+``[first-try] <label> k=v ...`` lines appear in logcat at
+each probe site.
+
+### azt_collabd 0.41.13 / azt_collab_client 0.41.13 — CAWL: TTL-cached os.walk + quieter resolve logs + S.SERVER_UNAVAILABLE / S.SERVER_ERROR constants
+
+**Cache-count undercount fixed.** 0.41.10's incremental
+counter (lazy-seed + per-fetch increment) had a race that
+produced an undercount in the wild (peer warmed 1661, daemon
+reported 1257). Tracing didn't fully pin the race but the
+failure-mode (silently wrong UI total) is bad enough that I
+replaced the scheme rather than patching it. ``_walk_image_count``
+is now a TTL-cached ``os.walk`` — 500 ms TTL, ~50 ms uncached
+on the canonical 1700-image set, near-zero CPU at 1 Hz
+polling. Accurate by construction: it counts what's actually
+on disk, no event-based bookkeeping that can drift. Dropped
+``_note_image_cached``, ``_cached_image_count``,
+``_cached_count_seeded`` and their call sites. The TTL-cached
+walk fallback is only used when no prefetch job is active for
+the repo (otherwise the prefetch state still wins; same logic
+as 0.41.11).
+
+**Quieter resolution logs.** The
+``[cawl] get_image_path: no index-resolution for X`` line was
+firing for already-nested paths even though those paths
+needed no resolution and the fetch was succeeding. Net effect
+was a logcat full of scary "no index-resolution" lines for
+calls that were working fine. Now: pass-through is silent;
+the "flat basename not in index" case still logs because
+that's a real "peer asked for something the daemon doesn't
+know" situation.
+
+**``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` constants.**
+The peer-routing example in ``azt_collab_client/CLAUDE.md``
+("Peer contract: routing on sync results") shows
+``result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR)`` but
+``status.py`` didn't actually export those constants —
+``AttributeError`` at runtime for conformant peer code. The
+string literals were always emitted on results
+(``Status('SERVER_UNAVAILABLE', …)`` from the wrappers'
+transport-failure branches); only the typing-aid constants
+were missing. Added to both ``azt_collab_client/status.py``
+and the mirrored ``azt_collabd/status.py``. Peer note filed
+2026-05-13 against 1.41.16 was the trigger.
+
+### azt_collabd 0.41.12 / azt_collab_client 0.41.12 — quiet the 1 Hz poll logs
+
+Three log-noise sources fired once per second once the
+cache-status poll kicked in:
+
+- ``[recent] GET /v1/recent/last_project → 'X' (from ...)``
+  (daemon-side, ``_h_get_last_project``).
+- ``[recent] last_project → 'X'`` (client-side wrapper).
+- Both happen because the daemon UI's poll resolved
+  ``last_project()`` every tick to know which project to
+  query.
+
+Fixes:
+
+- Drop the success log from both sites. Error paths still
+  log (``ServerUnavailable``, ``not ok``); they're rare and
+  useful. The setter (``_h_set_last_project``) still logs
+  because it's a real state change.
+- Daemon UI now resolves the langcode once at poll start
+  (``_start_cawl_cache_poll``) and reuses it across ticks.
+  The user doesn't switch projects while sitting on the
+  settings screen, so two RPCs/sec just to re-confirm the
+  same langcode was overhead with no benefit.
+
 ### azt_collabd 0.41.11 / azt_collab_client 0.41.11 — daemon-driven CAWL prefetch + accurate progress
 
 The 0.41.9 cache-status indicator reported "files on disk vs.

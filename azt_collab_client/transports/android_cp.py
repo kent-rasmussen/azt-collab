@@ -120,7 +120,13 @@ class AndroidContentProviderTransport(Transport):
         extras = self._Bundle()
         if body is not None:
             extras.putString('body', json.dumps(body))
+        from .._debug import first_try_log
+        first_try_log('transport.call.pre',
+                      method=method, path=path)
         bundle = self._resolver.call(uri, method, path, extras)
+        first_try_log('transport.call.post',
+                      method=method, path=path,
+                      bundle_null=bundle is None)
         if bundle is None:
             # Most common cause: signature-grant denial (peer's APK
             # signed with a different key than the suite keystore)

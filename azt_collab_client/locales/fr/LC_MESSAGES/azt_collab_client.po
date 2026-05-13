@@ -638,6 +638,84 @@ msgstr "Chargement..."
 msgid "Caching images: {cached} / {total} (network in use — please stay online)"
 msgstr "Mise en cache des images : {cached} / {total} (réseau utilisé — restez connecté)"
 
+msgid "Diagnostic log"
+msgstr "Journal de diagnostic"
+
+msgid "Save daemon log to file"
+msgstr "Enregistrer le journal du service dans un fichier"
+
+msgid "Stop saving daemon log"
+msgstr "Arrêter l'enregistrement du journal"
+
+msgid "Share daemon log"
+msgstr "Partager le journal du service"
+
+msgid "Email daemon log"
+msgstr "Envoyer le journal par e-mail"
+
+msgid "Daemon log is being saved to {path}"
+msgstr "Le journal du service est enregistré dans {path}"
+
+msgid "Daemon log is being saved to {path} ({bytes_n} bytes)."
+msgstr "Le journal du service est enregistré dans {path} ({bytes_n} octets)."
+
+msgid "Daemon log capture is off."
+msgstr "L'enregistrement du journal est désactivé."
+
+msgid "Daemon log unreachable."
+msgstr "Journal du service inaccessible."
+
+msgid "Daemon log is empty — turn on saving first, then reproduce the issue."
+msgstr "Journal du service vide — activez d'abord l'enregistrement, puis reproduisez le problème."
+
+msgid "Failed to update logging setting."
+msgstr "Échec de la mise à jour du paramètre de journalisation."
+
+msgid "Sending {bytes_n} bytes of daemon log…"
+msgstr "Envoi de {bytes_n} octets du journal du service…"
+
+msgid "AZT daemon log"
+msgstr "Journal du service AZT"
+
+msgid "Sharing is only available on Android."
+msgstr "Le partage n'est disponible que sur Android."
+
+msgid "Emailing is only available on Android."
+msgstr "L'envoi par e-mail n'est disponible que sur Android."
+
+msgid "Sharing failed: no Activity context."
+msgstr "Échec du partage : pas de contexte d'activité."
+
+msgid "Emailing failed: no Activity context."
+msgstr "Échec de l'envoi : pas de contexte d'activité."
+
+msgid "Could not share text:\n{error}"
+msgstr "Impossible de partager le texte :\n{error}"
+
+msgid "Could not start email:\n{error}"
+msgstr "Impossible d'ouvrir l'e-mail :\n{error}"
+
+msgid "Share"
+msgstr "Partager"
+
+msgid "Email"
+msgstr "E-mail"
+
+msgid "Share log"
+msgstr "Partager le journal"
+
+msgid "AZT log"
+msgstr "Journal AZT"
+
+msgid "Could not share log:\n{error}"
+msgstr "Impossible de partager le journal :\n{error}"
+
+msgid "Log file is empty."
+msgstr "Le fichier journal est vide."
+
+msgid "Log file: {path}"
+msgstr "Fichier journal : {path}"
+
 msgid "Active host"
 msgstr "Hôte actif"
 

@@ -952,7 +952,15 @@ class PickerApp(App):
 
 
 def main():
+    import time as _time
+    from azt_collab_client._debug import first_try_log
+    _t0 = _time.monotonic()
+    first_try_log('picker_app.main_entry',
+                  argv=sys.argv,
+                  platform=platform)
     PickerApp().run()
+    first_try_log('picker_app.main_returned',
+                  dt=f'{_time.monotonic() - _t0:.3f}s')
     if platform != 'android':
         sys.exit(PickerApp._exit_code)
     # On Android we never reach here while the Activity is alive
