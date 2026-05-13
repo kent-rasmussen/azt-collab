@@ -351,13 +351,46 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     # too: the user can long-press → Paste over the prefix or
     # select-all and overwrite it.
     _CLONE_URL_PREFIX = 'https://github.com/'
-    url_input = TextInput(
-        text=_CLONE_URL_PREFIX,
-        hint_text=_tr('owner/repository'),
-        multiline=False, size_hint_y=None, height=dp(48),
-        font_size=sp(14), font_name=font_name,
-    )
-    content.add_widget(url_input)
+    # On Android with zxing-android-embedded bundled, a "Scan QR"
+    # button sits next to the URL input — the user can flash the
+    # other device's "Share repo" QR (rendered by the daemon UI's
+    # ProjectScreen) and have the URL pre-filled. On desktop /
+    # Android-without-ZXing, the button is hidden and the user
+    # pastes the URL as before. ``qr_scan.available()`` is the
+    # gate.
+    from . import qr_scan as _qr_scan
+    _qr_available = _qr_scan.available()
+
+    if _qr_available:
+        url_row = BoxLayout(
+            orientation='horizontal', size_hint_y=None,
+            height=dp(48), spacing=dp(8))
+        url_input = TextInput(
+            text=_CLONE_URL_PREFIX,
+            hint_text=_tr('owner/repository'),
+            multiline=False, size_hint_y=None, height=dp(48),
+            font_size=sp(14), font_name=font_name,
+            size_hint_x=1,
+        )
+        scan_btn = Button(
+            text=_tr('Scan QR'),
+            size_hint_x=None, width=dp(110),
+            size_hint_y=None, height=dp(48),
+            font_size=sp(13), font_name=font_name,
+            background_color=theme.ACCENT,
+        )
+        url_row.add_widget(url_input)
+        url_row.add_widget(scan_btn)
+        content.add_widget(url_row)
+    else:
+        url_input = TextInput(
+            text=_CLONE_URL_PREFIX,
+            hint_text=_tr('owner/repository'),
+            multiline=False, size_hint_y=None, height=dp(48),
+            font_size=sp(14), font_name=font_name,
+        )
+        scan_btn = None
+        content.add_widget(url_input)
 
     btn_row = BoxLayout(
         size_hint_y=None, height=dp(48), spacing=dp(12))
@@ -373,7 +406,11 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     popup = Popup(
         title=_tr('Clone Repository'),
         content=content,
-        size_hint=(0.9, None), height=dp(290),
+        # Slightly taller when the Scan button row adds vertical
+        # weight on Android. On desktop the original height is
+        # fine.
+        size_hint=(0.9, None),
+        height=dp(290) if scan_btn is None else dp(308),
         auto_dismiss=True,
     )
 
@@ -467,6 +504,54 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     ok_btn.bind(on_release=_enter_mode_a)
     cancel_btn.bind(on_release=popup.dismiss)
     clone_btn.bind(on_release=_do_clone)
+
+    if scan_btn is not None:
+        def _on_scan_result(scanned_text):
+            # Trust the user's eyes: they pointed the camera at a
+            # QR the daemon UI generated, so the payload is the
+            # clone URL. We replace the textbox content entirely
+            # (no string-massaging) and let the existing
+            # ``_refresh_label_from_url`` derive the langcode from
+            # the new value.
+            url_input.text = (scanned_text or '').strip()
+            # Bring focus back to the URL so the user can edit /
+            # confirm before tapping Clone — same UX as a manual
+            # paste leaving the cursor in the field.
+            url_input.cursor = (len(url_input.text), 0)
+            url_input.focus = True
+
+        def _on_scan_cancel():
+            # No-op — popup stays as-is, user can retry or paste
+            # manually. Logged on the qr_scan side already.
+            pass
+
+        def _on_scan_tap(*_):
+            # Diagnostic: confirm the button is wired through.
+            # The 0.41.0 "scan button does nothing, no logcat"
+            # report (NOTES_TO_DAEMON.md) had several candidate
+            # causes; this print + the entry log in
+            # ``qr_scan.scan_qr`` close the diagnostic gap so a
+            # future regression is visible from logcat alone.
+            import sys
+            print('[clone_url_popup] Scan QR tapped',
+                  file=sys.stderr, flush=True)
+            # Exceptions inside Kivy event handlers are caught
+            # higher up but can be swallowed silently depending
+            # on Kivy version. Wrap so we always see *something*
+            # in logcat if scan_qr blows up.
+            try:
+                _qr_scan.scan_qr(
+                    on_result=_on_scan_result,
+                    on_cancel=_on_scan_cancel,
+                    prompt=_tr('Point camera at a repo QR code'),
+                )
+            except Exception as ex:
+                print(f'[clone_url_popup] scan_qr raised: '
+                      f'{type(ex).__name__}: {ex}',
+                      file=sys.stderr, flush=True)
+                # Fall through silently — user can paste URL.
+
+        scan_btn.bind(on_release=_on_scan_tap)
 
     # Position the cursor at the end of the pre-populated prefix
     # so typing immediately appends (the common case). Schedule on

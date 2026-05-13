@@ -11,6 +11,760 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.41.11 / azt_collab_client 0.41.11 — daemon-driven CAWL prefetch + accurate progress
+
+The 0.41.9 cache-status indicator reported "files on disk vs.
+all image-shaped entries in the index". For the canonical
+``kent-rasmussen/images_CAWL`` set that's "959 / 3231" — the
+total is the count of every image file across all variants,
+but the peer typically warms one variant per CAWL identifier
+(~1661 files). The banner plateaued at ~1661/3231 with no way
+for the user to tell whether the system was done. Misleading
+for the indicator's core purpose ("don't disconnect, you're
+not done yet").
+
+Root cause: the peer iterated its working-set and called
+``get_image_path`` per entry. The daemon saw a stream of
+independent requests with no "session" concept; its
+progress-reporting could only count the on-disk count
+against the index's total — a structural over-count.
+
+This release flips the iteration. Peer hands the daemon a
+single list of paths via ``POST /v1/projects/<lang>/cawl/
+prefetch``; daemon spawns a background worker that iterates
+the list, warms each path through ``get_image_path`` (cache
+hit or GitHub fetch), and tracks per-job ``requested`` /
+``completed`` / ``failed`` counters. ``cache_status`` now
+reads from that job state when a prefetch has run, so the
+progress bar reflects work the peer actually wants done.
+
+**Endpoints.**
+
+- ``POST /v1/projects/<lang>/cawl/prefetch`` with body
+  ``{paths: [...]}`` — kicks off the worker, returns
+  ``{requested, completed, finished}`` immediately. Idempotent:
+  a second call with the same paths-set against an active job
+  returns the existing state; a call with a different set
+  replaces it.
+- ``GET /v1/projects/<lang>/cawl/cache_status`` — unchanged
+  wire shape (``{image_repo, cached, total}``). When a
+  prefetch is active or completed for the repo, ``cached`` =
+  job's ``completed`` and ``total`` = job's ``requested``,
+  giving a progress bar that ends at 100%. Falls back to the
+  old "on-disk vs. index" semantics when no prefetch has run.
+
+**Client wrapper.** ``cawl_prefetch(langcode, paths)`` returns
+the initial state dict; peers chain it with the existing
+``cawl_cache_status(langcode)`` poll for progress display.
+
+**On-demand path untouched.** ``CAWLHandle(...).open_read``
+still works for any individual image; daemon serves from
+cache or fetches on demand exactly as before. The new path
+is just for bulk warming; individual reads share the same
+cache.
+
+**Daemon UI banner.** Updated to reflect the same numbers —
+when a prefetch is in flight, the daemon UI's top-banner
+shows "Caching images: M / N (network in use — please stay
+online)" against the job's actual counts. Auto-hides when
+``cached >= total``.
+
+**Logging.** Removed ``_touch_project`` from the
+``cache_status`` handler — a 1 Hz status poll isn't "user is
+working on this project" signal and was flooding logcat with
+``[recent] _touch_project`` lines.
+
+**Peer adoption.** Contract updated at
+``CLIENT_INTEGRATION.md`` § 10 with the new wiring shape and
+the rationale ("daemon-driven, not peer-driven"). Peers
+calling ``CAWLHandle.open_read`` in a loop for bulk warming
+should migrate to ``cawl_prefetch`` for accurate progress;
+their on-demand single-image calls don't need to change.
+
+### azt_collabd 0.41.10 — CAWL cache-status: top-banner placement + 1 Hz poll + memoised counts
+
+Follow-on to 0.41.9. Three iterations on the cache-status
+indicator after first contact with the user:
+
+**Banner moves to the top of the SettingsScreen.** Previously
+the status line was inside the bottom Status section, which by
+design is low-attention "what's going on" diagnostic info. The
+caching indicator's whole purpose is the *opposite* — grab
+attention so the user doesn't disconnect network. Now lives
+as a pinned BoxLayout banner directly under the TopBar, above
+the ScrollView, so it can't scroll out of view. Accent-coloured
+background + bold text + an explicit "please stay online"
+clause in the message.
+
+**Poll interval drops to 1 Hz.** 5-second polls made the
+counter look broken — 10+ images cached per refresh produced
+visible-but-jumpy progress. 1 Hz feels live.
+
+**``cache_status`` is now near-zero cost per call.** The 1 Hz
+poll needed this: the previous implementation did one
+``os.walk`` over the daemon-owned images dir (~50-100 ms for
+the canonical 1700-image set) plus one ``_read_cached_index``
+JSON parse per call. At 1 Hz that's 5-10% daemon CPU, hot
+enough to notice on a phone.
+
+Memoisation:
+
+- ``_cached_image_count[repo]`` is an in-memory counter. Lazy
+  ``os.walk`` seeds it once per repo per daemon process;
+  ``_note_image_cached(repo)`` increments it on every
+  successful image-fetch + cache-write. Reset on daemon
+  restart (re-seeds on first call). No invalidation needed —
+  the counter only grows because cached images aren't
+  removed.
+- ``_total_count_cache[repo]`` is mtime-keyed. The
+  ``_count_index_images`` lookup parses the cached index file
+  once per (repo, index mtime); subsequent calls return the
+  cached count. Invalidates automatically when ``get_index``
+  refreshes and rewrites the cache file.
+
+Net: cold-start ``cache_status`` is one ``os.walk`` + one JSON
+parse; steady-state is a dict lookup + an ``os.path.getmtime``.
+
+### azt_collabd 0.41.9 / azt_collab_client 0.41.9 — CAWL cache-status endpoint
+
+The first cold-cache prefetch on the canonical
+``kent-rasmussen/images_CAWL`` repo pulls ~1660 image binaries
+sequentially through the daemon; on a typical mobile connection
+this takes minutes during which the user has no in-app
+indication that the daemon is using their network. They might
+naturally disconnect Wi-Fi between gestures and end up with a
+half-warm cache (every uncached image then has to fetch on
+demand, which is exactly what the prefetch was avoiding).
+
+This adds a project-scoped cache-status endpoint peers can
+poll on a short interval to drive a "Caching images: M / N"
+indicator:
+
+- Daemon: ``GET /v1/projects/<lang>/cawl/cache_status`` →
+  ``{ok, image_repo, cached, total}`` where ``cached`` is the
+  count of image files in the on-disk cache for the project's
+  resolved image_repo and ``total`` is the image-shaped index
+  entries.
+- Client: ``cawl_cache_status(langcode)`` wrapper returns the
+  same shape as a dict (no Result wrapper — this is a status
+  query, not a state-changing op). Empty values on any
+  transport / not-found failure so the peer can poll
+  unconditionally without exception handling.
+
+Cost: one ``os.walk`` over the daemon-owned images dir per
+poll. Bounded by total_count (~1700 files for the canonical
+set); fast enough for a 5-second poll interval. No network.
+
+**Daemon UI mirror.** The settings screen
+(``python -m azt_collabd ui`` / ``open_server_ui()``) also
+surfaces this progress: a small line in the Status section
+that says "Caching images: M / N (network in use)" while a
+prefetch is running, auto-hides when the cache catches up.
+Polled on a 5-second ``Clock.schedule_interval`` while the
+SettingsScreen is visible; cancelled in ``on_leave`` so it
+doesn't wake the daemon for a screen the user can't see.
+
+**Peer-side adoption.** The recorder / future viewer should
+mirror the same indicator on their own loading screen so
+users see the progress without navigating into Sync Settings.
+Contract documented in
+``azt_collab_client/CLIENT_INTEGRATION.md`` § 10 with the
+copy-paste shape.
+
+### azt_collabd 0.41.8 — CAWL: drop daemon-side offline backoff (peer has a circuit breaker already)
+
+0.41.4 added a daemon-side 60s offline backoff that suppressed
+``[cawl] image fetch failed`` log spam when a peer iterated a
+~1700-image set on a device with no network. After diagnosis
+of an "55 images succeed, then 10 fail silently" pattern in
+the wild, the backoff was actively making things harder to
+debug: when the daemon went silent it was impossible to tell
+from the peer side whether a fetch had been attempted at all
+or whether the daemon had short-circuited on a stale backoff
+window. The peer already has its own circuit breaker that
+suppresses pulls after N consecutive failures, so the daemon
+log-spam concern was solved peer-side anyway.
+
+This release rips out the daemon-side backoff entirely.
+``get_image_path`` and ``get_index`` now attempt the fetch on
+every cache miss (lock-coalesced, as before) and emit a
+verbose log line per failure. The peer's circuit breaker (in
+``lift.py: _CAWLImageResolver._pull``) is the right place for
+the "stop trying after N failures" policy.
+
+Removed: ``_OFFLINE_BACKOFF_SECONDS``, ``_offline_state_lock``,
+``_offline_until``, ``_offline_suppressed``,
+``_is_in_offline_backoff``, ``_note_fetch_failure``,
+``_note_fetch_success``. The ``http.client.HTTPException``
+catch added in 0.41.4 stays — InvalidURL et al. still must not
+escape uncaught.
+
+### azt_collabd 0.41.7 / azt_collab_client 0.41.7 — atomic_open_write via FD + finalize (Binder cap on writes)
+
+Same Binder per-transaction cap (~1 MB) that broke the CAWL
+index read in 0.41.2 also breaks the LIFT atomic write for
+projects whose LIFT exceeds ~700 KB (base64 inflates 1.33× and
+the JSON envelope blows past the cap). Symptom is identical:
+``ContentResolver.call`` Bundle drops on the way to the
+daemon, transport raises, ``atomic_commit_bytes`` returns
+``SERVER_UNAVAILABLE``, ``_UriAtomicWriteFile.commit`` raises
+``IOError``, the audio-save path (or any other write through
+``LiftHandle.atomic_open_write``) fails. The user-visible
+break is "stopping a recording loses the entry"; the daemon
+never sees the call so there's no daemon-side log.
+
+**Two-phase write.** Bytes now cross the IPC boundary via the
+ContentProvider FD path (no Binder size cap), then a tiny
+RPC finalizes the atomic rename under ``project_lock``:
+
+1. Peer generates ``token = secrets.token_hex(16)``, opens
+   ``content://<auth>/<lang>/_atomic_pending/<token>`` for
+   write via ``ContentResolver.openFileDescriptor``, writes
+   the buffered bytes through that kernel FD. The daemon's
+   ``_resolve_path`` routes ``_atomic_pending`` to
+   ``<working_dir>/.azt_atomic_pending/<token>`` (new write-
+   only route, token-validated against
+   ``^[A-Za-z0-9_-]{1,64}$``).
+2. Peer calls ``POST /v1/projects/<lang>/atomic_finalize``
+   with ``{token, path}``. The daemon validates the path
+   against the same whitelist
+   ``atomic_commit`` uses (``<file>.lift`` /
+   ``audio/<file>`` / ``images/<file>``), reads the pending
+   file for size + sha256, then ``os.replace``s it under
+   ``project_lock``. Returns ``ATOMIC_COMMITTED`` with the
+   same params shape as ``atomic_commit_bytes``.
+
+**Atomicity preserved.** The rename still happens under the
+project lock so concurrent peer-vs-peer / peer-vs-merge
+writers can't tear the destination. Phase 1 writes to a
+unique per-token scratch path so two concurrent peers don't
+collide on the pending file either. The only new failure
+surface is "phase 1 succeeds, phase 2 fails": the scratch
+file may linger under ``.azt_atomic_pending/`` on the
+daemon. No automatic GC yet — operationally OK since the
+total scratch volume is bounded by recent failed writes.
+The daemon best-effort unlinks on rename failure.
+
+**Backward compatibility.** ``_UriAtomicWriteFile.commit``
+falls back to the legacy single-RPC ``atomic_commit_bytes``
+path if phase 1 raises (pre-0.41.7 daemon that doesn't know
+``_atomic_pending``) or phase 2 returns ``SERVER_ERROR``
+(daemon missing the route). The legacy path still works
+against any 0.36.0+ daemon for payloads under the cap, so
+small-LIFT projects don't regress on a mixed-version
+deployment.
+
+**Where the bump goes.** The daemon side ships in the server
+APK. The client-side rewrite of ``_UriAtomicWriteFile.commit``
++ the new ``atomic_finalize_pending`` wrapper lives in
+``azt_collab_client`` — peer apps bundle this at build time,
+so peers must be rebuilt to pick up the new write flow. Once
+a peer is on 0.41.7+, atomic LIFT writes of any size up to
+~10 MB cross cleanly.
+
+### azt_collabd 0.41.6 — CAWL: literal-%20 in filename + drop defensive url-field re-encode
+
+Surfaced once 0.41.5 got us past the flat-basename resolution
+to a real fetch URL: a subset of canonical ``kent-rasmussen/
+images_CAWL`` filenames literally contain ``%20`` as part of
+the filename (not as URL encoding for a space). The actual
+on-disk filenames look like
+``2d%20minimalistic%20black%20and%20white%20line%20art%20of%20right%20elbow__bw.png``.
+
+``Uri.getPath()`` on Android URL-decodes once, so the Python
+side receives the literal-character filename — including the
+literal ``%20`` substrings. The previous
+``quote(rel_path, safe='/%')`` preserved those ``%``
+characters unchanged into the URL, so GitHub decoded ``%20`` →
+space and looked for a file with literal spaces, which doesn't
+exist — 404.
+
+Fix: ``quote(rel_path, safe='/')`` (drop ``%`` from safe). The
+``%`` in literal-``%20`` filenames now encodes to ``%25``,
+producing ``%2520`` in the URL. GitHub decodes once → literal
+``%20`` → matches the actual filename on disk.
+
+Also removed the defensive ``url``-field re-encoding in
+``_h_cawl_index`` that 0.41.3 added. With the new encoding
+rules, ``_fetch_index_from_github`` now emits correctly-
+encoded ``url`` fields, and the defensive re-encode would
+double-encode them (``%2520`` → ``%252520``) and break peers
+that actually use ``entry['url']``. The current Stage-2 peers
+use ``CAWLHandle`` (which goes through the daemon's fetch
+path, not the per-entry ``url``), so removing the defensive
+layer doesn't regress anything we ship.
+
+**Decision log: idempotent encoding vs. canonical encoding.**
+0.41.4's ``safe='/%'`` was an attempt at idempotent encoding —
+"if input is already encoded, don't double-encode." That logic
+is fundamentally ambiguous: ``%20`` in the input means either
+"encoded space" or "literal ``%20`` in the filename" and we
+can't tell from input alone. The canonical-encoding rule
+(always encode ``%`` to ``%25``) gives consistent semantics:
+peer-side input is always literal-character (URI decoding
+gives that for free), daemon always encodes once for HTTP.
+Peers that want to pass pre-encoded paths are broken under
+this model — they shouldn't.
+
+### azt_collabd 0.41.5 — CAWL: flat-basename → nested-path resolution via index
+
+The canonical ``kent-rasmussen/images_CAWL`` repo keeps images
+under category subdirs (``0001_body/<basename>.png``,
+``0002_head/<basename>.png``, …). A peer parsing the index
+typically extracts a CAWL identifier + a flat basename, then
+calls ``CAWLHandle(langcode, basename).open_read()`` with just
+the basename — it doesn't need to track the category prefix
+because every category is part of the same CAWL set.
+
+Before this fix the daemon would receive that flat basename
+and ask GitHub for ``HEAD/<basename>.png`` (top level) — which
+returns 404 because the file actually lives at
+``HEAD/0001_body/<basename>.png``. After the offline-backoff
+kicked in on the first 404, all subsequent image fetches in
+the same minute also went silent → user-visible "no images."
+
+New helper ``_resolve_basename_via_index(repo, rel_path)``:
+if ``rel_path`` is a flat basename (no ``/``) and the index
+has exactly that basename under some nested path, the daemon
+canonicalizes to the nested path before computing the cache
+target / fetch URL. Both the on-disk cache and the GitHub
+request use the canonical nested path; subsequent flat-basename
+requests for the same file hit the cache directly because the
+canonicalization is deterministic.
+
+If the index isn't cached yet, ``_resolve_basename_via_index``
+returns ``rel_path`` unchanged so the network fetch attempt
+fails honestly (rather than silently rewriting to a wrong
+path). The index seed is bundled in the APK, so this only
+matters in the rare case where the seed is missing and a
+network fetch hasn't run yet.
+
+### azt_collabd 0.41.4 — CAWL: SSL via certifi + URL encoding + offline-backoff coalescing
+
+Three related image-fetch fixes that surfaced once 0.41.3's
+slim index let the peer actually request binaries.
+
+**URL encoding for paths with spaces / unsafe chars.** Both the
+per-file ``url`` field in ``_fetch_index_from_github``'s emitted
+index and the request URL in ``_fetch_image_bytes_from_github``
+now percent-encode the path component. ``safe='/%'`` so the
+encoding is idempotent (won't double-encode an already-encoded
+input). CAWL filenames commonly include spaces / commas /
+parens; raw URLs containing those raise
+``http.client.InvalidURL`` at ``_validate_path`` time, before
+the request goes out. The except clause in ``get_image_path``
+also now catches ``http.client.HTTPException`` (parent of
+``InvalidURL``); previously it only caught ``OSError`` /
+``URLError`` and an InvalidURL escaped uncaught past the
+offline-backoff handler, turning into a Java-side
+``FileNotFoundException`` with no peer-visible
+``[cawl] image fetch failed`` log.
+
+The rest of this entry covers two related fixes that ride on
+the same release:
+
+Two related image-fetch fixes that surfaced once 0.41.3's slim
+index let the peer actually request binaries.
+
+**SSL bundle on Android.** ``_fetch_index_from_github`` and
+``_fetch_image_bytes_from_github`` were using raw
+``urllib.request.urlopen`` without calling ``net._ensure_ssl()``
+first. Every other network site in the daemon does call it; the
+CAWL module was the lone holdout. On p4a Android (no system CA
+store) this manifested as ``SSL: CERTIFICATE_VERIFY_FAILED``
+for every image fetch. Fix: both call sites now call
+``_ensure_ssl()`` before the urlopen. The patch is idempotent
+and globally monkey-patches ``ssl._create_default_https_context``
+to use certifi's bundle, so once it has run any stdlib HTTPS
+works.
+
+**Offline backoff (per-process, shared between index + image
+fetches).** When a connect-class urllib error fires
+(URLError / OSError / TimeoutError), the daemon now enters a
+60s cooldown during which subsequent CAWL fetch attempts
+short-circuit silently. Without this, a peer iterating a
+~1700-image set on a fully-offline device (or one with
+broken DNS / SSL) spammed logcat with 1700 near-identical
+``[cawl] image fetch failed`` lines, drowning real signal.
+Coalesced semantics:
+
+- First failure in a fresh window → one verbose log line
+  identifying the repo + cause.
+- Subsequent failures in the same window → silent skip
+  (no network attempt, no log).
+- Any successful fetch → backoff cleared immediately + one
+  ``[cawl] network recovered`` log with the suppressed count.
+
+The window is per-daemon-process module-state; restart
+clears it. ``_OFFLINE_BACKOFF_SECONDS = 60`` is tuned for
+"long enough that a 1700-image swipe-prefetch loop quiets
+down, short enough that the user reconnecting wifi gets
+images within a minute". Index lookups in the window serve
+from cache (stale OK) per the existing fallback policy.
+
+### azt_collabd 0.41.3 — slim CAWL index over JSON-RPC (image extensions only)
+
+Server-side companion to 0.41.2's FD-route client fix. The
+0.41.2 fix only helps peers that have rebuilt against the
+updated ``azt_collab_client``; existing peer installs keep
+calling ``cawl_index`` over the JSON-RPC path and keep
+receiving an empty response because the ~1.5 MB index Bundle
+exceeds the Binder per-transaction cap.
+
+Per the recorder peer's 2026-05-13 filing
+(NOTES_TO_DAEMON.md), the daemon now filters the index
+response to ``.png`` / ``.jpg`` / ``.jpeg`` paths before
+serializing. The canonical ``kent-rasmussen/images_CAWL`` repo
+includes ~3700 non-image blobs (README, LICENSE, .gitignore)
+that every peer's parser discards on receipt anyway —
+filtering server-side just stops shipping bytes nobody uses.
+Reduces the wire from ~5479 entries (~1.5 MB) to ~1700
+entries (~470 KB), well under the Binder ceiling.
+
+**Where the filter applies.** Only the JSON-RPC dispatch
+(``_h_cawl_index``). The file-route URI
+(``<lang>/cawl/index.json`` via ContentProvider, which 0.41.2
+clients use on Android) still serves the raw cache file
+unfiltered — file FDs have no Binder size cap, so there's no
+reason to slim, and the peer self-filters on extension in
+either case. So:
+
+- Pre-0.41.2 peer + 0.41.3 daemon → JSON-RPC path, ~470 KB,
+  fits, peer gets a populated index without rebuilding.
+- 0.41.2+ peer + 0.41.3 daemon → FD path, full index,
+  unaffected.
+- Pre-0.41.2 peer + pre-0.41.3 daemon → JSON-RPC path, full
+  index, Binder drops the Bundle, peer reads empty (the
+  regression).
+
+**Decision log: filter at serve, not at cache.** The on-disk
+cache (``$AZT_HOME/cawl/<owner>/<repo>/index.json``) keeps
+the canonical full set GitHub returned. Cache stays repo-
+faithful; serve-time filter is cheap and reversible. A
+future endpoint that wants the full set (admin UI, indexing
+tool) can read the cache directly.
+
+### azt_collabd 0.41.2 / azt_collab_client 0.41.2 — CAWL index over file FD on Android (Binder 1 MB cap)
+
+Patch fix: the daemon was serving the populated CAWL index
+(``files=5479`` in the success log added in 0.41.1), but the
+peer's ``cawl_index(langcode)`` wrapper read ``{}`` — peer
+logged ``[cawl] _load: ... repo='' files=0`` and never
+requested any images. Root cause: ``ContentResolver.call``
+ships responses as a ``Bundle`` over Binder, which caps
+single transactions at ~1 MB. The populated index
+(~1.5 MB with 5000+ entries × long GitHub raw-content URLs)
+exceeds the cap; the Bundle is dropped on the way back, the
+peer's transport raises (caught by the wrapper as
+``ServerUnavailable``), and the wrapper returns ``{}``. The
+daemon-side success log fires regardless because the handler
+ran — the gap is in the IPC return trip, not the dispatch.
+
+**Fix.** On Android, ``cawl_index`` now reads the on-disk
+index file directly via the ContentProvider's existing file
+route (``<lang>/cawl/index.json``). ``ContentResolver.openFile
+Descriptor`` returns a kernel FD with no Binder size cap; the
+peer reads the JSON bytes and parses locally. The daemon's
+``_resolve_cawl_path`` already populated the cache via
+``cawl.get_index`` before returning the path, so the file is
+guaranteed present (seed-on-cold-cache covers the
+no-network-on-install case). Desktop loopback HTTP has no
+such cap and keeps the JSON-RPC path.
+
+**Client (azt_collab_client):**
+
+- ``cawl_index(langcode)`` now branches on platform:
+  Android → file-route via new ``lift_io._cawl_index_via_fd``
+  helper; desktop → existing ``GET
+  /v1/projects/<lang>/cawl/index`` over loopback HTTP.
+  Empty-on-failure contract preserved on both paths.
+- New ``lift_io._cawl_index_via_fd(langcode)`` — opens
+  ``content://<authority>/<lang>/cawl/index.json`` via
+  ``_open_content_uri``, reads, parses. Same URI shape
+  ``CAWLHandle`` uses for image bytes.
+
+**Decision log.** Not changing the daemon-side wire shape;
+the JSON-RPC endpoint stays correct and serves desktop. The
+asymmetry (HTTP path on desktop, FD path on Android) lives
+on the client side because that's where the Binder cap is
+visible. A future symmetric refactor could move both peers
+to the FD path uniformly, but desktop has no FD provider
+available without adding a new loopback file-serving
+endpoint — not worth the surface area for an IPC-layer
+workaround.
+
+### azt_collabd 0.41.1 / azt_collab_client 0.41.1 — CAWL nested paths + success-path logging
+
+Patch fix: 0.41.0's CAWL image fetching silently rejected any
+``rel_path`` containing ``/``, which is exactly the shape the
+canonical ``kent-rasmussen/images_CAWL`` repo uses
+(``0001_body/foo.png``-style category subdirs). Net effect:
+the seed index was served fine, but every per-image request
+returned silently → peers saw no images, no daemon log line
+recorded the failure. This release accepts nested rel-paths
+and adds success-path logging so the next similar gap is
+visible from logcat alone.
+
+**CAWL daemon (azt_collabd/cawl.py):**
+
+- ``_looks_safe_basename`` → ``_looks_safe_rel_path``. Accepts
+  ``/`` between components; rejects ``..``/``.``, absolute
+  paths, backslashes, and empty components.
+- ``get_image_path`` now takes ``rel_path`` (not ``basename``).
+  Composes the on-disk target under
+  ``<cache_root>/<repo>/images/<rel_path>``; verifies
+  containment with ``realpath`` + ``commonpath`` (belt-and-
+  braces against symlink tricks). Creates intermediate cache
+  subdirs on first write.
+- ``_fetch_image_bytes_from_github`` URL-encodes each path
+  component for the raw URL (``urllib.parse.quote(path,
+  safe='/')`` — keeps slashes between components intact;
+  encodes spaces, commas, parens, etc. that CAWL filenames
+  commonly contain).
+
+**Transport routing:**
+
+- ``android_cp._resolve_cawl_path`` accepts 2+ segments under
+  ``images/`` (was strict ``[images, basename]``). Joins
+  remaining segments back into the rel-path that
+  ``cawl.get_image_path`` validates.
+- ``server._match_cawl_image_path`` accepts 7+ segments; per-
+  component URL-decodes via ``urllib.parse.unquote``; rejects
+  post-decode traversal tricks (``%2E%2E`` → ``..`` and
+  ``%2F`` → ``/`` inside a single segment).
+
+**Client (azt_collab_client/lift_io.py):**
+
+- ``CAWLHandle(langcode, rel_path)`` — the ``basename`` arg
+  renamed to ``rel_path``. ``handle.basename`` kept as a
+  read-only alias for back-compat with peer log lines.
+- ``CAWLHandle.open_read`` URL-encodes the rel-path with
+  ``urllib.parse.quote(safe='/')`` before composing the
+  ``content://`` URI or the loopback HTTP URL. Slashes
+  between components preserved; unsafe characters percent-
+  encoded.
+
+**Success-path logging — new in both endpoints:**
+
+- ``[cawl] served index for repo=… langcode=… files=N`` on
+  every successful ``_h_cawl_index``. ``files=0`` is the
+  early-warning signal that something's upstream-wrong
+  (empty seed, mis-resolved repo, …).
+- ``[cawl] served image repo=… path=… bytes=…`` on every
+  successful ``_h_cawl_image_bytes``.
+- ``[cawl] image rejected: project_not_found / no_image_repo_configured``
+  and ``[cawl] image unavailable: repo=… path=…`` on the
+  refusal paths. The 0.41.0 bug went unseen because none of
+  the success-or-rejection paths logged — only the
+  network-fetch-failed path did.
+
+**Tests:** new in ``tests/test_cawl.py``:
+
+- ``test_get_image_path_accepts_nested_rel_path`` — regression
+  test for the 0.41.0 bug.
+- ``test_get_image_path_accepts_spaces_and_special_chars`` —
+  CAWL filenames in the canonical repo have these.
+- ``test_fetch_url_encodes_path_components`` — slashes
+  preserved, unsafe chars percent-encoded.
+- ``test_match_cawl_image_path_accepts_nested_path``,
+  ``_url_decodes_components``,
+  ``_rejects_traversal_post_decode``,
+  ``_rejects_slash_in_decoded_segment``.
+- ``test_h_cawl_image_bytes_serves_nested_rel_path`` —
+  end-to-end through the binary handler.
+- ``test_resolve_path_cawl_image_accepts_nested`` — through
+  the ContentProvider routing.
+- Existing path-traversal test updated to remove
+  ``sub/file.jpg`` from the rejected-shapes list and add
+  ``a/../b`` / ``foo//bar`` as new rejection cases.
+
+**Floor:** patch bump. No wire-format change beyond accepting
+strictly more rel-path shapes. Pre-0.41.1 daemons reject
+nested paths silently; pre-0.41.1 clients that pass flat
+basenames work against 0.41.1 daemons unchanged (the new
+endpoints accept both).
+
+## [0.41.0] - 2026-05-12
+
+### azt_collabd 0.41.0 / azt_collab_client 0.41.0 — collaborator UI consolidation + QR share/scan
+
+Project-bound actions (Grant collaborator, Share repo) move into
+the daemon settings UI's SettingsScreen, bound to the
+``last_project()`` the daemon already tracks. Peers shrink to
+a single "Open Sync Settings" button (``open_server_ui()``) for
+these flows — same pattern as the GitHub Connect / GitLab
+forms already on this screen.
+
+Plus a QR pair: the daemon UI generates a QR of the published
+repo URL ("Share this repo"), and the picker's clone flow
+scans QRs to pre-fill its URL textbox.
+
+**Daemon UI (azt_collabd/ui/app.py):**
+
+- New ``project_actions_row`` in SettingsScreen, gated on
+  ``last_project()`` resolving to a project that has a
+  ``remote_url``. Mutually exclusive with the existing
+  ``publish_row`` (which is gated on no remote) — the user
+  sees one "what can I do with this project" surface at a
+  time, appropriate to the project's current state.
+- ``Grant collaborator access`` button → invokes the shared
+  ``grant_collaborator_popup(langcode=last_project())``. The
+  popup itself already lives in
+  ``azt_collab_client.ui.popups`` (no work needed there).
+- ``Share this repo (QR)`` button → opens a new
+  ``_show_share_repo_qr_popup`` that renders the remote URL
+  as a QR via segno + a Kivy ``Image`` widget, with a "Copy
+  URL" fallback that goes through ``kivy.core.clipboard``.
+- ``SettingsScreen.publish()`` updated for the 0.40.0 wire —
+  no longer passes ``contributor=`` to ``init_project``
+  (daemon reads from store). Adds ``S.CONTRIBUTOR_UNSET`` to
+  the publish-failed-codes set so the publish msg routes
+  correctly when the user hasn't entered their name yet.
+- ``CollabUIApp.font_name`` now an instance attribute (was
+  a local in ``build()``) so screens can pass it to shared
+  popups for visual consistency (CharisSIL across daemon UI
+  surfaces).
+
+**QR generation (segno):**
+
+- New requirement: ``segno`` in
+  ``server_apk/buildozer.spec`` (and ``.tmpl``). Pure-Python,
+  ~50 KB, no native deps. PNG output uses Pillow which Kivy
+  already pulls in.
+- ``_show_share_repo_qr_popup(url, langcode, font_name)`` —
+  module-level helper in ``app.py``. Generates the QR with
+  ``error='M'`` (15% correction, good camera tolerance) and
+  ``scale=8`` (~250 px square in the popup). Falls back to
+  ``_show_segno_missing_popup`` on desktop installs where
+  segno isn't pip-installed.
+
+**QR scan (zxing-android-embedded):**
+
+- New requirement: ``com.journeyapps:zxing-android-embedded:4.3.0``
+  in ``android.gradle_dependencies`` (server APK only). ~500 KB
+  AAR; pulls in the camera-preview CaptureActivity + barcode
+  decoder. Android-only.
+- New permission: ``CAMERA`` in ``android.permissions``. ZXing
+  requests the runtime grant itself at CaptureActivity launch;
+  we only need the manifest entry.
+- New module ``azt_collab_client/ui/qr_scan.py``:
+  ``scan_qr(on_result, on_cancel, prompt)`` launches ZXing's
+  ``IntentIntegrator``, reads ``SCAN_RESULT`` from
+  ``onActivityResult``, marshals the callback to the Kivy main
+  thread. ``available()`` is the cheap probe peers use to gate
+  the UI affordance on platforms where ZXing isn't bundled.
+- ``clone_url_popup`` (the picker's clone-by-URL flow) grows a
+  "Scan QR" button next to the URL textbox when
+  ``qr_scan.available()`` is True. On scan success the
+  textbox is filled with the decoded URL and the existing
+  ``_refresh_label_from_url`` derives the langcode. Desktop
+  / no-ZXing builds keep the original "paste URL" UI.
+
+**Floor:** no bumps. Daemon UI additions are server-side only;
+peer wire surfaces unchanged. Pre-0.41 daemons / clients
+interoperate normally (peers just don't see the new daemon-UI
+buttons, which is fine — those weren't there before either).
+
+**Recorder follow-up (deferred to a NOTES_TO_PEERS item back
+to the recorder team).** Now that the consolidated surface
+exists in the daemon UI, the recorder's CollabScreen Publish +
+Grant collaborator sub-screens become redundant. Strip-out
+follows Phase 3 from NOTES_TO_DAEMON.md (don't combine with
+this release — peer that strips before daemon grows the
+replacement loses the feature entirely until both sides
+converge).
+
+### azt_collabd 0.40.0 / azt_collab_client 0.40.0 — commit author moves to daemon; device-name disambiguator
+
+Two coordinated changes, one release:
+
+1. **Contributor name is strictly daemon-owned now.** Peers no
+   longer pass a commit-author name on the wire; daemon endpoints
+   ignore any ``body['contributor']`` and read the stored value
+   directly. If no name is set, commit-issuing endpoints refuse
+   with the new ``S.CONTRIBUTOR_UNSET`` status — peers route the
+   user to the daemon settings UI (``open_server_ui()``) to set
+   their name rather than silently producing meaningless
+   ``"Recorder"`` commits.
+2. **New ``device_name`` field** disambiguates commits when the
+   same human contributes from multiple devices. The git author
+   email slot becomes ``<safe_contributor>@<safe_device>`` so
+   GitHub's author-aggregation still groups by person, while
+   ``git log --format='%ae'`` differentiates by device. Auto-
+   populates from the OS on first read (Android:
+   ``Settings.Global.DEVICE_NAME`` → ``Build.MANUFACTURER +
+   MODEL``; desktop: ``socket.gethostname()``); user can override
+   via the settings UI for a friendlier label.
+
+**Why this lands together.** Both are corollaries of the
+"daemon is the sole authoritative source for per-user state"
+rule (NOTES_TO_DAEMON.md, recorder 1.41.3 filing). Pre-0.40 the
+contributor name was duplicated across peer and daemon, with
+the peer's pass-through silently winning even when the user
+typed a name in the daemon UI; the literal ``"Recorder"``
+default in the client wrapper turned every peer that didn't
+override it into a commit signed "Recorder". 0.40 closes both
+issues by removing the wire surface and replacing the
+placeholder ``@device`` email slot with a real disambiguator.
+
+**Wire changes:**
+
+- ``POST /v1/projects/init`` — ignores ``body['contributor']``.
+- ``POST /v1/projects/<lang>/sync`` — ignores ``body['contributor']``.
+- ``POST /v1/projects/<lang>/sync_async`` — ignores
+  ``body['contributor']``; the enqueued job runs against the
+  stored contributor at exec time. If unset, scheduler returns
+  ``Result(CONTRIBUTOR_UNSET)`` which peers see via
+  ``poll_job(job_id)``.
+- ``GET /v1/config/device_name`` — new. Returns the stored or
+  auto-detected device name (always non-empty after first read).
+- ``POST /v1/config/device_name`` — new. Sets / clears the
+  override. Whitespace stripped; empty clears and re-triggers
+  autodetect on next read.
+
+**Client API changes:**
+
+- ``init_project(working_dir, remote_url, branch='main')`` —
+  ``contributor`` kwarg removed.
+- ``sync_project(langcode)`` — ``contributor`` parameter
+  removed.
+- ``request_sync(langcode)`` — ``contributor`` parameter
+  removed.
+- New ``get_device_name()`` / ``set_device_name(name)``
+  wrappers, exported in ``__all__``.
+- New ``S.CONTRIBUTOR_UNSET`` status code, translation in
+  ``translate.py``.
+
+**Daemon-side changes:**
+
+- ``store.resolve_contributor`` **removed**. Was the host of the
+  ``'Recorder'`` fallback. Any in-tree caller that still imports
+  it fails at import time — fail-loud.
+- ``store.get_device_name`` / ``store.set_device_name`` new.
+  Auto-populates on first read; persists the autodetect so
+  subsequent reads are stable.
+- ``repo._default_author(contributor, device_name=None)`` —
+  ``device_name=None`` lazy-looks-up via ``store.get_device_name()``;
+  ``''`` explicitly skips the lookup (deterministic test
+  output). Email slot is ``<safe_contributor>@<safe_device>``;
+  the literal ``@device`` placeholder is gone.
+- ``scheduler.Job`` no longer carries a ``contributor`` field;
+  ``request_sync(langcode)`` signature drops the second
+  positional. Pre-0.40 ``jobs.json`` entries with the field
+  decode cleanly (ignored on load).
+- ``_h_init_project`` / ``_h_project_sync`` refuse upfront with
+  ``S.CONTRIBUTOR_UNSET`` when ``store.get_contributor()`` is
+  empty. ``_h_project_sync_async`` enqueues unconditionally;
+  the scheduler's exec-time re-check at ``_run_sync`` is the
+  defence-in-depth.
+
+**Floor:** neither MIN_SERVER_VERSION nor MIN_CLIENT_VERSION
+bumps. Pre-0.40 clients that still pass ``contributor`` in the
+body get their value silently ignored (strict improvement —
+the override they sent was the bug). Pre-0.40 daemons talking
+to a 0.40 client work unchanged (the client just doesn't send
+the field). No corruption surface, no forced cut-over.
+
 ### azt_collabd 0.39.0 / azt_collab_client 0.39.0 — per-project `repo_slug` field
 
 Closes the recorder 1.41.3 ask from

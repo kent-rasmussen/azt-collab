@@ -386,25 +386,123 @@ def _save_config_file(d):
 
 
 def get_contributor():
-    """Stored display name for ``git log``. Empty string if unset."""
+    """Stored display name for ``git log``. Empty string if unset.
+
+    Peers consume via ``GET /v1/config/contributor`` (the
+    ``azt_collab_client.get_contributor()`` wrapper). The daemon
+    uses this directly for every commit / sync / init op —
+    callers do NOT pass a contributor through the wire; the
+    ``'sole authoritative source'`` rule (NOTES_TO_DAEMON.md)
+    means the daemon owns it without peer override. If empty,
+    commit-issuing endpoints refuse with ``S.CONTRIBUTOR_UNSET``
+    rather than fall back to a placeholder string."""
     return (_load_config_file().get('collab') or {}).get('contributor', '')
 
 
 def set_contributor(name):
     """Persist the user's display name. Strips whitespace; an empty
-    string clears the field (sync flows then revert to the
-    ``'Recorder'`` default)."""
+    string clears the field (commit ops then refuse with
+    ``S.CONTRIBUTOR_UNSET`` until a name is set again)."""
     cfg = _load_config_file()
     cfg.setdefault('collab', {})['contributor'] = (name or '').strip()
     _save_config_file(cfg)
 
 
-def resolve_contributor(passed):
-    """Pick the right contributor for a sync/commit op: caller's
-    explicit value wins, then the stored display name, then the
-    fallback ``'Recorder'``. Used by ``_h_project_sync`` /
-    ``_h_init_project`` / ``scheduler._run_sync``."""
-    return (passed or '').strip() or get_contributor() or 'Recorder'
+# ── device name (commit identity disambiguator) ─────────────────────────────
+#
+# A short human-or-machine-readable label that disambiguates which
+# device authored a commit when the same human ``contributor`` is
+# active on multiple installs. Stored in
+# ``$AZT_HOME/config.json :: collab.device_name`` next to
+# ``contributor``. The daemon composes the git author email slot
+# from it (``<safe_contributor>@<safe_device_name>``) so GitHub's
+# author-aggregation still groups by human, while ``git log
+# --format='%ae'`` differentiates by device when needed.
+#
+# Auto-populated on first read if unset: Android picks up
+# ``Settings.Global.DEVICE_NAME`` (the user-customised "Marie's
+# Tablet" name when set), falling back to
+# ``Build.MANUFACTURER + " " + Build.MODEL`` (factory string).
+# Desktop falls back to ``socket.gethostname()``. Last-resort
+# fallback is the literal ``'unknown-device'`` — obviously a
+# placeholder, not pretending to be real.
+
+
+def _autodetect_device_name():
+    """Best-effort device name when none is stored. See module
+    docstring for the resolution order."""
+    # Android first (jnius is the platform tell).
+    try:
+        from jnius import autoclass  # type: ignore[import-not-found]
+        try:
+            Settings_Global = autoclass('android.provider.Settings$Global')
+            ActivityThread = autoclass('android.app.ActivityThread')
+            app = ActivityThread.currentApplication()
+            if app is not None:
+                resolver = app.getContentResolver()
+                # DEVICE_NAME is the user-customised "Marie's Tablet"
+                # string. May be null / empty on factory builds.
+                name = Settings_Global.getString(resolver, 'device_name')
+                if name and name.strip():
+                    return name.strip()
+        except Exception:
+            pass
+        try:
+            Build = autoclass('android.os.Build')
+            mfr = (Build.MANUFACTURER or '').strip()
+            model = (Build.MODEL or '').strip()
+            if mfr or model:
+                return f'{mfr} {model}'.strip()
+        except Exception:
+            pass
+    except ImportError:
+        pass
+    # Desktop fallback.
+    try:
+        import socket
+        name = (socket.gethostname() or '').strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return 'unknown-device'
+
+
+def get_device_name():
+    """Stored device-name label. Auto-populates (and persists) on
+    first read if unset, so callers never see an empty string
+    after the first call. Empty input to ``set_device_name`` later
+    *also* triggers re-autodetection on next read.
+
+    The auto-populated value is just a best-effort default — the
+    user can override via the settings UI for clarity / privacy
+    ("Marie's tablet" instead of "SM-T580")."""
+    stored = (_load_config_file().get('collab') or {}).get(
+        'device_name', '')
+    if stored:
+        return stored
+    detected = _autodetect_device_name()
+    # Persist so subsequent calls (and other peers on this device)
+    # see a stable value without re-running the autodetect probes.
+    cfg = _load_config_file()
+    cfg.setdefault('collab', {})['device_name'] = detected
+    try:
+        _save_config_file(cfg)
+    except OSError:
+        # Persist failure is not fatal — caller still gets the
+        # autodetected value; next call will re-detect. Logging
+        # would be noisy in tests.
+        pass
+    return detected
+
+
+def set_device_name(name):
+    """Persist the user's device-name override. Strips whitespace;
+    empty string clears, causing ``get_device_name`` to re-detect
+    on next read."""
+    cfg = _load_config_file()
+    cfg.setdefault('collab', {})['device_name'] = (name or '').strip()
+    _save_config_file(cfg)
 
 
 # ── recent project (server-canonical) ───────────────────────────────────────

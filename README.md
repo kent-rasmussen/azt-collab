@@ -103,9 +103,11 @@ entries 0.6.0 → 0.8.0.
   loopback fallback**: if the server APK isn't installed, the client
   surfaces `ServerUnavailable('server_apk_not_installed')` so peers can
   show an install prompt.
-- **Sync flow.** Client calls `request_sync(langcode, contributor)`,
-  daemon debounces (default 500 ms) and runs commit-first → fetch →
+- **Sync flow.** Client calls `request_sync(langcode)`, daemon
+  debounces (default 500 ms) and runs commit-first → fetch →
   fast-forward / merge / push, with `merge_retry_max` race retries.
+  The commit author comes from the daemon-stored contributor /
+  device_name pair — peers don't pass either on the wire (0.40+).
 - **LIFT-aware merge.** `<entry guid="...">` is the merge key.
   Conflicts get `<annotation name="azt-lift-conflict">` markers;
   divergent versions are kept side by side.
@@ -377,8 +379,15 @@ from azt_collab_client import (
 A typical sister-app sync flow:
 
 ```python
+from azt_collab_client import set_contributor
+
+# Once — the daemon owns the commit author name; peers don't
+# pass it per-call. Typically the user sets this through the
+# daemon settings UI (open_server_ui()) at first run.
+set_contributor('Kent')
+
 register_project('fra', '/path/to/working_tree', '/path/.../fra.lift')
-job_id = request_sync('fra', contributor='Kent')
+job_id = request_sync('fra')
 # ...later, after debounce_ms...
 status = poll_job(job_id)
 if status['state'] == 'DONE':

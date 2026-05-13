@@ -43,6 +43,7 @@ import azt_collabd
 from azt_collabd.status import AuthError
 from azt_collab_client import (
     S,
+    cawl_cache_status,
     get_contributor,
     get_credentials_status,
     github_app_install_url,
@@ -63,6 +64,180 @@ from azt_collab_client import (
 
 
 _tr = _client_i18n._
+
+
+def _show_share_repo_qr_popup(url, langcode, font_name='Roboto'):
+    """Modal popup that renders ``url`` as a QR code via segno
+    and shows the URL underneath, plus a "Copy URL" button as a
+    fallback for receivers without a QR scanner.
+
+    Lives at module level (not a method on SettingsScreen) so it
+    can be opened from anywhere the daemon UI later wants to —
+    project picker, future per-project context menu, etc. The
+    only inputs are ``url`` (what to encode), ``langcode`` (for
+    the popup title so the user can confirm which project), and
+    ``font_name`` (matches the rest of the daemon UI's
+    CharisSIL look)."""
+    import io
+    from kivy.core.image import Image as CoreImage
+    from kivy.graphics import Color, RoundedRectangle
+    from kivy.uix.boxlayout import BoxLayout
+    from kivy.uix.button import Button
+    from kivy.uix.image import Image
+    from kivy.uix.label import Label
+    from kivy.uix.modalview import ModalView
+
+    # segno is bundled via the server APK's ``requirements``.
+    # On desktop it must be pip-installed; if missing we surface
+    # an actionable error instead of crashing the popup-open.
+    try:
+        import segno  # type: ignore[import-not-found]
+    except ImportError:
+        _show_segno_missing_popup(font_name)
+        return
+
+    # Generate the QR. segno.make() picks an error-correction
+    # level that fits the URL; ``error='M'`` (15% correction)
+    # gives a good camera-tolerance margin without inflating the
+    # symbol size. ``border=2`` matches the canonical 4-module
+    # quiet zone halved — enough for most decoders, keeps the
+    # rendered widget compact.
+    qr = segno.make(url, error='M')
+    png_buf = io.BytesIO()
+    # scale: 8 → ~250 px square at typical QR sizes. Plenty for
+    # camera capture, fits comfortably in a Kivy popup.
+    qr.save(png_buf, kind='png', scale=8, border=2)
+    png_buf.seek(0)
+    core_img = CoreImage(png_buf, ext='png')
+
+    view = ModalView(size_hint=(0.92, None), height=dp(520),
+                     auto_dismiss=False,
+                     background_color=theme.OVERLAY_DARK)
+    box = BoxLayout(orientation='vertical', padding=dp(16),
+                    spacing=dp(12))
+    with box.canvas.before:
+        Color(*theme.SURFACE)
+        box._bg = RoundedRectangle(pos=box.pos, size=box.size,
+                                   radius=[dp(8)])
+    box.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+             size=lambda w, s: setattr(w._bg, 'size', s))
+
+    title = Label(
+        text=_tr('Share project {langcode}').format(langcode=langcode),
+        color=theme.ACCENT, font_size=sp(17), bold=True,
+        font_name=font_name,
+        size_hint_y=None, height=dp(36),
+        halign='center', valign='middle')
+    title.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    box.add_widget(title)
+
+    instr = Label(
+        text=_tr('Scan with another device to clone the repo.'),
+        color=theme.TEXT_DIM, font_size=sp(13),
+        font_name=font_name,
+        size_hint_y=None, height=dp(28),
+        halign='center', valign='middle')
+    instr.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    box.add_widget(instr)
+
+    qr_widget = Image(texture=core_img.texture,
+                      size_hint=(1, None), height=dp(260),
+                      allow_stretch=True, keep_ratio=True)
+    box.add_widget(qr_widget)
+
+    url_label = Label(
+        text=url, color=theme.TEXT, font_size=sp(12),
+        font_name=font_name,
+        size_hint_y=None, height=dp(36),
+        halign='center', valign='middle')
+    url_label.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    box.add_widget(url_label)
+
+    btn_row = BoxLayout(orientation='horizontal',
+                        size_hint_y=None, height=dp(48),
+                        spacing=dp(10))
+
+    def _make_btn(label, fill, on_release):
+        btn = Button(
+            text=label, size_hint_y=None, height=dp(48),
+            background_color=theme.TRANSPARENT,
+            background_normal='',
+            color=(1, 1, 1, 1), font_size=sp(15), bold=True,
+            font_name=font_name)
+        with btn.canvas.before:
+            Color(*fill)
+            btn._bg = RoundedRectangle(pos=btn.pos, size=btn.size,
+                                       radius=[dp(8)])
+        btn.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+                 size=lambda w, s: setattr(w._bg, 'size', s))
+        btn.bind(on_release=on_release)
+        return btn
+
+    def _copy(_btn):
+        # ``Clipboard.copy`` works on every Kivy platform; on
+        # Android it routes through the system clipboard service.
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(url)
+            instr.text = _tr('Copied to clipboard.')
+        except Exception as ex:
+            instr.text = _tr('Could not copy: {error}').format(
+                error=ex)
+
+    btn_row.add_widget(_make_btn(
+        _tr('Copy URL'), theme.SURFACE, _copy))
+    btn_row.add_widget(_make_btn(
+        _tr('Close'), theme.ACCENT, lambda *_: view.dismiss()))
+    box.add_widget(btn_row)
+
+    view.add_widget(box)
+    view.open()
+
+
+def _show_segno_missing_popup(font_name):
+    """Fallback popup for desktop installs that haven't installed
+    ``segno`` (the suite's server APK bundles it; pip-installed
+    daemon hosts may not have it). One-button modal pointing the
+    user at the install command. Better than a silent crash."""
+    from kivy.graphics import Color, RoundedRectangle
+    from kivy.uix.boxlayout import BoxLayout
+    from kivy.uix.button import Button
+    from kivy.uix.label import Label
+    from kivy.uix.modalview import ModalView
+    view = ModalView(size_hint=(0.85, None), height=dp(220),
+                     auto_dismiss=False,
+                     background_color=theme.OVERLAY_DARK)
+    box = BoxLayout(orientation='vertical', padding=dp(16),
+                    spacing=dp(12))
+    with box.canvas.before:
+        Color(*theme.SURFACE)
+        box._bg = RoundedRectangle(pos=box.pos, size=box.size,
+                                   radius=[dp(8)])
+    box.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+             size=lambda w, s: setattr(w._bg, 'size', s))
+    msg = Label(
+        text=_tr('QR generation requires the "segno" package. '
+                 'Install with:\n\n    pip install segno'),
+        color=theme.TEXT, font_size=sp(14), font_name=font_name,
+        halign='left', valign='middle')
+    msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    box.add_widget(msg)
+    btn = Button(
+        text=_tr('OK'), size_hint_y=None, height=dp(48),
+        background_color=theme.TRANSPARENT,
+        background_normal='',
+        color=(1, 1, 1, 1), font_size=sp(15), bold=True,
+        font_name=font_name)
+    with btn.canvas.before:
+        Color(*theme.ACCENT)
+        btn._bg = RoundedRectangle(pos=btn.pos, size=btn.size,
+                                   radius=[dp(8)])
+    btn.bind(pos=lambda w, p: setattr(w._bg, 'pos', p),
+             size=lambda w, s: setattr(w._bg, 'size', s))
+    btn.bind(on_release=lambda *_: view.dismiss())
+    box.add_widget(btn)
+    view.add_widget(box)
+    view.open()
 
 
 _AZT_ICON = os.path.join(
@@ -215,6 +390,35 @@ KV_TEMPLATE = '''
         orientation: 'vertical'
         TopBar:
             title: _('AZT Collaboration — Settings')
+        # CAWL image-cache progress banner. Pinned ABOVE the
+        # ScrollView (not inside it) so it stays visible while the
+        # user scrolls; the whole point is to let them know the
+        # daemon is using network in the background so they don't
+        # disconnect Wi-Fi mid-fetch. Visible only while a prefetch
+        # is in flight (``cached < total``); hidden via height /
+        # opacity once the cache catches up. The bottom-of-page
+        # Status section is the wrong home — by design it's
+        # supposed to fade into the background.
+        BoxLayout:
+            id: cawl_cache_status_banner
+            orientation: 'vertical'
+            size_hint_y: None
+            height: 0
+            opacity: 0
+            padding: dp(10), dp(6)
+            canvas.before:
+                Color:
+                    rgba: T.ACCENT
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            BodyLabel:
+                id: cawl_cache_status_label
+                text: ''
+                color: T.BG
+                bold: True
+                size_hint_y: None
+                height: self.texture_size[1]
         ScrollView:
             do_scroll_x: False
             BoxLayout:
@@ -344,6 +548,47 @@ KV_TEMPLATE = '''
                         on_press: root.publish()
                     BodyLabel:
                         id: publish_msg
+                        text: ''
+                        color: T.TEXT_DIM
+                        size_hint_y: None
+                        height: dp(20)
+                # Project actions for an already-published project:
+                # invite a GitHub collaborator. Gated on
+                # ``refresh()`` finding a last_project with a remote
+                # URL; hidden otherwise via the height/opacity
+                # pattern. Both actions are operations on the
+                # current project, so they live alongside the
+                # publish row rather than on a separate screen — the
+                # user's mental model is "settings page = manage
+                # what I'm doing right now."
+                BoxLayout:
+                    id: project_actions_row
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: 0
+                    opacity: 0
+                    spacing: dp(8)
+                    SectionLabel:
+                        id: project_actions_label
+                        text: _('Current project')
+                    BodyLabel:
+                        id: project_actions_info
+                        text: ''
+                        color: T.TEXT_DIM
+                        size_hint_y: None
+                        height: self.texture_size[1] + dp(4)
+                    RecBtn:
+                        id: grant_collab_btn
+                        text: _('Grant collaborator access')
+                        normal_color: T.SURFACE
+                        on_press: root.grant_collaborator()
+                    RecBtn:
+                        id: share_repo_btn
+                        text: _('Share this repo (QR)')
+                        normal_color: T.SURFACE
+                        on_press: root.share_repo_qr()
+                    BodyLabel:
+                        id: project_actions_msg
                         text: ''
                         color: T.TEXT_DIM
                         size_hint_y: None
@@ -696,7 +941,78 @@ class SettingsScreen(Screen):
         def _ready(*_):
             self._build_lang_selector()
             self.refresh()
+            self._start_cawl_cache_poll()
         Clock.schedule_once(_ready, 0)
+
+    def on_leave(self):
+        # Stop the CAWL cache poll when the user navigates away —
+        # don't leave a Clock-scheduled callback waking the daemon
+        # every 5 s for a screen the user can't see.
+        self._stop_cawl_cache_poll()
+
+    _cawl_cache_event = None
+
+    def _start_cawl_cache_poll(self):
+        """Begin polling the daemon's CAWL cache_status endpoint so
+        the in-flight prefetch progress is visible alongside the
+        rest of the daemon's status block. Auto-stops once the
+        cache catches up to the index. The peer-side indicator
+        (CLIENT_INTEGRATION.md § 10) covers the same need from the
+        recorder's main screen; this is the daemon-UI mirror for
+        users who navigate here while caching is running.
+
+        1 Hz feels live without dragging — the daemon's
+        ``cache_status`` is memoised after first call (counter
+        increment per image fetch, no per-poll os.walk), so 1 Hz
+        polling is near-zero CPU."""
+        self._stop_cawl_cache_poll()
+        self._tick_cawl_cache_status()  # immediate first read
+        self._cawl_cache_event = Clock.schedule_interval(
+            lambda _dt: self._tick_cawl_cache_status(), 1.0)
+
+    def _stop_cawl_cache_poll(self):
+        if self._cawl_cache_event is not None:
+            try:
+                self._cawl_cache_event.cancel()
+            except Exception:
+                pass
+            self._cawl_cache_event = None
+
+    def _tick_cawl_cache_status(self):
+        banner = self.ids.get('cawl_cache_status_banner')
+        label = self.ids.get('cawl_cache_status_label')
+        if banner is None or label is None:
+            return
+        langcode = (last_project() or '').strip()
+        if not langcode:
+            self._hide_cawl_cache_banner(banner, label)
+            return
+        status = cawl_cache_status(langcode)
+        total = status['total']
+        cached = status['cached']
+        if total == 0:
+            self._hide_cawl_cache_banner(banner, label)
+            return
+        if cached >= total:
+            # Cache is warm; stop polling.
+            self._hide_cawl_cache_banner(banner, label)
+            self._stop_cawl_cache_poll()
+            return
+        # Show progress + the explicit "network in use" cue so
+        # the user knows not to disconnect.
+        label.text = _tr(
+            'Caching images: {cached} / {total} '
+            '(network in use — please stay online)').format(
+                cached=cached, total=total)
+        label.height = label.texture_size[1]
+        banner.height = label.height + dp(12)
+        banner.opacity = 1
+
+    def _hide_cawl_cache_banner(self, banner, label):
+        label.text = ''
+        label.height = 0
+        banner.height = 0
+        banner.opacity = 0
 
     def _build_lang_selector(self):
         """Populate the language selector row with one button per
@@ -831,6 +1147,124 @@ class SettingsScreen(Screen):
         ]
         self.ids.status_label.text = '\n'.join(lines)
         self._refresh_publish_row(status)
+        self._refresh_project_actions_row(status)
+
+    def _refresh_project_actions_row(self, status):
+        """Show / hide the "Current project" actions row (Grant
+        collaborator, etc.) and seed its info label.
+
+        Visibility rule: there's a ``last_project()`` that resolves
+        to a registered project AND that project has a remote URL.
+        If no project is selected, or the selected project hasn't
+        been published, this row stays hidden and the
+        publish_row sibling takes precedence.
+
+        The two rows are mutually exclusive by construction —
+        publish_row shows ONLY when remote is empty; this row
+        shows ONLY when remote is present — so the user sees one
+        "what can I do with this project" surface at a time,
+        appropriate to the project's current state."""
+        row = self.ids.get('project_actions_row')
+        info = self.ids.get('project_actions_info')
+        msg = self.ids.get('project_actions_msg')
+        btn = self.ids.get('grant_collab_btn')
+        if row is None or btn is None:
+            return
+        # Default hidden; flip on only if all gates pass.
+        row.height = 0
+        row.opacity = 0
+        if info is not None:
+            info.text = ''
+        if msg is not None:
+            msg.text = ''
+        project = self._pick_publish_candidate()
+        if project is None:
+            return
+        # Live remote_url — same plumbing the publish row uses to
+        # detect a freshly-pushed remote that hasn't propagated to
+        # the cached Project record yet.
+        live_remote_url = (project.remote_url or '').strip()
+        try:
+            ps = project_status(project.langcode)
+        except Exception:
+            ps = None
+        if ps is not None and (ps.remote_url or '').strip():
+            live_remote_url = ps.remote_url.strip()
+        if not live_remote_url:
+            return
+        # Gate passed — show row and seed info.
+        if info is not None:
+            info.text = _tr(
+                'Project: {langcode}\nRemote: {remote_url}').format(
+                    langcode=project.langcode,
+                    remote_url=live_remote_url)
+        # Heights: section label (dp 32) + info (~dp 40) + grant
+        # button (dp 52) + share button (dp 52) + msg (dp 20) +
+        # 4× spacing (dp 8 each).
+        row.height = (dp(32) + dp(40) + dp(52) + dp(52) + dp(20)
+                      + dp(8) * 4)
+        row.opacity = 1
+
+    def grant_collaborator(self):
+        """Open the shared ``grant_collaborator_popup`` for the
+        current project. The popup itself handles the GitHub-
+        username input + server-side ``grant_collaborator`` RPC,
+        and surfaces the resulting Result through its own status
+        line — we just hand it the langcode and a status sink for
+        post-dismiss feedback."""
+        project = self._pick_publish_candidate()
+        if project is None:
+            self._set_project_actions_msg(_tr(
+                'No project selected.'))
+            return
+        from azt_collab_client.ui.popups import grant_collaborator_popup
+        grant_collaborator_popup(
+            langcode=project.langcode,
+            font_name=App.get_running_app().font_name,
+            on_done=lambda _r: Clock.schedule_once(
+                lambda _dt: self.refresh(), 0),
+        )
+
+    def share_repo_qr(self):
+        """Open a popup that renders the current project's remote
+        URL as a QR code. Pairs with the picker's "Scan QR to
+        clone" affordance on the receiving device — the user
+        flashes one device's QR at another, the receiver decodes
+        the URL and pre-fills its clone textbox.
+
+        Generates via ``segno`` (pure Python) → PNG bytes →
+        ``CoreImage`` → Kivy ``Image`` widget. Also offers a
+        "Copy URL" button as a fallback for receivers that don't
+        have a camera or QR scanner available."""
+        project = self._pick_publish_candidate()
+        if project is None:
+            self._set_project_actions_msg(_tr(
+                'No project selected.'))
+            return
+        # Use live remote_url — same plumbing _refresh_project_actions_row
+        # uses — so a freshly-published project shows the right URL
+        # without a manual refresh.
+        live_remote_url = (project.remote_url or '').strip()
+        try:
+            ps = project_status(project.langcode)
+        except Exception:
+            ps = None
+        if ps is not None and (ps.remote_url or '').strip():
+            live_remote_url = ps.remote_url.strip()
+        if not live_remote_url:
+            self._set_project_actions_msg(_tr(
+                'No remote URL — publish first.'))
+            return
+        _show_share_repo_qr_popup(
+            url=live_remote_url,
+            langcode=project.langcode,
+            font_name=App.get_running_app().font_name,
+        )
+
+    def _set_project_actions_msg(self, text):
+        msg = self.ids.get('project_actions_msg')
+        if msg is not None:
+            msg.text = text or ''
 
     def _refresh_publish_row(self, status):
         """Show / hide / enable the "Publish <langcode> data" row.
@@ -1120,7 +1554,11 @@ class SettingsScreen(Screen):
             return
         domain = 'gitlab.com' if host == 'gitlab' else 'github.com'
         remote_url = f'https://{domain}/{user}/{langcode}.git'
-        contributor = (status.get('contributor', '') or '').strip() or 'Recorder'
+        # 0.40.0: contributor is daemon-owned; we don't pass it on the
+        # wire any more. ``init_project`` reads from ``store.get_contributor()``
+        # itself; if unset, it returns ``Result(CONTRIBUTOR_UNSET)`` and
+        # the message routes the user back to the "Your name" field
+        # above (which is on this same screen).
         btn = self.ids.get('publish_btn')
         if btn is not None:
             btn.disabled = True
@@ -1128,17 +1566,17 @@ class SettingsScreen(Screen):
             url=remote_url))
         threading.Thread(
             target=self._publish_worker,
-            args=(project.working_dir, remote_url, contributor),
+            args=(project.working_dir, remote_url),
             daemon=True).start()
 
-    def _publish_worker(self, working_dir, remote_url, contributor):
+    def _publish_worker(self, working_dir, remote_url):
         import sys
         print(f'[publish] init_project working_dir={working_dir!r} '
-              f'remote_url={remote_url!r} contributor={contributor!r}',
+              f'remote_url={remote_url!r}',
               file=sys.stderr, flush=True)
         try:
             result = init_project(working_dir, remote_url,
-                                  branch='main', contributor=contributor)
+                                  branch='main')
             codes = result.codes()
             print(f'[publish] init_project done: codes={codes!r}',
                   file=sys.stderr, flush=True)
@@ -1150,7 +1588,8 @@ class SettingsScreen(Screen):
             ok = not result.has_any(
                 'SERVER_UNAVAILABLE', 'SERVER_ERROR',
                 S.AUTH_REQUIRED, S.APP_NOT_INSTALLED,
-                S.REPO_NOT_AUTHORIZED, S.ACCESS_DENIED)
+                S.REPO_NOT_AUTHORIZED, S.ACCESS_DENIED,
+                S.CONTRIBUTOR_UNSET)
         except Exception as ex:
             print(f'[publish] init_project raised: '
                   f'{type(ex).__name__}: {ex}',
@@ -2070,8 +2509,8 @@ class CollabUIApp(App):
 
     def build(self):
         theme.set_theme('Ocean')
-        font_name = register_charis()
-        register_kv(font_name)
+        self.font_name = register_charis()
+        register_kv(self.font_name)
         self.sm = RootSM(transition=SlideTransition())
         return self.sm
 

@@ -140,8 +140,14 @@ def main(working_dir):
           f'changes={status.n_changes}')
 
     # 5. Make a tiny edit, then request a sync.
+    # As of azt_collab_client 0.40.0, ``request_sync`` no longer
+    # takes a ``contributor`` argument — the daemon resolves the
+    # commit-author name from its store. Set it once via
+    # ``set_contributor`` (typically through the daemon settings
+    # UI) before running this demo, or the sync will refuse with
+    # ``S.CONTRIBUTOR_UNSET`` (visible via ``poll_job(...)['result']``).
     _touch_lift(lift_path)
-    job_id = request_sync(langcode, contributor='Sister App Demo')
+    job_id = request_sync(langcode)
     print(f'job_id: {job_id}')
 
     # 6. Poll for completion.

@@ -256,22 +256,48 @@ def _parse_provider_uri(uri):
 
 
 class _UriAtomicWriteFile:
-    """Atomic write over a ``content://`` URI via the daemon's
-    ``/v1/projects/<lang>/atomic_commit`` RPC (daemon 0.36.0+).
+    """Atomic write over a ``content://`` URI, two-phase.
 
-    Buffers writes in memory; on clean exit ships the full payload
-    as one base64-encoded RPC body. The daemon writes a tempfile +
-    ``os.replace`` in its own process, serialized via
-    ``project_lock`` — so concurrent writers (peer-vs-peer,
-    peer-vs-daemon's merge-output) can't tear the destination.
+    Phase 1 (bytes): on commit, generate a per-write hex token,
+    open ``content://<auth>/<lang>/_atomic_pending/<token>`` via
+    ``ContentResolver.openFileDescriptor`` for write, and ship the
+    buffered bytes through that kernel FD. No Binder size cap on
+    the FD path — a 3+ MB LIFT crosses fine.
 
-    On exception, the buffered bytes are dropped and the RPC is
-    NOT sent; the destination is untouched.
+    Phase 2 (finalize): call ``POST
+    /v1/projects/<lang>/atomic_finalize`` with the token + final
+    rel_path. The daemon atomic-renames the pending scratch file
+    into the canonical location under ``project_lock``, so
+    concurrent writers (peer-vs-peer, peer-vs-daemon's merge
+    output) can't tear the destination.
 
-    Memory: holds the full file bytes in a peer-side BytesIO until
-    commit. For LIFT (tens of MB at worst) this is fine. A future
-    chunked endpoint can shrink the working set if a much larger
-    payload ever ships."""
+    Why two-phase: the previous single-RPC ``atomic_commit`` path
+    shipped the full payload as base64 inside the Bundle that
+    ``ContentResolver.call`` shuttles over Binder. Binder caps
+    individual transactions at ~1 MB, so any LIFT bigger than
+    ~700 KB (base64 inflates 1.33x) silently failed the round
+    trip — the daemon never even saw the request. Splitting the
+    bytes onto the FD path closes that gap while preserving the
+    atomicity contract (rename is still serialized via project_lock
+    on the daemon).
+
+    On exception, the buffered bytes are dropped and neither phase
+    runs; the destination is untouched. If phase 1 succeeds but
+    phase 2 fails the pending scratch file may linger under
+    ``.azt_atomic_pending/`` on the daemon — the daemon best-
+    effort cleans it on finalize-failure but a peer crash between
+    phases would leave a stranded file.
+
+    Memory: still holds the full file bytes in a peer-side BytesIO
+    until commit. For LIFT (tens of MB at worst) this is fine.
+    Streaming directly from the BytesIO into the FD avoids a
+    second copy.
+
+    Backward compatibility: pre-0.41.7 daemons return 404 / not_found
+    on the ``atomic_finalize`` route. ``commit`` falls back to the
+    old single-RPC ``atomic_commit_bytes`` path in that case (which
+    works for small payloads against any daemon ≥ 0.36.0).
+    """
 
     __slots__ = ('_uri', '_buf', '_lock', '_lock_held', '_committed')
 
@@ -298,25 +324,68 @@ class _UriAtomicWriteFile:
         pass   # buffered write — nothing to flush before commit
 
     def commit(self):
-        """Ship the buffered bytes to the daemon. Raises ``IOError``
-        on RPC failure; the destination is untouched in that case
-        because the daemon never started a write."""
+        """Ship the buffered bytes to the daemon and atomic-rename.
+        Raises ``IOError`` on transport / finalize failure; the
+        destination is untouched in that case because the daemon
+        only swaps the inode after the rename succeeds."""
         if self._committed:
             return
         self._committed = True
-        # Deferred import to avoid a circular dependency between
+        # Deferred imports avoid a circular dependency between
         # ``azt_collab_client.__init__`` (which imports lift_io)
-        # and ``atomic_commit_bytes`` (which lives there).
-        from . import atomic_commit_bytes
+        # and the wrappers (which live there).
+        from . import (atomic_commit_bytes,
+                       atomic_finalize_pending)
         from . import status as _S
         langcode, rel_path = _parse_provider_uri(self._uri)
-        result = atomic_commit_bytes(
-            langcode, rel_path, self._buf.getvalue())
+        data = self._buf.getvalue()
         self._buf = None
-        if not result.has(_S.ATOMIC_COMMITTED):
-            raise IOError(
-                f'atomic_commit({self._uri!r}, {rel_path!r}) failed: '
-                f'{result.codes()!r}')
+
+        # Phase 1: ship bytes via FD to per-token scratch path.
+        # The FD route has no Binder size cap, so a 3+ MB LIFT
+        # crosses cleanly.
+        import secrets
+        token = secrets.token_hex(16)
+        pending_uri = (f'{_CONTENT_PREFIX}{_AZTCOLLAB_AUTHORITY}/'
+                       f'{langcode}/_atomic_pending/{token}')
+        try:
+            with _open_content_uri(pending_uri, 'w') as f:
+                f.write(data)
+        except IOError as ex:
+            # FD-write path failed. Either the daemon's
+            # _resolve_path doesn't know the _atomic_pending route
+            # (pre-0.41.7 daemon) or the openFile itself failed.
+            # Fall back to the legacy single-RPC path — works for
+            # small payloads against any 0.36.0+ daemon.
+            result = atomic_commit_bytes(langcode, rel_path, data)
+            if not result.has(_S.ATOMIC_COMMITTED):
+                raise IOError(
+                    f'atomic_commit({self._uri!r}, {rel_path!r}) '
+                    f'failed (FD path: {ex!r}; '
+                    f'fallback RPC: {result.codes()!r})')
+            return
+
+        # Phase 2: atomic-rename via small RPC.
+        result = atomic_finalize_pending(langcode, rel_path, token)
+        if result.has(_S.ATOMIC_COMMITTED):
+            return
+        # Finalize endpoint missing → pre-0.41.7 daemon. The
+        # phase-1 write left a scratch file the daemon won't know
+        # how to consume; the legacy single-RPC path is our
+        # fallback. (No need to clean up the scratch file from the
+        # client — the daemon's pending-cleanup logic / a future
+        # GC sweep handles strays.) Detect the missing endpoint by
+        # the SERVER_ERROR status with error='not_found'.
+        codes = result.codes()
+        if 'SERVER_ERROR' in codes:
+            # Try legacy path; if it also fails the finalize error
+            # is the more informative one to surface.
+            fallback = atomic_commit_bytes(langcode, rel_path, data)
+            if fallback.has(_S.ATOMIC_COMMITTED):
+                return
+        raise IOError(
+            f'atomic_commit({self._uri!r}, {rel_path!r}) failed: '
+            f'{codes!r}')
 
     def close(self):
         """Release the path lock. Idempotent. Does NOT commit on
@@ -572,19 +641,39 @@ class CAWLHandle:
             # decode / display
     """
 
-    __slots__ = ('langcode', 'basename')
+    __slots__ = ('langcode', 'rel_path')
 
-    def __init__(self, langcode, basename):
+    def __init__(self, langcode, rel_path):
         if not langcode or not isinstance(langcode, str):
             raise ValueError(
                 f'CAWLHandle needs a langcode, got {langcode!r}')
-        if not basename or not isinstance(basename, str):
+        if not rel_path or not isinstance(rel_path, str):
             raise ValueError(
-                f'CAWLHandle needs a basename, got {basename!r}')
-        if '/' in basename or '\\' in basename or basename in ('.', '..'):
-            raise ValueError(f'invalid CAWL basename: {basename!r}')
+                f'CAWLHandle needs a rel_path, got {rel_path!r}')
+        # Reject path-traversal at construction time. Nested
+        # paths (``0001_body/foo.png``) are fine — CAWL repos
+        # commonly use category subdirs — but absolute paths
+        # and ``..``/``.`` components are rejected here so the
+        # ``CAWLHandle('x', '../../etc/passwd')`` mistake fails
+        # loud at the call site rather than silently at the
+        # daemon.
+        if '\\' in rel_path or rel_path.startswith('/'):
+            raise ValueError(f'invalid CAWL rel_path: {rel_path!r}')
+        for seg in rel_path.split('/'):
+            if not seg or seg in ('.', '..'):
+                raise ValueError(
+                    f'invalid CAWL rel_path component: {rel_path!r}')
         self.langcode = langcode
-        self.basename = basename
+        self.rel_path = rel_path
+
+    @property
+    def basename(self):
+        """Back-compat alias for ``rel_path``. Pre-0.41.1 the
+        attribute was named ``basename`` under a flat-filename
+        assumption. The on-disk path is rel_path-shaped now;
+        keeping this read-only alias lets any peer that read
+        ``handle.basename`` (e.g. for log lines) keep working."""
+        return self.rel_path
 
     def open_read(self):
         """Open for binary read. Returns a file-like usable as a
@@ -594,19 +683,70 @@ class CAWLHandle:
             from kivy.utils import platform
         except Exception:
             platform = ''
+        # URL-encode each path component for transit so that
+        # spaces, commas, parentheses, etc. that CAWL filenames
+        # commonly contain don't break URI / URL parsing. The
+        # slashes between components stay intact (``safe='/'``)
+        # so the daemon sees the same component structure.
+        from urllib.parse import quote as _urlquote
+        encoded = _urlquote(self.rel_path, safe='/')
         if platform == 'android':
             uri = (f'{_CONTENT_PREFIX}{_AZTCOLLAB_AUTHORITY}/'
-                   f'{self.langcode}/cawl/images/{self.basename}')
+                   f'{self.langcode}/cawl/images/{encoded}')
             return _open_content_uri(uri, 'r')
-        return _http_get_cawl_image(self.langcode, self.basename)
+        return _http_get_cawl_image(self.langcode, encoded)
 
     def __repr__(self):
         return (f'<CAWLHandle langcode={self.langcode!r} '
-                f'basename={self.basename!r}>')
+                f'rel_path={self.rel_path!r}>')
 
 
-def _http_get_cawl_image(langcode, basename):
+def _cawl_index_via_fd(langcode):
+    """Read the CAWL index JSON for ``langcode`` through the
+    ContentProvider's file route, bypassing the JSON-RPC path.
+
+    Why this exists: ``GET /v1/projects/<lang>/cawl/index`` over
+    ContentResolver.call() ships the daemon's response as a
+    Bundle through Binder, which caps individual transactions at
+    ~1 MB. A populated CAWL index (5000+ entries with long
+    GitHub raw-content URLs) blows past that cap, the Bundle
+    silently fails to traverse the boundary, the peer's wrapper
+    catches the resulting Java exception as ``ServerUnavailable``
+    and returns ``{}``. The daemon-side success log fires (the
+    handler ran) but the peer reads empty — the diagnostic gap
+    that hid this bug pre-0.41.2.
+
+    The fix is to read the on-disk cache file directly via
+    ``openFileDescriptor``, which uses a kernel FD and has no
+    Binder size cap. The daemon's ContentProvider already
+    publishes ``<lang>/cawl/index.json`` as a file route
+    (``service.py:_resolve_cawl_path``), so peer-side this is
+    just a ``ContentResolver.openFileDescriptor`` against the
+    same URI shape ``CAWLHandle`` uses for image binaries.
+
+    Returns the parsed index dict. Raises ``IOError`` if the
+    file route can't open (URI grant missing, daemon process
+    not up). Caller (``cawl_index``) catches and returns ``{}``
+    to preserve the wrapper's empty-on-failure contract."""
+    import json as _json
+    uri = (f'{_CONTENT_PREFIX}{_AZTCOLLAB_AUTHORITY}/'
+           f'{langcode}/cawl/index.json')
+    with _open_content_uri(uri, 'r') as f:
+        data = f.read()
+    if not data:
+        return {}
+    try:
+        return _json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, _json.JSONDecodeError):
+        return {}
+
+
+def _http_get_cawl_image(langcode, encoded_rel_path):
     """Loopback-HTTP path for ``CAWLHandle.open_read`` on desktop.
+
+    ``encoded_rel_path`` is already URL-encoded by the caller
+    (``CAWLHandle.open_read`` uses ``urllib.parse.quote(...,
+    safe='/')`` to keep slashes intact but encode unsafe chars).
 
     Reads ``server.json`` for the bearer token, GETs the binary
     endpoint, returns an ``io.BytesIO``. Raises
@@ -633,7 +773,7 @@ def _http_get_cawl_image(langcode, basename):
         raise ServerUnavailable(
             'server.json missing port/token', kind='http')
     url = (f'http://127.0.0.1:{port}/v1/projects/{langcode}/'
-           f'cawl/images/{basename}')
+           f'cawl/images/{encoded_rel_path}')
     req = urllib.request.Request(
         url, headers={'Authorization': f'Bearer {token}'})
     try:
@@ -643,7 +783,7 @@ def _http_get_cawl_image(langcode, basename):
         if ex.code == 404:
             raise FileNotFoundError(
                 f'CAWL image not available: '
-                f'{langcode}/{basename}') from ex
+                f'{langcode}/{encoded_rel_path}') from ex
         raise IOError(
             f'CAWL image HTTP {ex.code}: {ex.reason}') from ex
     except (urllib.error.URLError, OSError) as ex:

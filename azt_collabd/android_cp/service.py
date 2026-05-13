@@ -315,6 +315,20 @@ def _resolve_path(rel, mode):
     if len(parts) >= 2 and parts[1] == 'cawl':
         return _resolve_cawl_path(parts[0], parts[2:], mode)
 
+    # Atomic-commit two-phase routing: <lang>/_atomic_pending/<token>.
+    # Peers writing a large LIFT / media file open this URI for write
+    # to ship the bytes via FD (Binder size cap doesn't apply to the
+    # FD path), then call ``POST /v1/projects/<lang>/atomic_finalize``
+    # to atomic-rename the scratch file into the canonical location
+    # under ``project_lock``. The two phases together preserve the
+    # same atomicity contract that ``atomic_commit_bytes``'s single-
+    # RPC path offers — but split so bytes don't have to fit in a
+    # Bundle. Scratch files live under
+    # ``<working_dir>/.azt_atomic_pending/<token>``; the finalize
+    # endpoint reads them by token. See _h_project_atomic_finalize.
+    if len(parts) == 3 and parts[1] == '_atomic_pending':
+        return _resolve_atomic_pending_path(parts[0], parts[2], mode)
+
     # Existing project-scoped shapes.
     if len(parts) == 2:
         # <lang>/<file>.lift — the only top-level file shape.
@@ -361,6 +375,61 @@ def _resolve_path(rel, mode):
     return target
 
 
+_TOKEN_RE = None
+
+
+def _is_safe_pending_token(token):
+    """True if ``token`` is structurally safe to use as a filename
+    under ``.azt_atomic_pending/``. Accepts hex / underscores /
+    hyphens only — peers should pass ``secrets.token_hex(N)`` or
+    similar. Rejects empty, overlong, or anything with path
+    separators / shell metas."""
+    global _TOKEN_RE
+    if _TOKEN_RE is None:
+        import re
+        _TOKEN_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+    return isinstance(token, str) and bool(_TOKEN_RE.match(token))
+
+
+def _resolve_atomic_pending_path(langcode, token, mode):
+    """Map ``<lang>/_atomic_pending/<token>`` to a per-project
+    scratch file under ``<working_dir>/.azt_atomic_pending/<token>``.
+
+    Used by ``LiftHandle.atomic_open_write`` / ``MediaHandle.
+    atomic_open_write`` on Android to ship large bytes via the
+    ContentProvider FD path (which has no Binder size cap) before
+    a tiny ``atomic_finalize`` RPC renames the scratch into the
+    canonical location under ``project_lock``.
+
+    Write mode creates the parent dir on demand. Read mode is
+    rejected — peers don't read pending files; the finalize RPC
+    does on the daemon side. Returns ``None`` on token-validation
+    failure or unknown langcode."""
+    if not _is_safe_pending_token(token):
+        return None
+    if not mode or 'w' not in mode:
+        # The pending file is daemon-internal — peers only ever
+        # write to it. A read attempt is structurally suspicious.
+        return None
+    from .. import projects as _projects
+    p = _projects.get(langcode)
+    if p is None or not p.working_dir:
+        return None
+    base = os.path.realpath(p.working_dir)
+    pending_dir = os.path.join(base, '.azt_atomic_pending')
+    target = os.path.realpath(os.path.join(pending_dir, token))
+    # Containment — token validation already rejects '/' and '..',
+    # but realpath + commonpath is the belt-and-braces check that
+    # catches any future structural-check gap.
+    try:
+        if os.path.commonpath([base, target]) != base:
+            return None
+    except ValueError:
+        return None
+    os.makedirs(pending_dir, exist_ok=True)
+    return target
+
+
 def _resolve_cawl_path(langcode, rest, mode):
     """Map a CAWL provider path to an absolute file. ``rest`` is
     the path segments *after* ``<lang>/cawl/``. CAWL files are
@@ -373,11 +442,23 @@ def _resolve_cawl_path(langcode, rest, mode):
     - ``[index.json]``    → daemon's cached index for this
                             project's image_repo. Fetches lazily
                             if missing.
-    - ``[images, <base>]`` → daemon's cached image binary.
-                            Fetches lazily if missing.
+    - ``[images, <path...>]`` → daemon's cached image binary at
+                                ``<path>`` (relative to the repo's
+                                images root). May be a flat
+                                filename or a nested path
+                                (e.g. ``['images', '0001_body',
+                                'foo.png']``) — CAWL repos
+                                commonly nest images under
+                                category subdirs.
 
-    The repo lookup goes through ``cawl.resolve_image_repo`` so
-    the per-project field overrides the daemon-global default."""
+    Path-traversal-safe at two layers: the outer
+    ``_resolve_path`` already rejected any ``..``/``.`` segment
+    in ``rel``, so ``rest`` here is structurally clean; and
+    ``cawl.get_image_path`` re-validates + does a
+    ``commonpath`` containment check against the realpath of
+    the cache dir. The repo lookup goes through
+    ``cawl.resolve_image_repo`` so the per-project field
+    overrides the daemon-global default."""
     if mode and ('w' in mode or 'a' in mode):
         return None
     from .. import projects as _projects
@@ -395,7 +476,12 @@ def _resolve_cawl_path(langcode, rest, mode):
         _cawl.get_index(repo)
         target = _cawl.index_path(repo)
         return target if os.path.isfile(target) else None
-    if len(rest) == 2 and rest[0] == 'images':
-        basename = rest[1]
-        return _cawl.get_image_path(repo, basename)
+    if len(rest) >= 2 and rest[0] == 'images':
+        # Join remaining segments back into a forward-slash
+        # rel-path. ``cawl.get_image_path`` revalidates and does
+        # the containment check; we just hand it the joined
+        # form. Segments came from Uri.getPath() which gives us
+        # the URL-decoded form already.
+        rel_path = '/'.join(rest[1:])
+        return _cawl.get_image_path(repo, rel_path)
     return None

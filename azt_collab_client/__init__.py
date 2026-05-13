@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.39.0"
+__version__ = "0.41.11"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -793,9 +793,46 @@ def get_contributor():
 
 def set_contributor(name):
     """Persist the user's display name on the server. Best-effort:
-    silently no-ops on transport failure."""
+    silently no-ops on transport failure.
+
+    The display name is the **commit author** for every git op
+    the daemon runs. As of 0.40.0 peers no longer pass it
+    per-call — the daemon reads from store directly. If the
+    stored name is empty, commit-issuing endpoints refuse with
+    ``S.CONTRIBUTOR_UNSET``."""
     try:
         call('POST', '/v1/config/contributor', {'contributor': name})
+    except ServerUnavailable:
+        pass
+
+
+def get_device_name():
+    """Return the daemon's stored device-name label. Auto-populates
+    from the OS on first read (Android: ``Settings.Global.DEVICE_NAME``
+    → ``Build.MANUFACTURER + MODEL``; desktop: ``socket.gethostname()``),
+    so a non-empty string comes back on a fresh install.
+
+    The label disambiguates the git commit author's email slot
+    (``<contributor>@<device_name>``) when the same human commits
+    from multiple devices. Peers display it in the daemon settings
+    UI alongside the contributor name; both are user-editable.
+
+    Empty string on transport failure."""
+    try:
+        resp = call('GET', '/v1/config/device_name')
+    except ServerUnavailable:
+        return ''
+    if not resp.get('ok'):
+        return ''
+    return str(resp.get('device_name', '') or '')
+
+
+def set_device_name(name):
+    """Persist the user's device-name label. Empty string clears
+    the override, causing the daemon to re-detect from the OS on
+    next read. Best-effort: silently no-ops on transport failure."""
+    try:
+        call('POST', '/v1/config/device_name', {'device_name': name})
     except ServerUnavailable:
         pass
 
@@ -1048,16 +1085,24 @@ def derive_langcode(working_dir, lift_path=''):
     return str(resp.get('langcode', ''))
 
 
-def init_project(working_dir, remote_url, branch='main',
-                 contributor='Recorder'):
+def init_project(working_dir, remote_url, branch='main'):
     """Initialize a git repo at *working_dir*, set the remote, and
-    push. Server uses store-resident credentials. Returns Result."""
+    push. Server uses store-resident credentials AND the
+    store-resident contributor name (set via ``set_contributor``).
+
+    As of 0.40.0 peers no longer pass ``contributor`` — the daemon
+    is the sole authoritative source for the commit-author name
+    (NOTES_TO_DAEMON.md "Daemon is now the sole authoritative
+    source"). If no name is set, the daemon refuses with
+    ``S.CONTRIBUTOR_UNSET`` — peers route the user to set their
+    name via the daemon settings UI (``open_server_ui()``).
+
+    Returns Result."""
     try:
         resp = call('POST', '/v1/projects/init', {
             'working_dir': working_dir,
             'remote_url': remote_url,
             'branch': branch,
-            'contributor': contributor,
         })
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
@@ -1195,13 +1240,17 @@ def project_status(langcode):
     return ProjectStatus.from_dict(resp)
 
 
-def sync_project(langcode, contributor):
-    """Synchronous sync. Returns Result. Blocks until the server's sync
-    pass returns. Use ``request_sync`` for fire-and-forget edits where
-    the UI doesn't wait."""
+def sync_project(langcode):
+    """Synchronous sync. Returns Result. Blocks until the server's
+    sync pass returns. Use ``request_sync`` for fire-and-forget
+    edits where the UI doesn't wait.
+
+    As of 0.40.0 ``contributor`` is no longer a parameter — the
+    daemon uses its store-resident contributor name. If unset,
+    the daemon refuses with ``S.CONTRIBUTOR_UNSET`` (route the
+    user to the daemon settings UI via ``open_server_ui()``)."""
     try:
-        resp = call('POST', f'/v1/projects/{langcode}/sync',
-                    {'contributor': contributor})
+        resp = call('POST', f'/v1/projects/{langcode}/sync', {})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -1211,17 +1260,23 @@ def sync_project(langcode, contributor):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
-def request_sync(langcode, contributor):
-    """Schedule a debounced sync server-side. Returns a job_id (str) or
-    None on transport failure. Multiple calls within the debounce
-    window collapse into one run; the server commits and pushes once."""
+def request_sync(langcode):
+    """Schedule a debounced sync server-side. Returns a job_id (str)
+    or None on transport failure. Multiple calls within the debounce
+    window collapse into one run; the server commits and pushes once.
+
+    As of 0.40.0 ``contributor`` is no longer a parameter — the
+    daemon uses its store-resident name. If the name is unset, the
+    enqueued job runs and refuses with ``S.CONTRIBUTOR_UNSET`` at
+    exec time; peers see the refusal via ``poll_job(job_id)`` in
+    the normal result shape (same as any other terminal status).
+    Route the user to set their name via ``open_server_ui()``
+    when ``CONTRIBUTOR_UNSET`` appears in a polled result."""
     import sys as _sys
-    print(f'[sync-client] request_sync({langcode!r}, '
-          f'contributor={contributor!r}) sending',
+    print(f'[sync-client] request_sync({langcode!r}) sending',
           file=_sys.stderr, flush=True)
     try:
-        resp = call('POST', f'/v1/projects/{langcode}/sync_async',
-                    {'contributor': contributor})
+        resp = call('POST', f'/v1/projects/{langcode}/sync_async', {})
     except ServerUnavailable as ex:
         print(f'[sync-client] request_sync({langcode!r}) → '
               f'ServerUnavailable: {ex}',
@@ -1281,7 +1336,28 @@ def cawl_index(langcode):
     want; the daemon stays naming-convention-agnostic. For image
     *binaries* (the bytes), use ``CAWLHandle(langcode, basename).
     open_read()`` — also daemon-served, one cache per device per
-    repo regardless of peer count."""
+    repo regardless of peer count.
+
+    Android transport routes through the ContentProvider's file
+    URI (``<lang>/cawl/index.json``) instead of the JSON-RPC
+    endpoint. The RPC path goes through ``ContentResolver.call``
+    whose Bundle response is capped at ~1 MB per Binder
+    transaction — a populated CAWL index (~5000+ entries with
+    long GitHub raw URLs) exceeds that cap and the Bundle is
+    dropped silently, surfacing here as an empty dict even though
+    the daemon emits the full payload. The file route uses a
+    kernel FD with no IPC size limit. Desktop loopback HTTP has
+    no such cap so the JSON-RPC path is fine there."""
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    if platform == 'android':
+        try:
+            from .lift_io import _cawl_index_via_fd
+            return _cawl_index_via_fd(langcode)
+        except Exception:
+            return {}
     try:
         resp = call('GET', f'/v1/projects/{langcode}/cawl/index')
     except ServerUnavailable:
@@ -1290,6 +1366,94 @@ def cawl_index(langcode):
         return {}
     index = resp.get('index')
     return index if isinstance(index, dict) else {}
+
+
+def cawl_prefetch(langcode, paths):
+    """Ask the daemon to warm a working-set of CAWL image paths
+    in the background.
+
+    The daemon spawns a worker that iterates *paths* and pulls
+    each into its image cache (``get_image_path``-driven; serves
+    from cache or fetches from GitHub). Returns immediately; peers
+    poll ``cawl_cache_status(langcode)`` for progress.
+
+    Idempotent: a second call with the same paths against an
+    active worker returns the existing state. A call with a
+    different paths-set replaces the state and starts a new
+    worker.
+
+    *paths* is a list of relative paths inside the repo
+    (``"0001_body/foo.png"``, ``"0002_skin_of_man/bar.png"``,
+    etc.) — the same shape ``cawl_index(langcode)['files'][i]
+    ['path']`` returns. Peers that map CAWL identifiers to a
+    single variant per identifier should pass just their chosen
+    variants here so the progress banner reflects work the peer
+    will actually use, not the whole repo.
+
+    Why peers should prefer this over iterating
+    ``CAWLHandle(...).open_read()`` themselves: the daemon-driven
+    iteration lets the daemon know the size of the work, which is
+    what makes the ``cache_status`` progress indicator
+    meaningful. The per-image path still works for on-demand
+    fetches when the peer needs a specific image (e.g., the
+    current swipe target); use it for that, use this for bulk
+    warming.
+
+    Returns a dict::
+
+        {'image_repo': 'owner/repo',
+         'requested': N, 'completed': M, 'finished': bool}
+
+    Empty/failure values on any transport or daemon error."""
+    empty = {'image_repo': '', 'requested': 0,
+             'completed': 0, 'finished': True}
+    if not isinstance(paths, (list, tuple)):
+        return empty
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/cawl/prefetch',
+                    {'paths': list(paths)})
+    except ServerUnavailable:
+        return empty
+    if not resp.get('ok'):
+        return empty
+    return {
+        'image_repo': resp.get('image_repo') or '',
+        'requested': int(resp.get('requested') or 0),
+        'completed': int(resp.get('completed') or 0),
+        'finished': bool(resp.get('finished')),
+    }
+
+
+def cawl_cache_status(langcode):
+    """Return ``{'image_repo': str, 'cached': int, 'total': int}``
+    for the CAWL image cache backing *langcode*'s image_repo.
+
+    ``cached`` is the count of image files currently on disk in the
+    daemon's cache; ``total`` is the image-shaped index entries.
+    Peers poll this while a CAWL prefetch is running and surface
+    a "Caching images: M / N" indicator so the user knows
+    network is being used in the background — without that
+    indicator they might disconnect Wi-Fi mid-fetch and end up
+    with a half-warm cache.
+
+    Returns ``{'image_repo': '', 'cached': 0, 'total': 0}`` on
+    any failure (daemon unreachable, project unknown, no image
+    repo configured, endpoint missing on older daemons). Peers
+    treat that as "nothing to show" and hide the indicator."""
+    empty = {'image_repo': '', 'cached': 0, 'total': 0}
+    try:
+        resp = call('GET',
+                    f'/v1/projects/{langcode}/cawl/cache_status')
+    except ServerUnavailable:
+        return empty
+    if not resp.get('ok'):
+        return empty
+    return {
+        'image_repo': resp.get('image_repo') or '',
+        'cached': int(resp.get('cached') or 0),
+        'total': int(resp.get('total') or 0),
+    }
 
 
 def set_cawl_image_repo(langcode, repo):
@@ -1393,6 +1557,39 @@ def atomic_commit_bytes(langcode, rel_path, data):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
+def atomic_finalize_pending(langcode, rel_path, token):
+    """Phase 2 of the two-phase atomic write: rename the daemon's
+    scratch file at ``<working_dir>/.azt_atomic_pending/<token>``
+    to ``<working_dir>/<rel_path>``, atomically, under the project
+    lock.
+
+    Used internally by ``LiftHandle.atomic_open_write`` /
+    ``MediaHandle.atomic_open_write`` on Android to bypass the
+    Binder per-transaction size cap that limits the legacy
+    single-RPC ``atomic_commit_bytes`` to payloads under ~700 KB.
+    Phase 1 ships the bytes via the ContentProvider FD path (no
+    Binder cap); this RPC is the small finalize.
+
+    Public-but-internal: peers should drive this through
+    ``atomic_open_write``, not call it directly.
+
+    Returns ``Result``. Success: a single ``ATOMIC_COMMITTED``
+    status with ``bytes_written`` and ``sha256`` params, same
+    shape ``atomic_commit_bytes`` returns. Transport failures
+    translate to ``SERVER_UNAVAILABLE`` / ``SERVER_ERROR``."""
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/atomic_finalize',
+                    {'token': token, 'path': rel_path})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 def poll_job(job_id):
     """Return the current state of a job: dict with keys ``state``
     ('PENDING' | 'RUNNING' | 'DONE'), ``langcode``, ``result`` (Result
@@ -1472,6 +1669,7 @@ __all__ = [
     'check_server_compat',
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
+    'get_device_name', 'set_device_name',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',
@@ -1484,8 +1682,9 @@ __all__ = [
     'clone_project',
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'request_sync', 'poll_job',
-    'atomic_commit_bytes',
-    'cawl_index', 'set_cawl_image_repo', 'set_repo_slug',
+    'atomic_commit_bytes', 'atomic_finalize_pending',
+    'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
+    'set_cawl_image_repo', 'set_repo_slug',
     'record_project_sync_time', 'grant_collaborator',
     'LiftHandle', 'MediaHandle', 'CAWLHandle',
     'audio_uri_for', 'image_uri_for', 'is_content_uri',

@@ -70,6 +70,14 @@ COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
 INVALID_USERNAME = 'INVALID_USERNAME'
 NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 
+# Returned by commit-issuing endpoints (init / sync / sync_async)
+# when the daemon's stored contributor name is empty. Peers must
+# route the user to ``set_contributor`` (typically through the
+# daemon settings UI) before any further sync/init can land. Pre-
+# 0.40 the daemon silently substituted ``'Recorder'``; that's gone
+# now and unset state surfaces explicitly.
+CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
+
 
 @dataclass
 class Status:

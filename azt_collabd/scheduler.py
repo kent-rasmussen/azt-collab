@@ -59,13 +59,17 @@ class JobState:
 
 
 class Job:
-    __slots__ = ('id', 'langcode', 'contributor', 'state', 'result',
+    # As of 0.40.0 Job no longer carries a contributor name: the
+    # daemon resolves contributor from store at exec time (sole-
+    # authoritative-source rule). Pre-0.40 jobs.json entries that
+    # still have a ``contributor`` field decode cleanly — we ignore
+    # it on load and stop writing it on save.
+    __slots__ = ('id', 'langcode', 'state', 'result',
                  'created_at', 'started_at', 'finished_at')
 
-    def __init__(self, langcode, contributor):
+    def __init__(self, langcode):
         self.id = uuid.uuid4().hex[:12]
         self.langcode = langcode
-        self.contributor = contributor
         self.state = JobState.PENDING
         self.result = None
         self.created_at = time.time()
@@ -76,7 +80,6 @@ class Job:
         return {
             'job_id': self.id,
             'langcode': self.langcode,
-            'contributor': self.contributor,
             'state': self.state,
             'result': self.result.to_dict() if self.result else None,
             'created_at': self.created_at,
@@ -89,7 +92,6 @@ class Job:
         j = cls.__new__(cls)
         j.id = d.get('job_id', '') or uuid.uuid4().hex[:12]
         j.langcode = d.get('langcode', '')
-        j.contributor = d.get('contributor', '')
         j.state = d.get('state', JobState.PENDING)
         raw_result = d.get('result')
         j.result = Result.from_dict(raw_result) if raw_result else None
@@ -225,10 +227,16 @@ def _set_pending_push(langcode, value):
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def request_sync(langcode, contributor):
+def request_sync(langcode):
     """Schedule a debounced sync for *langcode*. Returns the job id of
     the eventual run (the same id is returned for subsequent calls
-    within the debounce window — the timer just resets)."""
+    within the debounce window — the timer just resets).
+
+    As of 0.40.0 the contributor name is no longer a parameter —
+    ``_run_sync`` reads it from ``store.get_contributor()`` at exec
+    time. The "last-call-wins" debounce that used to overwrite the
+    pending job's contributor goes away naturally; there's no
+    per-call value to overwrite."""
     debounce_s = _settings.debounce_ms() / 1000.0
     with _lock:
         existing_timer = _pending_timers.pop(langcode, None)
@@ -236,12 +244,9 @@ def request_sync(langcode, contributor):
             existing_timer.cancel()
         job = _pending_jobs.get(langcode)
         if job is None:
-            job = Job(langcode, contributor)
+            job = Job(langcode)
             _pending_jobs[langcode] = job
             _store_job(job)
-        else:
-            # Latest contributor name wins (last-call-wins debounce)
-            job.contributor = contributor
         print(f'[sync-debounce] {langcode!r} debounce={debounce_s}s '
               f'job_id={job.id!r}',
               file=sys.stderr, flush=True)
@@ -278,7 +283,7 @@ def _fire(langcode):
         _persist_locked()
 
     try:
-        result = _run_sync(job.langcode, job.contributor)
+        result = _run_sync(job.langcode)
     except Exception as ex:
         result = Result().add(S.PUSH_FAILED, error=str(ex))
     with _lock:
@@ -295,9 +300,21 @@ def _fire(langcode):
         _set_pending_push(langcode, True)
 
 
-def _run_sync(langcode, contributor):
+def _run_sync(langcode):
     from . import store as _store
-    contributor = _store.resolve_contributor(contributor)
+    # 0.40.0: contributor read at exec time from store, not passed
+    # in. Defence-in-depth — request_sync's upfront refusal at
+    # ``_h_project_sync_async`` should catch unset-contributor
+    # before a job is enqueued, but a long-running debounce window
+    # plus a user clearing their name mid-flight could land us
+    # here without one. Refuse rather than emit a meaningless
+    # commit.
+    contributor = _store.get_contributor()
+    if not contributor:
+        print(f'[sync] {langcode!r} → CONTRIBUTOR_UNSET '
+              f'(refused at exec time)',
+              file=sys.stderr, flush=True)
+        return Result().add(S.CONTRIBUTOR_UNSET)
     # Async sync runs from a worker thread well after the request_sync
     # call returned, so the request-time _touch_project on the server
     # handler has already fired. We re-touch here just to keep the

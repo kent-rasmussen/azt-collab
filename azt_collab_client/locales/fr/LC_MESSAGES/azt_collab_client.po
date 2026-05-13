@@ -635,6 +635,9 @@ msgstr "État"
 msgid "Loading..."
 msgstr "Chargement..."
 
+msgid "Caching images: {cached} / {total} (network in use — please stay online)"
+msgstr "Mise en cache des images : {cached} / {total} (réseau utilisé — restez connecté)"
+
 msgid "Active host"
 msgstr "Hôte actif"
 
@@ -1069,4 +1072,11 @@ msgstr ""
 
 #: azt_collab_client/ui/update.py:1096
 msgid "Downloading…"
+msgstr ""
+
+# ── Drift placeholders appended by tests/add_missing_msgids.py ──
+# Translate the msgstr values when ready; empty msgstr falls back to the msgid (English) at runtime, same as the pre-add behaviour.
+
+#: azt_collab_client/translate.py:162
+msgid "Please set your name in the sync settings before publishing or syncing."
 msgstr ""

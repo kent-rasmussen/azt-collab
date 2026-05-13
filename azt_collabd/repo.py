@@ -487,9 +487,51 @@ def _stage_all(repo, project_dir):
         porcelain.add(repo, paths=paths)
 
 
-def _default_author(contributor_name):
-    safe = contributor_name.lower().replace(' ', '_')
-    return _enc(f'{contributor_name} <{safe}@device>')
+def _safe_email_segment(s):
+    """Make ``s`` safe for the local-part / domain-part of an
+    email-shaped string. Lowercase; spaces → ``_``; anything not
+    in ``a-z0-9_-`` dropped. Empty input becomes ``'unknown'``."""
+    out = []
+    for ch in (s or '').lower():
+        if ch.isalnum() or ch in ('_', '-'):
+            out.append(ch)
+        elif ch == ' ':
+            out.append('_')
+        # else drop
+    cleaned = ''.join(out).strip('-_')
+    return cleaned or 'unknown'
+
+
+def _default_author(contributor_name, device_name=None):
+    """Compose the git author identity for a commit.
+
+    Author NAME = the contributor's display name verbatim, so
+    GitHub's author-aggregation groups commits by person.
+    Author EMAIL = ``<safe_contributor>@<safe_device>`` so
+    ``git log --format='%ae'`` differentiates by device when one
+    person commits from multiple devices.
+
+    The email is non-routable (the suite doesn't have email
+    infrastructure for users); it's an identifier, not an
+    address. GitHub-side, the commit shows up under the
+    contributor's name; email shows in the raw commit metadata
+    and disambiguates between devices.
+
+    ``device_name=None`` (the default for in-tree callers)
+    triggers a lazy lookup of the daemon's stored device name
+    via ``store.get_device_name()``, which auto-populates from
+    the OS on first read. Explicit empty string skips the lookup
+    and produces ``@unknown`` — useful for tests that want
+    deterministic output without touching the store.
+
+    Pre-0.40 the email was always ``<safe>@device`` (literal
+    string ``device``), which left no useful disambiguation."""
+    safe_name = _safe_email_segment(contributor_name)
+    if device_name is None:
+        from . import store as _store
+        device_name = _store.get_device_name()
+    safe_device = _safe_email_segment(device_name)
+    return _enc(f'{contributor_name} <{safe_name}@{safe_device}>')
 
 
 def _app_committer():
@@ -669,9 +711,17 @@ def _count_commits_ahead(repo, branch):
 
 
 def init_repo(project_dir, remote_url, username, token,
-              branch='main', contributor_name='Recorder'):
+              branch='main', contributor_name=''):
     """Initialize a git repo, commit everything, set remote, push.
-    Returns a Result."""
+    Returns a Result.
+
+    Pre-0.40 ``contributor_name`` defaulted to the literal
+    ``'Recorder'`` so a missing arg silently produced
+    ``Recorder <recorder@device>`` commits. As of 0.40 the daemon's
+    endpoints refuse the call upstream when contributor is unset
+    (``S.CONTRIBUTOR_UNSET``); the default here is empty for
+    test convenience but production callers always pass a real
+    name."""
     _ensure_ssl()
     try:
         with project_lock(project_dir):

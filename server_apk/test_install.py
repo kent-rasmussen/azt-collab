@@ -256,7 +256,13 @@ def section_4_to_8_kill_recovery(working_dir):
                   f'project registered: langcode={langcode}',
                   'register_project returned None'):
         return
-    job_id = request_sync(langcode, contributor='Test Install Demo')
+    # 0.40.0+: request_sync doesn't take contributor; daemon
+    # reads from store. Test harness sets it directly so the
+    # scheduler's exec-time refusal doesn't blank-out this
+    # smoke test.
+    from azt_collabd import store as _store
+    _store.set_contributor('Test Install Demo')
+    job_id = request_sync(langcode)
     if not expect(bool(job_id),
                   f'request_sync returned job_id={job_id}',
                   'request_sync returned no job_id'):

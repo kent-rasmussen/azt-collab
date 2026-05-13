@@ -280,6 +280,30 @@ def _h_set_contributor(body):
     return 200, {"ok": True, "contributor": store.get_contributor()}
 
 
+def _h_get_device_name(_body):
+    """Return the daemon's stored device-name label. Auto-populates
+    from the OS on first read (Android: ``Settings.Global.DEVICE_NAME``
+    → ``Build.MANUFACTURER + MODEL``; desktop: ``socket.gethostname()``),
+    so the response is never empty after the first call.
+
+    Used as the disambiguator in the git commit author email slot
+    (``<contributor>@<device_name>``) so the same human committing
+    from multiple devices is still groupable by name on GitHub while
+    distinguishable by device in raw git metadata. Peers surface this
+    in the daemon settings UI for the user to override if they want
+    a friendlier label than the OS default."""
+    return 200, {"ok": True, "device_name": store.get_device_name()}
+
+
+def _h_set_device_name(body):
+    """Persist a user-chosen device-name label. Empty string clears,
+    re-triggering OS autodetection on next read. Whitespace is
+    stripped before persist."""
+    name = body.get('device_name', '')
+    store.set_device_name(name)
+    return 200, {"ok": True, "device_name": store.get_device_name()}
+
+
 def _h_get_ui_language(_body):
     """Return the daemon-side UI language persisted in
     ``$AZT_HOME/config.json::ui.language``.
@@ -339,12 +363,48 @@ def _h_cawl_index(langcode, _body):
         index = _cawl.get_index(repo)
     except Exception as ex:
         return 500, {"ok": False, "error": str(ex)}
+    # Filter to image-shaped entries before serializing. The
+    # canonical CAWL repo includes README / LICENSE / .gitignore
+    # blobs that every peer's parser discards anyway — emitting
+    # them just inflates the response. The ~5500-entry full
+    # index is ~1.5 MB serialized, which exceeds Android's
+    # Binder ~1 MB per-transaction cap and silently drops the
+    # response Bundle on the way back to the peer; filtering to
+    # image extensions cuts it to ~1700 entries (~470 KB) and
+    # the round-trip fits comfortably. File-route consumers
+    # (peers using ``cawl_index`` 0.41.2+ on Android) read the
+    # raw cache file via openFileDescriptor and self-filter, so
+    # this only affects the JSON-RPC dispatch path. See
+    # NOTES_TO_DAEMON.md "CAWL index response lost in transit"
+    # 2026-05-13 for the diagnostic chain.
+    if isinstance(index, dict):
+        files = index.get('files') or []
+        slim_files = [
+            f for f in files
+            if isinstance(f, dict)
+            and isinstance(f.get('path'), str)
+            and f['path'].lower().endswith(
+                ('.png', '.jpg', '.jpeg'))
+        ]
+        index = dict(index)
+        index['files'] = slim_files
+    n_files = len((index or {}).get('files') or [])
+    print(f'[cawl] served index for repo={repo!r} '
+          f'langcode={langcode!r} files={n_files}',
+          file=sys.stderr, flush=True)
     return 200, {"ok": True, "index": index, "image_repo": repo}
 
 
-def _h_cawl_image_bytes(langcode, basename):
+def _h_cawl_image_bytes(langcode, rel_path):
     """Return ``(status, content_type, data_bytes)`` for the cached
     CAWL image binary, fetching it lazily if not yet on disk.
+
+    ``rel_path`` may be a flat filename or a nested path (CAWL
+    repos commonly nest images under category subdirs:
+    ``0001_body/foo.png``). The matcher
+    (``_match_cawl_image_path``) URL-decodes each component
+    before passing in, so this function sees the same on-disk
+    form the index emitted.
 
     Not part of the JSON dispatch table because it returns binary
     bytes, not a JSON dict. The HTTP handler routes the path
@@ -356,7 +416,7 @@ def _h_cawl_image_bytes(langcode, basename):
 
     Status codes:
         200 — bytes available (cache hit or successful fetch).
-        404 — project unknown, basename rejected, OR fetch failed
+        404 — project unknown, rel_path rejected, OR fetch failed
               and no cached copy exists. Logged on stderr; the
               peer should fall through to its no-image rendering.
         500 — unexpected internal error.
@@ -367,15 +427,29 @@ def _h_cawl_image_bytes(langcode, basename):
     fallback already covers the recoverable case."""
     p = projects.get(langcode)
     if p is None:
+        print(f'[cawl] image rejected: project_not_found '
+              f'langcode={langcode!r}',
+              file=sys.stderr, flush=True)
         return 404, 'application/json', \
             b'{"ok":false,"error":"project_not_found"}'
     _touch_project(langcode)
     repo = _cawl.resolve_image_repo(langcode)
     if not repo:
+        print(f'[cawl] image rejected: no_image_repo_configured '
+              f'langcode={langcode!r}',
+              file=sys.stderr, flush=True)
         return 404, 'application/json', \
             b'{"ok":false,"error":"no_image_repo_configured"}'
-    target = _cawl.get_image_path(repo, basename)
+    target = _cawl.get_image_path(repo, rel_path)
     if target is None:
+        # ``get_image_path`` already logs ``[cawl] image fetch
+        # failed`` when the network attempt fails. We log a
+        # second line here so cases where the rel_path itself
+        # was rejected (path-traversal etc.) — which produce no
+        # fetch-attempt log — are still visible.
+        print(f'[cawl] image unavailable: repo={repo!r} '
+              f'path={rel_path!r}',
+              file=sys.stderr, flush=True)
         return 404, 'application/json', \
             b'{"ok":false,"error":"image_unavailable"}'
     try:
@@ -385,7 +459,13 @@ def _h_cawl_image_bytes(langcode, basename):
         return 500, 'application/json', \
             json.dumps({"ok": False,
                         "error": f'cache_read: {ex}'}).encode()
-    return 200, _content_type_for(basename), data
+    # Success log — keeps ops visibility into the read path
+    # (which previously had none). ``rel_path`` (not ``target``)
+    # so the line is comparable across cache dir relocations.
+    print(f'[cawl] served image repo={repo!r} path={rel_path!r} '
+          f'bytes={len(data)}',
+          file=sys.stderr, flush=True)
+    return 200, _content_type_for(rel_path), data
 
 
 _CONTENT_TYPES = {
@@ -831,12 +911,23 @@ def _h_derive_langcode(body):
 
 def _h_init_project(body):
     """Initialize a git repo at *working_dir*, set the remote, and push.
-    Server uses store-resident credentials — peers do not pass tokens."""
+    Server uses store-resident credentials and contributor — peers do
+    not pass tokens or the commit author name."""
     from .repo import init_repo as _init_repo
     working_dir = body.get('working_dir', '')
     remote_url = body.get('remote_url', '')
     branch = body.get('branch', 'main')
-    contributor = store.resolve_contributor(body.get('contributor', ''))
+    # 0.40.0: contributor comes from store only. Peer-passed
+    # ``body['contributor']`` is ignored (peer-side mirror of the
+    # name is the anti-pattern this contract closes; see
+    # NOTES_TO_DAEMON.md "sole authoritative source"). Empty stored
+    # value refuses with CONTRIBUTOR_UNSET so the user sets a real
+    # name before any commit lands.
+    contributor = store.get_contributor()
+    if not contributor:
+        return 200, {"ok": True,
+                     "result": Result().add(
+                         S.CONTRIBUTOR_UNSET).to_dict()}
     if not working_dir or not remote_url:
         return 400, {"ok": False,
                      "error": "missing_working_dir_or_remote_url"}
@@ -1143,7 +1234,13 @@ def _h_project_sync(langcode, body):
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
-    contributor = store.resolve_contributor(body.get('contributor', ''))
+    # 0.40.0: contributor from store, not body. See _h_init_project.
+    contributor = store.get_contributor()
+    if not contributor:
+        print(f'[sync-rpc] {langcode!r} → CONTRIBUTOR_UNSET',
+              file=sys.stderr, flush=True)
+        res = Result().add(S.CONTRIBUTOR_UNSET)
+        return 200, {"ok": True, "result": res.to_dict()}
     print(f'[sync-rpc] {langcode!r} contributor={contributor!r} '
           f'remote_url={p.remote_url!r}',
           file=sys.stderr, flush=True)
@@ -1288,17 +1385,22 @@ def _h_grant_collaborator(langcode, body):
     return 200, {"ok": True, "result": res.to_dict()}
 
 
-def _h_project_sync_async(langcode, body):
+def _h_project_sync_async(langcode, _body):
     p = projects.get(langcode)
     if p is None:
         print(f'[sync-async] {langcode!r} → project_not_found',
               file=sys.stderr, flush=True)
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
-    contributor = store.resolve_contributor(body.get('contributor', ''))
-    job_id = scheduler.request_sync(langcode, contributor)
-    print(f'[sync-async] {langcode!r} contributor={contributor!r} '
-          f'enqueued job_id={job_id!r}',
+    # 0.40.0: contributor is no longer passed on the wire. The
+    # async endpoint enqueues unconditionally; if contributor is
+    # unset, ``scheduler._run_sync`` refuses at exec time and the
+    # job result carries ``S.CONTRIBUTOR_UNSET``. Peers polling
+    # via ``poll_job(job_id)`` see the same shape as any other
+    # terminal status — no special "upfront refusal vs job_id"
+    # branching on the peer side.
+    job_id = scheduler.request_sync(langcode)
+    print(f'[sync-async] {langcode!r} enqueued job_id={job_id!r}',
           file=sys.stderr, flush=True)
     return 200, {"ok": True, "job_id": job_id}
 
@@ -1426,23 +1528,233 @@ def _h_project_atomic_commit(langcode, body):
     return 200, {"ok": True, "result": res.to_dict()}
 
 
+def _h_cawl_prefetch(langcode, body):
+    """``POST /v1/projects/<lang>/cawl/prefetch`` — start a
+    daemon-driven prefetch of a working-set of CAWL image paths.
+
+    Request body::
+
+        {"paths": ["0001_body/foo.png",
+                   "0002_skin_of_man/bar.png", ...]}
+
+    The daemon spawns a background worker that iterates the
+    paths and warms the cache via ``get_image_path`` (which
+    serves from on-disk cache or fetches from GitHub). Returns
+    immediately with the initial state; peers poll
+    ``cache_status`` for progress.
+
+    Why this exists (and the legacy per-image path doesn't
+    cover it): the peer used to iterate the list itself,
+    one IPC + one ``get_image_path`` per entry. That worked
+    but left the daemon ignorant of the total size of the work
+    being done, so its progress reporting could only count
+    on-disk-vs.-all-index-files — a misleading total. Moving
+    the iteration into the daemon means the progress reporter
+    knows what it's reporting against, by construction.
+
+    Idempotent: a peer that calls ``prefetch`` twice with the
+    same paths gets back the existing state, not a second
+    worker. The on-demand ``get_image_path`` path
+    (``content://<auth>/<lang>/cawl/images/<rel_path>``) is
+    unaffected — peers can still request individual images
+    whenever they need them; the daemon serves from cache or
+    fetches on demand exactly as before."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    paths = body.get('paths')
+    if not isinstance(paths, list):
+        return 400, {"ok": False, "error": "missing_paths"}
+    _touch_project(langcode)
+    repo = _cawl.resolve_image_repo(langcode)
+    if not repo:
+        return 200, {"ok": True, "image_repo": "",
+                     "requested": 0, "completed": 0,
+                     "finished": True}
+    state = _cawl.start_prefetch(repo, paths)
+    if state is None:
+        return 400, {"ok": False, "error": "invalid_paths"}
+    return 200, {"ok": True, "image_repo": repo,
+                 "requested": state['requested'],
+                 "completed": state['completed'],
+                 "finished": state['finished']}
+
+
+def _h_cawl_cache_status(langcode, _body):
+    """``GET /v1/projects/<lang>/cawl/cache_status`` — return cache
+    progress for the image_repo backing this project.
+
+    Response::
+
+        {"ok": True,
+         "image_repo": "<owner/repo>",
+         "cached": <count of image files on disk>,
+         "total":  <count of image-shaped index entries>}
+
+    Peers poll this on a short interval (5-10 s) while a CAWL
+    prefetch is running so they can show a "Caching images: M / N"
+    indicator. The indicator's job is to tell the user the
+    daemon is still using network so they don't disconnect Wi-Fi
+    mid-fetch and end up with a half-warm cache.
+
+    Both counts are cheap — index lookup is in-memory, on-disk
+    count is one ``os.walk`` over the daemon-owned images dir.
+    No network. Returns ``cached == 0`` and ``total == 0`` when
+    the project has no image_repo configured or the index isn't
+    yet loaded; peers should treat that as "nothing to show"."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    # No ``_touch_project`` here: this is a read-only progress
+    # poll the indicator runs at 1 Hz. Treating each poll as
+    # project activity floods logcat with ``[recent]
+    # _touch_project`` lines (one per second per active poller)
+    # without adding any real "user is working on X" signal.
+    repo = _cawl.resolve_image_repo(langcode)
+    if not repo:
+        return 200, {"ok": True, "image_repo": "",
+                     "cached": 0, "total": 0}
+    cached, total = _cawl.cache_status(repo)
+    return 200, {"ok": True, "image_repo": repo,
+                 "cached": cached, "total": total}
+
+
+def _h_project_atomic_finalize(langcode, body):
+    """POST /v1/projects/<lang>/atomic_finalize
+
+    Request body::
+
+        {"token": "<hex-token>", "path": "<rel_path>"}
+
+    Atomically renames ``<working_dir>/.azt_atomic_pending/<token>``
+    (a scratch file the peer wrote via the ContentProvider FD path)
+    to ``<working_dir>/<rel_path>``. Used by
+    ``LiftHandle.atomic_open_write`` / ``MediaHandle.atomic_open_write``
+    on Android to bypass the Binder per-transaction size cap that
+    blocks shipping a large body via ``atomic_commit_bytes``.
+
+    The peer-side flow is two-phase: (1) write bytes to
+    ``content://<auth>/<lang>/_atomic_pending/<token>`` via
+    ``ContentResolver.openFileDescriptor`` — kernel FD, no IPC
+    size limit; (2) call this endpoint with the token + final
+    rel_path to atomic-rename under ``project_lock``.
+
+    The lock guarantees the rename can't overlap a sync's merge-
+    output write or another peer's atomic_commit; net effect is
+    the same as the single-RPC ``atomic_commit_bytes`` for small
+    payloads, just split so bytes don't have to fit in a Bundle.
+
+    Returns ``ATOMIC_COMMITTED`` (with ``bytes_written`` and
+    ``sha256``) on success. Missing-pending-file returns 404
+    (peer probably forgot to write first); path-validation
+    failures return 400; filesystem failures return 500."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    token = body.get('token') or ''
+    rel = body.get('path') or ''
+    # Token validation matches the ContentProvider's
+    # ``_is_safe_pending_token`` — hex / underscore / hyphen, 1-64
+    # chars. Reject anything else before any filesystem touch.
+    import re
+    if not isinstance(token, str) or not re.match(
+            r'^[A-Za-z0-9_-]{1,64}$', token):
+        return 400, {"ok": False, "error": "invalid_token"}
+    final_target = _resolve_atomic_commit_path(p.working_dir, rel)
+    if final_target is None:
+        return 400, {"ok": False, "error": "path_rejected"}
+    pending = os.path.join(p.working_dir, '.azt_atomic_pending', token)
+    # Containment for the pending path — token is structurally clean
+    # but defence-in-depth.
+    pending_real = os.path.realpath(pending)
+    base_real = os.path.realpath(p.working_dir)
+    try:
+        if os.path.commonpath([base_real, pending_real]) != base_real:
+            return 400, {"ok": False, "error": "pending_path_rejected"}
+    except ValueError:
+        return 400, {"ok": False, "error": "pending_path_rejected"}
+    if not os.path.isfile(pending_real):
+        return 404, {"ok": False, "error": "pending_not_found"}
+    _touch_project(langcode)
+    # Read once for size + hash before the rename moves the inode.
+    # Hashing 3-10 MB is in the tens of ms range; cheaper than the
+    # network round-trips this whole flow saves vs. the JSON-RPC
+    # path it replaces.
+    try:
+        with open(pending_real, 'rb') as f:
+            data = f.read()
+    except OSError as ex:
+        return 500, {"ok": False, "error": f"read_pending: {ex}"}
+    try:
+        with project_lock(p.working_dir):
+            os.makedirs(os.path.dirname(final_target) or '.',
+                        exist_ok=True)
+            os.replace(pending_real, final_target)
+    except Exception as ex:
+        # Clean up pending file if the rename failed — don't leave
+        # turds under .azt_atomic_pending/.
+        try:
+            if os.path.isfile(pending_real):
+                os.unlink(pending_real)
+        except OSError:
+            pass
+        return 500, {"ok": False, "error": str(ex)}
+    res = Result().add(S.ATOMIC_COMMITTED,
+                       bytes_written=len(data),
+                       sha256=hashlib.sha256(data).hexdigest())
+    return 200, {"ok": True, "result": res.to_dict()}
+
+
 def _match_cawl_image_path(path):
-    """If ``path`` is ``/v1/projects/<lang>/cawl/images/<basename>``,
-    return ``(langcode, basename)``. Else ``None``. Strict shape:
-    exactly six segments, ``cawl`` + ``images`` in positions 4/5,
-    no trailing slashes."""
+    """If ``path`` is ``/v1/projects/<lang>/cawl/images/<rel_path>``,
+    return ``(langcode, rel_path)``. Else ``None``.
+
+    ``rel_path`` may be a flat filename or a nested path (CAWL
+    repos commonly nest images under category subdirs:
+    ``0001_body/foo.png``). On the wire the rel-path is
+    URL-encoded; this function URL-decodes each component
+    before joining so ``cawl.get_image_path`` sees the same
+    on-disk path the index emitted.
+
+    Path-traversal rejection: ``..``/``.``/empty components are
+    rejected here as belt-and-braces. ``cawl.get_image_path``
+    also re-validates and does a ``commonpath`` containment
+    check — defence-in-depth — but rejecting early keeps the
+    matcher's contract clean."""
     if not path.startswith('/v1/projects/'):
         return None
     parts = path.split('/')
-    if len(parts) != 7:
+    # Minimum 7 segments: ['', 'v1', 'projects', '<lang>', 'cawl',
+    # 'images', '<rel_path[0]>']. Nested paths add more.
+    if len(parts) < 7:
         return None
     if parts[4] != 'cawl' or parts[5] != 'images':
         return None
     langcode = parts[3]
-    basename = parts[6]
-    if not langcode or not basename:
+    if not langcode:
         return None
-    return langcode, basename
+    from urllib.parse import unquote as _urlunquote
+    rel_segments = []
+    for seg in parts[6:]:
+        if not seg:
+            return None
+        decoded = _urlunquote(seg)
+        if decoded in ('.', '..') or '/' in decoded or '\\' in decoded:
+            # Reject post-decode tricks (an encoded ``%2f`` would
+            # decode to ``/`` and let a single segment become a
+            # path; reject that). ``cawl.get_image_path``
+            # catches this too but rejecting at the matcher
+            # keeps the contract tight.
+            return None
+        rel_segments.append(decoded)
+    if not rel_segments:
+        return None
+    rel_path = '/'.join(rel_segments)
+    return langcode, rel_path
 
 
 def dispatch(method, path, body):
@@ -1462,6 +1774,8 @@ def dispatch(method, path, body):
             return _h_credentials_status(body)
         if path == '/v1/config/contributor':
             return _h_get_contributor(body)
+        if path == '/v1/config/device_name':
+            return _h_get_device_name(body)
         if path == '/v1/credentials/github/install_url':
             return _h_github_install_url(body)
         if path == '/v1/credentials/github/client_id':
@@ -1485,6 +1799,9 @@ def dispatch(method, path, body):
             if len(parts) == 6 and parts[4] == 'cawl' \
                     and parts[5] == 'index':
                 return _h_cawl_index(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'cawl' \
+                    and parts[5] == 'cache_status':
+                return _h_cawl_cache_status(parts[3], body)
         if path.startswith('/v1/jobs/'):
             parts = path.split('/')
             if len(parts) == 4 and parts[3]:
@@ -1496,6 +1813,8 @@ def dispatch(method, path, body):
             return _h_set_host(body)
         if path == '/v1/config/contributor':
             return _h_set_contributor(body)
+        if path == '/v1/config/device_name':
+            return _h_set_device_name(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':
@@ -1538,6 +1857,11 @@ def dispatch(method, path, body):
                 return _h_project_sync_async(parts[3], body)
             if len(parts) == 5 and parts[4] == 'atomic_commit':
                 return _h_project_atomic_commit(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'atomic_finalize':
+                return _h_project_atomic_finalize(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'cawl' \
+                    and parts[5] == 'prefetch':
+                return _h_cawl_prefetch(parts[3], body)
             if len(parts) == 5 and parts[4] == 'last_sync':
                 return _h_set_project_last_sync(parts[3], body)
             if len(parts) == 5 and parts[4] == 'collaborators':
@@ -1627,10 +1951,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if not self._auth_ok():
                 return self._send_json(
                     401, {"ok": False, "error": "unauthorized"})
-            langcode, basename = binary_match
+            langcode, rel_path = binary_match
             try:
                 status, content_type, data = _h_cawl_image_bytes(
-                    langcode, basename)
+                    langcode, rel_path)
             except Exception as ex:
                 return self._send_json(
                     500, {"ok": False, "error": str(ex)})

@@ -98,6 +98,16 @@ COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
 INVALID_USERNAME = 'INVALID_USERNAME'
 NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 
+# ── Contributor identity unset ─────────────────────────────────────────────
+# Returned by commit-issuing endpoints (init / sync / sync_async) when
+# ``store.get_contributor()`` is empty. Pre-0.40 the daemon silently
+# substituted the literal ``'Recorder'`` for missing names, producing
+# meaningless "Recorder" commits in GitHub history. 0.40 forces the
+# unset state to be user-visible: every commit op refuses with this
+# status, peers route the user to set their name via
+# ``set_contributor`` (typically through the daemon settings UI).
+CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
+
 
 @dataclass
 class Status:

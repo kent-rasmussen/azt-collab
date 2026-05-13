@@ -204,7 +204,7 @@ All exposed by `azt_collab_client.__all__`. Patterns:
 - **Projects.** `list_projects()` → `[Project]`,
   `open_project(langcode)`, `register_project(...)`,
   `derive_langcode(working_dir, lift_path='')`,
-  `init_project(working_dir, remote_url, branch='main', contributor=...)` → `Result`,
+  `init_project(working_dir, remote_url, branch='main')` → `Result`,
   `create_project_from_template(vernlang, dest_dir, template_url='')`,
   `clone_project(remote_url, dest_dir, on_progress=None, ...)` (synchronous;
   use `clone_project_start` + `clone_project_status` for a
@@ -219,11 +219,15 @@ All exposed by `azt_collab_client.__all__`. Patterns:
   fall through to the picker rather than crashing on a not-found.
   The picker's host-side `list_projects()` filters missing entries
   out automatically.
-- **Sync.** `sync_project(langcode, contributor)` blocks; returns
-  `Result`. `request_sync(langcode, contributor)` is fire-and-forget
-  (returns a `job_id`, debounced server-side). `poll_job(job_id)`
-  returns `{state, result, ...}` where `state` is
-  `'PENDING' | 'RUNNING' | 'DONE'`.
+- **Sync.** `sync_project(langcode)` blocks; returns `Result`.
+  `request_sync(langcode)` is fire-and-forget (returns a
+  `job_id`, debounced server-side). `poll_job(job_id)` returns
+  `{state, result, ...}` where `state` is
+  `'PENDING' | 'RUNNING' | 'DONE'`. Commit-author identity
+  is daemon-resolved (0.40+): set once via `set_contributor`
+  (typically through the daemon settings UI); peers don't pass
+  it per-call. If unset, the result carries
+  `S.CONTRIBUTOR_UNSET`.
 - **Bookkeeping.** `record_project_sync_time(langcode, timestamp=None)`.
 
 Wrappers must:
@@ -378,10 +382,10 @@ The general shape — both contexts:
 # Auto-sync (post-load, post-edit, background) — silent on
 # configuration-class AND transport-class failures; never derail
 # whatever the user was doing.
-def _auto_sync(self, langcode, contributor):
-    result = sync_project(langcode, contributor)
+def _auto_sync(self, langcode):
+    result = sync_project(langcode)
     if result.has_any(S.NOT_A_REPO, S.NO_REMOTE,
-                      S.AUTH_REQUIRED,
+                      S.AUTH_REQUIRED, S.CONTRIBUTOR_UNSET,
                       S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
                       S.REPO_NOT_AUTHORIZED,
                       S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
@@ -396,13 +400,13 @@ def _auto_sync(self, langcode, contributor):
         return
     if result.has(S.JOB_INTERRUPTED):
         # One silent retry; on second failure, log and move on.
-        return self._auto_sync_retry_once(langcode, contributor)
+        return self._auto_sync_retry_once(langcode)
     self.show_status(translate_result(result))  # PUSHED, etc.
 
 # User-initiated sync — the user just tapped Sync; route to
 # whatever fixes the problem, or surface the success line.
-def do_sync(self, langcode, contributor):
-    result = sync_project(langcode, contributor)
+def do_sync(self, langcode):
+    result = sync_project(langcode)
 
     # AUTH_REFRESH_STALE piggybacks on whatever primary code the
     # sync returned (PUSHED + STALE while the access token is
@@ -420,6 +424,12 @@ def do_sync(self, langcode, contributor):
 
     if result.has_any(S.NOT_A_REPO, S.NO_REMOTE):
         self.open_publish_settings(langcode)
+    elif result.has(S.CONTRIBUTOR_UNSET):
+        # User hasn't entered their name yet; route to the
+        # daemon settings UI's contributor field. Same shape
+        # as AUTH_REQUIRED — actionable on user-initiated sync,
+        # silent on auto-sync (handled above).
+        self.open_sync_settings()
     elif result.has(S.AUTH_REQUIRED):
         self.open_github_connect()
     elif result.has_any(S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
@@ -638,7 +648,7 @@ result = poll_job(job_id)['result']
 if result and result.has(S.JOB_INTERRUPTED):
     # retry the underlying operation; the daemon respawned and
     # forgot the worker thread that was running this job_id.
-    new_id = request_sync(langcode, contributor)
+    new_id = request_sync(langcode)
 ```
 
 ### Don't cache. Use `ContentResolver` every time.
@@ -960,6 +970,71 @@ on the client side to *read* the fields; the setters
 (``set_cawl_image_repo``, ``set_repo_slug``) are documented as
 part of the public API surface in ``CLIENT_INTEGRATION.md``
 § 11.
+
+## Commit identity — architectural rationale
+
+> **For the conformity contract** — what peers must call, hard
+> rules, refusal-status handling — see ``CLIENT_INTEGRATION.md``
+> § 12 (Commit identity). This section is the *why*.
+
+The git commit author identity has two slots: NAME (human
+display name, used by GitHub for author-aggregation) and
+EMAIL (a stable per-identity string, used by git tooling for
+disambiguation). As of 0.40.0 the suite uses these as:
+
+- NAME = the user's display name verbatim. GitHub groups
+  commits by NAME, so one person committing from multiple
+  devices appears as one author in the project's contributor
+  list.
+- EMAIL = ``<safe_name>@<safe_device>``. ``git log
+  --format='%ae'`` differentiates by device when the same
+  human commits from a phone vs. a tablet vs. a laptop. The
+  email is non-routable; it's an identifier, not an address.
+
+**Why daemon-owned, no peer pass-through.** Pre-0.40 the
+contributor name lived in two places — peers passed it on
+every sync/init RPC, and the daemon also kept a stored
+fallback. The peer's pass-through won by default. That meant
+a user who typed their name in the daemon UI but had a peer
+hard-coding ``contributor='Recorder'`` got commits attributed
+to "Recorder" anyway, with no visible cause. 0.40 removes the
+wire surface entirely (peer wrappers drop the kwarg, daemon
+endpoints ignore body['contributor']) and forces unset state
+to surface explicitly as ``S.CONTRIBUTOR_UNSET`` rather than
+silently substituting a placeholder. Same architectural rule
+as the rest of the per-user state in NOTES_TO_DAEMON.md's
+sole-authoritative-source table.
+
+**Why device_name auto-populates.** Reading
+``Settings.Global.DEVICE_NAME`` (Android) or
+``socket.gethostname()`` (desktop) on first read gives a
+useful default without forcing the user through a settings
+screen on day one. The OS value is a known label (the user
+named their phone, or the manufacturer slug like
+``"SM-T580"`` is at least diagnosable). User can override via
+the settings UI for clarity / privacy. Empty stored value
+re-triggers detection on next read — a "reset to OS default"
+affordance.
+
+**Why no ``@unknown`` fallback in production.** The
+``unknown-device`` last-resort is the explicit "nothing
+worked" sentinel for the rare case where all autodetect
+probes fail (de-Googled Android with no settings provider, a
+chroot without ``socket.gethostname``). It's visibly a
+placeholder — the same philosophy as removing the
+``'Recorder'`` literal: if the system can't identify the
+device, the commit author should make that obvious, not
+pretend.
+
+**Decision log: why two fields, not one composed string.**
+Storing ``name + device`` as a single user-typed string
+("Marie Dubois (tablet)") would seem simpler but conflates
+two things — and GitHub's author-aggregation can't group by
+"Marie Dubois" if some commits arrive as
+"Marie Dubois (tablet)" and others as "Marie Dubois
+(laptop)". Splitting into NAME and EMAIL leverages git's
+native distinction; the cost is two store fields, the win is
+correct GitHub UX.
 
 ## UI submodule (`azt_collab_client.ui`)
 

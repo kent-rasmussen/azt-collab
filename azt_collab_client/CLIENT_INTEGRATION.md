@@ -235,7 +235,7 @@ peer might expect. If your ``build()`` is already the first
 place that touches Android Java surfaces (the recorder is),
 this is free. If your peer touches Android elsewhere first,
 prewarm may shift the cost rather than reduce it — measure
-with the harness in § 15 if your peer's structure is unusual.
+with the harness in § 16 if your peer's structure is unusual.
 
 Toggle for measurement runs (no rebuild needed):
 - ``$AZT_HOME/_no_prewarm`` sentinel file → opts the call out.
@@ -527,6 +527,124 @@ of:
   (``files[].path`` is the basename peers map to CAWL
   identifiers and remains valid.)
 
+### Daemon-driven prefetch + progress indicator (required when prefetching)
+
+If the peer warms a working-set of CAWL images on project
+load, it MUST do so via the daemon's ``cawl_prefetch``
+endpoint AND surface a user-visible progress indicator while
+the warm runs. Without the indicator, users have no way to
+tell the daemon is using network in the background; they
+naturally disconnect Wi-Fi between gestures and end up with
+a half-warm cache that then blocks on demand-fetch for every
+uncached image.
+
+**Daemon-driven, not peer-driven.** The peer used to iterate
+its working-set itself, calling ``CAWLHandle(...).open_read``
+once per image. That worked but left the daemon ignorant of
+how many images the peer was warming — its progress
+indicator could only count "files on disk vs. all image
+entries in the index", and the canonical CAWL repo has 2-4
+image variants per CAWL identifier so the index's total
+over-counts what the peer actually fetches. Result: a
+progress bar that plateaus far short of "100%" with no way
+for the user to tell whether it's done. Daemon-driven puts
+the iteration on the party that does the actual fetching,
+so progress is accurate by construction.
+
+The split:
+
+- **Bulk warming** → ``cawl_prefetch(langcode, paths)``. Peer
+  hands the daemon its working-set once; daemon iterates in a
+  background thread and reports progress.
+- **On-demand fetch** → ``CAWLHandle(...).open_read`` for any
+  individual image the peer needs to display *right now*
+  (current swipe target, etc.). Still daemon-served from
+  cache or fetched if missing — same backing store the bulk
+  warm populates.
+
+#### Wiring
+
+```python
+from kivy.clock import Clock
+from azt_collab_client import (
+    cawl_index, cawl_prefetch, cawl_cache_status)
+
+def _start_cawl_warm(self, langcode):
+    """Kick off the daemon-driven prefetch + the progress
+    indicator. Call once per project load."""
+    # 1. Compute the working set this peer cares about. The
+    # canonical CAWL repo has multiple variants per identifier;
+    # pick the one your UI will actually render.
+    index = cawl_index(langcode)
+    paths = self._choose_one_variant_per_cawl_id(
+        index.get('files') or [])
+    if not paths:
+        return  # no image_repo, nothing to do
+    # 2. Hand the list to the daemon. Returns immediately;
+    # warm runs in the daemon's background thread.
+    cawl_prefetch(langcode, paths)
+    # 3. Start the progress poll at 1 Hz.
+    self._cache_status_langcode = langcode
+    self._cache_status_last = (-1, -1)
+    self._cache_status_event = Clock.schedule_interval(
+        lambda _dt: self._tick_cache_status(), 1.0)
+    self._tick_cache_status()
+
+def _tick_cache_status(self):
+    status = cawl_cache_status(self._cache_status_langcode)
+    cached, total = status['cached'], status['total']
+    # Log ONLY on state change so a 1 Hz poll doesn't fill
+    # logcat with identical lines.
+    if (cached, total) != self._cache_status_last:
+        print(f'[cache-status] {cached}/{total}',
+              file=sys.stderr)
+        self._cache_status_last = (cached, total)
+    if total == 0:
+        self._hide_cache_indicator()
+        return
+    if cached >= total:
+        self._hide_cache_indicator()
+        self._cache_status_event.cancel()
+        return
+    self._show_cache_indicator(
+        _('Caching images: {cached} / {total} '
+          '(network in use — please stay online)').format(
+              cached=cached, total=total))
+```
+
+Where the indicator lives is peer-specific (collab screen
+status line, persistent toast, banner above the main
+content) — what matters is that it's visible during the
+natural waiting moments AND the wording makes clear that
+network is being used. "Loading…" doesn't cut it; the user
+already assumes loading. The phrase to convey is "don't
+disconnect."
+
+**Polling cadence.** 1 Hz is the right interval — feels live,
+and the daemon's ``cache_status`` is O(1) (counter increment
+per fetch, no per-poll filesystem scan). Stop polling once
+``cached >= total`` so an idle peer doesn't keep waking the
+daemon. Log only on state change; a fixed 1 Hz log of
+unchanged values is just noise.
+
+**On-demand still works.** Peers don't have to wait for the
+prefetch to finish before opening individual images. The
+``CAWLHandle(...).open_read`` path serves from cache or
+fetches on demand; if the prefetch worker hasn't reached a
+specific image yet but the user navigates to it, the
+on-demand request fetches it directly (and the worker will
+skip it later via the cache-hit fast path).
+
+**Backward compatibility.** Pre-0.41.11 daemons return
+``not_found`` for ``cawl_prefetch``; the wrapper returns
+``{requested: 0, completed: 0, finished: True}`` and the
+peer's progress poll sees the no-prefetch fallback semantics
+of ``cache_status``. Pre-0.41.9 daemons return ``not_found``
+for ``cache_status`` too; the wrapper returns
+``{cached: 0, total: 0}``, which trips the "nothing to show"
+branch and hides the indicator. Either way: no peer-side
+version pin needed; call sites degrade gracefully.
+
 ## 11. Per-project overrides (`cawl_image_repo`, `repo_slug`)
 
 Two per-project string fields live on the daemon's project
@@ -576,14 +694,106 @@ single authoritative source. A peer that caches the slug in
 its own prefs has to keep two copies in sync, and they will
 drift. Read each time.
 
-## 12. Granting collaborator access
+## 12. Commit identity (contributor + device_name)
 
-Peers that want to let a project owner invite others to the
-backing GitHub repo wire ``grant_collaborator_popup`` into the
-peer's **per-project settings surface** — not a global setting.
-The operation is meaningless without a specific project context,
-and the UX guarantee is that the user can't be confused about
-which repo they're acting on. Pattern:
+As of 0.40.0 the daemon owns the git commit author identity
+end-to-end. Peers DO NOT pass a contributor name on the wire;
+the daemon resolves from its store every time it issues a
+commit.
+
+**Required calls.**
+
+```python
+from azt_collab_client import (
+    get_contributor, set_contributor,
+    get_device_name, set_device_name,
+)
+```
+
+- ``set_contributor(name)`` — persist the user's display name
+  (the human visible in ``git log``). Empty string clears.
+- ``get_contributor()`` — read it back. Empty string means
+  unset; the user has not entered a name yet.
+- ``get_device_name()`` — read the device-name label. Auto-
+  populates from the OS on first call (Android:
+  ``Settings.Global.DEVICE_NAME`` → ``Build.MANUFACTURER +
+  MODEL``; desktop: ``socket.gethostname()``), so a non-empty
+  string comes back on a fresh install.
+- ``set_device_name(name)`` — override the autodetected
+  label. Empty clears and re-triggers OS autodetect on next
+  read.
+
+The daemon composes the git author identity as
+``<name> <safe_contributor>@<safe_device>`` — author name
+groups GitHub commits by human, email distinguishes commits
+across the same human's devices.
+
+**Hard rules.**
+
+- **Don't pass ``contributor=`` to any RPC wrapper.** The
+  signature is gone from ``init_project``, ``sync_project``,
+  ``request_sync`` as of 0.40.0. Pre-migration peer code that
+  still passes it in the body will have the value silently
+  ignored by the daemon — but you should remove the call-site
+  arg as part of the upgrade so the code matches the wire.
+- **Don't mirror ``contributor`` or ``device_name`` in peer
+  prefs / config / globals.** Same single-source-of-truth
+  rule as the per-project settings in § 11. Read each time
+  via ``get_contributor()`` / ``get_device_name()``.
+- **Handle ``S.CONTRIBUTOR_UNSET``** as a routing-class
+  failure on user-initiated sync: surface a toast / dialog
+  with "Please set your name in sync settings" + a button to
+  ``open_server_ui()`` (which lands the user on the daemon
+  settings UI where ``set_contributor`` is wired). On
+  auto-sync, silence (same shape as other config-class
+  failures per the daemon-client contract).
+
+**Sync-result routing.** ``CONTRIBUTOR_UNSET`` fits the
+existing routing table from the daemon-client contract:
+treat it like ``AUTH_REQUIRED`` / ``NOT_A_REPO`` — silent on
+auto-sync, actionable + route-to-settings on user-initiated
+sync. The status is returned by:
+
+- ``init_project(...)`` synchronously (publish flow).
+- ``sync_project(langcode)`` synchronously.
+- ``poll_job(job_id)`` for an async ``request_sync`` that the
+  scheduler refused at exec time (defence-in-depth).
+
+**UI for setting these.** Both fields should live on the
+daemon settings UI's "User identity" surface — the daemon
+settings UI is the canonical home (peer apps delegate via
+``open_server_ui()``). A peer with its own first-run flow
+MAY prompt for the contributor name inline to spare the user
+the round-trip to settings on day one, but the persist call
+goes through ``set_contributor`` exactly the same way; the
+data lives on the daemon.
+
+## 13. Granting collaborator access
+
+**Recommended (azt_collabd 0.41.0+): delegate to the daemon
+settings UI.** The daemon now hosts a "Grant collaborator
+access" button on the SettingsScreen, bound to
+``last_project()`` — peers expose a single "Open Sync
+Settings" button (``open_server_ui()``) and the user does the
+invite in the daemon UI. No per-peer UI to maintain; the
+"user can't be confused about which repo" disambiguation
+guarantee is carried by the daemon UI's project-identity
+display.
+
+```python
+from azt_collab_client import open_server_ui
+
+def _on_invite_btn(self, *_):
+    # Delegate; the daemon UI shows the current project's
+    # langcode + remote URL and the invite UI inline.
+    open_server_ui(on_status=self._set_log)
+```
+
+**Direct invocation (if your peer hosts its own per-project
+surface):** wire ``grant_collaborator_popup`` from the shared
+client UI module. Same contract — langcode-driven, daemon
+owns the project lookup — just hosted on the peer instead of
+the daemon.
 
 ```python
 from azt_collab_client.ui import grant_collaborator_popup
@@ -643,7 +853,7 @@ rather than substring-matching on codes.
   something else; valid GitHub values are ``pull`` /
   ``triage`` / ``push`` / ``maintain`` / ``admin``.
 
-## 13. Smooth UI across reloads
+## 14. Smooth UI across reloads
 
 A peer's view of project data has two backing stores: the
 canonical bytes on disk (owned by the daemon, refreshed by
@@ -696,11 +906,11 @@ has none of this). The contract is the principle, not the
 recipe.
 
 ```python
-# Example shape (recorder-flavoured; adapt to your model):
+# Example shape (adapt to your model):
 from azt_collab_client import sync_project, LiftHandle, S
 
 def _on_sync_tap(self, *_):
-    result = sync_project(self._current_langcode, self._contributor)
+    result = sync_project(self._current_langcode)
     if result.has(S.PULLED):
         self._refresh_in_place()
     # ... surface other status codes through translate_result ...
@@ -735,7 +945,7 @@ project, a daemon-restart notice, a future `MERGED_REMOTE`
 status. The user's anchor stays; the content under it
 refreshes; nothing else moves.
 
-## 14. Recovery
+## 15. Recovery
 
 The single peer-visible recovery surface is
 ``Result.has(S.JOB_INTERRUPTED)`` from ``request_sync`` /
@@ -743,7 +953,7 @@ The single peer-visible recovery surface is
 ``sync_project`` callers don't see this code — the transport
 retries internally.
 
-## 15. Testing
+## 16. Testing
 
 The suite has a pytest scaffold in the canonical
 ``azt-collab/tests/`` directory. Run ``pytest tests/ -q`` from the
@@ -821,7 +1031,7 @@ peer; don't duplicate them in your peer code:
   sheet for the running APK.
 - ``azt_collab_client.ui.popups.grant_collaborator_popup`` —
   per-project "invite a GitHub collaborator" popup; wire it from
-  your project-context settings (see § 12).
+  your project-context settings (see § 13).
 - ``azt_collab_client.ui.LangPickerScreen`` /
   ``ProjectPickerScreen`` / ``LiftHandle`` / ``MediaHandle`` — see
   ``azt_collab_client/CLAUDE.md`` for the longer rundown.

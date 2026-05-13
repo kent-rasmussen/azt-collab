@@ -347,12 +347,16 @@ def test_get_image_path_fetch_failure_returns_none(monkeypatch):
 
 
 def test_get_image_path_rejects_path_traversal():
+    # ``subdir/file.jpg`` is NOT in this list — nested paths are
+    # valid since 0.41.1 (CAWL repos commonly nest images under
+    # category subdirs). Only path-traversal shapes are rejected.
     for bad in ('../etc/passwd', '..', '.', '/abs/path',
-                'subdir/file.jpg', '\\windows'):
-        assert cawl.get_image_path('kent/images', bad) is None
+                '\\windows', 'foo//bar', 'a/../b'):
+        assert cawl.get_image_path('kent/images', bad) is None, (
+            f'expected {bad!r} to be rejected as unsafe rel_path')
 
 
-def test_get_image_path_empty_basename_rejected():
+def test_get_image_path_empty_rel_path_rejected():
     assert cawl.get_image_path('kent/images', '') is None
     assert cawl.get_image_path('kent/images', None) is None
 
@@ -362,6 +366,67 @@ def test_get_image_path_empty_repo_returns_none(monkeypatch):
     monkeypatch.setattr(cawl.urllib.request, 'urlopen', fake)
     assert cawl.get_image_path('', 'cawl-1.jpg') is None
     assert fake.calls == 0
+
+
+# ── Nested rel-paths (0.41.1 fix) ───────────────────────────────────────
+
+
+def test_get_image_path_accepts_nested_rel_path(monkeypatch):
+    """CAWL repos commonly nest images under category subdirs
+    (e.g. ``0001_body/<filename>.png``). The daemon must accept
+    these and write them at the corresponding nested location
+    in the cache. Pre-0.41.1 the daemon rejected any path with
+    ``/`` silently — the regression test pins the fix."""
+    payload = b'\x89PNG-nested-bytes'
+    monkeypatch.setattr(cawl.urllib.request, 'urlopen',
+                        _FakeUrlopen(body=payload))
+    target = cawl.get_image_path(
+        'kent/images', '0001_body/foo.png')
+    assert target is not None
+    assert target.endswith(
+        os.path.join('cawl', 'kent', 'images', 'images',
+                     '0001_body', 'foo.png'))
+    assert open(target, 'rb').read() == payload
+
+
+def test_get_image_path_accepts_spaces_and_special_chars(monkeypatch):
+    """CAWL filenames in the canonical repo include spaces,
+    commas, parentheses — they're URL-encoded for transit, but
+    on disk the rel_path is the human-readable form. Make sure
+    that round-trips."""
+    payload = b'\x89PNG'
+    monkeypatch.setattr(cawl.urllib.request, 'urlopen',
+                        _FakeUrlopen(body=payload))
+    target = cawl.get_image_path(
+        'kent/images',
+        '0001_body/2d minimalistic, line art (female)_0_bw.png')
+    assert target is not None
+    assert os.path.isfile(target)
+    assert open(target, 'rb').read() == payload
+
+
+def test_fetch_url_encodes_path_components(monkeypatch):
+    """The URL the daemon hits at raw.githubusercontent.com must
+    URL-encode path components — slashes between components stay
+    intact (so the directory structure is preserved), but
+    spaces / commas / parens get percent-encoded.
+
+    Verifies the URL by inspecting the recorded urls in
+    _FakeUrlopen rather than introspecting urllib internals."""
+    payload = b'\x89PNG'
+    fake = _FakeUrlopen(body=payload)
+    monkeypatch.setattr(cawl.urllib.request, 'urlopen', fake)
+    cawl.get_image_path(
+        'kent/images', '0001_body/foo bar, baz (qux).png')
+    assert fake.calls == 1
+    fetched_url = fake.url_history[-1]
+    # Slashes preserved (component structure).
+    assert '0001_body/' in fetched_url
+    # Spaces / commas / parens encoded.
+    assert ' ' not in fetched_url
+    assert '%20' in fetched_url
+    assert '%2C' in fetched_url
+    assert '%28' in fetched_url
 
 
 # ── Index endpoint via dispatcher ────────────────────────────────────────
@@ -502,6 +567,51 @@ def test_match_cawl_image_path_rejects_wrong_prefix():
         '/v2/projects/sw-x-test/cawl/images/x.jpg') is None
 
 
+def test_match_cawl_image_path_accepts_nested_path():
+    """0.41.1: nested paths (CAWL repos with category subdirs)
+    must round-trip through the matcher. The wire form has the
+    components joined with ``/``; the matcher returns them
+    re-joined into a single rel_path."""
+    assert srv._match_cawl_image_path(
+        '/v1/projects/sw-x-test/cawl/images/0001_body/foo.png') \
+        == ('sw-x-test', '0001_body/foo.png')
+
+
+def test_match_cawl_image_path_url_decodes_components():
+    """Spaces and other unsafe characters arrive percent-encoded
+    on the wire (peer-side ``urllib.parse.quote``); the matcher
+    decodes per-component so the daemon sees the on-disk form."""
+    # ``%20`` is space, ``%2C`` is comma, ``%28``/``%29`` are parens.
+    encoded = (
+        '/v1/projects/sw-x-test/cawl/images/'
+        '0001_body/2d%20line%20art%2C%20%28female%29.png')
+    langcode, rel_path = srv._match_cawl_image_path(encoded)
+    assert langcode == 'sw-x-test'
+    assert rel_path == '0001_body/2d line art, (female).png'
+
+
+def test_match_cawl_image_path_rejects_traversal_post_decode():
+    """Defence-in-depth: a peer that URL-encodes ``..`` as
+    ``%2E%2E`` still gets rejected. After decode, the segment
+    becomes ``..`` and the matcher refuses."""
+    encoded = (
+        '/v1/projects/sw-x-test/cawl/images/'
+        '%2E%2E/etc/passwd')
+    assert srv._match_cawl_image_path(encoded) is None
+
+
+def test_match_cawl_image_path_rejects_slash_in_decoded_segment():
+    """A peer that double-encodes a slash (``%2F`` → ``/`` after
+    decode) would let one URL segment expand into a path. Reject
+    that — the wire form is "segments separated by /, each segment
+    has no embedded /". Catches an attack a naive matcher would
+    miss."""
+    encoded = (
+        '/v1/projects/sw-x-test/cawl/images/'
+        '0001_body%2F..%2Fpasswd.png')
+    assert srv._match_cawl_image_path(encoded) is None
+
+
 # ── Image binary handler ────────────────────────────────────────────────
 
 
@@ -544,6 +654,21 @@ def test_h_cawl_image_bytes_404_on_fetch_failure(monkeypatch):
     assert status == 404
 
 
+def test_h_cawl_image_bytes_serves_nested_rel_path(monkeypatch):
+    """End-to-end: nested rel_path through the binary handler.
+    Regression test for the 0.41.1 fix — pre-fix, this returned
+    404 silently because the daemon rejected any path with ``/``."""
+    _register_project()
+    payload = b'\x89PNG-nested'
+    monkeypatch.setattr(cawl.urllib.request, 'urlopen',
+                        _FakeUrlopen(body=payload))
+    status, ctype, data = srv._h_cawl_image_bytes(
+        'sw-x-test', '0001_body/foo.png')
+    assert status == 200
+    assert ctype == 'image/png'
+    assert data == payload
+
+
 def test_content_type_for_extensions():
     assert srv._content_type_for('foo.jpg') == 'image/jpeg'
     assert srv._content_type_for('foo.jpeg') == 'image/jpeg'
@@ -579,6 +704,23 @@ def test_resolve_path_cawl_image_returns_cached_path(monkeypatch):
     assert open(target, 'rb').read() == payload
 
 
+def test_resolve_path_cawl_image_accepts_nested(monkeypatch):
+    """0.41.1: ContentProvider routes nested paths (category
+    subdir + filename) through to ``cawl.get_image_path``.
+    Regression test for the silent rejection bug."""
+    _register_project()
+    payload = b'\x89PNG-nested'
+    monkeypatch.setattr(cawl.urllib.request, 'urlopen',
+                        _FakeUrlopen(body=payload))
+    target = cp_service._resolve_path(
+        '/sw-x-test/cawl/images/0001_body/foo.png', 'r')
+    assert target is not None
+    assert open(target, 'rb').read() == payload
+    assert target.endswith(
+        os.path.join('cawl', 'kent', 'images', 'images',
+                     '0001_body', 'foo.png'))
+
+
 def test_resolve_path_cawl_rejects_write_mode(monkeypatch):
     _register_project()
     body = _stub_tree_response(['cawl-1.jpg'])
@@ -606,19 +748,24 @@ def test_resolve_path_cawl_no_repo_configured_returns_none(monkeypatch):
         '/sw-x-test/cawl/index.json', 'r') is None
 
 
-def test_resolve_path_cawl_rejects_basename_traversal(monkeypatch):
+def test_resolve_path_cawl_rejects_traversal(monkeypatch):
+    """``..`` and other path-traversal shapes are rejected. Note
+    that ``sub/file.png`` is NOT in this list as of 0.41.1 —
+    nested paths are now valid (see
+    ``test_resolve_path_cawl_image_accepts_nested``)."""
     _register_project()
     body = _stub_tree_response(['cawl-1.jpg'])
     monkeypatch.setattr(cawl.urllib.request, 'urlopen',
                         _FakeUrlopen(body=body))
-    # ``..`` segments rejected by the generic empty/dot guard.
+    # ``..`` mid-path rejected by the outer ``_resolve_path``
+    # empty/dot guard.
     assert cp_service._resolve_path(
         '/sw-x-test/cawl/../images/x.png', 'r') is None
-    # ``cawl/images/<basename>`` with a traversing basename:
-    # the cawl branch processes ``rest=['images', '../etc/passwd']``;
-    # get_image_path rejects unsafe basenames.
+    # ``cawl/images/../etc/passwd`` — the outer guard rejects
+    # the ``..`` segment in the rel before we even reach the
+    # cawl branch.
     assert cp_service._resolve_path(
-        '/sw-x-test/cawl/images/sub/file.png', 'r') is None
+        '/sw-x-test/cawl/images/../etc/passwd', 'r') is None
 
 
 # ── Cross-project sharing of one repo's cache ───────────────────────────
