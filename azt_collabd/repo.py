@@ -10,6 +10,7 @@ rather than raising; that matches the existing log-append style.
 import io
 import json
 import os
+import re
 import sys
 
 from . import config as _config
@@ -27,9 +28,169 @@ def _busy_result(working_dir):
     return Result().add(S.BUSY, working_dir=os.path.abspath(working_dir))
 
 
+def _sha_str(sha):
+    """Coerce a sha (bytes / str / None) to a string suitable for
+    storage in a diagnostic XML attribute. Empty when the input
+    is empty/None."""
+    if not sha:
+        return ''
+    if isinstance(sha, bytes):
+        try:
+            return sha.decode('ascii')
+        except UnicodeDecodeError:
+            return sha.hex()
+    return str(sha)
+
+
+def _write_merge_diagnostic(project_dir, *, guard_kind, lift_path,
+                             local_sha, remote_sha, base_sha,
+                             base_bytes, ours_bytes, theirs_bytes,
+                             merged_bytes, conflict_fields):
+    """Persist a forensic-data XML dump under
+    ``<working_dir>/.azt-collab/diagnostics/<timestamp>-<kind>-<nonce>.xml``
+    when a daemon-side merge guard fires. The file gets staged
+    into the merge commit by ``_stage_all`` and pushed alongside
+    the rest of the merge, so a later analysis can ``git log
+    .azt-collab/diagnostics/`` to find when guards fired and
+    ``git show <commit>:.azt-collab/diagnostics/<file>.xml`` to
+    read the dump.
+
+    Best-effort: failures here are logged to stderr and
+    swallowed so a diagnostic-write hiccup doesn't block the
+    merge commit itself."""
+    try:
+        import azt_collabd
+        diag_dir = os.path.join(project_dir, *lift_merge.DIAGNOSTICS_SUBDIR)
+        os.makedirs(diag_dir, exist_ok=True)
+        diag_filename = lift_merge.diagnostic_filename(guard_kind)
+        diag_path = os.path.join(diag_dir, diag_filename)
+        diag_bytes = lift_merge.build_diagnostic_xml(
+            guard_kind=guard_kind,
+            lift_path=lift_path,
+            local_sha=local_sha,
+            remote_sha=remote_sha,
+            base_sha=base_sha,
+            base_bytes=base_bytes,
+            ours_bytes=ours_bytes,
+            theirs_bytes=theirs_bytes,
+            merged_bytes=merged_bytes,
+            conflict_fields=conflict_fields,
+            daemon_version=getattr(azt_collabd, '__version__', ''),
+            working_dir=project_dir,
+        )
+        # Atomic write: don't risk staging a half-written
+        # diagnostic into the merge commit.
+        tmp_path = diag_path + '.tmp'
+        with open(tmp_path, 'wb') as f:
+            f.write(diag_bytes)
+        os.replace(tmp_path, diag_path)
+        lift_merge.trace(
+            f'[merge-diag] guard={guard_kind} dumped to '
+            f'{diag_path!r} ({len(diag_bytes)} bytes)')
+    except Exception as ex:
+        lift_merge.trace(
+            f'[merge-diag] failed to write diagnostic: '
+            f'{type(ex).__name__}: {ex}')
+
+
+# ``\b403\b`` matches HTTP 403 in messages like
+# ``"unexpected http resp 403 for https://..."`` (dulwich's
+# GitProtocolError format) but NOT inside a 40-char hex SHA — hex is
+# all word chars, so the ``\b`` anchors don't fire between adjacent
+# digits. Plain ``'403' in str(exc)`` false-positives on any
+# ``DivergedBranches`` whose hex SHAs happen to contain ``403`` as a
+# substring (probability ~1 in 250 per push: 4 digits × ~10⁻³ for the
+# trigraph in a 40-char string), and the false positive routes a
+# diverged-branch failure through ``diagnose_403`` which then reports
+# a bogus ``REPO_NOT_AUTHORIZED`` — observed in the field, blocked
+# real sync for ~25 minutes of a user's session.
+_HTTP_403_RE = re.compile(r'\b403\b')
+
+
+def _is_http_403(exc):
+    return bool(_HTTP_403_RE.search(str(exc)))
+
+
 # ---------------------------------------------------------------------------
 # Merge helpers (LIFT-aware three-way)
 # ---------------------------------------------------------------------------
+
+def _apply_tree_to_workdir(repo, project_dir, old_sha, new_sha):
+    """Update the working tree + index from ``old_sha`` to ``new_sha``.
+
+    Used by the fast-forward branch of ``_sync_repo_locked``: just
+    moving the branch ref forward updates git's view of HEAD but
+    leaves the on-disk files at the old version, so peers reading
+    the LIFT file (via ``LiftHandle``) get stale bytes and the
+    "phone B doesn't see phone A's changes" symptom appears even
+    when the daemon's logs show ``S.PULLED`` and ``S.PUSHED``.
+
+    Diff-driven (write only what changed, delete only what's gone)
+    rather than nuking + re-extracting the whole tree, so we don't
+    touch unrelated untracked files in the working dir (audio
+    recordings the user just made and hasn't committed yet, etc.).
+
+    The index is reset to ``new_sha``'s tree at the end so the next
+    ``porcelain.status`` call doesn't see the gap between old-index
+    / new-HEAD as a giant diff. Best-effort: if the dulwich version
+    here doesn't expose ``repo.reset_index`` we rebuild the index
+    via ``_stage_all`` instead. ``_stage_all`` is heavier but
+    correct."""
+    if not new_sha:
+        return
+    if old_sha:
+        try:
+            old_commit = repo[old_sha]
+            old_blobs = _walk_tree(repo, old_commit.tree)
+        except KeyError:
+            old_blobs = {}
+    else:
+        old_blobs = {}
+    try:
+        new_commit = repo[new_sha]
+    except KeyError:
+        return
+    new_blobs = _walk_tree(repo, new_commit.tree)
+
+    # Write changed / added files.
+    for path, content in new_blobs.items():
+        if old_blobs.get(path) == content:
+            continue
+        full = os.path.join(project_dir, path)
+        parent = os.path.dirname(full) or project_dir
+        os.makedirs(parent, exist_ok=True)
+        with open(full, 'wb') as f:
+            f.write(content)
+
+    # Remove files in old tree but not new tree.
+    for path in old_blobs:
+        if path in new_blobs:
+            continue
+        full = os.path.join(project_dir, path)
+        try:
+            os.remove(full)
+        except OSError:
+            pass
+
+    # Reset the index to the new tree so subsequent status / commit
+    # calls don't think the user has a giant diff to commit.
+    # ``repo.reset_index`` is the canonical dulwich API; if it
+    # raises (older dulwich, IO error), fall back to re-staging
+    # the working tree.
+    try:
+        repo.reset_index(new_commit.tree)
+        return
+    except Exception as ex:
+        lift_merge.trace(
+            f'[sync-trace] _apply_tree_to_workdir reset_index '
+            f'failed, falling back to _stage_all: {ex!r}')
+    try:
+        _stage_all(repo, project_dir)
+    except Exception as ex:
+        lift_merge.trace(
+            f'[sync-trace] _apply_tree_to_workdir index fallback '
+            f'failed: {ex!r}')
+
 
 def _walk_tree(repo, tree_sha, prefix=b''):
     """Return dict[path-as-str → blob bytes] for every file under *tree_sha*."""
@@ -177,6 +338,25 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
             mr = lift_merge.three_way_merge(b or b'', o, t, path=path)
             merged_writes[path] = mr.merged_bytes
             conflicts.extend(mr.conflicts)
+            # Persist a forensic dump for any guard trip. The dump
+            # lands under ``<working_dir>/.azt-collab/diagnostics/``
+            # and gets staged into the merge commit by the
+            # ``_stage_all`` below — pushed to the remote as a
+            # normal file, retrievable post-hoc from any clone.
+            # User isn't bothered; daemon team / future LLM can
+            # diff git history to find the dumps.
+            for _c in mr.conflicts:
+                if lift_merge.is_guard_kind(_c.kind):
+                    _write_merge_diagnostic(
+                        project_dir, guard_kind=_c.kind, lift_path=path,
+                        local_sha=_sha_str(local_sha),
+                        remote_sha=_sha_str(remote_sha),
+                        base_sha=_sha_str(base_sha) if base_sha else '',
+                        base_bytes=b or b'', ours_bytes=o,
+                        theirs_bytes=t,
+                        merged_bytes=mr.merged_bytes,
+                        conflict_fields=_c.fields)
+                    break   # one dump per merged file is enough
             continue
 
         if o == t:
@@ -231,25 +411,21 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
     msg = msg_str.encode('utf-8')
 
     bot = _enc(merge_commit.bot_identity())
-    try:
-        sha = porcelain.commit(
-            repo, message=msg,
-            author=bot, committer=bot,
-            merge_heads=[remote_sha],
-        )
-    except TypeError:
-        # Older dulwich without merge_heads — manually attach the
-        # extra parent below.
-        sha = porcelain.commit(
-            repo, message=msg, author=bot, committer=bot)
-        try:
-            commit = repo[sha]
-            commit.parents = list(commit.parents) + [remote_sha]
-            repo.object_store.add_object(commit)
-            repo.refs[_enc(f'refs/heads/{branch}')] = commit.id
-            sha = commit.id
-        except Exception as ex:
-            print(f'[merge] could not graft second parent: {ex}')
+    # ``porcelain.commit`` does NOT expose ``merge_heads`` as a public
+    # kwarg (it's used internally only for ``amend``). Passing it
+    # raises ``TypeError`` on dulwich 1.2.x, and the older grafting
+    # fallback (mutate ``commit.parents`` post-hoc + re-add to object
+    # store) silently produces a commit whose stored parents are
+    # ``[local_sha]`` only — the next push then rejects with
+    # ``DivergedBranches`` because the merge commit doesn't actually
+    # contain ``remote_sha``. Drop down to the worktree-level commit
+    # API, which DOES accept ``merge_heads`` and sets
+    # ``c.parents = [old_head, *merge_heads]`` atomically before
+    # writing the object + advancing the ref.
+    sha = repo.get_worktree().commit(
+        message=msg, author=bot, committer=bot,
+        merge_heads=[remote_sha],
+    )
     return sha, conflicts
 
 
@@ -686,8 +862,9 @@ def _pull_repo_locked(project_dir, username, token):
         result.add(S.NO_REMOTE)
         return result
     try:
+        # Remote NAME, not URL — see _sync_repo_locked for why.
         porcelain.pull(
-            repo, remote_url,
+            repo, 'origin',
             username=username, password=token,
             errstream=io.BytesIO(),
         )
@@ -836,23 +1013,38 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
         except KeyError:
             return None
 
-    # Fetch (no merge yet)
-    print(f'[sync-trace] fetch begin remote={remote_url!r}',
-          file=sys.stderr, flush=True)
+    # Fetch (no merge yet).
+    #
+    # Pass the remote NAME (``'origin'``), not the URL. Dulwich's
+    # ``porcelain.fetch`` only writes ``refs/remotes/<name>/<branch>``
+    # when ``get_remote_repo`` can resolve the first positional arg
+    # back to a configured remote section (``porcelain/__init__.py``
+    # gates ``_import_remote_refs`` on ``remote_name is not None``).
+    # Passing the URL leaves ``remote_name=None``, so the fetch
+    # downloads new objects but the local tracking ref stays frozen
+    # at whatever ``porcelain.clone`` wrote at project-create time.
+    # Symptom in the field: ``remote_sha`` read from
+    # ``refs/remotes/origin/main`` was the *clone-time* SHA forever;
+    # the merge kept reconciling against a phantom remote tip, every
+    # push attempt lost the same race, and 3 retries later we gave
+    # up with ``PUSH_FAILED``. Dulwich resolves ``'origin'`` to the
+    # URL via the config we already populated in
+    # ``_init_repo_locked`` / ``_clone_repo_locked``, so the URL we
+    # read above is only used for diagnostics and error reporting.
+    lift_merge.trace(f'[sync-trace] fetch begin remote={remote_url!r}')
     try:
         porcelain.fetch(
-            repo, remote_url,
+            repo, 'origin',
             username=username, password=token,
             errstream=io.BytesIO(),
         )
     except Exception as exc:
-        if '403' in str(exc):
+        if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
             return result
         # Non-fatal: maybe remote is empty or temporarily unreachable.
         result.add(S.PULL_FAILED, error=str(exc))
-    print('[sync-trace] fetch done',
-          file=sys.stderr, flush=True)
+    lift_merge.trace('[sync-trace] fetch done')
 
     # ``repo.refs`` is ``DiskRefsContainer`` which does NOT define a
     # dict-style ``.get()`` — only ``__getitem__`` (raises ``KeyError``
@@ -865,29 +1057,35 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     # dulwich API: subscript + ``KeyError`` for missing.
     local_sha = _read_ref(branch_ref) or repo.head()
     remote_sha = _read_ref(remote_ref)
-    print(f'[sync-trace] local_sha={local_sha!r} '
-          f'remote_sha={remote_sha!r}',
-          file=sys.stderr, flush=True)
+    lift_merge.trace(
+        f'[sync-trace] local_sha={local_sha!r} remote_sha={remote_sha!r}')
 
     retries_remaining = max(1, _settings.merge_retry_max())
     needs_merge = remote_sha is not None and remote_sha != local_sha
-    print(f'[sync-trace] needs_merge={needs_merge}',
-          file=sys.stderr, flush=True)
+    lift_merge.trace(f'[sync-trace] needs_merge={needs_merge}')
 
     if needs_merge and _is_ancestor(repo, local_sha, remote_sha):
         # Fast-forward
-        print('[sync-trace] fast-forward', file=sys.stderr, flush=True)
+        lift_merge.trace('[sync-trace] fast-forward')
+        prev_local_sha = local_sha
         repo.refs[branch_ref] = remote_sha
+        # Materialise the new tree to the working directory + index.
+        # Bumping the ref alone leaves on-disk files at the old
+        # bytes — ``LiftHandle`` then serves stale content to peers
+        # and the user-visible symptom is "Phone B never sees Phone
+        # A's changes." ``_apply_tree_to_workdir`` writes the diff
+        # between prev_local_sha and remote_sha and resets the
+        # index so the next ``porcelain.status`` is clean.
+        _apply_tree_to_workdir(
+            repo, project_dir, prev_local_sha, remote_sha)
         local_sha = remote_sha
         result.add(S.PULLED)
     elif needs_merge and _is_ancestor(repo, remote_sha, local_sha):
         # We're already ahead — nothing to merge
-        print('[sync-trace] local ahead of remote',
-              file=sys.stderr, flush=True)
+        lift_merge.trace('[sync-trace] local ahead of remote')
         pass
     elif needs_merge:
-        print('[sync-trace] merge_diverged begin',
-              file=sys.stderr, flush=True)
+        lift_merge.trace('[sync-trace] merge_diverged begin')
         try:
             merged_sha, conflicts = _merge_diverged(
                 repo, project_dir, branch, local_sha, remote_sha)
@@ -896,33 +1094,31 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
             if conflicts:
                 result.add('CONFLICTS',
                            paths=[c.path for c in conflicts][:50])
-            print(f'[sync-trace] merge_diverged done '
-                  f'conflicts={len(conflicts)}',
-                  file=sys.stderr, flush=True)
+            lift_merge.trace(
+                f'[sync-trace] merge_diverged done '
+                f'conflicts={len(conflicts)}')
         except Exception as exc:
-            print(f'[sync-trace] merge_diverged FAILED: {exc}',
-                  file=sys.stderr, flush=True)
+            lift_merge.trace(f'[sync-trace] merge_diverged FAILED: {exc}')
             result.add(S.PULL_FAILED, error=f'merge failed: {exc}')
             return result
 
     # Push, with retry loop for races (someone pushed between our
     # fetch and our push).
     refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
-    print(f'[sync-trace] push loop begin retries={retries_remaining}',
-          file=sys.stderr, flush=True)
+    lift_merge.trace(
+        f'[sync-trace] push loop begin retries={retries_remaining}')
     while retries_remaining > 0:
         retries_remaining -= 1
-        print(f'[sync-trace] push attempt '
-              f'(retries_remaining_after={retries_remaining})',
-              file=sys.stderr, flush=True)
+        lift_merge.trace(
+            f'[sync-trace] push attempt '
+            f'(retries_remaining_after={retries_remaining})')
         try:
             porcelain.push(
                 repo, remote_url, refspec,
                 username=username, password=token,
                 errstream=io.BytesIO(),
             )
-            print('[sync-trace] push done',
-                  file=sys.stderr, flush=True)
+            lift_merge.trace('[sync-trace] push done')
             # Push advances the remote on GitHub but doesn't update the
             # *local mirror* of refs/remotes/origin/<branch>. Without
             # this set, ``_count_commits_ahead`` keeps comparing the
@@ -933,35 +1129,43 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
             try:
                 repo.refs[remote_ref] = local_sha
             except Exception as ex:
-                print(f'[sync-trace] post-push remote-mirror '
-                      f'update failed: {ex!r}',
-                      file=sys.stderr, flush=True)
+                lift_merge.trace(
+                    f'[sync-trace] post-push remote-mirror '
+                    f'update failed: {ex!r}')
             result.add(S.PUSHED, branch=branch)
             return result
         except Exception as exc:
-            print(f'[sync-trace] push raised: {exc!r}',
-                  file=sys.stderr, flush=True)
-            if '403' in str(exc):
+            lift_merge.trace(f'[sync-trace] push raised: {exc!r}')
+            if _is_http_403(exc):
                 result.statuses.append(diagnose_403(token, remote_url))
                 return result
             if retries_remaining <= 0:
                 result.add(S.PUSH_FAILED, error=str(exc))
                 return result
-            # Try to fetch + remerge once more
+            # Try to fetch + remerge once more. Use the remote NAME
+            # so dulwich updates ``refs/remotes/origin/<branch>`` —
+            # see the rationale above the initial fetch call.
             try:
                 porcelain.fetch(
-                    repo, remote_url,
+                    repo, 'origin',
                     username=username, password=token,
                     errstream=io.BytesIO(),
                 )
                 new_remote = _read_ref(remote_ref)
+                lift_merge.trace(
+                    f'[sync-trace] retry fetch new_remote={new_remote!r} '
+                    f'local_sha={local_sha!r}')
                 if new_remote and new_remote != local_sha and \
                         not _is_ancestor(repo, local_sha, new_remote):
                     merged_sha, _ = _merge_diverged(
                         repo, project_dir, branch, local_sha, new_remote)
+                    lift_merge.trace(
+                        f'[sync-trace] retry merge done '
+                        f'merged_sha={merged_sha!r}')
                     local_sha = merged_sha
-            except Exception:
-                pass
+            except Exception as ex:
+                lift_merge.trace(
+                    f'[sync-trace] retry fetch/merge failed: {ex!r}')
     return result
 
 
@@ -1066,15 +1270,16 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
     except Exception:
         branch = 'main'
 
-    # Pull first (fetch + merge) so push won't be rejected
+    # Pull first (fetch + merge) so push won't be rejected. Remote
+    # NAME, not URL — see _sync_repo_locked for why.
     try:
         porcelain.pull(
-            repo, remote_url,
+            repo, 'origin',
             username=username, password=token,
             errstream=io.BytesIO(),
         )
     except Exception as exc:
-        if '403' in str(exc):
+        if _is_http_403(exc):
             # Local commit is safe; surface the access issue
             result.statuses.append(diagnose_403(token, remote_url))
             return result
@@ -1091,7 +1296,7 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
         )
         result.add(S.COMMITTED_AND_PUSHED, n=n)
     except Exception as exc:
-        if '403' in str(exc):
+        if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
         else:
             result.add(S.PUSH_FAILED, error=str(exc))

@@ -1,0 +1,6 @@
+# summary
+  peer   peer wait until daemon answered                    0.059s
+  peer   prewarm overlap window                             1.844s
+  daemon daemon Python boot to dispatcher live              0.593s
+  daemon azt_collabd import cost                            0.112s
+  daemon reconcile_on_startup cost                          0.413s

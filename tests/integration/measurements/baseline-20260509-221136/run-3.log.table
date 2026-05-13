@@ -1,0 +1,19 @@
+wall	proc	phase	t_proc	extras
+05-09 20:12:44.120	peer	prewarm_called	0.062	
+05-09 20:12:44.143	peer	prewarm_bound_main_thread	0.085	
+05-09 20:12:44.159	peer	prewarm_worker_start	0.088	
+05-09 20:12:44.559	daemon	module_loaded	0.000	
+05-09 20:12:44.559	daemon	main_entered	0.000	
+05-09 20:12:44.559	daemon	before_import_azt_collabd	0.000	
+05-09 20:12:44.681	daemon	after_import_azt_collabd	0.122	
+05-09 20:12:44.681	daemon	configured	0.123	
+05-09 20:12:44.771	daemon	before_install_callbacks	0.212	
+05-09 20:12:45.177	daemon	after_install_callbacks	0.618	
+05-09 20:12:45.177	daemon	before_reconcile	0.618	
+05-09 20:12:45.328	daemon	after_reconcile	0.769	
+05-09 20:12:45.328	daemon	entering_idle_loop	0.769	
+05-09 20:12:45.428	peer	prewarm_worker_done	1.358	
+05-09 20:12:45.980	peer	bootstrap_called	1.922	
+05-09 20:12:45.981	peer	compat_probe	1.924	attempt=0
+05-09 20:12:46.025	peer	compat_ok	1.967	
+05-09 20:12:46.124	peer	bootstrap_done	2.067	

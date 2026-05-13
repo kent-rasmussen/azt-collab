@@ -1,5 +1,20 @@
 # CLAUDE.md — azt_collab_client
 
+> **Scope of this file.** This is the philosophy / rationale /
+> architecture reference for `azt_collab_client` — why the
+> design is the way it is, what architectural invariants the
+> client owes the daemon and vice versa, deeper API surface for
+> someone working *inside* the package. **The peer conformity
+> contract — what peers must do to be conformant — lives in
+> `CLIENT_INTEGRATION.md` next to this file.** If you're a
+> peer maintainer trying to figure out "what do I have to call,
+> what do I have to honor, what's the migration checklist",
+> read that file first. Read this one if you want to understand
+> *why*. Action-oriented content does not belong here; if you
+> find yourself writing a "do X / don't do Y" rule, put it in
+> `CLIENT_INTEGRATION.md` and link forward instead of
+> duplicating.
+
 Guidance for Claude Code (claude.ai/code) when working with the
 `azt_collab_client` package, including from sister apps that consume
 it as a symlink (`../azt-collab/azt_collab_client` → `./azt_collab_client`).
@@ -253,6 +268,187 @@ from inside the client.
   to the current `_tr`, useful for KV `#:import` so subsequent
   `set_translator` calls take effect.
 
+### Peer contract: routing on sync results
+
+This section codifies how peers MUST respond to `sync_project` /
+`request_sync` result codes, so future peers (viewer, next sister
+app) match the recorder's existing behaviour without
+reverse-engineering it from the recorder source.
+
+**Two contexts, two contracts.** The same `Result` reaches the
+peer from two different triggers and they need different
+responses:
+
+1. **Auto-sync** — the peer fires `request_sync` itself, without
+   a user gesture: project-select, project-load, background
+   periodic, post-edit debounce. The user did NOT ask to sync.
+2. **User-initiated sync** — the user tapped a sync icon /
+   "Sync now" button / similar deliberate gesture. The user
+   explicitly asked.
+
+Auto-sync MUST be silent on configuration-class failures. The
+user is in the middle of doing something else (opening a project,
+finishing an edit); a sync popup / forced settings navigation /
+modal error in that moment is a regression: it derails the flow
+the user was in, sometimes visibly enough to look like project
+selection itself "failed" or "fell back to the old project." Log
+to stderr/logcat for diagnostics; don't surface to the user; let
+whatever the user was doing complete.
+
+User-initiated sync, by contrast, IS the gesture — the user
+asked to sync and they want to know what happened. If the
+project isn't publishable yet (`NOT_A_REPO`, `NO_REMOTE`) or auth
+is broken (`AUTH_REQUIRED`, etc.), route them to the place
+where they can fix it.
+
+| Status code         | Auto-sync                                      | User-initiated sync                                                                                                                |
+|---------------------|------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `S.NOT_A_REPO`      | **Silent.** Log; project keeps working.        | Route to **publish / collaboration settings** for this project. ("Not a git repo. Publish first.") |
+| `S.NO_REMOTE`       | **Silent.** Log; project keeps working.        | Same — route to publish settings.                                                                                                  |
+| `S.AUTH_REQUIRED`   | **Silent.** Log; sync just doesn't happen until creds are configured. | Route to **GitHub Connect** flow.                                                                            |
+| `S.APP_NOT_INSTALLED` / `S.APP_SUSPENDED` / `S.REPO_NOT_AUTHORIZED` | **Silent.** Log; sync didn't go through but the project is still usable. | Open the `url` param the Status carries.                                  |
+| `S.JOB_INTERRUPTED` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails.                                                                |
+| `S.SERVER_UNAVAILABLE` / `S.SERVER_ERROR` | **Silent.** Log; daemon will be reachable again next time. | Surface a transient-error toast ("Service unavailable, try again in a moment"). DO NOT route to settings — there's no user-fixable config here, just a daemon that's currently down. |
+| `S.AUTH_REFRESH_STALE` | **Silent.** Log; the access token is still valid until its 8h cliff, so don't derail the auto-sync flow. (Peers MAY show a non-intrusive banner on a settings-screen entry — this code is also visible via `get_credentials_status()` → `github.refresh_broken`.) | Surface the translated toast — `translate_status` renders "GitHub session needs re-authentication — current access expires {deadline}. Open GitHub Connect and tap Re-authenticate." `params['expires_at']` is the unix timestamp at which the access token expires (token_time + 8h); `translate._format_deadline` converts it to a relative phrase ("in 47 minutes", "in 3 hours") so the user knows how much runway they have. DO NOT route to settings here — the toast text already names GitHub Connect as the next step; routing would steal control from a user who's mid-sync. |
+| Everything else (`PUSHED`, `PULLED`, `NOTHING_TO_COMMIT`, `CONFLICTS`, …) | Translate to status line. | Translate to status line.                                                                            |
+
+The peer is the only party that knows which trigger fired the
+sync — the daemon sees an `RPC: sync` and answers truthfully
+either way. So the auto/user distinction lives on the peer
+side, typically as a flag passed alongside the contributor
+name or distinguishing methods (`do_sync()` vs.
+`_auto_sync_on_load()`).
+
+**Pre-0.34.1 anti-pattern, fixed by following this contract.**
+Treating every sync failure as a user-facing error in the
+auto-sync path manifested intermittently as "I selected
+project B but ended up back on project A": the auto-sync on
+project-load returned `NOT_A_REPO`, the peer's error path
+caused the project-load flow to bail / revert / show a
+dialog the user couldn't see while a screen transition was
+mid-animation, and the user landed on whatever project the
+peer had been showing before. This is a peer-side bug, not a
+daemon or picker bug — but it has a daemon-side mitigation
+*by contract* (this section). Silent auto-sync failures keep
+the user in the project they actually selected.
+
+Status-code meanings, for the table above:
+
+- `S.NOT_A_REPO` — project working dir is not a git repo
+  (never published).
+- `S.NO_REMOTE` — working dir is a git repo but has no
+  `remote.origin.url`.
+- `S.AUTH_REQUIRED` — no GitHub / GitLab credentials configured
+  for this remote host.
+- `S.APP_NOT_INSTALLED` / `S.APP_SUSPENDED` /
+  `S.REPO_NOT_AUTHORIZED` — credentials present but the
+  GitHub-side install is missing / suspended / doesn't cover
+  this repo. Each carries a `url` param pointing at the page
+  that fixes it.
+- `S.JOB_INTERRUPTED` — async job's worker thread died
+  (daemon respawned mid-job).
+- `S.SERVER_UNAVAILABLE` / `S.SERVER_ERROR` — daemon was
+  unreachable or returned a transport-level error. Wrappers
+  translate every transport failure (`ServerUnavailable`,
+  non-`ok` response) into one of these codes, so peers never
+  see a raw exception from a query-shaped wrapper. Distinct
+  from the config-class codes: there's no user-facing
+  configuration that fixes a daemon that's currently down.
+- `S.AUTH_REFRESH_STALE` — the daemon's last attempt to refresh
+  the GitHub access token failed (typically
+  `incorrect_client_credentials` from the OAuth endpoint). The
+  current access token is still valid until its 8h-from-issuance
+  expiry, so sync keeps working in this session — but the
+  refresh path can't mint a replacement, so once the access
+  token expires every authenticated git op will start failing
+  with no user-visible warning unless this code is surfaced.
+  Carries `params['expires_at']` (unix timestamp of the access
+  token cliff) so `translate_status` can render the relative
+  deadline ("in 47 minutes", "in 3 hours") in the toast. Also
+  surfaced via `get_credentials_status()` →
+  `github.refresh_broken` / `github.access_token_expires_at`
+  for peers that want a startup-time banner. Cleared when the
+  user completes a fresh device flow at GitHub Connect (which
+  calls `set_github_tokens` daemon-side; that function clears
+  `refresh_broken` atomically with the token write).
+
+The general shape — both contexts:
+
+```python
+# Auto-sync (post-load, post-edit, background) — silent on
+# configuration-class AND transport-class failures; never derail
+# whatever the user was doing.
+def _auto_sync(self, langcode, contributor):
+    result = sync_project(langcode, contributor)
+    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE,
+                      S.AUTH_REQUIRED,
+                      S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
+                      S.REPO_NOT_AUTHORIZED,
+                      S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
+                      S.AUTH_REFRESH_STALE):
+        # Log only; sync just didn't happen (or it did but a
+        # warning piggybacked), project keeps working, user
+        # keeps working. The AUTH_REFRESH_STALE deadline warning
+        # is surfaced in do_sync below, not here.
+        print(f'[auto-sync] {langcode}: '
+              f'{result.codes()!r} (silenced)',
+              file=sys.stderr)
+        return
+    if result.has(S.JOB_INTERRUPTED):
+        # One silent retry; on second failure, log and move on.
+        return self._auto_sync_retry_once(langcode, contributor)
+    self.show_status(translate_result(result))  # PUSHED, etc.
+
+# User-initiated sync — the user just tapped Sync; route to
+# whatever fixes the problem, or surface the success line.
+def do_sync(self, langcode, contributor):
+    result = sync_project(langcode, contributor)
+
+    # AUTH_REFRESH_STALE piggybacks on whatever primary code the
+    # sync returned (PUSHED + STALE while the access token is
+    # still valid; NOT_A_REPO + STALE if the user has both a
+    # publish gap AND a broken refresh, etc.). Always surface
+    # it BEFORE the routing branches consume the result, so the
+    # deadline warning isn't silently dropped on the way to
+    # the publish-settings page. ``translate_status`` renders
+    # just the AUTH_REFRESH_STALE message — the primary code is
+    # handled separately below.
+    stale = next((s for s in result.statuses
+                  if s.code == S.AUTH_REFRESH_STALE), None)
+    if stale is not None:
+        self.show_toast(translate_status(stale))
+
+    if result.has_any(S.NOT_A_REPO, S.NO_REMOTE):
+        self.open_publish_settings(langcode)
+    elif result.has(S.AUTH_REQUIRED):
+        self.open_github_connect()
+    elif result.has_any(S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
+                        S.REPO_NOT_AUTHORIZED):
+        # Each of these statuses carries the actionable URL in
+        # ``params['url']``. Pull from the first matching status.
+        url = next((s.params.get('url', '') for s in result.statuses
+                    if s.code in (S.APP_NOT_INSTALLED,
+                                  S.APP_SUSPENDED,
+                                  S.REPO_NOT_AUTHORIZED)),
+                   '')
+        self.open_url(url) if url else self.open_github_connect()
+    elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
+        # Transient — no user-fixable config here; just say so
+        # and let the user retry.
+        self.show_toast(translate_result(result))
+    elif result.has(S.JOB_INTERRUPTED):
+        # Retry; surface a transient-error toast if retry fails.
+        ...
+    else:
+        # PUSHED / PULLED / NOTHING_TO_COMMIT / CONFLICTS / etc.
+        self.show_status(translate_result(result))
+```
+
+This is the part of the daemon → peer contract that "status code,
+not translated string" exists for. Substring-matching the
+translated message ("if 'publish' in msg: route_to_settings") is
+the regression to avoid.
+
 ## Internationalization (i18n)
 
 The client owns gettext domain `azt_collab_client`. Catalogs live at
@@ -486,6 +682,53 @@ usable as context managers. The picker side adds
 to the result Intent so the URI grant is in place by the time
 `pick_project()` returns to the peer.
 
+### `atomic_open_write` — when peers need cross-process atomicity
+
+`LiftHandle.atomic_open_write()` (and `MediaHandle`) gives the
+peer an atomic-replace contract on both transports:
+
+- **Filesystem path**: writes a sibling tempfile and renames over
+  the destination via `os.replace`. Peer-process tempfile, peer-
+  process rename.
+- **`content://` URI** (daemon 0.36.0+): buffers bytes in memory
+  and ships them to `POST /v1/projects/<lang>/atomic_commit`. The
+  daemon writes a tempfile in its own process and renames; the
+  write is serialized via `project_lock` against the daemon's
+  own merge-output writes and any concurrent atomic_commit from
+  another peer.
+
+On exception, the destination is untouched in both cases. Two
+concurrent `atomic_open_write` calls on the same destination are
+safe: whichever rename runs last wins, and the destination is
+always a complete copy of one version, never torn.
+
+```python
+from azt_collab_client import LiftHandle
+
+handle = LiftHandle(path_or_uri_from_picker)
+with handle.atomic_open_write() as f:
+    tree.write(f, encoding='utf-8', xml_declaration=True)
+# On clean exit: destination is now the new bytes, atomically.
+# On exception during the with block: destination unchanged.
+```
+
+**When to use which.** Use `atomic_open_write` whenever the
+write needs to be safe against concurrent observers — most LIFT
+writes do, because the daemon's merge-output write can land at
+any moment. `open_write` is the older path-lock-only contract;
+it's safe for same-process serialization but not for cross-process
+races. Pre-0.36.0 the URI form of `atomic_open_write` fell back
+to `open_write` because there was no daemon-side RPC for the
+atomic-rename half of the contract; that gap is closed now and
+peers should prefer `atomic_open_write` for any URI write that
+could race.
+
+**Memory cost on URIs.** The peer holds ~1.33× the file size
+during base64 encoding + send (the request body is base64 inside
+the JSON envelope). For LIFT (≤ tens of MB at worst) this is
+fine. A future chunked-upload endpoint could shrink the working
+set if a much larger payload ever ships.
+
 ### Recorder migration checklist
 
 When migrating a peer (the recorder is the first; viewer / future
@@ -543,19 +786,24 @@ content://org.atoznback.aztcollab/<lang>/audio/<basename>
 content://org.atoznback.aztcollab/<lang>/images/<basename>
 ```
 
-Provider auto-creates `audio/` on first write (`openFile(mode='w')`
-mkdir-p's the parent). Image writes from peers are not supported —
-the daemon owns image additions; peers only read. The picker's
-result-Intent grant flags
+Provider auto-creates `audio/` and `images/` on first write
+(`openFile(mode='w')` mkdir-p's the parent — see
+`azt_collabd/android_cp/service.py:_resolve_path`'s
+`_ALLOWED_MEDIA_DIRS = ('audio', 'images')` whitelist). Both
+audio and images are read+write from peers as of 0.35.2 (0.18.0
+through 0.35.1 gated image writes behind a `PermissionError`
+under an "daemon owns image additions" rule; tracing the history
+showed no concern actually driving that gate, and symmetry with
+audio is cleaner). The picker's result-Intent grant flags
 (`FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION`)
 cover same-authority sibling URIs without per-file grants.
 
 **Client side (`azt_collab_client.lift_io`):**
 
 - `MediaHandle(path_or_uri, kind='audio'|'image')` — `LiftHandle`
-  subclass with a `kind` field. `open_write()` raises
-  `PermissionError` for `kind='image'` (the architectural rule:
-  daemon owns image additions). Read-side identical to `LiftHandle`.
+  subclass with a `kind` field used in log lines / error messages
+  only. Both kinds are read+write; the kind label doesn't gate
+  anything functionally.
 - `audio_uri_for(lift_path_or_uri, basename)` /
   `image_uri_for(lift_path_or_uri, basename)` — compose the sibling
   URI / filesystem path so callers stay blind to the path-vs-URI
@@ -579,16 +827,139 @@ cover same-authority sibling URIs without per-file grants.
 - `play_audio` resolves to `audio_uri_for(...)` on URI projects and
   uses `MediaPlayer.setDataSource(ctx, Uri.parse(uri))` instead of
   the path string overload.
-- Image *additions* still gate off on URI projects — the URL/cache
-  fallback in `lift.py` keeps the displayed image rendering, only
-  the local-copy-into-`images/` step is skipped because the daemon
-  owns adds.
+- Image *additions* go through `MediaHandle('content://…/images/<basename>',
+  'image').open_write()` since 0.35.2 — same shape as audio. Pre-0.35.2
+  the peer gated off image writes on URI projects under a now-removed
+  "daemon owns image additions" policy; the URL/cache fallback for
+  displaying images still works the same way (it has its own merits
+  for offline rendering), but the local-copy-into-`images/` step
+  now runs on URI projects too. Two-write race semantics on the
+  illustration ref (LIFT-side update via `LiftHandle.open_write`)
+  mirror audio's pre-existing pattern; binary-conflict resolution
+  on basename collisions surfaces as `non-lift-modify-modify`
+  Conflict per `repo._merge_diverged`.
 
 **Discovery:** no `list_audio` / `list_images` RPCs needed — both
 sets of basenames are already encoded in the LIFT XML (audio in
 `<citation><form>` audiolang text, images in
 `<illustration href=…/>`). If a future admin UI wants directory
 listing, add `/v1/projects/<lang>/list_images` separately.
+
+## CAWL image access — architectural rationale
+
+> **For the conformity contract** — what peers must call, what
+> they must not do, the two-stage migration checklist, the
+> verification block — see ``CLIENT_INTEGRATION.md`` § 10 (CAWL
+> image access) and § 11 (per-project overrides). This section
+> is the *why*; that file is the *what*.
+
+### Why CAWL lives on the daemon
+
+The CAWL → image-URL index and the CAWL image binaries are
+**suite-scoped infrastructure**: the same data is correct for
+every project, every peer, every device on a given install.
+The suite's mental buckets:
+
+- **Project-scoped resources** (LIFT, audio, project images):
+  daemon owns them, peers consume via provider URIs.
+- **Suite-scoped resources** (CAWL index, CAWL image
+  binaries — same for every project, every peer, every
+  device): also daemon-owned. "Shared by everyone on this
+  device" is exactly what one-daemon-per-device gives you.
+- **Peer-scoped resources** (UI state, theme, in-memory hot
+  caches for render perf): peer-owned. Only category that
+  genuinely belongs in a peer's ``filesDir``.
+
+Pre-0.37 CAWL was peer-scoped — a vestige from when the suite
+had only one peer. That produced three structural failures:
+
+1. **Rate limit.** GitHub's unauthenticated REST cap is
+   60/hour/IP; tight rebuild loops, CI, or multi-peer
+   devices exhausted it and the resolver returned empty for
+   the rest of the session.
+2. **Per-peer disk duplication.** N peers × ~100–300 MB of
+   image binaries each, sandbox-isolated on Android so they
+   couldn't share even if you wanted them to.
+3. **Install-day-no-network.** Fresh install with no
+   connectivity had no way to bootstrap.
+
+Daemon ownership fixes all three. Cache lives at
+``$AZT_HOME/cawl/<owner>/<repo>/{index.json, images/<basename>}``,
+keyed by repo slug — so N projects sharing one image_repo share
+*one* on-disk cache directory.
+
+### Why per-project `cawl_image_repo`
+
+CAWL repo selection is a per-project setting, not a daemon-
+global or peer-global one. Different projects can legitimately
+point at different image sets (fork, culturally specific
+imagery, internal mirror). The ``Project`` record carries the
+field; the daemon-global default is fallback.
+
+Resolution precedence:
+
+1. ``Project.cawl_image_repo`` — per-project override.
+2. ``azt_collabd.config.cawl_image_repo()`` — daemon-global
+   fallback. Default
+   ``_CAWL_IMAGE_REPO_DEFAULT`` lives in ``azt_collabd/
+   config.py`` and is the single source of truth for the
+   suite-canonical CAWL repo.
+3. Empty everywhere → daemon serves ``{}`` /
+   ``FileNotFoundError`` without any network call.
+
+The cache layer doesn't know whether the resolved slug came
+from per-project or from the global default. Both paths land
+on the same on-disk cache file when they resolve to the same
+slug — the dedup property is preserved across the
+configuration surface.
+
+### Why we don't bundle the image binaries
+
+The APK ships a bundled **index** seed (``azt_collabd/data/
+cawl/<owner>/<repo>/index.json``, ~50 KB) so install-day-no-
+network devices have *something* to serve. The image binaries
+themselves are deliberately not bundled: 1701 images × 50–200
+KB ≈ 100–300 MB shipping in every APK release is the wrong
+trade — slow install, mobile-data hostile, and the daemon-side
+lazy cache covers the steady state without bundling.
+Decision logged 2026-05-12.
+
+If a future session proposes "bundle the whole CAWL image set
+in the APK", refuse — it's a re-litigation of a closed
+decision, not a fresh question.
+
+### Why the two-stage migration matters
+
+Stage 1 (peer swaps its index fetch for ``cawl_index``) removes
+the user-visible rate-limit symptom (the 403). It feels like
+the migration is done. It isn't — Stage 2 (peer swaps its
+binary fetches for ``CAWLHandle``) is where the architectural
+wins land:
+
+- Cross-peer dedup: one cache, N peers reading from it.
+- Survives peer uninstall: the daemon's cache outlives any
+  individual peer.
+- Removes the per-peer 100–300 MB on-disk cost.
+
+A half-migrated peer (Stage 1 only) loses none of these wins
+to the rate-limit *symptom* — but it still pays the
+architectural cost. The contract says both stages because both
+are needed for the architecture to be correct, not just for
+the surface symptom to go away. ``CLIENT_INTEGRATION.md`` § 10
+spells out the action items + verification.
+
+### Wire-shape note
+
+``Project.cawl_image_repo`` and ``Project.repo_slug`` are
+plain string fields on the project record, returned by every
+``open_project`` / ``project_status`` / ``list_projects``
+response. The client-side ``Project`` dataclass mirrors them
+with empty-string defaults so pre-0.39 daemons that don't emit
+the fields still decode cleanly. No code changes are required
+on the client side to *read* the fields; the setters
+(``set_cawl_image_repo``, ``set_repo_slug``) are documented as
+part of the public API surface in ``CLIENT_INTEGRATION.md``
+§ 11.
 
 ## UI submodule (`azt_collab_client.ui`)
 
@@ -682,7 +1053,10 @@ def update_app(self):
     check_for_update(
         repo='kent-rasmussen/azt-recorder',   # or your fork
         current_version=__version__,           # peer's own __version__
-        asset_filename='azt_recorder.apk',     # peer's release asset
+        # asset_filename omitted — derived at runtime from the
+        # peer's own Android package name (e.g. aztrecorder.apk
+        # for org.atoznback.aztrecorder). Pass explicitly only if
+        # the fork publishes under a non-default scheme.
         on_status=self._set_update_msg,
         on_no_update=lambda: self._set_update_msg(_('Up to date.')),
         on_error=self._show_error,
@@ -733,7 +1107,8 @@ def _run_bootstrap(self):
     bootstrap(
         peer_repo='kent-rasmussen/azt-recorder',
         peer_version=__version__,
-        peer_asset_filename='azt_recorder.apk',
+        # peer_asset_filename omitted — derived at runtime from the
+        # peer's own Android package name.
         peer_display_name=APP_NAME,
         on_status=self._log_bootstrap_status,
         on_done=self._auto_load_last_project,

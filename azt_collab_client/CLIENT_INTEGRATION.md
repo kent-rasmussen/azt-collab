@@ -1,16 +1,27 @@
 # Client integration checklist
 
-Every AZT-suite peer (recorder, viewer, future apps) is a thin
-``azt_collab_client`` consumer. This doc is the **single contract**
-each peer follows so the suite stays coherent. Re-read it whenever
-you bump the bundled client; the contract evolves with the client
-and silent drift is what produced the v0.28.x bugs ("multiple
-stacked popups", "settings page reachable when no server", "no
-progress indicator", "Dismiss didn't quit when it should have").
+> **Scope of this file.** This is the **conformity contract**
+> every AZT-suite peer follows — and nothing else. Action-
+> oriented sections: API peers must call, hard rules they must
+> honor, migration checklists, verification blocks. No
+> philosophy, no architectural rationale, no "why this design"
+> — those live in ``azt_collab_client/CLAUDE.md``. If you find
+> yourself wanting to add a "why" paragraph here, put it there
+> instead and link forward. The contract is the part peers
+> have to obey; the rationale is the part they may want to
+> read to understand.
 
-If you're starting a brand-new peer, work through every section in
-order. If you're updating an existing peer, treat each section
-heading as a checklist item and confirm.
+Every AZT-suite peer is a thin ``azt_collab_client`` consumer.
+This doc is the **single contract** each peer follows so the
+suite stays coherent. Re-read it whenever you bump the bundled
+client; the contract evolves with the client and silent drift
+is what produced the v0.28.x bugs ("multiple stacked popups",
+"settings page reachable when no server", "no progress
+indicator", "Dismiss didn't quit when it should have").
+
+If you're starting a brand-new peer, work through every section
+in order. If you're updating an existing peer, treat each
+section heading as a checklist item and confirm.
 
 This file lives alongside ``azt_collab_client`` so peers see it
 through their symlink — there's no need to clone the canonical
@@ -61,6 +72,39 @@ android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
 ``<queries>`` block Android 11+ needs for PackageManager visibility
 of the server APK.)
 
+**Java sources from the suite** — required since 0.33.0 so the
+peer-side ``AZTServiceConnector`` (Phase B2 bindService for OOM
+priority + Android 15 freezer mitigation) compiles into the peer
+APK. **Point at the canonical filesystem path, not through your
+``android/`` symlink** — buildozer's ``android.add_src`` doesn't
+reliably follow symlinks across versions:
+
+```ini
+# Mirror what server_apk/buildozer.spec.tmpl does — relative path
+# that hits the canonical azt-collab tree directly.
+android.add_src = ../azt-collab/android/src/main/java
+```
+
+Adjust the ``..`` count if your peer doesn't sit as a sibling of
+``azt-collab/``. Without this line peers see ``[android_cp]
+AZTServiceConnector.ensureBound failed: ClassNotFoundException``
+in logcat on every cold start, the bind never happens, and the
+freezer issue is unmitigated.
+
+If that still fails (older buildozer / path-policing edge case),
+fall back to copying the file directly into the peer repo:
+
+```bash
+mkdir -p java_src/org/atoznback/aztcollab
+cp ../azt-collab/android/src/main/java/org/atoznback/aztcollab/\
+AZTServiceConnector.java java_src/org/atoznback/aztcollab/
+# in buildozer.spec:
+# android.add_src = java_src
+```
+
+Brittle (the copy goes stale when the canonical changes); only
+use if the relative-path approach doesn't work.
+
 **Sign with the suite keystore.** APKs signed with a different key
 install fine but the install-time grant for
 ``AZT_COLLAB_ACCESS`` is denied, and provider calls silently fail.
@@ -89,7 +133,10 @@ def _run_bootstrap(self):
     bootstrap(
         peer_repo='kent-rasmussen/azt-recorder',     # ← your repo
         peer_version=__version__,                    # main.py __version__
-        peer_asset_filename='azt_recorder.apk',      # ← your asset name
+        # peer_asset_filename omitted — derived at runtime from the
+        # running peer's Android package name (= aztrecorder.apk
+        # for org.atoznback.aztrecorder). Pass explicitly only if
+        # your fork publishes under a different scheme.
         peer_display_name='AZT Recorder',            # ← your app name
         on_status=self._set_status,                  # progress sink
         on_error=self._set_status,                   # failure surface
@@ -129,6 +176,74 @@ no-server / server-too-old branches do NOT fire ``on_done`` —
 they show a modal popup that's the terminal state. So your
 ``on_done`` callback can safely assume the daemon is reachable
 and the peer is current; no defensive try/except needed.
+
+### Automatic since 0.33.0: peer holds a service bind
+
+The client transport's ``discover()`` automatically holds a
+``bindService`` against the server APK's ``AZTServiceProviderhost``
+for the rest of the peer's process lifetime. This is what
+keeps the daemon's ``:provider`` process un-frozen on Android
+15 and warm-cached across calls within a session. No peer
+code change is required — importing ``azt_collab_client`` and
+making any RPC call (which ``bootstrap()`` does on startup) is
+enough to trigger the bind on first contact.
+
+If you see ``[android_cp] AZTServiceConnector.ensureBound
+failed: ClassNotFoundException`` in your peer's logcat, the
+peer's ``buildozer.spec`` is missing
+``android.add_src = android/src/main/java`` (see § 2 above).
+Without that, the connector ``.java`` doesn't get merged into
+the dist's source set and the class isn't on the runtime
+classpath. ``buildozer android clean`` after adding the line is
+required — buildozer caches dist trees and won't repopulate
+``src/`` on its own.
+
+### Required: pre-warm in ``App.build()``
+
+Cold-start on Android serializes peer Kivy boot, then daemon
+lazy-spawn (via the bind from B2), then the peer's first
+compat probe. ``bootstrap.prewarm()`` overlaps the daemon's
+lazy-spawn with the peer's own Kivy init by firing the bind
+early.
+
+**Wire it into every peer's ``App.build()``:**
+
+```python
+class MyApp(App):
+    def build(self):
+        from azt_collab_client.ui.bootstrap import prewarm
+        prewarm()
+        return self._build_root_widget()
+```
+
+Idempotent; no-op on non-Android.
+
+**Why required.** Measured on R500-class slow tablet
+(2026-05-09 post-Phase-B2): daemon Python boot is ~600ms
+steady-state, ~1.1s on first cold start. Prewarm overlap
+window is ~1.9s. With prewarm, daemon boot fits inside Kivy
+init, peer wait is **~50–60ms**. Without prewarm, peer wait
+would be the full ~600–1000ms — the difference between "feels
+instant" and "feels sluggish." Fast phones see the wait
+shrink to sub-second either way, but the cost of always
+calling prewarm is essentially zero, so there's no reason
+not to.
+
+Tradeoff to be aware of: ``prewarm`` initialises pyjnius /
+the ContentProvider transport earlier than the rest of the
+peer might expect. If your ``build()`` is already the first
+place that touches Android Java surfaces (the recorder is),
+this is free. If your peer touches Android elsewhere first,
+prewarm may shift the cost rather than reduce it — measure
+with the harness in § 15 if your peer's structure is unusual.
+
+Toggle for measurement runs (no rebuild needed):
+- ``$AZT_HOME/_no_prewarm`` sentinel file → opts the call out.
+- ``AZT_BOOT_PREWARM=0`` env var (where reachable) → also opts out.
+
+The ``measure_boot.sh`` harness drops/clears the sentinel via
+``adb shell run-as`` so peers built with debug-keystore can
+flip scenarios without rebuilding.
 
 ## 4. **Do NOT roll your own "server is missing" UI.**
 
@@ -279,10 +394,348 @@ with handle.open_write() as f:
     pass
 ```
 
-For image rendering: ``MediaHandle(..., kind='image')`` for read
-only — peers cannot write images (the daemon owns image additions).
+For images, the same shape — both reads and writes — since the
+0.35.2 client. ``MediaHandle(image_uri_for(lift_path_or_uri,
+basename), kind='image')`` opens for read; ``.open_write()``
+attaches new image bytes. Use ``LiftHandle.open_write`` to
+update the ``<illustration href=…>`` reference in the LIFT
+itself in the same flow (two-write pattern: media bytes +
+LIFT-side ref).
 
-## 10. Recovery
+## 10. CAWL image access
+
+The CAWL → image-URL map and the CAWL image binaries are
+suite-scoped resources served by the daemon. Peers consume
+them through ``cawl_index(langcode)`` and
+``CAWLHandle(langcode, basename)`` — not by hitting GitHub
+directly.
+
+**Hard rules.**
+
+- Don't hit ``api.github.com`` from the peer for the CAWL
+  tree listing. Call ``cawl_index(langcode)`` instead.
+- Don't hit ``raw.githubusercontent.com`` from the peer for
+  CAWL image binaries. Use ``CAWLHandle(langcode, basename).
+  open_read()`` instead.
+- Don't keep a peer-side **on-disk** cache of CAWL image
+  bytes. The daemon's cache (``$AZT_HOME/cawl/<owner>/<repo>/
+  images/<basename>``) is the durable copy and is shared
+  across every peer on the device. An in-memory hot cache
+  (LRU keyed by basename in the display loop) is fine — only
+  durable peer-side storage is forbidden.
+- Don't follow ``cawl_index().files[].url`` from peer code
+  once Stage 2 is done. That field is informational only —
+  the URL is the upstream the daemon would fetch from. A peer
+  that follows it bypasses the cache layer and is back to the
+  Stage 2 anti-pattern.
+- Don't mirror the project's ``cawl_image_repo`` slug in peer
+  prefs; read it through ``open_project`` /
+  ``project_status`` / ``list_projects`` each time. See § 11.
+
+**Required API surface.**
+
+- ``cawl_index(langcode) -> dict`` — returns
+  ``{repo, branch, fetched_at, files: [{path, url}, …]}`` or
+  ``{}``. Peer code maps ``files[].path`` (basename) to CAWL
+  identifiers per its own convention. Treat ``{}`` as "no
+  images known" — same shape pre-migration peers got from an
+  empty resolver dict; no separate daemon-error branch needed.
+
+- ``CAWLHandle(langcode, basename).open_read() -> file-like`` —
+  binary file-like, usable as a context manager. Returns a
+  ContentProvider FD on Android (zero-copy from the daemon's
+  cache), an ``io.BytesIO`` on desktop (HTTP-loopback into the
+  same cache). Raises ``FileNotFoundError`` on 404 / fetch
+  failure with no cached copy; raises ``ServerUnavailable``
+  on transport failure. Both are recoverable — fall through
+  to the peer's no-image rendering and try again next session.
+
+  Read-only; ``open_write`` isn't supported (the
+  ContentProvider rejects write modes for CAWL paths).
+
+**Migration is two stages — both are required.**
+
+A peer that's done Stage 1 only is **not conformant**. The
+user-visible rate-limit symptom (the 403 from
+``api.github.com``) is gone after Stage 1, which is
+satisfying, but Stage 2 (image binaries) is the lift that
+eliminates per-peer disk duplication and enables cross-peer
+dedup. Any one of these symptoms means the migration is not
+complete:
+
+- Peer code still calls
+  ``urlopen('https://raw.githubusercontent.com/…')`` for CAWL
+  images.
+- A peer-side disk cache directory of CAWL bytes (any name —
+  ``image_cache_dir/``, ``user_data_dir/image_cache/``,
+  similar) exists and accumulates files.
+- The daemon's cache at ``$AZT_HOME/cawl/<owner>/<repo>/
+  images/`` stays empty even though entries are rendering
+  (bytes are flowing somewhere they shouldn't).
+
+**Migration checklist.**
+
+1. **Stage 1 — replace direct ``api.github.com`` calls.**
+   Anywhere the peer hits
+   ``urlopen('https://api.github.com/repos/<repo>/git/trees/HEAD?recursive=1')``
+   to build a CAWL resolver, swap for
+   ``cawl_index(langcode)``. The peer's filename → identifier
+   mapping stays peer-side; only the URL listing moves.
+
+2. **Stage 2 — replace direct ``raw.githubusercontent.com``
+   calls.** Anywhere the peer does
+   ``urlopen('https://raw.githubusercontent.com/<repo>/HEAD/<basename>')``
+   followed by ``write_to_peer_cache(basename, bytes)``, swap
+   for:
+
+   ```python
+   from azt_collab_client import CAWLHandle
+   with CAWLHandle(langcode, basename).open_read() as f:
+       bytes_for_display = f.read()
+   ```
+
+   Drop the peer-side cache-write step entirely. Any resolver
+   code that read ``files[].url`` from ``cawl_index()`` for an
+   HTTP fetch should no longer reference that field at all.
+
+3. **Delete the peer-side CAWL on-disk cache directory.**
+   That whole code path (``image_cache_dir/``,
+   ``user_data_dir/image_cache/``, any sibling) goes away. An
+   in-memory hot cache for rendering perf (LRU keyed by
+   basename) is fine to keep — Stage 2 only kills *durable*
+   peer-side storage of CAWL bytes. Migrating peers can
+   ``shutil.rmtree(..., ignore_errors=True)`` the old
+   directory on startup as a one-shot cleanup of
+   pre-Stage-2 installs.
+
+4. **Decide whether the peer needs a per-project
+   ``cawl_image_repo`` UI** (see § 11). Most peers can skip
+   this — the daemon-global default covers the common case.
+
+**Verification.** After Stage 2 is in, the peer must pass all
+of:
+
+- ``grep -r 'raw.githubusercontent.com' <peer>/`` returns
+  zero hits in CAWL-related code.
+- The peer's pre-migration CAWL cache directory doesn't
+  exist on disk after a fresh install, and isn't created on
+  first run.
+- On Android, ``dumpsys diskstats`` shows the daemon's
+  ``$AZT_HOME/cawl/`` populating with image files as entries
+  render, while the peer's ``filesDir`` stays small.
+- No peer code references ``cawl_index().files[].url``.
+  (``files[].path`` is the basename peers map to CAWL
+  identifiers and remains valid.)
+
+## 11. Per-project overrides (`cawl_image_repo`, `repo_slug`)
+
+Two per-project string fields live on the daemon's project
+record. Both default to empty; non-empty values override
+default behaviour.
+
+**Read access.** Both fields surface on every project record
+the daemon serves — ``open_project(langcode)``,
+``project_status(langcode)``, ``list_projects()`` — so peers
+read them in the same RPC that fetches anything else about a
+project. The mirrored ``Project`` dataclass on the client
+side carries both as ``str`` fields defaulting to ``''`` for
+forward-compat with pre-0.39 daemons.
+
+**Setters.**
+
+```python
+from azt_collab_client import set_cawl_image_repo, set_repo_slug
+
+set_cawl_image_repo(langcode, 'owner/repo')   # or '' to clear
+set_repo_slug(langcode, 'my-vanity-name')      # or '' to clear
+```
+
+Both return the updated ``Project`` (so a UI can confirm) or
+``None`` on transport failure / unknown langcode.
+
+**``cawl_image_repo`` — per-project CAWL image set.** Empty
+means the project uses the daemon-global default
+(suite-canonical CAWL repo). Set it when a project needs a
+fork or culturally specific image set distinct from the
+suite default. Read access is usually internal —
+``cawl_index(langcode)`` and ``CAWLHandle`` resolve it for
+you; peers only need to read the field if they want to
+display the slug in a settings UI.
+
+**``repo_slug`` — per-project publish-repo override.** Empty
+means callers should treat as equal to ``langcode`` (the
+typical case: publish to a repo named after the langcode).
+Non-empty means the user explicitly chose a different repo
+name. The publish-path UI should seed any
+"GitHub repo name" textbox from ``project.repo_slug or
+project.langcode`` and persist user edits via
+``set_repo_slug`` so the override survives relaunch.
+
+**Don't mirror these in peer prefs.** The daemon is the
+single authoritative source. A peer that caches the slug in
+its own prefs has to keep two copies in sync, and they will
+drift. Read each time.
+
+## 12. Granting collaborator access
+
+Peers that want to let a project owner invite others to the
+backing GitHub repo wire ``grant_collaborator_popup`` into the
+peer's **per-project settings surface** — not a global setting.
+The operation is meaningless without a specific project context,
+and the UX guarantee is that the user can't be confused about
+which repo they're acting on. Pattern:
+
+```python
+from azt_collab_client.ui import grant_collaborator_popup
+
+def _on_invite_btn(self, *_):
+    if not self._current_langcode:
+        return
+    grant_collaborator_popup(
+        langcode=self._current_langcode,
+        font_name=self._font_name,
+        on_done=lambda result: self._refresh_after_invite(),
+    )
+```
+
+The popup looks the project up server-side via
+``project_status(langcode)`` and displays the langcode + remote
+URL prominently before the user types a username. Project
+disambiguation is the load-bearing UX guarantee here — peers
+must NOT pre-resolve the URL or owner/repo and pass them in
+themselves; the daemon owns the lookup so the wrong-repo failure
+mode is unreachable.
+
+Underneath, the popup calls
+``azt_collab_client.grant_collaborator(langcode, username,
+level='push')`` against ``POST /v1/projects/<lang>/collaborators``.
+Direct callers (e.g. a CLI helper, or a peer that wants to roll
+its own UI rather than use the popup) get a ``Result``
+carrying one of:
+
+- ``S.COLLABORATOR_INVITED`` — invitation issued; the user must
+  still accept it on GitHub before they can clone or sync.
+- ``S.COLLABORATOR_ALREADY`` — already a collaborator (or has a
+  pending invite); no new state on GitHub.
+- ``S.INVALID_USERNAME`` — empty / whitespace username.
+- ``S.NO_REMOTE`` — project has no remote URL configured.
+- ``S.NOT_GITHUB_REMOTE`` — remote isn't a github.com URL
+  (GitLab + self-hosted aren't supported by this endpoint yet).
+- ``S.AUTH_REQUIRED`` — no GitHub token on file for the host;
+  user needs to connect via the server APK's settings UI first.
+- ``S.COLLABORATOR_INVITE_FAILED`` — GitHub returned an
+  unexpected error; ``error`` param carries the underlying
+  message.
+
+Translations live in ``azt_collab_client/translate.py``; if you
+roll your own UI, run results through ``translate_result()``
+rather than substring-matching on codes.
+
+**Scope** (v1):
+
+- GitHub-only. GitLab has different invite semantics and is not
+  yet wired through. The popup surfaces ``NOT_GITHUB_REMOTE``
+  cleanly when the user tries it on a non-GitHub project.
+- Invite-only. No list-existing or revoke yet; the popup is
+  designed to grow either later without restructuring.
+- Default permission level ``push`` (matches typical SIL
+  collaborator flow). Override via the ``level`` arg if you need
+  something else; valid GitHub values are ``pull`` /
+  ``triage`` / ``push`` / ``maintain`` / ``admin``.
+
+## 13. Smooth UI across reloads
+
+A peer's view of project data has two backing stores: the
+canonical bytes on disk (owned by the daemon, refreshed by
+sync / merge), and whatever the peer caches in memory to
+render its UI. Anything that updates the on-disk bytes —
+``sync_project`` returning ``S.PULLED``, a future
+``MERGED_REMOTE`` after a remote-driven update, a peer-
+triggered re-clone — invalidates the peer's in-memory view.
+
+**Principle.** When the on-disk bytes change underneath the
+peer, the user's current view should *refresh in place*:
+
+- **Same context.** The user stays on whatever screen / entry /
+  scroll position they were on. Sync is not a navigation event.
+  Don't reset to the picker, don't jump to a different
+  langcode, don't scroll to top, don't close an open detail
+  panel.
+- **Visible changes are evident.** If the data the user is
+  *looking at* changed (an entry someone else edited, a new
+  field, a freshly attached audio reference), the peer renders
+  the new values so the change is observable. "Same context"
+  doesn't mean "freeze the pixels" — it means "same anchor,
+  fresh content." Real upstream deletions also propagate
+  normally — if the entry the user is viewing was actually
+  deleted in the LIFT, that's worth showing. (LIFT workflows
+  rarely delete entries, so this case is mostly theoretical
+  but shouldn't be papered over.)
+- **No other navigation changes.** New entries elsewhere in
+  the dataset, deletions of entries the user isn't viewing,
+  reorderings — all reflected in lists / counts / search
+  results, but the user's focus point doesn't move.
+- **Suspend client-side filters that would hide the current
+  view.** Peers commonly filter the dataset by some UI toggle
+  ("show past data on/off", "audio recorded only", "this
+  contributor's entries"). If a refresh would cause the
+  currently-viewed entry to fall outside the active filter
+  (e.g. an entry that's now older than the freshly-arrived
+  cutoff), drop or relax the filter so the entry stays
+  visible. The trigger is *the user's current anchor*, not
+  the filter's intent — the user shouldn't watch their entry
+  disappear because the data clock advanced. (Recorder
+  example: a "don't show past data" toggle that would
+  exclude an entry the user is mid-edit — disable the toggle
+  for this view rather than swap the entry out.)
+
+How a peer implements this depends on its model layer (the
+recorder has a per-entry KV view + a DOM-style LIFT model;
+a future viewer might have a virtualised list; a CLI helper
+has none of this). The contract is the principle, not the
+recipe.
+
+```python
+# Example shape (recorder-flavoured; adapt to your model):
+from azt_collab_client import sync_project, LiftHandle, S
+
+def _on_sync_tap(self, *_):
+    result = sync_project(self._current_langcode, self._contributor)
+    if result.has(S.PULLED):
+        self._refresh_in_place()
+    # ... surface other status codes through translate_result ...
+
+def _refresh_in_place(self):
+    anchor = self._snapshot_view()           # guid + scroll + tab
+    self._reload_model_from_disk()
+    entry = self._model.find_by_guid(anchor.guid)
+    if entry is None:
+        # Real upstream deletion — let the natural empty-state
+        # render so the change is visible.
+        self._render_empty_after_delete(anchor)
+        return
+    if self._active_filter_would_hide(entry):
+        # Filter would exclude the current view post-refresh
+        # (e.g. "show past data" toggle now excludes this
+        # entry's date). Suspend the filter for this view so
+        # the user's anchor stays present, even though the
+        # data clock moved.
+        self._suspend_filter_for_current_view()
+    self._render_entry(entry, scroll_y=anchor.scroll_y)
+```
+
+If your peer caches derived state (a sorted entry list, a
+search index, a recent-projects ribbon), recompute it from
+the freshly-parsed model before re-rendering — the cache is
+yours to invalidate.
+
+The same principle applies any time the peer detects external
+mutation: an Android picker re-entry that returned the same
+project, a daemon-restart notice, a future `MERGED_REMOTE`
+status. The user's anchor stays; the content under it
+refreshes; nothing else moves.
+
+## 14. Recovery
 
 The single peer-visible recovery surface is
 ``Result.has(S.JOB_INTERRUPTED)`` from ``request_sync`` /
@@ -290,13 +743,62 @@ The single peer-visible recovery surface is
 ``sync_project`` callers don't see this code — the transport
 retries internally.
 
-## 11. Testing
+## 15. Testing
 
 The suite has a pytest scaffold in the canonical
 ``azt-collab/tests/`` directory. Run ``pytest tests/ -q`` from the
 canonical repo before publishing a client-bundling peer. Manual
 matrix is in ``azt-collab/docs/test_plan.md`` § 8 (canonical-only;
 not symlinked into peers).
+
+### Boot-trace instrumentation
+
+Both peers and the daemon emit ``[boot-trace-peer] phase=…
+t=…`` and ``[boot-trace-daemon] phase=… t=…`` lines to
+stderr → logcat at every cold-start cost-center. These are
+cheap (≤ 10 lines per launch) and shipped enabled. **Don't strip
+them** if you have a logcat filter — the harness depends on
+them to compute timing tables, and they're load-bearing for
+diagnosing slow-tablet field reports.
+
+Phases the peer emits (from ``azt_collab_client/ui/bootstrap.py``):
+``bootstrap_called``, ``compat_probe attempt=N``, ``compat_ok``,
+``bootstrap_done``, plus ``prewarm_*`` if ``prewarm()`` is wired
+in.
+
+Phases the daemon emits (from ``server_apk/service.py``):
+``module_loaded``, ``main_entered``,
+``before_import_azt_collabd`` / ``after_import_azt_collabd``,
+``configured``, ``before_install_callbacks`` /
+``after_install_callbacks``, ``before_reconcile`` /
+``after_reconcile``, ``entering_idle_loop``.
+
+### Cold-start measurement harness
+
+``tests/integration/measure_boot.sh`` drives a real Android
+device through ``baseline``, ``doze``, ``prewarm``, and
+``doze+prewarm`` scenarios. Run it on each device class your
+peer's users have (a fast phone + a slow tablet covers the
+useful range) before deciding whether to wire ``prewarm()`` into
+``App.build()``. The harness's README at
+``tests/integration/README.md`` covers prerequisites, scenario
+semantics, and how to interpret the per-iteration summaries.
+
+Useful intervals to read off the summary:
+
+- **peer wait until daemon answered** — what the user actually
+  feels; the number you're trying to drive down.
+- **daemon Python boot to dispatcher live** — where most of the
+  time goes on slow tablets; ``import azt_collabd`` is the long
+  pole.
+- **prewarm overlap window** — only present if your peer calls
+  ``prewarm()``; the gap between that and ``compat_ok`` tells
+  you whether the overlap actually saved anything.
+
+If you ship a new peer, run the harness once before tagging
+your first release; if its `peer wait` interval is consistently
+> 5 s on the slow-tablet target, wire ``prewarm()`` and re-measure
+before tagging.
 
 ## What the suite does *for* you (keep code shareable)
 
@@ -317,6 +819,9 @@ peer; don't duplicate them in your peer code:
   download/install (no GitHub API); for stable redirect URLs.
 - ``azt_collab_client.ui.share.share_running_apk`` — Android share
   sheet for the running APK.
+- ``azt_collab_client.ui.popups.grant_collaborator_popup`` —
+  per-project "invite a GitHub collaborator" popup; wire it from
+  your project-context settings (see § 12).
 - ``azt_collab_client.ui.LangPickerScreen`` /
   ``ProjectPickerScreen`` / ``LiftHandle`` / ``MediaHandle`` — see
   ``azt_collab_client/CLAUDE.md`` for the longer rundown.

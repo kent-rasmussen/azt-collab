@@ -58,7 +58,11 @@ source.include_patterns = main.py,service.py
 # po/mo: gettext catalogs under azt_collab_client/locales/<lang>/LC_MESSAGES.
 # Without these the device's available_languages() finds nothing and the
 # settings UI only offers English.
-source.include_exts = py,xml,gz,png,po,mo
+# json: azt_collabd/data/cawl/<owner>/<repo>/index.json — CAWL
+# index seed assets, copied into $AZT_HOME/cawl/ on first
+# daemon access for that repo if no cache file exists yet.
+# Closes install-day-no-network for index lookup.
+source.include_exts = py,xml,gz,png,po,mo,json
 
 version.regex = __version__ = ['"](.*)['"]
 # This buildozer is running in a subdirectory of the azt-collab package,

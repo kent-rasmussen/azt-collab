@@ -1,0 +1,20 @@
+05-09 12:49:17.042 15827 15851 I python  :  [boot-trace-peer] phase=prewarm_called t=0.079
+05-09 12:49:17.058 15827 15856 I python  :  [boot-trace-peer] phase=prewarm_worker_start t=0.080
+05-09 12:49:17.917 15827 15856 I python  :  [boot-trace-peer] phase=prewarm_worker_done t=0.954
+05-09 12:49:18.364 15827 15851 I python  :  [boot-trace-peer] phase=bootstrap_called t=1.401
+05-09 12:49:18.366 15827 15873 I python  :  [boot-trace-peer] phase=compat_probe t=1.403 attempt=0
+05-09 12:49:18.660 15827 15874 I python  :  [boot-trace-peer] phase=compat_probe t=1.696 attempt=1
+05-09 12:49:19.091 15827 15875 I python  :  [boot-trace-peer] phase=compat_probe t=2.127 attempt=2
+05-09 12:49:19.923 15827 15876 I python  :  [boot-trace-peer] phase=compat_probe t=2.960 attempt=3
+05-09 12:49:21.570 15827 15877 I python  :  [boot-trace-peer] phase=compat_probe t=4.607 attempt=4
+05-09 12:49:23.612 15827 15879 I python  :  [boot-trace-peer] phase=compat_probe t=6.649 attempt=5
+05-09 12:49:25.651 15827 15880 I python  :  [boot-trace-peer] phase=compat_probe t=8.687 attempt=6
+05-09 12:49:27.689 15827 15881 I python  :  [boot-trace-peer] phase=compat_probe t=10.725 attempt=7
+05-09 12:49:29.728 15827 15882 I python  :  [boot-trace-peer] phase=compat_probe t=12.764 attempt=8
+05-09 12:49:31.765 15827 15884 I python  :  [boot-trace-peer] phase=compat_probe t=14.802 attempt=9
+05-09 12:49:33.808 15827 15885 I python  :  [boot-trace-peer] phase=compat_probe t=16.845 attempt=10
+05-09 12:49:35.850 15827 15886 I python  :  [boot-trace-peer] phase=compat_probe t=18.886 attempt=11
+05-09 12:49:37.876 15827 15887 I python  :  [boot-trace-peer] phase=compat_probe t=20.913 attempt=12
+05-09 12:49:39.900 15827 15888 I python  :  [boot-trace-peer] phase=compat_probe t=22.936 attempt=13
+05-09 12:49:41.939 15827 15889 I python  :  [boot-trace-peer] phase=compat_probe t=24.975 attempt=14
+05-09 12:49:43.972 15827 15890 I python  :  [boot-trace-peer] phase=compat_probe t=27.009 attempt=15

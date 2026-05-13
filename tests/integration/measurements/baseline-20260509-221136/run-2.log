@@ -1,0 +1,18 @@
+05-09 20:12:12.448 27153 27182 I python  :  [boot-trace-peer] phase=prewarm_called t=0.075
+05-09 20:12:12.468 27153 27182 I python  :  [boot-trace-peer] phase=prewarm_bound_main_thread t=0.096
+05-09 20:12:12.470 27153 27204 I python  :  [boot-trace-peer] phase=prewarm_worker_start t=0.098
+05-09 20:12:13.115 27206 27219 I python  : [boot-trace-daemon] phase=module_loaded t=0.000
+05-09 20:12:13.115 27206 27219 I python  : [boot-trace-daemon] phase=main_entered t=0.000
+05-09 20:12:13.115 27206 27219 I python  : [boot-trace-daemon] phase=before_import_azt_collabd t=0.000
+05-09 20:12:13.379 27206 27219 I python  : [boot-trace-daemon] phase=after_import_azt_collabd t=0.264
+05-09 20:12:13.379 27206 27219 I python  : [boot-trace-daemon] phase=configured t=0.264
+05-09 20:12:13.577 27206 27219 I python  : [boot-trace-daemon] phase=before_install_callbacks t=0.462
+05-09 20:12:13.597 27153 27204 I python  :  [boot-trace-peer] phase=prewarm_worker_done t=1.224
+05-09 20:12:14.246 27206 27219 I python  : [boot-trace-daemon] phase=after_install_callbacks t=1.131
+05-09 20:12:14.246 27206 27219 I python  : [boot-trace-daemon] phase=before_reconcile t=1.131
+05-09 20:12:14.396 27206 27219 I python  : [boot-trace-daemon] phase=after_reconcile t=1.281
+05-09 20:12:14.396 27206 27219 I python  : [boot-trace-daemon] phase=entering_idle_loop t=1.282
+05-09 20:12:14.523 27153 27182 I python  :  [boot-trace-peer] phase=bootstrap_called t=2.151
+05-09 20:12:14.551 27153 27222 I python  :  [boot-trace-peer] phase=compat_probe t=2.152 attempt=0
+05-09 20:12:14.590 27153 27222 I python  :  [boot-trace-peer] phase=compat_ok t=2.217
+05-09 20:12:14.692 27153 27182 I python  :  [boot-trace-peer] phase=bootstrap_done t=2.320

@@ -290,10 +290,24 @@ def diagnose_403(token, remote_url):
     via GitHub's UI — the 403 is from the install being suspended,
     not from a missing install or repo permission. The user fixes
     this by going to ``settings/installations/<id>`` and resuming;
-    the Status carries that URL."""
+    the Status carries that URL.
+
+    Scopes ``check_app_installed`` to the **repo owner** so the
+    installation we inspect is the one that should host the repo. A
+    user who's a collaborator on five orgs that all installed the
+    App will get five entries back from ``/user/installations``;
+    picking the first match silently inspected an unrelated org's
+    install and falsely reported ``REPO_NOT_AUTHORIZED`` (observed
+    in the field). When the URL isn't parseable, falls back to the
+    legacy "first match" behaviour so unknown hosts still get a
+    best-effort diagnosis."""
     if not token:
         return Status(S.AUTH_REQUIRED)
-    info = check_app_installed(token)
+    import re
+    m = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', remote_url)
+    owner = m.group(1) if m else None
+    repo_name = m.group(2) if m else None
+    info = check_app_installed(token, account_login=owner)
     install_id = info['installation_id']
     if info['suspended']:
         return Status(S.APP_SUSPENDED,
@@ -301,16 +315,12 @@ def diagnose_403(token, remote_url):
     if not info['installed']:
         return Status(S.APP_NOT_INSTALLED,
                       {'url': _config.install_url()})
-    if not info['all_repos']:
-        import re
-        m = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', remote_url)
-        if m:
-            owner, repo_name = m.group(1), m.group(2)
-            if not check_repo_in_installation(token, install_id, owner, repo_name):
-                settings_url = app_install_url(install_id)
-                return Status(S.REPO_NOT_AUTHORIZED,
-                              {'owner_repo': f'{owner}/{repo_name}',
-                               'url': settings_url})
+    if not info['all_repos'] and owner and repo_name:
+        if not check_repo_in_installation(token, install_id, owner, repo_name):
+            settings_url = app_install_url(install_id)
+            return Status(S.REPO_NOT_AUTHORIZED,
+                          {'owner_repo': f'{owner}/{repo_name}',
+                           'url': settings_url})
     return Status(S.ACCESS_DENIED,
                   {'url': app_install_url(install_id)})
 
@@ -435,16 +445,34 @@ def test_gitlab_credentials(username, token):
     return {'valid': True, 'server_username': server_username, 'error': ''}
 
 
-def add_collaborator(owner, repo_name, collaborator, token):
-    """Add *collaborator* to *owner/repo_name* on GitHub. Silently succeeds if
-    already a collaborator or if the invitation was already sent."""
+def add_collaborator(owner, repo_name, collaborator, token,
+                     permission='push'):
+    """Invite *collaborator* to *owner/repo_name* on GitHub.
+
+    Returns one of:
+
+    - ``'invited'`` — HTTP 201, invitation issued (the user must accept
+      it via GitHub's normal invite-acceptance UI).
+    - ``'already'`` — HTTP 204 (already a collaborator) or HTTP 422
+      (pending invite already exists). No new state on GitHub's side;
+      from the user's perspective the operation is a no-op.
+
+    Raises ``HTTPError`` / ``URLError`` / ``OSError`` on real failures
+    (auth refused, repo not found, network error, etc.). Callers that
+    just want fire-and-forget semantics — e.g. the post-create
+    auto-invite from ``repo._publish_repo`` — wrap the call in
+    ``try/except Exception``; callers that want to surface the
+    outcome to the user (the new
+    ``POST /v1/projects/<lang>/collaborators`` endpoint) read the
+    return value to pick a status code."""
     _ensure_ssl()
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
-    url = f'https://api.github.com/repos/{owner}/{repo_name}/collaborators/{collaborator}'
+    url = (f'https://api.github.com/repos/{owner}/{repo_name}'
+           f'/collaborators/{collaborator}')
     req = Request(
         url,
-        data=json.dumps({'permission': 'push'}).encode(),
+        data=json.dumps({'permission': permission}).encode(),
         headers={
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github+json',
@@ -454,7 +482,8 @@ def add_collaborator(owner, repo_name, collaborator, token):
     )
     try:
         with urlopen(req, timeout=15) as resp:
-            pass  # 201 = invited, 204 = already collaborator
+            return 'already' if resp.status == 204 else 'invited'
     except HTTPError as e:
-        if e.code not in (204, 422):  # 422 = already invited
-            print(f'[collab] add collaborator failed ({e.code}): {e.read()[:200]}')
+        if e.code == 422:
+            return 'already'  # pending invite already exists
+        raise

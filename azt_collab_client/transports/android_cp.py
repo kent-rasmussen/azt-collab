@@ -24,7 +24,22 @@ CANONICAL_AUTHORITY = 'org.atoznback.aztcollab'
 
 def discover():
     """Return an AndroidContentProviderTransport bound to the canonical
-    server-APK authority if it answers ``ping``, else None."""
+    server-APK authority if it answers ``ping``, else None.
+
+    Side effect on success (Phase B2): kicks off a peer-side
+    ``bindService`` against the server APK's
+    ``AZTServiceProviderhost`` via ``AZTServiceConnector.ensureBound``.
+    The bind raises ``:provider``'s OOM priority for as long as the
+    peer is alive, defeating Android 15's app freezer that would
+    otherwise suspend the daemon's Python interpreter mid-init on
+    cached processes — exactly the symptom that produced the
+    R500-tablet "AZT Collaboration not responding" reports.
+
+    Best-effort: any failure (no jnius, missing connector class,
+    bind refused) is logged and silenced. The transport still
+    works against the ContentProvider without the bind; on
+    freezer-affected devices it just degrades to the pre-B2
+    behaviour."""
     try:
         from jnius import autoclass
     except ImportError:
@@ -43,6 +58,21 @@ def discover():
             return None
         if bundle is None:
             return None
+        # Phase B2: hold a service binding so :provider stays warm
+        # across the peer's session. Idempotent; safe to invoke on
+        # every discover() (only the first invocation actually binds;
+        # subsequent calls no-op while the bind is alive). Async —
+        # we don't wait for onServiceConnected. The peer's compat
+        # probe retry loop handles the daemon-boot latency naturally.
+        try:
+            Connector = autoclass(
+                'org.atoznback.aztcollab.AZTServiceConnector')
+            Connector.ensureBound(activity)
+        except Exception as ex:
+            import sys as _sys
+            print(f'[android_cp] AZTServiceConnector.ensureBound '
+                  f'failed: {ex}',
+                  file=_sys.stderr, flush=True)
         return AndroidContentProviderTransport(CANONICAL_AUTHORITY)
     except Exception:
         return None
@@ -73,7 +103,9 @@ class AndroidContentProviderTransport(Transport):
         except ServerUnavailable:
             raise
         except Exception as ex:
-            raise ServerUnavailable(f'provider call failed: {ex}')
+            raise ServerUnavailable(
+                f'provider call failed: {ex}',
+                kind='transport_error')
 
     def _raw_call(self, method, path, body, timeout):
         # ContentResolver.call(uri, method, arg, extras) consumes the
@@ -90,19 +122,32 @@ class AndroidContentProviderTransport(Transport):
             extras.putString('body', json.dumps(body))
         bundle = self._resolver.call(uri, method, path, extras)
         if bundle is None:
-            raise ServerUnavailable('provider returned null')
+            # Most common cause: signature-grant denial (peer's APK
+            # signed with a different key than the suite keystore)
+            # or the provider authority not actually present.
+            # Structural; bootstrap's warmup loop fails fast on this
+            # kind rather than waiting the full 60s budget.
+            raise ServerUnavailable(
+                'provider returned null',
+                kind='null_bundle')
         status = bundle.getInt('status', 500)
         json_str = bundle.getString('json') or ''
         try:
             response = json.loads(json_str) if json_str else {}
         except Exception:
             raise ServerUnavailable(
-                f'provider returned non-JSON: {json_str[:200]!r}')
+                f'provider returned non-JSON: {json_str[:200]!r}',
+                kind='transport_error')
         # Mirror loopback semantics: the dispatcher returns its dict
         # regardless of status; surface 5xx as ServerUnavailable so
         # callers retry through the transport seam.
         if status >= 500:
+            error_code = response.get('error', '')
+            kind = ('daemon_not_ready'
+                    if error_code == 'daemon_not_ready'
+                    else 'http_5xx')
             raise ServerUnavailable(
                 f'provider HTTP {status}: '
-                f'{response.get("error", "unknown")}')
+                f'{error_code or "unknown"}',
+                kind=kind)
         return response

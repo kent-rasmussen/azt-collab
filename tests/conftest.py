@@ -76,6 +76,34 @@ def azt_home(tmp_path, monkeypatch):
     return home
 
 
+# ── module-level cache resets ─────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def reset_module_caches():
+    """Clear process-local caches in ``azt_collab_client`` between
+    tests so module state from an earlier test doesn't bleed into
+    the next.
+
+    Currently the only one is ``update._release_cache`` (a per-
+    process dict keyed by ``owner/repo`` that caches GitHub-
+    Releases responses for ``_RELEASE_CACHE_TTL_S``). Without this
+    reset, the first test that mocks urlopen to return a release
+    seeds the cache for the whole module; every subsequent test
+    using the same repo slug sees the cached value regardless of
+    what its own mock returns. That produces a confusing failure
+    shape where the test's own mock is verifiably correct but the
+    test fails anyway.
+
+    Add new caches here as the surface grows. The pattern is
+    "reset everything every test"; we're not paying enough cache-
+    hit cost across tests to make a more targeted approach worth
+    the complexity."""
+    from azt_collab_client.ui import update as _upd
+    _upd._release_cache.clear()
+    yield
+    _upd._release_cache.clear()
+
+
 # ── platform monkeypatch helper ───────────────────────────────────────────
 
 @pytest.fixture

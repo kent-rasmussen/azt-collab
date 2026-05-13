@@ -31,6 +31,10 @@ OPEN_PR = 'OPEN_PR'
 NO_AUDIO = 'NO_AUDIO'
 NO_REPO = 'NO_REPO'
 
+# Successful response from /v1/projects/<lang>/atomic_commit (daemon
+# 0.36.0+). Carries ``params['bytes_written']`` and ``params['sha256']``.
+ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
+
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
@@ -50,10 +54,21 @@ APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'
 APP_SUSPENDED = 'APP_SUSPENDED'
 REPO_NOT_AUTHORIZED = 'REPO_NOT_AUTHORIZED'
 ACCESS_DENIED = 'ACCESS_DENIED'
+# Carries ``params['expires_at']`` — unix timestamp at which the
+# current GitHub access token expires (token_time + 8h). See the
+# daemon's status.py for the full rationale and the peer-side
+# contract section of CLAUDE.md.
+AUTH_REFRESH_STALE = 'AUTH_REFRESH_STALE'
 
 AUTH_EXPIRED = 'AUTH_EXPIRED'
 AUTH_DENIED = 'AUTH_DENIED'
 AUTH_TIMEOUT = 'AUTH_TIMEOUT'
+
+COLLABORATOR_INVITED = 'COLLABORATOR_INVITED'
+COLLABORATOR_ALREADY = 'COLLABORATOR_ALREADY'
+COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
+INVALID_USERNAME = 'INVALID_USERNAME'
+NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 
 
 @dataclass

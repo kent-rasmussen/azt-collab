@@ -322,6 +322,14 @@ def _run_sync(langcode, contributor):
               file=sys.stderr, flush=True)
         return Result().add(S.COMMITTED_OFFLINE)
     res = _sync_repo(p.working_dir, git_user, token, contributor)
+    # Mirror the user-initiated path: append AUTH_REFRESH_STALE
+    # when the persisted refresh state says the refresh path is
+    # broken. Peers in the auto-sync path silence this code per
+    # the auto/user contract; including it in the result keeps
+    # the daemon's emission uniform regardless of which side
+    # fired the sync.
+    from .server import _annotate_with_auth_health
+    _annotate_with_auth_health(res)
     codes = res.codes()
     print(f'[sync] {langcode!r} done: codes={codes!r}',
           file=sys.stderr, flush=True)

@@ -15,7 +15,34 @@ from typing import Optional
 
 
 class ServerUnavailable(RuntimeError):
-    """Raised when no transport can reach the daemon."""
+    """Raised when no transport can reach the daemon.
+
+    ``kind`` is a coarse machine-readable bucket so callers can pick
+    fail-fast vs keep-retrying without parsing the exception message.
+    Recognised values:
+
+    - ``'daemon_not_ready'`` — provider returned a 503 with the
+      ``daemon_not_ready`` body. Service is up but Python's
+      ``install_callbacks()`` hasn't fired yet. Boot-in-progress;
+      worth retrying.
+    - ``'null_bundle'`` — ``ContentResolver.call`` returned ``null``.
+      Most common cause is signature-grant denial (peer's APK signed
+      with a different key than the suite keystore) or the provider
+      authority not actually being installed. Structural; retrying
+      doesn't help.
+    - ``'server_apk_not_installed'`` — discovery returned ``None``;
+      same shape, surfaced from ``pick_transport``.
+    - ``'http'`` — loopback / HTTP error from the desktop transport.
+    - ``''`` — unspecified (legacy / unclassified site).
+
+    Bootstrap's warmup retry loop uses ``kind`` to pick the budget
+    and the backoff: ``daemon_not_ready`` gets the full warm-up
+    schedule; ``null_bundle`` fails fast (no amount of waiting
+    fixes a signature mismatch)."""
+
+    def __init__(self, message='', kind=''):
+        super().__init__(message)
+        self.kind = kind
 
 
 class Transport:
@@ -60,7 +87,9 @@ def pick_transport():
         from . import android_cp
         cp = android_cp.discover()
         if cp is None:
-            raise ServerUnavailable('server_apk_not_installed')
+            raise ServerUnavailable(
+                'server_apk_not_installed',
+                kind='server_apk_not_installed')
         _transport = cp
         return _transport
     from .loopback import LoopbackTransport

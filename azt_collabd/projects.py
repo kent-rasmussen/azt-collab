@@ -55,6 +55,23 @@ class Project:
     last_commit: float = 0.0
     last_sync: float = 0.0
     created_at: float = 0.0
+    # Per-project CAWL image source. Empty → fall back to the daemon's
+    # global ``config.cawl_image_repo()`` value (smoothes the recorder
+    # migration so unmigrated projects don't have to be touched). When
+    # set, the daemon serves CAWL index / image bytes for this project
+    # from ``$AZT_HOME/cawl/<owner>/<repo>/...`` — multiple projects
+    # pointing at the same repo share that one cache directory.
+    cawl_image_repo: str = ''
+    # Per-project override for the GitHub repo *name* (last segment of
+    # the remote URL) used by the publish path. Empty → callers treat
+    # as equal to ``langcode`` (no override; the typical case).
+    # Non-empty values let the user keep a vanity / project-style /
+    # collision-avoiding repo name while the LIFT ``<form lang="…">``
+    # tag (== ``langcode``) stays canonical. Recorder 1.41.3 removed
+    # its peer-side ``collab_langcode`` peer_pref under the
+    # no-daemon-owned-caches rule; this field is the canonical home
+    # for that data.
+    repo_slug: str = ''
 
     def to_dict(self):
         return {
@@ -65,6 +82,8 @@ class Project:
             'last_commit': self.last_commit,
             'last_sync': self.last_sync,
             'created_at': self.created_at,
+            'cawl_image_repo': self.cawl_image_repo,
+            'repo_slug': self.repo_slug,
         }
 
     @classmethod
@@ -77,6 +96,8 @@ class Project:
             last_commit=float(d.get('last_commit', 0.0)),
             last_sync=float(d.get('last_sync', 0.0)),
             created_at=float(d.get('created_at', 0.0)),
+            cawl_image_repo=d.get('cawl_image_repo', ''),
+            repo_slug=d.get('repo_slug', ''),
         )
 
 
@@ -118,8 +139,16 @@ def _update(mutator):
 
 # ── public API ──────────────────────────────────────────────────────────────
 
-def register(langcode, working_dir, lift_path='', remote_url=''):
-    """Register or update a project. Returns the resulting Project."""
+def register(langcode, working_dir, lift_path='', remote_url='',
+             cawl_image_repo=None, repo_slug=None):
+    """Register or update a project. Returns the resulting Project.
+
+    ``cawl_image_repo`` / ``repo_slug`` accept None (don't touch
+    the field; preserves any previously-set value across
+    re-registration), empty string (explicitly clear; the
+    project falls back to default behaviour — daemon-global
+    CAWL repo for ``cawl_image_repo``, ``langcode`` itself for
+    ``repo_slug``), or a non-empty string."""
     if not langcode:
         raise ValueError('langcode required')
     if not working_dir:
@@ -131,11 +160,36 @@ def register(langcode, working_dir, lift_path='', remote_url=''):
         entry['lift_path'] = lift_path
     if remote_url:
         entry['remote_url'] = remote_url
+    if cawl_image_repo is not None:
+        entry['cawl_image_repo'] = cawl_image_repo
+    if repo_slug is not None:
+        entry['repo_slug'] = repo_slug
     entry.setdefault('last_sync', 0.0)
     entry.setdefault('created_at', time.time())
     data[langcode] = entry
     _save_raw(data)
     return Project.from_entry(langcode, entry)
+
+
+def set_cawl_image_repo(langcode, repo):
+    """Persist a per-project CAWL image repo slug. Empty string is a
+    valid value — clears the override so the project falls back to the
+    daemon-global default."""
+    def mut(d):
+        if langcode in d:
+            d[langcode]['cawl_image_repo'] = repo
+    _update(mut)
+
+
+def set_repo_slug(langcode, slug):
+    """Persist a per-project GitHub-repo-name override for the
+    publish path. Empty string is a valid value — clears the
+    override so callers fall back to ``langcode`` (the typical
+    case)."""
+    def mut(d):
+        if langcode in d:
+            d[langcode]['repo_slug'] = slug
+    _update(mut)
 
 
 def unregister(langcode):

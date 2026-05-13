@@ -14,15 +14,18 @@ can surface it in its usual error channel.
 from ..translate import tr as _tr
 
 
-def share_running_apk(filename='app.apk', on_error=None):
+def share_running_apk(filename=None, on_error=None):
     """Share the running APK via Android's share sheet.
 
     Parameters
     ----------
-    filename : str
-        MediaStore display name for the shared file (e.g.
-        ``'azt_recorder.apk'``). Each peer passes its own — the
-        running APK's actual on-disk name is opaque.
+    filename : str | None
+        MediaStore display name for the shared file. When ``None``
+        (default), derived from the running Android package's last
+        segment via
+        ``azt_collab_client.ui.update.default_asset_filename`` —
+        e.g. ``'aztrecorder.apk'`` for ``org.atoznback.aztrecorder``.
+        Pass explicitly to override for a fork or test harness.
     on_error : callable(str) | None
         Invoked with a translated, user-visible message on any
         failure (non-Android, MediaStore insert refused, copy or
@@ -37,6 +40,10 @@ def share_running_apk(filename='app.apk', on_error=None):
         if on_error is not None:
             on_error(_tr('APK sharing is only available on Android.'))
         return
+
+    if not filename:
+        from .update import default_asset_filename
+        filename = default_asset_filename() or 'app.apk'
 
     try:
         from jnius import autoclass, cast

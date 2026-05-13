@@ -5,8 +5,10 @@ Each host wires a small adapter that supplies three pieces of identity:
 
     repo             — 'owner/repo' on GitHub (releases endpoint)
     current_version  — caller's running ``__version__`` string
-    asset_filename   — the release asset to fetch (e.g. ``azt_collab.apk``,
-                       ``azt_recorder.apk``); each app names its own.
+    asset_filename   — the release asset to fetch (e.g. ``aztcollab.apk``,
+                       ``aztrecorder.apk``; convention is
+                       ``<buildozer.spec package.name>.apk``). Omit to
+                       derive at runtime via ``default_asset_filename``.
 
 The helper spawns a worker thread, polls
 ``GET /repos/{repo}/releases/latest``, compares the tag name to
@@ -551,6 +553,37 @@ def _apk_parse_info(apk_path):
         return None
 
 
+def default_asset_filename():
+    """Derive the release-asset filename from the running peer's own
+    Android package name. Returns ``'<package-segment>.apk'`` (e.g.
+    ``'aztrecorder.apk'`` for ``org.atoznback.aztrecorder``), or
+    ``''`` off Android.
+
+    Suite convention is that every APK's release asset is named after
+    its ``buildozer.spec → package.name`` (= the Android package's
+    last segment = the short-form name in the suite naming table).
+    Hardcoding the name in each peer drifted (the recorder shipped
+    with ``'azt_recorder.apk'`` for several releases while the
+    actual published asset was ``'aztrecorder.apk'`` — Python-pkg
+    underscore vs. Android-segment no-underscore — and self-update
+    404'd until the user reinstalled manually). Derive at runtime
+    instead: ``activity.getPackageName().rsplit('.', 1)[-1] +
+    '.apk'`` is what every suite peer wants, with no per-peer
+    boilerplate. Forks that publish under a different scheme pass
+    ``asset_filename=`` explicitly to override.
+    """
+    _pm, ctx = _android_package_manager()
+    if ctx is None:
+        return ''
+    try:
+        pkg = ctx.getPackageName() or ''
+    except Exception:
+        return ''
+    if not pkg:
+        return ''
+    return f'{pkg.rsplit(".", 1)[-1]}.apk'
+
+
 def _signature_matches_installed(apk_path, package_name):
     """Compare the signing certificate of ``apk_path`` against the
     installed app's certificate for ``package_name``. Returns:
@@ -587,7 +620,7 @@ def _signature_matches_installed(apk_path, package_name):
         return None
 
 
-def check_for_update(*, repo, current_version, asset_filename,
+def check_for_update(*, repo, current_version, asset_filename=None,
                      on_status, on_no_update=None, on_error=None,
                      download_dir=None, install_target_package=None,
                      on_install_complete=None,
@@ -607,9 +640,13 @@ def check_for_update(*, repo, current_version, asset_filename,
     current_version : str
         The caller's running ``__version__`` (compared as a semver tuple
         against the release's ``tag_name``).
-    asset_filename : str
-        Exact name of the release asset to fetch. Each suite app names
-        its own (``aztcollab.apk``, ``azt_recorder.apk``, …).
+    asset_filename : str | None
+        Exact name of the release asset to fetch. When ``None``
+        (default), derived from the running Android package's last
+        segment via ``default_asset_filename()`` — i.e.
+        ``'aztrecorder.apk'`` for ``org.atoznback.aztrecorder``.
+        Pass explicitly to override (e.g. a fork that publishes
+        under a different naming scheme).
     on_status : callable(str)
         Called repeatedly with translated, user-visible state strings:
         "Checking for updates…", "Downloading {pct}%…", "Installing…".
@@ -656,6 +693,20 @@ def check_for_update(*, repo, current_version, asset_filename,
     if download_dir is None:
         download_dir = os.path.join(azt_home(), 'updates')
 
+    # Resolve asset_filename now, on the calling (UI) thread — needs
+    # an Android Activity, which is available here but might not be
+    # later. Pre-platform-gate this fallback is a no-op (returns '');
+    # we're already inside the ``platform == 'android'`` branch, so a
+    # blank result from default_asset_filename means the Activity
+    # genuinely couldn't be reached, which we surface to the caller.
+    resolved_asset = asset_filename or default_asset_filename()
+    if not resolved_asset:
+        _safe_call(on_error, _tr(
+            'Update check failed: could not derive asset filename '
+            '(running Activity unreachable). Pass asset_filename='
+            ' explicitly.'))
+        return
+
     def _ui_status(msg):
         _on_ui(_safe_call, on_status, msg)
 
@@ -666,6 +717,10 @@ def check_for_update(*, repo, current_version, asset_filename,
         _on_ui(_safe_call, on_no_update)
 
     def _worker():
+        # Allow the resilient-asset-name fallback below to rebind
+        # ``resolved_asset`` so the cache path + MediaStore display
+        # name use the actually-found filename.
+        nonlocal resolved_asset
         _ui_status(_tr('Checking for updates…'))
         try:
             release = _fetch_latest(repo)
@@ -681,11 +736,28 @@ def check_for_update(*, repo, current_version, asset_filename,
             _ui_no_update()
             return
 
-        asset = _pick_asset(release, asset_filename)
+        asset = _pick_asset(release, resolved_asset)
+        if asset is None:
+            # Resilient fallback: if the caller passed an explicit
+            # ``asset_filename`` literal that doesn't match the
+            # actually-published asset (real bug: peer ``main.py``
+            # pinned Python-pkg ``azt_recorder.apk`` while the
+            # release shipped Android-segment ``aztrecorder.apk``),
+            # try the runtime-derived name. Survives peer-side
+            # literal drift without requiring a peer rebuild.
+            derived = default_asset_filename()
+            if derived and derived != resolved_asset:
+                asset = _pick_asset(release, derived)
+                if asset is not None:
+                    print(f'[update] explicit asset {resolved_asset!r} '
+                          f'not in release {latest!r}; falling back '
+                          f'to derived {derived!r}',
+                          file=sys.stderr, flush=True)
+                    resolved_asset = derived
         if asset is None:
             _ui_error(_tr(
                 'Update check failed: no {file} in release {tag}'
-            ).format(file=asset_filename, tag=latest))
+            ).format(file=resolved_asset, tag=latest))
             return
 
         download_url = asset.get('browser_download_url') or ''
@@ -708,7 +780,7 @@ def check_for_update(*, repo, current_version, asset_filename,
             _ui_error(_tr('Could not create download dir: {error}')
                       .format(error=ex))
             return
-        dest = os.path.join(download_dir, asset_filename)
+        dest = os.path.join(download_dir, resolved_asset)
 
         # Cache-staleness check. Two layers:
         #
@@ -861,7 +933,7 @@ def check_for_update(*, repo, current_version, asset_filename,
                     _open_unknown_sources_settings(activity)
                     _safe_call(on_user_action_needed)
                     return
-                uri = _media_store_uri(dest, asset_filename)
+                uri = _media_store_uri(dest, resolved_asset)
                 _trigger_install(uri)
                 _safe_call(on_status, _tr('Installing…'))
                 if install_target_package:
@@ -876,7 +948,7 @@ def check_for_update(*, repo, current_version, asset_filename,
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def install_apk_from_url(*, url, asset_filename, on_status,
+def install_apk_from_url(*, url, asset_filename=None, on_status,
                          on_error=None, on_install_complete=None,
                          on_user_action_needed=None,
                          install_target_package=None,
@@ -928,6 +1000,17 @@ def install_apk_from_url(*, url, asset_filename, on_status,
     if download_dir is None:
         download_dir = os.path.join(azt_home(), 'updates')
 
+    # See check_for_update for rationale: derive on the UI thread so
+    # the Activity reference is reliably reachable, error out fast if
+    # the caller didn't pass a name and we couldn't resolve one.
+    resolved_asset = asset_filename or default_asset_filename()
+    if not resolved_asset:
+        _safe_call(on_error, _tr(
+            'Install failed: could not derive asset filename '
+            '(running Activity unreachable). Pass asset_filename='
+            ' explicitly.'))
+        return
+
     def _ui_status(msg):
         _on_ui(_safe_call, on_status, msg)
 
@@ -935,29 +1018,57 @@ def install_apk_from_url(*, url, asset_filename, on_status,
         _on_ui(_safe_call, on_error, msg)
 
     def _worker():
+        # ``nonlocal`` lets the resilient-asset-name fallback below
+        # rebind both names — the resolved filename (used for cache
+        # path + MediaStore display) and the download URL (which may
+        # need to be replaced by the release JSON's authoritative
+        # browser_download_url when the caller-baked URL points at
+        # the wrong asset name).
+        nonlocal resolved_asset
+        download_url = url
         try:
             os.makedirs(download_dir, exist_ok=True)
         except OSError as ex:
             _ui_error(_tr('Could not create download dir: {error}')
                       .format(error=ex))
             return
-        dest = os.path.join(download_dir, asset_filename)
 
-        # When ``repo`` is supplied, fetch the release JSON to get
-        # GitHub's authoritative ``asset.digest``. We use it ONLY
-        # for cache freshness — the download still goes through the
-        # caller-supplied direct ``url``. Without this, a previous-
-        # version cache + matching sidecar look fresh to
-        # ``_has_fresh_download`` and we'd silently install the
-        # stale bytes (real bug: bootstrap reused 0.30.28 against a
-        # 0.30.29 latest because direct-URL mode has no way to
-        # cross-check).
+        # When ``repo`` is supplied, the release JSON is the
+        # authoritative source for BOTH the digest (cache freshness)
+        # AND the download URL (resilience). Resilience matters
+        # because the caller-supplied ``url`` is typically
+        # ``releases/latest/download/<name>`` constructed by
+        # ``bootstrap.py`` from a peer-baked literal — and that
+        # literal historically drifted from the published asset
+        # name (Python-pkg ``azt_recorder.apk`` vs. published
+        # ``aztrecorder.apk``). If the explicit name isn't found in
+        # the release, fall back to the runtime-derived name; the
+        # client is the right place to know the convention since the
+        # peer's only knowledge is its own
+        # ``activity.getPackageName()``.
         expected_sha = ''
         if repo:
             try:
                 rel = _fetch_latest(repo)
-                asset = _pick_asset(rel, asset_filename)
+                asset = _pick_asset(rel, resolved_asset)
+                if asset is None:
+                    derived = default_asset_filename()
+                    if derived and derived != resolved_asset:
+                        asset = _pick_asset(rel, derived)
+                        if asset is not None:
+                            print(f'[update] install: explicit asset '
+                                  f'{resolved_asset!r} not in release; '
+                                  f'falling back to derived '
+                                  f'{derived!r}', file=sys.stderr,
+                                  flush=True)
+                            resolved_asset = derived
                 if asset is not None:
+                    # Use the API-provided URL — survives wrong-name
+                    # literals in the caller-baked
+                    # ``releases/latest/download/<name>`` URL.
+                    api_url = asset.get('browser_download_url') or ''
+                    if api_url:
+                        download_url = api_url
                     digest = asset.get('digest') or ''
                     if digest.startswith('sha256:'):
                         expected_sha = digest[len('sha256:'):].strip()
@@ -968,9 +1079,11 @@ def install_apk_from_url(*, url, asset_filename, on_status,
                 # "Install button doesn't work at all", and the
                 # signature / parse checks still defend the install
                 # against a corrupted cache.
-                print(f'[update] install_apk_from_url: digest fetch '
-                      f'failed for {repo!r}: {ex}',
+                print(f'[update] install_apk_from_url: release JSON '
+                      f'fetch failed for {repo!r}: {ex}',
                       file=sys.stderr, flush=True)
+
+        dest = os.path.join(download_dir, resolved_asset)
 
         # If we just downloaded this file (typically: user tapped
         # Install, finished download, granted "Install unknown
@@ -989,12 +1102,12 @@ def install_apk_from_url(*, url, asset_filename, on_status,
                 _ui_status(msg)
 
             try:
-                _download(url, dest, 0, _on_progress,
+                _download(download_url, dest, 0, _on_progress,
                           on_status=_on_retry_status)
             except Exception as ex:
                 _ui_error(
                     _tr('Download failed: {error}').format(error=ex)
-                    + '\n' + _wrappable_url(url))
+                    + '\n' + _wrappable_url(download_url))
                 return
             _save_download_sha(dest)
 
@@ -1049,7 +1162,7 @@ def install_apk_from_url(*, url, asset_filename, on_status,
                     # left with disabled buttons forever.
                     _safe_call(on_user_action_needed)
                     return
-                uri = _media_store_uri(dest, asset_filename)
+                uri = _media_store_uri(dest, resolved_asset)
                 _trigger_install(uri)
                 _safe_call(on_status, _tr('Installing…'))
                 if install_target_package:

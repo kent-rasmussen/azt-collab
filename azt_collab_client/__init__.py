@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.31.0"
+__version__ = "0.39.0"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -35,7 +35,119 @@ __version__ = "0.31.0"
 # path against the latest peer build. Drop back to a real-world
 # floor before any release that ships in the public update
 # channel.
-MIN_SERVER_VERSION = "0.31.0"
+#
+# 0.36.0 floor: HARD requirement. 0.36.0 daemons expose
+# ``POST /v1/projects/<lang>/atomic_commit`` so peers writing
+# LIFT / audio / image bytes through a ``content://`` URI on
+# Android can hand the full payload to the daemon, which then
+# performs the tempfile + ``os.replace`` atomic write in its own
+# process — serialized via ``project_lock`` against the daemon's
+# own merge-output writes. Pre-0.36.0 daemons have no atomic
+# write for URI peers; ``LiftHandle.atomic_open_write`` on a URI
+# falls back to the lock-only ``open_write``, which prevents
+# same-peer-process races but NOT peer-vs-daemon nor peer-vs-other-
+# peer-process races. The malformed-XML ``baf`` repro
+# (NOTES_TO_DAEMON.md 2026-05-12, closed) is the canonical
+# example: two same-process writes interleaved through the
+# ContentProvider FD path produced two same-lang gloss elements
+# with overlapping text, which the daemon's merge then misparsed
+# catastrophically. The 0.36.0 client uses the new RPC for URI
+# atomic writes, closing that gap; pinning the floor here forces
+# every peer talking to a 0.36.0+ daemon to be running a client
+# that knows about the RPC (older daemons reject the endpoint).
+#
+# 0.35.4 floor: HARD requirement. 0.35.4 daemons write a
+# forensic ``<azt-collab-diagnostic>`` XML file under the
+# project's ``.azt-collab/diagnostics/`` whenever any input or
+# output guard fires, and stage it into the merge commit so the
+# data is retrievable from any clone. Pre-0.35.4 daemons log
+# the guard trip to stderr only — Android logcat is ephemeral
+# and not retrievable post-hoc, so a guard trip with a
+# pre-0.35.4 daemon leaves no audit trail. The user explicitly
+# asked (2026-05-12) that every guard firing be recoverable
+# from the repo so a future analysis can reconstruct what
+# happened; pinning the floor here is the discipline that
+# enforces it.
+#
+# 0.35.3 floor: HARD requirement. The reopened ``baf`` field
+# repro (NOTES_TO_DAEMON.md, 2026-05-12 second cut) showed that
+# the 0.35.1 input-side truncation guard was insufficient: a
+# merge produced 1 entry from two healthy 1700-entry inputs.
+# 0.35.3 adds an output-side ``_looks_catastrophic_output``
+# guard that refuses to commit a merge result whose entry count
+# is < 1/4 of the smaller healthy input. Defense-in-depth
+# regardless of upstream cause. Forcing the floor here ensures
+# no peer talks to a daemon that lacks the output guard, since
+# the proximate-cause analysis for the original baf collapse is
+# undetermined and the same bug shape could recur.
+#
+# 0.35.1 floor: HARD requirement. Pre-0.35.1 daemons have no
+# truncation guard in ``lift_merge.three_way_merge``; if one side
+# arrives at the merge with a near-empty entry list (peer-side
+# write race / partial commit / sandbox hiccup — upstream cause
+# not yet narrowed), the merge correctly honors the apparent
+# deletions and produces a 1-entry destructive result, which the
+# daemon then commits and pushes before any peer can notice.
+# Field-reported 2026-05-12 against the ``baf`` project: 1701
+# entries reduced to 1, project unrecoverable via the normal
+# clone flow. The 0.35.1 daemon refuses the destructive merge
+# (keeps the larger side intact, surfaces a
+# ``truncation-suspected`` Conflict). Forcing the floor blocks
+# the entire sync flow until the user updates the server APK —
+# preferable to letting a pre-fix daemon irreversibly wipe a
+# project's contents.
+#
+# 0.35.0 floor: SOFT requirement — the wire format hasn't changed
+# (older daemons just don't emit ``AUTH_REFRESH_STALE``; older
+# clients fall back to the verbose ``[CODE] {...}`` translate
+# render on unknown codes). Raised anyway to flush peer rebuilds
+# through the new auto/user sync contract documented in
+# ``CLAUDE.md`` § "Peer contract: routing on sync results".
+# Without that contract, the recorder (and any future peer)
+# disrupts mid-flow on ``NOT_A_REPO`` / ``NO_REMOTE`` /
+# ``SERVER_UNAVAILABLE`` etc. during auto-sync — the same
+# symptom that surfaced as the "selected B got A" picker
+# complaint earlier in this session. Forcing the floor ensures
+# every peer that talks to a 0.35.0+ daemon has been rebuilt
+# against the new client, where the contract is loud in
+# CLAUDE.md and the AUTH_REFRESH_STALE handler is wired through
+# translate.py. Also bundles the deadline-aware re-auth toast
+# so users see the 8h-cliff warning before they hit it.
+#
+# 0.34.1 floor: HARD requirement on top of the 0.34.0 sync fixes.
+# Pre-0.34.1 ``lift_merge.three_way_merge`` walks
+# ``sorted(all_guids)``, which rewrites every LIFT file in
+# guid-alphabetical order on the first real merge. The damage is
+# committed to git history before any peer can notice (the picker
+# / recorder never sees the disk state before the merge commit
+# pushes), so silent fallback against a pre-0.34.1 daemon
+# guarantees one-shot, irreversible loss of document order for the
+# project. Forcing the floor blocks the merge entirely until the
+# user updates the server APK — preferable to scrambling and
+# pushing the result. See NOTES_TO_DAEMON.md (closed 2026-05-11)
+# for the field repro against ``kent-rasmussen/sw-US-x-kent``.
+#
+# 0.34.0 floor: HARD requirement, not a deliberate-test bump. Three
+# load-bearing sync fixes only land in 0.34.0: (1) ``_merge_diverged``
+# now uses ``worktree.commit(merge_heads=…)`` to atomically write
+# the second parent — pre-0.34 graft fallback silently produced
+# merge commits with only the local parent, every push then
+# rejected with ``DivergedBranches``; (2) HTTP 403 detection moved
+# from ``'403' in str(exc)`` substring matching (false-positives on
+# the trigraph inside hex SHAs, observed in the field) to
+# ``\b403\b`` word-boundary regex + ``diagnose_403`` now scopes
+# ``check_app_installed`` to the repo owner so multi-org users
+# don't get a bogus ``REPO_NOT_AUTHORIZED`` against an unrelated
+# org's install; (3) ``porcelain.fetch`` / ``pull`` now pass the
+# remote NAME (``'origin'``) not the URL, so dulwich's
+# ``_import_remote_refs`` actually fires and
+# ``refs/remotes/origin/<branch>`` advances on each fetch —
+# pre-0.34 the local tracking ref was frozen at clone time and
+# every sync acted on a phantom remote state. A peer paired with
+# a pre-0.34 daemon will lose two-device sync silently after the
+# first race; the floor forces the user to update the server APK
+# before the peer will attempt a sync at all.
+MIN_SERVER_VERSION = "0.36.0"
 # Public release page for the server APK. Tapping "Open install
 # page" in ``install_server_apk_popup`` opens this URL in the
 # browser so the user can read release notes / browse the project
@@ -55,13 +167,16 @@ SERVER_APK_INSTALL_URL = (
 # Forks should override this in their own build of the client
 # (no env-var hook yet — change here, rebuild the peer APK).
 MAINTAINER_EMAIL = 'kent_rasmussen@sil.org'
+
+import base64
 from . import status as S
 from .status import Status, Result
 from .projects import Project, ProjectStatus
 from .translate import translate_status, translate_result, set_translator
 from .rpc import call, health, ServerUnavailable
 from .lift_io import (
-    LiftHandle, MediaHandle, audio_uri_for, image_uri_for, is_content_uri,
+    LiftHandle, MediaHandle, CAWLHandle,
+    audio_uri_for, image_uri_for, is_content_uri,
 )
 from .recent import last_project, set_last_project
 from .peer_prefs import peer_pref, set_peer_pref
@@ -528,17 +643,45 @@ def is_online():
 def _version_tuple(s):
     """Best-effort 'X.Y.Z' → (X, Y, Z). Pads with zeros, ignores trailing
     pre-release tags. Wrong only on absurd inputs and we'd surface the
-    server as too old in that case, which is the safer side."""
+    server as too old in that case, which is the safer side.
+
+    Rules:
+
+    - Splits on ``.`` AND ``-`` so date-tagged forms like
+      ``2026-05-06`` decompose to ``(2026, 5, 6)`` rather than
+      collapsing to ``(2026, 0, 0)``.
+    - **First chunk** uses leading-digits-only: a ``v`` /
+      ``V`` prefix on the first chunk yields ``0`` so a
+      caller that forgot to ``.lstrip('vV')`` surfaces as
+      "too old" instead of accidentally matching. Pure-text
+      first chunks (``'garbage'``) also yield ``0``.
+    - **Later chunks** concatenate every digit character in
+      the chunk: ``'rc1'`` → ``1``, ``'05'`` → ``5``,
+      ``'beta12'`` → ``12``. This lets pre-release-style
+      suffixes still contribute a usable ordinal in the
+      tuple without forcing the caller to normalise them.
+      Pure-text later chunks (``'final'``, ``'rc'``) still
+      yield ``0``.
+    """
     if not s:
         return (0, 0, 0)
+    import re
+    chunks = re.split(r'[.\-]', str(s))
     out = []
-    for chunk in str(s).split('.'):
-        digits = ''
-        for ch in chunk:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            # First chunk: leading digits only. 'v1' → 0 so a
+            # caller that forgot to strip 'v' surfaces as
+            # version 0 (too old) rather than silently matching.
+            digits = ''
+            for ch in chunk:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+        else:
+            # Later chunks: every digit character contributes.
+            digits = ''.join(c for c in chunk if c.isdigit())
         out.append(int(digits) if digits else 0)
     while len(out) < 3:
         out.append(0)
@@ -575,8 +718,13 @@ def check_server_compat():
     try:
         resp = call('GET', '/v1/health', timeout=5)
     except ServerUnavailable as ex:
+        # Surface the transport's coarse failure ``kind`` so
+        # bootstrap can pick fail-fast vs keep-retrying without
+        # parsing the message. See ``transports.ServerUnavailable``
+        # for the recognised values.
         return {'ok': False, 'error': 'server_unreachable',
-                'detail': str(ex)}
+                'detail': str(ex),
+                'kind': getattr(ex, 'kind', '') or ''}
     server_version = str(resp.get('version', ''))
     if (_version_tuple(server_version)
             < _version_tuple(MIN_SERVER_VERSION)):
@@ -1090,6 +1238,161 @@ def request_sync(langcode, contributor):
     return job_id
 
 
+def cawl_index(langcode):
+    """Return the daemon's CAWL image-URL index for ``langcode``'s
+    image repo.
+
+    The daemon resolves the project's ``cawl_image_repo`` (per-
+    project field with daemon-global fallback) and serves the
+    cached index for that repo. Two projects pointing at the same
+    image_repo share one cache directory, so the dedup is
+    transparent — the peer doesn't need to know the repo slug.
+
+    Shape::
+
+        {
+            'repo':       'owner/repo',          # what was fetched
+            'branch':     'HEAD',                # symbolic; not deref'd
+            'fetched_at': 1715520000,            # unix seconds
+            'files': [
+                {'path': 'cawl-1234.jpg',
+                 'url':  'https://raw.githubusercontent.com/.../cawl-1234.jpg'},
+                ...
+            ],
+        }
+
+    Empty dict on any failure (daemon unreachable, project unknown,
+    no image_repo configured for the project, endpoint missing on
+    older daemons): peers treat that as "no images known" — same
+    shape as their pre-migration empty resolver dict, no daemon-
+    error branch required.
+
+    The daemon caches the index under
+    ``$AZT_HOME/cawl/<owner>/<repo>/index.json`` and refreshes
+    lazily on a TTL (24h default). Peers calling ``cawl_index``
+    repeatedly within the TTL get the cached copy — there is no
+    per-peer rate-limit cost to calling this on every project
+    load. Pre-migration peers fetched directly from
+    ``api.github.com`` on every load and exhausted GitHub's
+    60/hr unauthenticated cap; this wrapper is the daemon-owned
+    replacement.
+
+    Peers map ``files`` to whatever CAWL-identifier→URL shape they
+    want; the daemon stays naming-convention-agnostic. For image
+    *binaries* (the bytes), use ``CAWLHandle(langcode, basename).
+    open_read()`` — also daemon-served, one cache per device per
+    repo regardless of peer count."""
+    try:
+        resp = call('GET', f'/v1/projects/{langcode}/cawl/index')
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    index = resp.get('index')
+    return index if isinstance(index, dict) else {}
+
+
+def set_cawl_image_repo(langcode, repo):
+    """Persist a per-project CAWL image_repo override.
+
+    ``repo`` is a GitHub ``owner/repo`` slug, e.g.
+    ``'kent-rasmussen/cawl-images'``. Empty string clears the
+    override; the project then falls back to the daemon-global
+    default (set via ``azt_collabd.configure(cawl_image_repo=…)``
+    on the recorder side, or the ``AZT_CAWL_IMAGE_REPO`` env var).
+
+    Returns the updated ``Project``, or None on transport failure
+    / unknown langcode. Best-effort: callers can drive a UI from
+    the return shape but should not block on it."""
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/cawl_image_repo',
+                    {'cawl_image_repo': str(repo or '')})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return Project.from_dict(resp.get('project', {}))
+
+
+def set_repo_slug(langcode, slug):
+    """Persist a per-project GitHub-repo-name override for the
+    publish path.
+
+    Most projects publish to a repo named after the langcode
+    (``Project.langcode`` is the typical default). This setter
+    lets the user override that — vanity slug, project-style
+    naming, collision avoidance with an existing GitHub repo —
+    without changing the LIFT ``<form lang="…">`` tag.
+
+    ``slug`` is a plain repo name (no owner, no slashes). Empty
+    string clears the override; callers should then fall back
+    to ``langcode``.
+
+    Returns the updated ``Project``, or None on transport
+    failure / unknown langcode. Read the resulting slug at any
+    time via ``open_project(langcode).repo_slug``;
+    ``project_status(langcode)`` and ``list_projects()`` carry
+    the same field. Pre-0.39 daemons don't emit it, so the
+    client-side dataclass defaults to ``''`` for forward-compat;
+    that means a peer that calls this against an older daemon
+    will get None back (404 on the endpoint) — the same shape
+    every other setter wrapper uses, so peer code branches
+    consistently."""
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/repo_slug',
+                    {'repo_slug': str(slug or '')})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return Project.from_dict(resp.get('project', {}))
+
+
+def atomic_commit_bytes(langcode, rel_path, data):
+    """Atomically write *data* to ``<working_dir>/<rel_path>`` for
+    project *langcode*. Goes through the daemon's
+    ``/v1/projects/<lang>/atomic_commit`` endpoint so the
+    tempfile-rename dance happens in the daemon's process — where
+    the destination filesystem lives on Android — and serializes
+    via ``project_lock`` against the daemon's own merge-output
+    writes and any other peer's atomic_commit.
+
+    *rel_path* is one of:
+
+    - ``<file>.lift``           — top-level LIFT file
+    - ``audio/<file>``          — sibling audio
+    - ``images/<file>``         — sibling image
+
+    Returns ``Result``. Success: a single ``ATOMIC_COMMITTED``
+    status with ``bytes_written`` and ``sha256`` params. Transport
+    failures translate to ``SERVER_UNAVAILABLE`` / ``SERVER_ERROR``
+    like every other wrapper — peers never see a raw
+    ``ServerUnavailable``.
+
+    Used by ``LiftHandle.atomic_open_write`` (and ``MediaHandle``)
+    for ``content://`` URIs, where the FD-write path through the
+    ContentProvider has no atomic-rename equivalent. Filesystem
+    paths still get the local tempfile+rename via
+    ``_AtomicWriteFile`` directly.
+
+    Memory cost: *data* is base64-encoded for transit, so the peer
+    holds ~1.33× the file size in memory between encode and the
+    HTTP/binder send. For LIFT (tens of MB at worst) this is fine.
+    Pass chunked uploads if a future case ships a much larger
+    payload."""
+    data_b64 = base64.b64encode(data).decode('ascii')
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/atomic_commit',
+                    {'path': rel_path, 'data_b64': data_b64})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 def poll_job(job_id):
     """Return the current state of a job: dict with keys ``state``
     ('PENDING' | 'RUNNING' | 'DONE'), ``langcode``, ``result`` (Result
@@ -1125,6 +1428,45 @@ def record_project_sync_time(langcode, timestamp=None):
         pass
 
 
+def grant_collaborator(langcode, username, level='push'):
+    """Invite ``username`` as a collaborator on the GitHub repo
+    backing ``langcode``. ``level`` is the GitHub permission
+    ('pull' | 'push' | 'admin' | 'maintain' | 'triage'); default
+    ``'push'`` matches typical SIL collaborator workflow.
+
+    Returns a ``Result`` carrying one of:
+
+    - ``S.COLLABORATOR_INVITED`` — invitation issued; the user must
+      still accept it on GitHub.
+    - ``S.COLLABORATOR_ALREADY`` — already a collaborator (or has
+      a pending invite); no new state on GitHub.
+    - ``S.INVALID_USERNAME`` — empty / whitespace username.
+    - ``S.NO_REMOTE`` — project has no remote URL configured.
+    - ``S.NOT_GITHUB_REMOTE`` — remote is not a GitHub URL (GitLab
+      / self-hosted not yet supported by this endpoint).
+    - ``S.AUTH_REQUIRED`` — no GitHub token on file for the host.
+    - ``S.COLLABORATOR_INVITE_FAILED`` — GitHub returned an
+      unexpected error (auth refused, repo not found, etc.); the
+      ``error`` param carries the underlying message.
+
+    The langcode-based dispatch means peers don't have to parse
+    repo URLs themselves — the daemon looks up the project's
+    ``remote_url`` and extracts ``owner/repo``, eliminating "wrong
+    project" risk from peer-side URL handling."""
+    body = {'username': str(username or ''), 'level': str(level or 'push')}
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/collaborators',
+                    body)
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 __all__ = [
     'configure', 'is_online', 'open_server_ui', 'pick_project',
     'check_server_compat',
@@ -1142,9 +1484,11 @@ __all__ = [
     'clone_project',
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'request_sync', 'poll_job',
-    'record_project_sync_time',
-    'LiftHandle', 'MediaHandle', 'audio_uri_for', 'image_uri_for',
-    'is_content_uri',
+    'atomic_commit_bytes',
+    'cawl_index', 'set_cawl_image_repo', 'set_repo_slug',
+    'record_project_sync_time', 'grant_collaborator',
+    'LiftHandle', 'MediaHandle', 'CAWLHandle',
+    'audio_uri_for', 'image_uri_for', 'is_content_uri',
     'last_project', 'set_last_project',
     'peer_pref', 'set_peer_pref',
     'Status', 'Result', 'S', 'Project', 'ProjectStatus',

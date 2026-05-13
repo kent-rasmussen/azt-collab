@@ -28,6 +28,19 @@ class Project:
     # surface as a not-found at open time. Defaults to True for
     # forward-compat with pre-0.16 daemons that don't emit the flag.
     lift_exists: bool = True
+    # Per-project CAWL image source (``owner/repo``). Empty → the
+    # project falls back to the daemon-global default; consumers
+    # generally shouldn't need to read this directly (the
+    # ``cawl_index(langcode)`` / ``CAWLHandle`` wrappers resolve it
+    # internally). Defaults to '' for forward-compat with pre-0.38
+    # daemons that don't emit it.
+    cawl_image_repo: str = ''
+    # Per-project GitHub repo-name override for the publish path.
+    # Empty → callers (recorder CollabScreen, future peers) treat
+    # as equal to ``langcode``. Non-empty → user explicitly chose a
+    # different repo name. Defaults to '' for forward-compat with
+    # pre-0.39 daemons that don't emit it.
+    repo_slug: str = ''
 
     @classmethod
     def from_dict(cls, d):
@@ -41,6 +54,8 @@ class Project:
             last_sync=float(d.get('last_sync', 0.0)),
             created_at=float(d.get('created_at', 0.0)),
             lift_exists=bool(d.get('lift_exists', True)),
+            cawl_image_repo=d.get('cawl_image_repo', '') or '',
+            repo_slug=d.get('repo_slug', '') or '',
         )
 
 
@@ -60,6 +75,11 @@ class ProjectStatus:
     # last_sync. Defaults to 0 for forward-compat with daemons that
     # don't yet emit it (see NOTES_TO_DAEMON.md).
     commits_ahead: int = 0
+    # Per-project metadata mirrored from the project record so
+    # peers can read status + identity in one round-trip. Empty
+    # for forward-compat with pre-0.39 daemons.
+    repo_slug: str = ''
+    cawl_image_repo: str = ''
 
     @classmethod
     def from_dict(cls, d):
@@ -74,4 +94,6 @@ class ProjectStatus:
             working_dir=d.get('working_dir', ''),
             lift_path=d.get('lift_path', ''),
             commits_ahead=int(d.get('commits_ahead', 0)),
+            repo_slug=d.get('repo_slug', '') or '',
+            cawl_image_repo=d.get('cawl_image_repo', '') or '',
         )

@@ -232,25 +232,31 @@ button. Consider a "Skip for now" option that lets the user use
 the peer without GitHub setup, with clear messaging that backup
 is disabled until they connect.
 
-## Recommended implementation order
+## Status (2026-05-09)
 
-When this comes back into focus:
+#1 through #7 are done or declined (see strikethroughs above —
+kept per the audit-trail rule). Items #8–#13 remain open and
+are listed here in current priority order:
 
-1. **#1 (``verification_uri_complete``)** — clearest single win.
-   ~5 lines of code, no UX redesign. Do first.
-2. **#3 (pre-flight explanation)** — small text addition above
-   the device-flow box.
-3. **#7, #8 (confirmation dialogs)** — wrap Disconnect / Re-auth
-   in a Yes/No before action.
-4. **#4 (rename "Test connection")** — single string change.
-5. **#5 (create-account link)** — single button addition.
-6. **#2 (restructure connect screen as Step 1/2/3)** — biggest
-   UX investment; needs design pass before coding.
-7. **#6 (GitHub vs GitLab choice)** — design call: hide GitLab
-   or rephrase the comparison.
-8. **#9 (timeout countdown)** — small but adds polish.
-9. **#10 (success moment)** — small UX win.
-10. **#11, #12 (plain language, scope explanation)** —
-    incremental polish.
-11. **#13 (skip-for-now path)** — design call: do we want users
-    running without backup at all?
+1. **#9 (device-flow timeout countdown + Start over)** —
+   small but visibly improves the "user set their phone down"
+   case. Highest UX impact of the remaining items.
+2. **#11 (plain-language status messages)** — touches
+   user-facing strings the SIL audience actually reads;
+   shouldn't need code restructuring.
+3. **#10 (more prominent "Setup complete" moment)** — small
+   reward-shaped UI win once the multi-step flow finishes.
+4. **#12 (pre-explain GitHub OAuth scope grant)** —
+   incremental polish; a single popup or pre-flight paragraph.
+5. **#8 (Re-authenticate / Disconnect prominence)** — design
+   call mirroring the resolution to #7. Per maintainer
+   preference (#7) we don't add confirmation popups; the move
+   here is reducing visual prominence without changing
+   behaviour.
+6. **#13 (skip-for-now / no-backup path)** — design call: do
+   we want SIL field linguists running without backup at all?
+   Defer until the question comes up from a real user.
+
+If this audit comes back into focus, re-prioritise against
+current device + GitHub state (`research_notes_2026-05.md` is
+the canonical reference for what's changed).

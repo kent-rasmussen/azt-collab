@@ -268,7 +268,8 @@ _ALLOWED_MEDIA_DIRS = ('audio', 'images')
 
 def _resolve_path(rel, mode):
     """Map a provider-supplied relative path to an absolute path under
-    the project's actual ``working_dir`` from projects.json. Returns
+    the project's actual ``working_dir`` from projects.json — or, for
+    CAWL paths, under ``$AZT_HOME/cawl/<owner>/<repo>/...``. Returns
     None on path-traversal attempts, unknown langcodes, or
     structurally-disallowed shapes so the Java side raises
     FileNotFoundException.
@@ -283,20 +284,20 @@ def _resolve_path(rel, mode):
     through ``<lang>/../<other>/audio/foo.wav`` and surfaces them as
     a clear FileNotFoundError instead of an opaque containment fail):
 
-    - ``<lang>/<file>.lift``     — top-level LIFT file
-    - ``<lang>/audio/<file>``    — sibling audio recording
-    - ``<lang>/images/<file>``   — sibling image asset
+    - ``<lang>/<file>.lift``         — top-level LIFT file
+    - ``<lang>/audio/<file>``        — sibling audio recording
+    - ``<lang>/images/<file>``       — sibling image asset
+    - ``<lang>/cawl/index.json``     — CAWL image-URL index for this
+                                       project's image_repo
+    - ``<lang>/cawl/images/<file>``  — CAWL image binary; fetched
+                                       lazily on first access
 
     The first segment is the **langcode** — the daemon's
-    ``projects.json`` key — not the on-disk directory name. Pre-0.21.2
-    this code assumed the directory name == langcode and built
-    ``$AZT_HOME/projects/<langcode>/...`` directly; that broke for
-    clones whose ``dest_dir`` was URL-derived (e.g. ``en_Demo.git``
-    cloned to ``projects/en_Demo/`` but the user chose langcode
-    ``en``, so the URI ``content://.../en/SILCAWL.lift`` resolved to
-    ``projects/en/SILCAWL.lift`` which didn't exist). Going through
-    ``projects.get(langcode).working_dir`` keeps the URI form
-    independent of the on-disk layout."""
+    ``projects.json`` key — not the on-disk directory name. CAWL
+    paths look project-scoped at the URI layer but the underlying
+    files live under ``$AZT_HOME/cawl/<owner>/<repo>/...`` so
+    multiple projects pointing at the same image_repo share one
+    on-disk cache."""
     if not rel:
         return None
     rel = rel.lstrip('/')
@@ -304,6 +305,17 @@ def _resolve_path(rel, mode):
     # Reject empty segments and parent-traversal anywhere.
     if any(p in ('', '..', '.') for p in parts):
         return None
+    from .. import projects as _projects
+
+    # CAWL routing: <lang>/cawl/index.json or <lang>/cawl/images/<base>.
+    # Resolution leaves the project's working_dir entirely; the cache
+    # lives under $AZT_HOME/cawl/<owner>/<repo>/... keyed by the
+    # project's cawl_image_repo (per-project field, falling back to
+    # the daemon-global default).
+    if len(parts) >= 2 and parts[1] == 'cawl':
+        return _resolve_cawl_path(parts[0], parts[2:], mode)
+
+    # Existing project-scoped shapes.
     if len(parts) == 2:
         # <lang>/<file>.lift — the only top-level file shape.
         if not parts[1].lower().endswith('.lift'):
@@ -320,7 +332,6 @@ def _resolve_path(rel, mode):
     # isn't registered, which preserves pre-registry URIs (created
     # before the picker auto-registers) without breaking the new
     # decoupled-layout flow.
-    from .. import projects as _projects
     langcode = parts[0]
     p = _projects.get(langcode)
     if p is not None and p.working_dir:
@@ -348,3 +359,43 @@ def _resolve_path(rel, mode):
             return target
         return None
     return target
+
+
+def _resolve_cawl_path(langcode, rest, mode):
+    """Map a CAWL provider path to an absolute file. ``rest`` is
+    the path segments *after* ``<lang>/cawl/``. CAWL files are
+    read-only from the peer's perspective (mode 'r' only); 'w' /
+    'a' attempts return None so the Java side surfaces
+    FileNotFoundException.
+
+    Two shapes accepted:
+
+    - ``[index.json]``    → daemon's cached index for this
+                            project's image_repo. Fetches lazily
+                            if missing.
+    - ``[images, <base>]`` → daemon's cached image binary.
+                            Fetches lazily if missing.
+
+    The repo lookup goes through ``cawl.resolve_image_repo`` so
+    the per-project field overrides the daemon-global default."""
+    if mode and ('w' in mode or 'a' in mode):
+        return None
+    from .. import projects as _projects
+    p = _projects.get(langcode)
+    if p is None:
+        return None
+    from .. import cawl as _cawl
+    repo = _cawl.resolve_image_repo(langcode)
+    if not repo:
+        return None
+    if len(rest) == 1 and rest[0] == 'index.json':
+        # Triggers a fetch/refresh as needed and writes the cache
+        # file. Return its path even if get_index served from
+        # stale cache — the file is there either way.
+        _cawl.get_index(repo)
+        target = _cawl.index_path(repo)
+        return target if os.path.isfile(target) else None
+    if len(rest) == 2 and rest[0] == 'images':
+        basename = rest[1]
+        return _cawl.get_image_path(repo, basename)
+    return None

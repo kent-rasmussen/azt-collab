@@ -13,17 +13,18 @@ from .langpicker import LangPickerScreen, register_kv as register_langpicker_kv
 from .picker import ProjectPickerScreen, register_kv as register_picker_kv
 from .popups import (
     clone_url_popup, confirm_langcode_popup, install_server_apk_popup,
+    grant_collaborator_popup,
 )
 from .fonts import register_charis
 from .icons import icon_path
 from .share import share_running_apk
-from .update import check_for_update
+from .update import check_for_update, default_asset_filename
 from .bootstrap import bootstrap
 
 __all__ = ['LangPickerScreen', 'register_langpicker_kv',
            'ProjectPickerScreen', 'register_picker_kv',
            'clone_url_popup', 'confirm_langcode_popup',
-           'install_server_apk_popup',
+           'install_server_apk_popup', 'grant_collaborator_popup',
            'register_charis', 'icon_path',
            'share_running_apk', 'check_for_update',
-           'bootstrap']
+           'default_asset_filename', 'bootstrap']

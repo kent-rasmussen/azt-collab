@@ -74,3 +74,54 @@ def test_gitlab_confirmed_lifecycle_unchanged():
     assert store.get_status()['gitlab']['confirmed'] is True
     store.set_gitlab('alice', 'different-token')
     assert store.get_status()['gitlab']['confirmed'] is False
+
+
+# ── refresh-broken lifecycle (0.34.3) ─────────────────────────────────────
+#
+# ``get_valid_github_token`` records ``refresh_broken=True`` on a
+# failed OAuth refresh (``incorrect_client_credentials`` etc.) and
+# exposes it via ``get_status``. Fresh tokens (re-auth via device
+# flow → ``set_github_tokens``) must clear it atomically — otherwise
+# the user re-authenticates and the toast keeps firing forever.
+# These tests pin that contract.
+
+def test_set_github_tokens_clears_refresh_broken():
+    store.set_github_tokens(access_token='tok', username='alice')
+    store._set_github_refresh_broken('incorrect_client_credentials')
+    assert store.get_status()['github']['refresh_broken'] is True
+
+    # Re-auth = fresh tokens. Must clear the flag.
+    store.set_github_tokens(access_token='tok2', username='alice')
+    assert store.get_status()['github']['refresh_broken'] is False
+    state = store.github_refresh_state()
+    assert state['broken'] is False
+    assert state['error'] == ''
+
+
+def test_status_exposes_access_token_expires_at():
+    store.set_github_tokens(access_token='tok', username='alice')
+    expires_at = store.get_status()['github']['access_token_expires_at']
+    # 8h-from-issuance window, in seconds. token_time stamped to
+    # ~now, so the deadline is ~now+28800. Allow generous slack
+    # for slow CI.
+    import time
+    delta = expires_at - time.time()
+    assert 8 * 3600 - 60 <= delta <= 8 * 3600 + 60
+
+
+def test_github_refresh_state_with_no_token():
+    """No token ever stored → broken=False, expires_at=0. Peers
+    should treat 0 as 'no deadline to render' and skip the toast."""
+    state = store.github_refresh_state()
+    assert state['broken'] is False
+    assert state['expires_at'] == 0
+    assert state['error'] == ''
+
+
+def test_clear_github_clears_refresh_state():
+    store.set_github_tokens(access_token='tok', username='alice')
+    store._set_github_refresh_broken('test')
+    store.clear_github()
+    state = store.github_refresh_state()
+    assert state['broken'] is False
+    assert state['expires_at'] == 0

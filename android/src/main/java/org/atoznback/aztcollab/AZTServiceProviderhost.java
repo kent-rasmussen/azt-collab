@@ -137,6 +137,39 @@ public class AZTServiceProviderhost extends PythonService {
         return 1337;  // unique within this APK
     }
 
+    /**
+     * Self-bootstrap Python in {@code onCreate} so {@code bindService}
+     * alone is sufficient to start the daemon. Android 12+ blocks
+     * {@code startService} from background contexts (the
+     * {@code :provider} lazy-spawn from
+     * {@code AZTCollabProvider.onCreate}, AND a peer's
+     * cross-package start while the peer is mid-cold-start, both
+     * surface as {@code BackgroundServiceStartNotAllowedException}).
+     * {@code bindService} is allowed from background, but it only
+     * triggers {@code onCreate}, not {@code onStartCommand} —
+     * which is where {@code PythonService} normally reads the
+     * {@code serviceEntrypoint} extras and launches the Python
+     * thread. Self-delivering an {@code onStartCommand} call here
+     * gets Python booting on the first bind.
+     *
+     * <p>Idempotent: {@code PythonService.onStartCommand} short-
+     * circuits when {@code mService != null}, so any subsequent
+     * {@code startService} call (legacy callers, retries) hits the
+     * existing Python interpreter and does nothing harmful.</p>
+     */
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        try {
+            Intent intent = getDefaultIntent(this, "");
+            onStartCommand(intent, 0, getServiceId());
+        } catch (Throwable t) {
+            android.util.Log.e(
+                "AZTServiceProviderhost",
+                "self-bootstrap from onCreate failed", t);
+        }
+    }
+
     @Override
     public IBinder onBind(Intent intent) {
         synchronized (AZTServiceProviderhost.class) {

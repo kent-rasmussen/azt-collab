@@ -36,6 +36,14 @@ OPEN_PR = 'OPEN_PR'
 NO_AUDIO = 'NO_AUDIO'
 NO_REPO = 'NO_REPO'
 
+# Successful response from /v1/projects/<lang>/atomic_commit.
+# Carries ``params['bytes_written']`` and ``params['sha256']`` so
+# the caller can verify the bytes that landed match the bytes it
+# sent. See ``server._h_project_atomic_commit`` and the client
+# wrapper ``atomic_commit_bytes``.
+ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
+
+
 # ── Failures / warnings ────────────────────────────────────────────────────
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
@@ -63,11 +71,32 @@ APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'
 APP_SUSPENDED = 'APP_SUSPENDED'
 REPO_NOT_AUTHORIZED = 'REPO_NOT_AUTHORIZED'
 ACCESS_DENIED = 'ACCESS_DENIED'
+# Refresh-token broken: the daemon attempted a proactive
+# refresh against the GitHub OAuth endpoint and got
+# ``incorrect_client_credentials`` (or any other refresh-side
+# failure). The current access token still works until its
+# 8h-from-issuance expiry; ``params['expires_at']`` carries that
+# unix timestamp so peers can format a deadline-aware toast in
+# the user-initiated sync path (per the auto/user contract in
+# azt_collab_client/CLAUDE.md). Auto-sync ignores this status;
+# user-initiated sync surfaces "re-auth by <deadline>" so the
+# user can act before the access token cliff.
+AUTH_REFRESH_STALE = 'AUTH_REFRESH_STALE'
 
 # ── Device flow ────────────────────────────────────────────────────────────
 AUTH_EXPIRED = 'AUTH_EXPIRED'
 AUTH_DENIED = 'AUTH_DENIED'
 AUTH_TIMEOUT = 'AUTH_TIMEOUT'
+
+# ── Collaborator grant ─────────────────────────────────────────────────────
+# Outcomes from POST /v1/projects/<lang>/collaborators. Wraps the GitHub
+# PUT /repos/.../collaborators/{user} call: 201 → COLLABORATOR_INVITED,
+# 204 or 422 → COLLABORATOR_ALREADY (collaborator or pending invite).
+COLLABORATOR_INVITED = 'COLLABORATOR_INVITED'
+COLLABORATOR_ALREADY = 'COLLABORATOR_ALREADY'
+COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
+INVALID_USERNAME = 'INVALID_USERNAME'
+NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
 
 
 @dataclass

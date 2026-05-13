@@ -191,7 +191,46 @@ class ProjectPickerScreen(Screen):
               f'{len(projects)} button(s)', flush=True)
         if not projects:
             return
-        for name, path in projects:
+        # Diagnostic for the intermittent picker bug (see
+        # NOTES_TO_DAEMON.md history). Plain-English log lines so a
+        # reader trawling logcat can answer two questions without
+        # any inference:
+        #
+        #   1. "Which button did the user tap?"
+        #      → look for the ``USER TAPPED '<langcode>'`` line.
+        #   2. "What did the picker actually emit back to the peer?"
+        #      → the same line ends ``emitting langcode='<X>'``.
+        #
+        # The daemon's own ``[recent] _touch_project(<lc>)`` lines
+        # in the same logcat window are NOT the tap signal — those
+        # are the previously-loaded project's unload-touch, fired
+        # by whatever cleanup RPC the peer makes when switching
+        # projects. The "USER TAPPED" line is the only authoritative
+        # source of truth for which button received the press.
+        #
+        # If the BUG line below ever prints, the picker IS
+        # substituting the wrong project — that's the smoking gun
+        # for the NOTES_TO_DAEMON.md report.
+        total = len(projects)
+
+        def _on_release(b):
+            tapped_text = getattr(b, 'text', '?')
+            tapped_lc = getattr(b, 'langcode', '')
+            tapped_path = getattr(b, 'lift_path', '')
+            if tapped_text != tapped_lc:
+                print(f"[picker] BUG: button labeled "
+                      f"{tapped_text!r} has stored "
+                      f"langcode={tapped_lc!r} (mismatch!) "
+                      f"lift_path={tapped_path!r}",
+                      flush=True)
+            else:
+                print(f"[picker] USER TAPPED {tapped_text!r} "
+                      f"→ emitting langcode={tapped_lc!r} "
+                      f"path={tapped_path!r}",
+                      flush=True)
+            app.load_lift(tapped_path, tapped_lc)
+
+        for i, (name, path) in enumerate(projects, 1):
             btn = Builder.load_string(
                 'RecBtn:\n'
                 f'    text: {name!r}\n'
@@ -205,6 +244,9 @@ class ProjectPickerScreen(Screen):
             # result Intent's ``langcode`` extra without having to
             # query the daemon a second time.
             btn.langcode = name
-            btn.bind(on_release=lambda b: app.load_lift(
-                b.lift_path, getattr(b, 'langcode', '')))
+            print(f"[picker] button {i}/{total}: label={name!r} "
+                  f"→ will emit langcode={btn.langcode!r} "
+                  f"path={btn.lift_path!r}",
+                  flush=True)
+            btn.bind(on_release=_on_release)
             box.add_widget(btn)

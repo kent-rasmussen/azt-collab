@@ -2118,7 +2118,9 @@ class CollabUIApp(App):
         check_for_update(
             repo=update_repo(),
             current_version=azt_collabd.__version__,
-            asset_filename='aztcollab.apk',
+            # asset_filename omitted — derived at runtime from the
+            # running Activity's package name (= aztcollab.apk for
+            # org.atoznback.aztcollab).
             on_status=self._set_update_msg,
             on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
             on_error=self._show_error,

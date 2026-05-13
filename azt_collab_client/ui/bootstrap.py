@@ -13,7 +13,7 @@ Each peer calls ``bootstrap(...)`` once, early in startup
    - ``error='server_unreachable'`` → likely the server APK isn't
      installed yet (or no network). Pop a Yes/No: "Install the
      AZT Collaboration service?" — on Yes, download the latest
-     ``azt_collab.apk`` from the server's release feed and dispatch
+     ``aztcollab.apk`` from the server's release feed and dispatch
      Android's system installer.
    - ``error='server_too_old'``     → Yes/No: "Update the AZT
      Collaboration service?" — same install path on Yes.
@@ -124,6 +124,7 @@ import json
 import os
 import sys
 import threading
+import time as _time
 
 from kivy.clock import Clock
 from kivy.metrics import dp, sp
@@ -155,8 +156,41 @@ _SERVER_PACKAGE_NAME = 'org.atoznback.aztcollab'
 # process anyway.
 _running = False
 
+# Idempotence guard for prewarm(). Issuing two compat probes in
+# parallel is harmless but pointless — the second would race the
+# first against the same daemon-lazy-spawn.
+_prewarm_started = False
 
-def bootstrap(*, peer_repo, peer_version, peer_asset_filename,
+# Process-start monotonic clock. Anchored at module-load time so
+# every ``_boot_trace`` line carries a consistent baseline. Both
+# peers and the daemon (server_apk/service.py) have their own
+# anchor; cross-process alignment is via logcat's wall-clock
+# timestamps, which the parser in
+# ``tests/integration/parse_boot_traces.py`` joins on.
+_proc_start_monotonic = _time.monotonic()
+
+
+def _boot_trace(phase, **fields):
+    """Emit a boot-timing trace line. Format:
+
+        [boot-trace-peer] phase=<phase> t=<elapsed-seconds> [k=v ...]
+
+    Used by ``tests/integration/parse_boot_traces.py`` to compute
+    timing tables for cold-start measurements (Q2 doze behaviour,
+    Q3 prewarm value). Cheap (single ``time.monotonic`` + print);
+    safe to leave on in shipping builds — the volume is tiny
+    (≤ 10 lines per peer launch) and the stderr → logcat path is
+    already established."""
+    elapsed = _time.monotonic() - _proc_start_monotonic
+    extras = ''
+    if fields:
+        extras = ' ' + ' '.join(f'{k}={v}' for k, v in fields.items())
+    print(f'[boot-trace-peer] phase={phase} t={elapsed:.3f}{extras}',
+          file=sys.stderr, flush=True)
+
+
+def bootstrap(*, peer_repo, peer_version,
+              peer_asset_filename=None,
               peer_display_name='',
               server_repo=_SERVER_REPO_DEFAULT,
               server_asset_filename=_SERVER_ASSET_DEFAULT,
@@ -174,9 +208,14 @@ def bootstrap(*, peer_repo, peer_version, peer_asset_filename,
     peer_version : str
         Caller's running ``__version__`` — compared as a semver
         tuple against the peer's latest release tag.
-    peer_asset_filename : str
-        Exact name of the peer's APK in its GitHub release
-        (e.g. ``'azt_recorder.apk'``).
+    peer_asset_filename : str | None
+        Exact name of the peer's APK in its GitHub release. When
+        ``None`` (default), derived from the running Android
+        package's last segment via
+        ``azt_collab_client.ui.update.default_asset_filename`` —
+        i.e. ``'aztrecorder.apk'`` for ``org.atoznback.aztrecorder``.
+        Pass explicitly to override for a fork that publishes under
+        a different naming scheme.
     peer_display_name : str
         Human-facing app name used in the self-update prompt
         ("Update <name>?"). Defaults to a safe fallback derived
@@ -202,6 +241,7 @@ def bootstrap(*, peer_repo, peer_version, peer_asset_filename,
         UI.
     """
     global _running
+    _boot_trace('bootstrap_called')
     try:
         from kivy.utils import platform
     except Exception:
@@ -220,6 +260,24 @@ def bootstrap(*, peer_repo, peer_version, peer_asset_filename,
         # Re-running would prompt the user twice; suppress instead.
         return
     _running = True
+
+    # Derive on the calling (UI) thread — the Activity reference
+    # behind ``default_asset_filename`` is reliably reachable here,
+    # and a blank result means we're in a configuration where the
+    # auto-update path can't function anyway. Hard-fail rather than
+    # silently 404 on a missing/wrong filename later.
+    if peer_asset_filename is None:
+        from .update import default_asset_filename
+        peer_asset_filename = default_asset_filename()
+    if not peer_asset_filename:
+        msg = _tr(
+            'Bootstrap failed: could not derive asset filename '
+            '(running Activity unreachable). Pass '
+            'peer_asset_filename= explicitly.')
+        _safe(on_status, msg)
+        _safe(on_error, msg)
+        _running = False
+        return
 
     if not peer_display_name:
         peer_display_name = _strip_apk(peer_asset_filename)
@@ -260,11 +318,35 @@ class _Ctx:
                  'peer_display_name', 'server_repo',
                  'server_asset_filename', 'server_display_name',
                  'on_status', 'on_done', 'on_error', 'font_name',
-                 'connecting_popup')
+                 'connecting_popup',
+                 # Warmup-loop telemetry. ``warmup_started_at`` is
+                 # the monotonic clock when the first 503 fired so
+                 # the connecting popup can show elapsed seconds.
+                 # ``last_error_kind`` is the
+                 # ``ServerUnavailable.kind`` from the most recent
+                 # failed compat probe; surfaced verbatim in the
+                 # connecting + unresponsive popups so a maintainer-
+                 # email loop carries actionable detail without adb.
+                 'warmup_started_at', 'last_error_kind',
+                 'last_error_detail',
+                 # Count of consecutive ``null_bundle`` failures
+                 # observed in the current warmup cycle. Used to
+                 # fail fast on signature-grant problems rather
+                 # than waiting the full 60s budget. Reset whenever
+                 # a 503 or any other kind shows up — those are
+                 # progress signals.
+                 'null_bundle_streak')
 
     def __init__(self, **kw):
+        # Default to None for slots the caller doesn't pass.
+        # Counters get a numeric default so the warmup loop can
+        # increment without an isinstance check on first use.
+        _numeric = {'null_bundle_streak'}
         for k in self.__slots__:
-            setattr(self, k, kw.get(k))
+            if k in _numeric:
+                setattr(self, k, kw.get(k, 0) or 0)
+            else:
+                setattr(self, k, kw.get(k))
 
 
 def _strip_apk(name):
@@ -303,8 +385,110 @@ def _on_done_and_release(ctx):
     The blocking-popup branches (no server / server too old) use
     ``_release_running`` instead so the host doesn't try to
     continue."""
+    _boot_trace('bootstrap_done')
     _release_running()
     _safe(ctx.on_done)
+
+
+def prewarm():
+    """Optional pre-warm hook for peers that want to overlap daemon
+    lazy-spawn with their own Kivy initialisation. Caller invokes
+    this from ``App.build()`` (or anywhere before ``bootstrap()``
+    fires); it kicks off a single ``check_server_compat`` probe on
+    a background thread and returns immediately. The probe causes
+    Android to lazy-spawn the server APK's ``:provider`` process
+    in parallel with whatever the peer is doing on the main thread.
+
+    Idempotent within a process. No-op on non-Android (desktop
+    transports auto-spawn synchronously; nothing to overlap).
+    Safe to call before ``bootstrap()`` — the transport's
+    per-process discovery cache means the second probe in
+    ``bootstrap`` reuses the binding from this one.
+
+    Best-effort: any failure is silent. The boot-trace
+    instrumentation around it lets
+    ``tests/integration/parse_boot_traces.py`` measure the
+    overlap savings (Q3 in the daemon-boot plan).
+
+    Recommended peer integration:
+
+        class MyApp(App):
+            def build(self):
+                from azt_collab_client.ui.bootstrap import prewarm
+                prewarm()
+                return self._build_root_widget()
+
+    Tradeoff: prewarm runs the transport's pyjnius initialisation
+    earlier than the rest of the peer expects. If your peer's
+    ``build()`` is the first place it touches Android Java
+    surfaces, this is fine; otherwise it may shift the cost rather
+    than reduce it. Measure with the boot-trace harness before
+    enabling in production."""
+    global _prewarm_started
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    if platform != 'android':
+        return
+    # Opt-out for the measurement harness: a sentinel file at
+    # ``$AZT_HOME/_no_prewarm`` (peer-private on Android) disables
+    # the call without rebuilding the peer. Lets
+    # ``tests/integration/measure_boot.sh`` toggle scenarios on
+    # the same APK via ``adb shell run-as <peer-pkg> touch ...``.
+    # The env-var equivalent (``AZT_BOOT_PREWARM=0``) also works
+    # for desktop hosts and any path where the env is reachable
+    # (e.g. CI).
+    if os.environ.get('AZT_BOOT_PREWARM', '1') == '0':
+        _boot_trace('prewarm_disabled_by_env')
+        return
+    try:
+        from ..paths import azt_home
+        if os.path.exists(os.path.join(azt_home(), '_no_prewarm')):
+            _boot_trace('prewarm_disabled_by_sentinel')
+            return
+    except Exception:
+        pass
+    if _prewarm_started:
+        return
+    _prewarm_started = True
+    _boot_trace('prewarm_called')
+
+    # B2 main-thread bind. The Python worker we're about to spawn
+    # runs on a thread JNI-attached with the system bootclassloader
+    # (no app classes), so its ``autoclass(
+    # 'org.atoznback.aztcollab.AZTServiceConnector')`` raises
+    # ClassNotFoundException — verified empirically on the R500
+    # tablet. Performing the bind here on the caller's thread
+    # (typically the peer's ``App.build()`` main-thread context)
+    # avoids the classloader scope mismatch and gets ``:provider``
+    # bound at the earliest possible moment in cold start, which
+    # is the whole point of prewarm. Best-effort: any failure is
+    # silent; the worker still runs and the transport's later
+    # ``discover()`` calls keep retrying via the same path.
+    try:
+        from jnius import autoclass
+        _Connector = autoclass(
+            'org.atoznback.aztcollab.AZTServiceConnector')
+        _Activity = autoclass('org.kivy.android.PythonActivity')
+        _Connector.ensureBound(_Activity.mActivity)
+        _boot_trace('prewarm_bound_main_thread')
+    except Exception as ex:
+        _boot_trace('prewarm_bind_failed',
+                    error=type(ex).__name__)
+
+    def _worker():
+        _boot_trace('prewarm_worker_start')
+        try:
+            from .. import check_server_compat
+            check_server_compat()
+        except Exception as ex:
+            _boot_trace('prewarm_worker_error',
+                        error=type(ex).__name__)
+            return
+        _boot_trace('prewarm_worker_done')
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ── decline memory ────────────────────────────────────────────────────────
@@ -341,6 +525,9 @@ def _save_config(cfg):
 
 
 def _declined_version(repo):
+    """Read-only peek at the persisted decline (or ``''``). Does
+    NOT clear the entry. Use ``_consume_decline`` at the call site
+    that actually decides whether to skip the prompt."""
     cfg = _load_config()
     block = (cfg.get(_CONFIG_NS) or {}).get(_DECLINED_KEY) or {}
     return block.get(repo, '') or ''
@@ -348,9 +535,19 @@ def _declined_version(repo):
 
 def _record_decline(repo, version):
     """Persist that the user declined ``version`` for ``repo``.
-    A later release with a different version string will re-prompt
-    automatically — we compare exact strings, not semver, so a
-    stuck prompt clears the moment the upstream tag changes."""
+
+    The decline is **one-shot**: it suppresses exactly the next
+    prompt for the same version, then clears itself the moment
+    ``_consume_decline`` consults it. The intent is "skip the
+    next ask", not "never ask again" — a stuck prompt is annoying
+    once but a permanently-muted prompt is worse, because the
+    user has no path to reconsider beyond waiting for the
+    upstream tag to change.
+
+    Cadence in practice: prompt → decline → skip → prompt →
+    decline → skip → … . Each accept short-circuits the loop; a
+    new upstream version invalidates the stored value via the
+    exact-string comparison."""
     cfg = _load_config()
     ns = cfg.setdefault(_CONFIG_NS, {})
     block = ns.setdefault(_DECLINED_KEY, {})
@@ -360,6 +557,48 @@ def _record_decline(repo, version):
     except OSError as ex:
         print(f'[bootstrap] could not persist decline: {ex}',
               file=sys.stderr, flush=True)
+
+
+def _consume_decline(repo, version):
+    """One-shot consume: returns True iff the persisted decline
+    matches ``version`` for ``repo``, and clears the entry as a
+    side effect.
+
+    On a True return, the caller should skip the prompt for THIS
+    launch only — the decline is already cleared on disk, so the
+    NEXT launch (with the same upstream version still present)
+    will prompt again. On a False return, either no decline was
+    recorded, or the recorded version doesn't match upstream
+    (a newer release; the stale entry is left in place since
+    clearing it would mean we ask twice in a row if upstream
+    rolls back).
+
+    Why one-shot rather than permanent: a "never ask again for
+    this version" rule paints users into a corner where they
+    can only reconsider by waiting for the next release. One-
+    shot gives the user breathing room (one launch's silence)
+    without trapping them."""
+    cfg = _load_config()
+    ns = cfg.get(_CONFIG_NS) or {}
+    block = ns.get(_DECLINED_KEY) or {}
+    if block.get(repo, '') != version:
+        return False
+    # Match. Clear the entry and persist.
+    del block[repo]
+    if not block:
+        ns.pop(_DECLINED_KEY, None)
+    if not ns:
+        cfg.pop(_CONFIG_NS, None)
+    try:
+        _save_config(cfg)
+    except OSError as ex:
+        # If we can't persist the clear, the next launch will
+        # consume the same decline again — i.e., the user gets
+        # an extra silent launch. Not ideal but not harmful;
+        # the eventual write will land.
+        print(f'[bootstrap] could not persist decline-consume: '
+              f'{ex}', file=sys.stderr, flush=True)
+    return True
 
 
 # ── release-meets-minimum probe ───────────────────────────────────────────
@@ -631,7 +870,13 @@ def _show_connecting_popup(ctx):
     is already up, no-op. Without this, the user sits looking at
     a peer UI with no daemon backing for the 10s retry window
     (RPCs return ServerUnavailable; screens render empty); the
-    popup makes that wait visible and bounded."""
+    popup makes that wait visible and bounded.
+
+    The body label has its identity stashed at ``popup._body`` so
+    ``_update_connecting_popup`` can refresh it on each retry
+    without rebuilding the popup. The label carries a sub-line for
+    retry count + elapsed seconds + last error kind so the user
+    sees concrete progress (no longer a static black box)."""
     if ctx.connecting_popup is not None:
         return
     from kivy.uix.popup import Popup
@@ -648,14 +893,57 @@ def _show_connecting_popup(ctx):
     )
     label.bind(size=lambda w, _v: setattr(w, 'text_size', w.size))
     content.add_widget(label)
+    detail_label = Label(
+        text='',
+        font_size=sp(11), color=theme.TEXT_DIM,
+        font_name=ctx.font_name,
+        halign='center', valign='middle',
+    )
+    detail_label.bind(size=lambda w, _v: setattr(w, 'text_size', w.size))
+    content.add_widget(detail_label)
     popup = Popup(
         title=_tr('Connecting…'),
         content=content,
-        size_hint=(0.85, None), height=dp(160),
+        size_hint=(0.85, None), height=dp(190),
         auto_dismiss=False,
     )
+    popup._body = label
+    popup._detail = detail_label
     popup.open()
     ctx.connecting_popup = popup
+
+
+def _update_connecting_popup(ctx, attempt_num, kind):
+    """Refresh the connecting popup's detail line with the current
+    retry count, elapsed seconds, and last-error kind. Best-effort:
+    no-op if the popup isn't up or attributes are missing.
+
+    Surfacing the kind in particular gives the user / maintainer
+    actionable info — a 60s ``daemon_not_ready`` wait reads very
+    differently from a 60s ``null_bundle`` wait (the latter is a
+    signature-grant problem, not a slow boot)."""
+    popup = ctx.connecting_popup
+    if popup is None:
+        return
+    detail = getattr(popup, '_detail', None)
+    if detail is None:
+        return
+    elapsed = 0.0
+    if ctx.warmup_started_at is not None:
+        import time as _t
+        elapsed = _t.monotonic() - ctx.warmup_started_at
+    parts = [_tr('Attempt {n} of {total}').format(
+        n=attempt_num, total=_DAEMON_WARMUP_RETRIES)]
+    if elapsed > 0:
+        parts.append(_tr('{s}s elapsed').format(s=int(elapsed)))
+    if kind:
+        # Keep the kind machine-readable; the maintainer-email
+        # link in the unresponsive popup picks it up verbatim, so
+        # users on slow tablets reading "daemon_not_ready" know to
+        # wait, while a "null_bundle" reading prompts a signature /
+        # reinstall workflow.
+        parts.append(kind)
+    detail.text = '  ·  '.join(parts)
 
 
 def _dismiss_connecting_popup(ctx):
@@ -673,25 +961,44 @@ def _dismiss_connecting_popup(ctx):
 
 # ── step 1: server compat ──────────────────────────────────────────────────
 
-# How many times to retry the compat probe when the server APK is
-# installed but its daemon hasn't responded yet. The 503
-# ``daemon_not_ready`` response comes from
-# ``AZTCollabProvider.java`` when the Python dispatch callback
-# isn't registered yet — i.e., the Python interpreter is still
-# loading. Warm-cache cold starts settle in 1–3 seconds; cold
-# starts after a freshly-installed APK or ``pm clear`` (where dex
-# caches need rebuilding) have been observed to run > 30s on
-# real devices (the 0.28.24 bump from 10s to 30s wasn't enough;
-# user reported "next boot fails, the following one succeeds").
-# Budget 30 × 2s = 60s to cover the worst observed cold start.
-# Warm launches exit the loop on the first attempt and never
-# feel the longer budget. Users on truly slow hardware can also
-# tap "Try again" on the unresponsive popup to extend further.
+# Warmup retry budget when the server APK is installed but its
+# daemon hasn't responded yet. The 503 ``daemon_not_ready``
+# response comes from ``AZTCollabProvider.java`` when the Python
+# dispatch callback isn't registered yet — Python interpreter
+# still loading.
+#
+# Adaptive backoff (Phase A, 2026-05): the previous fixed 2s
+# interval punished fast devices that were ready at attempt 2
+# (always paid 2s). Now the schedule starts short and grows:
+# 0.2s, 0.4s, 0.8s, 1.6s, then caps at 2.0s. Total budget
+# unchanged: ~60s, covers the worst observed cold start on slow
+# tablets (R500-class, 20–30s daemon Python boot) plus margin.
+# Warm-cache launches now land in <1s instead of 2s+.
+#
+# ``null_bundle`` failures (ContentResolver.call returning null —
+# usually signature-grant denial, structurally unrecoverable)
+# fail fast at ``_NULL_BUNDLE_FAIL_FAST`` consecutive nulls.
+# Waiting the full warmup on those is pointless; surface the
+# signature/install issue early.
 _DAEMON_WARMUP_RETRIES = 30
-_DAEMON_WARMUP_INTERVAL_S = 2.0
+_DAEMON_WARMUP_BACKOFF_SCHEDULE_S = (0.2, 0.4, 0.8, 1.6)
+_DAEMON_WARMUP_BACKOFF_CAP_S = 2.0
+_NULL_BUNDLE_FAIL_FAST = 3
+
+
+def _warmup_delay(attempt):
+    """Return the seconds to wait before retry attempt ``attempt``
+    (0-indexed: 0 means "first retry"). Schedule: ramp through
+    ``_DAEMON_WARMUP_BACKOFF_SCHEDULE_S``, then plateau at
+    ``_DAEMON_WARMUP_BACKOFF_CAP_S``."""
+    schedule = _DAEMON_WARMUP_BACKOFF_SCHEDULE_S
+    if attempt < len(schedule):
+        return schedule[attempt]
+    return _DAEMON_WARMUP_BACKOFF_CAP_S
 
 
 def _check_server(ctx, _warmup_attempt=0):
+    _boot_trace('compat_probe', attempt=_warmup_attempt)
     try:
         compat = check_server_compat()
     except Exception as ex:
@@ -719,30 +1026,71 @@ def _check_server(ctx, _warmup_attempt=0):
     _sync_ui_language_with_daemon()
 
     if compat.get('ok'):
+        _boot_trace('compat_ok')
         _on_ui(_dismiss_connecting_popup, ctx)
         _check_self(ctx)
         return
 
     err = compat.get('error', '') or ''
     if err == 'server_unreachable':
+        # Capture the transport's coarse failure kind for adaptive
+        # retry behavior + diagnostic surface. ``check_server_compat``
+        # threads it from ``ServerUnavailable.kind``.
+        kind = compat.get('kind', '') or ''
+        detail = compat.get('detail', '') or ''
+        ctx.last_error_kind = kind
+        ctx.last_error_detail = detail
         # Disambiguate: package absent vs. daemon-warming-up. If the
         # server APK is installed but the daemon happens to be down
         # (lazy-spawn in progress; OOM-killed mid-call; whatever),
         # prompting to *install* it is wrong — it's already installed.
         # Probe PackageManager before deciding.
         if _server_package_installed():
+            # ``null_bundle`` fast-fail. If ``ContentResolver.call``
+            # returns null repeatedly, the daemon will never come
+            # alive — most common cause is signature-grant denial,
+            # which a 60-second wait won't fix. Bail to the
+            # unresponsive popup early so the user can act on the
+            # actual problem (reinstall, sign matching).
+            if kind == 'null_bundle':
+                ctx.null_bundle_streak += 1
+            else:
+                # Any other kind (especially ``daemon_not_ready``)
+                # is a "boot in progress" signal — reset the streak.
+                ctx.null_bundle_streak = 0
+            if ctx.null_bundle_streak >= _NULL_BUNDLE_FAIL_FAST:
+                print(f'[bootstrap] null-bundle fast-fail: streak='
+                      f'{ctx.null_bundle_streak} attempt='
+                      f'{_warmup_attempt}',
+                      file=sys.stderr, flush=True)
+                _on_ui(_dismiss_connecting_popup, ctx)
+                _on_ui(_prompt_server_unresponsive, ctx)
+                return
             # Package is there but daemon isn't responding. Most
             # common reason at startup: Android is still spinning up
             # the server APK's Python interpreter. Retry the compat
-            # probe with backoff; the daemon usually settles within
-            # a few seconds.
+            # probe with adaptive backoff; the daemon usually
+            # settles within a few seconds.
             if _warmup_attempt < _DAEMON_WARMUP_RETRIES:
-                # Show the connecting popup on first retry so the
-                # user knows we're waiting (instead of staring at
-                # an empty-state peer UI for ~10s).
+                if ctx.warmup_started_at is None:
+                    import time as _t
+                    ctx.warmup_started_at = _t.monotonic()
+                # Show the connecting popup with retry count +
+                # elapsed seconds + last error kind so the user
+                # has feedback during the wait. Refreshed on each
+                # iteration via ``_update_connecting_popup``.
                 _on_ui(_show_connecting_popup, ctx)
+                _on_ui(_update_connecting_popup, ctx,
+                       _warmup_attempt + 1, kind)
                 _ui_status(ctx, _tr(
                     'Connecting to AZT Collaboration service…'))
+
+                delay = _warmup_delay(_warmup_attempt)
+                print(f'[bootstrap] warmup retry attempt='
+                      f'{_warmup_attempt + 1}/'
+                      f'{_DAEMON_WARMUP_RETRIES} '
+                      f'kind={kind!r} delay={delay}s',
+                      file=sys.stderr, flush=True)
 
                 def _retry(_dt):
                     threading.Thread(
@@ -751,7 +1099,7 @@ def _check_server(ctx, _warmup_attempt=0):
                         kwargs={'_warmup_attempt':
                                 _warmup_attempt + 1},
                         daemon=True).start()
-                Clock.schedule_once(_retry, _DAEMON_WARMUP_INTERVAL_S)
+                Clock.schedule_once(_retry, delay)
                 return
             # All retries exhausted: daemon is genuinely unreachable
             # despite being installed. Dismiss the connecting popup
@@ -1060,7 +1408,11 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
         #   currently show a new apk online, despite a different
         #   sha256."
         if (not mandatory and not digest_changed
-                and _declined_version(ctx.peer_repo) == latest):
+                and _consume_decline(ctx.peer_repo, latest)):
+            # One-shot decline consumed: silently skip THIS
+            # launch's prompt. The stored decline is now cleared
+            # so the next launch (still on the same upstream
+            # version) will prompt again.
             _on_ui(on_no_update)
             return
         _on_ui(_prompt_self_update, ctx, latest, mandatory, gh_digest)
@@ -1094,6 +1446,33 @@ def _post_install_continuation(ctx):
     Clock.schedule_once(_resume, 2.0)
 
 
+def _open_server_apk_launcher():
+    """Fire an ACTION_MAIN/CATEGORY_LAUNCHER intent for the server
+    APK package so its launcher activity moves to the foreground.
+    Returns True on success, False otherwise. Android-15 process-
+    freezer workaround: with the server APK foregrounded, its
+    package's processes (including ``:provider``) un-freeze and
+    the peer's next ContentResolver call lands."""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Intent = autoclass('android.content.Intent')
+        activity = PythonActivity.mActivity
+        if activity is None:
+            return False
+        pm = activity.getPackageManager()
+        intent = pm.getLaunchIntentForPackage(_SERVER_PACKAGE_NAME)
+        if intent is None:
+            return False
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(intent)
+        return True
+    except Exception as ex:
+        print(f'[bootstrap] _open_server_apk_launcher failed: {ex}',
+              file=sys.stderr, flush=True)
+        return False
+
+
 def _prompt_server_unresponsive(ctx):
     """Server APK is installed but didn't respond after the
     daemon-warm-up retries. Same canonical popup as the missing-
@@ -1108,17 +1487,85 @@ def _prompt_server_unresponsive(ctx):
     and the daemon isn't responding). Open install page opens
     the release page in the browser.
 
+    Android 15 add-on: an "Open AZT Collaboration" button. The
+    OS's app freezer can keep the server APK's ``:provider``
+    process frozen across peer-driven lazy-spawn (verified on
+    R500_V_US tablet), so peers time out before the daemon
+    responds. Tapping the button launches the server APK's
+    launcher activity, which un-freezes the whole package's
+    process group; we then re-run ``_check_server`` from a fresh
+    retry budget, and when the user switches back to the peer,
+    bootstrap's compat probe lands and the host resumes normal
+    startup. Cheaper recovery than reinstalling.
+
     Does not fire on_done — the popup is terminal. If the user
     reinstalls and the new daemon responds, the post-install
     continuation chain re-runs ``_check_server`` and the host's
     on_done fires from the healthy path."""
     from .popups import install_server_apk_popup
+
+    # Surface diagnostic state so the user (or maintainer if they
+    # tap an Email link) can act on the actual problem rather than
+    # blindly retrying. ``last_error_kind`` distinguishes
+    # ``daemon_not_ready`` (slow boot, retry / wake) from
+    # ``null_bundle`` (signature-grant denial — reinstall with
+    # matching keystore) from other transport failures. Server APK
+    # versionName via PackageManager confirms which build is
+    # actually installed (vs. what the user thinks they installed).
+    diag_lines = []
+    if ctx.last_error_kind:
+        diag_lines.append(_tr('Last error: {kind}').format(
+            kind=ctx.last_error_kind))
+    if ctx.warmup_started_at is not None:
+        import time as _t
+        elapsed = int(_t.monotonic() - ctx.warmup_started_at)
+        diag_lines.append(_tr('Waited {s}s before giving up.').format(
+            s=elapsed))
+    server_versionname = ''
+    try:
+        from .update import _installed_version_name
+        server_versionname = _installed_version_name(
+            _SERVER_PACKAGE_NAME)
+    except Exception:
+        pass
+    if server_versionname:
+        diag_lines.append(_tr(
+            'Installed {name} version: {v}').format(
+                name=ctx.server_display_name,
+                v=server_versionname))
+
     body = _tr(
         'The AZT Collaboration service ({name}) is installed but '
-        'did not respond. It may still be starting up; wait a '
-        'moment, then tap Install to reinstall it, or Quit to '
-        'close this app and try again later.'
+        'did not respond. Tap Open {name} to wake the service, '
+        'then come back here. Or tap Install to reinstall it, or '
+        'Quit to close this app and try again later.'
     ).format(name=ctx.server_display_name)
+    if diag_lines:
+        body = body + '\n\n' + '\n'.join(diag_lines)
+
+    def _wake_and_recheck():
+        # Launch the server APK's launcher activity to un-freeze
+        # its process group, then re-enter _check_server on a
+        # short delay so the daemon has a window to register
+        # callbacks. Bootstrap's existing retry loop + connecting
+        # popup take over from there; when the user switches back
+        # to the peer (Kivy Clock resumes), the compat probe lands
+        # and the host's on_done fires from the healthy path.
+        opened = _open_server_apk_launcher()
+        if not opened:
+            _ui_status(ctx, _tr(
+                'Could not open {name}.').format(
+                    name=ctx.server_display_name))
+        # Show the connecting popup right away so when the user
+        # switches back to the peer there's a visible "waiting"
+        # state instead of a blank screen.
+        _on_ui(_show_connecting_popup, ctx)
+
+        def _resume(_dt):
+            threading.Thread(target=_check_server, args=(ctx,),
+                             daemon=True).start()
+        Clock.schedule_once(_resume, 2.0)
+
     _release_running()
     install_server_apk_popup(
         on_status=ctx.on_status,
@@ -1132,6 +1579,9 @@ def _prompt_server_unresponsive(ctx):
         # path as the post-install continuation, including the 2s
         # daemon-warm-up pause).
         on_retry=lambda: _post_install_continuation(ctx),
+        on_open_app=_wake_and_recheck,
+        open_app_label=_tr('Open {name}').format(
+            name=ctx.server_display_name),
         repo=ctx.server_repo,
     )
 
@@ -1208,11 +1658,12 @@ def _prompt_server_update(ctx, current_version, min_required=''):
     On install completion the popup's continuation chain re-runs
     the compat check, same as the missing-server case."""
     from .popups import install_server_apk_popup
-    if current_version and _declined_version(
-            ctx.server_repo) == current_version:
-        # User explicitly declined this version earlier in a
-        # previous session. Let the host continue and surface the
-        # daemon's compat error its own way.
+    if current_version and _consume_decline(
+            ctx.server_repo, current_version):
+        # One-shot decline consumed: let the host continue at the
+        # old server version and surface the daemon's compat
+        # error its own way. The next launch (still against the
+        # same too-old server) will re-prompt.
         _on_done_and_release(ctx)
         return
     # Pre-flight: does the upstream release feed have a build that
@@ -1279,8 +1730,13 @@ def _prompt_self_update(ctx, latest_version, mandatory=False,
       detected path): body reads "A newer version of this app
       ({version}) is available." Dismiss button is "Not now",
       action is ``'dismiss'`` — peer keeps running at the current
-      version, decline is recorded via ``_record_decline`` so we
-      don't re-prompt for the same version next launch.
+      version, decline is recorded via ``_record_decline``. The
+      decline is one-shot: it suppresses exactly the next prompt
+      and clears (see ``_consume_decline``), so the cadence is
+      prompt → decline → skip → prompt → decline → skip → …
+      rather than the previous "never ask again for this version"
+      shape. A new upstream version invalidates the stored value
+      via exact-string compare.
     - **Mandatory** (``mandatory=True``, the ``client_too_old`` +
       newer-version-exists path): body reads
       "{name} {version} is required to use the AZT Collaboration

@@ -11,6 +11,1637 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.39.0 / azt_collab_client 0.39.0 — per-project `repo_slug` field
+
+Closes the recorder 1.41.3 ask from
+``NOTES_TO_DAEMON.md``: the GitHub-repo-name override that the
+publish path uses now lives on the daemon's project record, not
+in peer prefs.
+
+**Why this is needed.** Most projects publish to a repo named
+after the project's ``langcode``, and the daemon's
+``projects.json`` key is the right value to display. But a user
+can legitimately want a *different* repo name (vanity slug,
+project-style naming convention, collision avoidance with an
+existing GitHub repo) without changing the LIFT
+``<form lang="…">`` tag. Pre-1.41.3 the recorder persisted that
+override as a suite-wide ``peer_pref`` scalar
+(``collab_langcode``), which was wrong on two counts:
+peer-prefs are global but the override is per-project, and
+peer-side storage of project-identity data violates the
+no-daemon-owned-caches rule (also documented in
+``NOTES_TO_DAEMON.md`` "Daemon is now the sole authoritative
+source"). 1.41.3 dropped the peer-side mirror; this release
+gives the data its canonical daemon-side home.
+
+**Wire shape:**
+
+- ``Project.repo_slug`` field (string, default empty).
+  Returned by ``open_project`` / ``project_status`` /
+  ``list_projects`` so peers can read it without an extra
+  round-trip.
+- New endpoint ``POST /v1/projects/<lang>/repo_slug`` —
+  body ``{repo_slug: '<name>'}``. Whitespace stripped before
+  persist. Empty string explicitly clears (callers fall back
+  to using ``langcode``). 404 on unknown project, 400 on
+  missing field.
+- New client wrapper ``set_repo_slug(langcode, slug)`` —
+  returns the updated ``Project`` or ``None`` on transport
+  failure / unknown project, same shape as
+  ``set_cawl_image_repo``.
+- ``register_project`` now accepts ``repo_slug=…`` for the
+  initial-creation path (alongside the existing
+  ``cawl_image_repo`` kwarg). ``None`` preserves any existing
+  value; ``''`` explicitly clears.
+
+**Default-semantics rule for callers:** unset / empty
+``repo_slug`` is the typical case — callers should treat that
+as equal to ``langcode``. The daemon does NOT auto-fill the
+field with the langcode; the field stays empty until the user
+explicitly overrides. That keeps "did the user actually choose
+a different name?" decidable from the data alone.
+
+**Floor:** neither MIN_SERVER_VERSION nor MIN_CLIENT_VERSION
+bumps. The field is purely additive — pre-0.39 daemons don't
+emit it, the client-side dataclass defaults to ``''`` for
+forward-compat. A 0.39 client calling ``set_repo_slug``
+against a pre-0.39 daemon gets ``None`` (the endpoint returns
+404), which is the same failure shape every other setter
+wrapper uses.
+
+**Removed from NOTES_TO_DAEMON.md:** the "Per-project
+repo-slug override (publish path)" entry — shipped.
+
+### azt_collabd 0.38.1 / azt_collab_client 0.38.1 — CAWL index seed (install-day-no-network)
+
+Closes the install-day-no-network gap that Stages 1+2 (0.38.0)
+couldn't solve on their own: a freshly-installed device that has
+never reached GitHub now has a bundled CAWL index to serve, so
+peers can render illustrations on first launch.
+
+**Daemon side:**
+
+- New ``_seed_index_if_bundled(repo)`` in ``azt_collabd/cawl.py``.
+  ``get_index(repo)`` calls it before going to the network when
+  the on-disk cache file is missing — copies the bundled asset
+  from ``azt_collabd/data/cawl/<owner>/<repo>/index.json`` into
+  ``$AZT_HOME/cawl/<owner>/<repo>/index.json`` if it exists.
+- Silently no-ops when (a) no seed is shipped for the requested
+  repo, (b) the cache already has data, (c) the bundled JSON is
+  malformed. The first case is the common one: only the
+  suite-canonical repo is typically seeded; fork / per-project-
+  override repos keep their old install-day behaviour (no
+  illustrations until the network fetch lands).
+- The seed is treated as an ordinary cache entry once written:
+  fresh-within-TTL → serve directly; past-TTL → attempt a
+  network refresh and fall back to the seed if offline (the
+  pre-existing stale-cache fallback). When the device first
+  gets online, the next refresh overwrites the seed with current
+  data.
+
+**Bundle layout:**
+
+```
+azt_collabd/data/cawl/
+    <owner>/<repo>/
+        index.json
+```
+
+Subdirectory name matches the on-disk cache layout exactly.
+``azt_collabd/data/cawl/generate_seed.py`` is the maintainer
+script: with no args it refreshes the suite-canonical seed
+(daemon-global default ``kent-rasmussen/images_CAWL``); pass
+``owner/repo`` or set ``AZT_CAWL_IMAGE_REPO`` for a fork /
+non-canonical image set. Uses the same
+``cawl._fetch_index_from_github`` codepath the daemon does at
+runtime, writing to the right directory.
+``azt_collabd/data/cawl/README.md`` documents the wire shape +
+when to re-run.
+
+The daemon-global ``cawl_image_repo`` default is no longer empty
+— recorder 1.41.3 removed its own hard-coded fallback under the
+no-daemon-owned-caches rule, so the daemon is now the sole
+source of this slug at runtime. Default set to
+``kent-rasmussen/images_CAWL`` to preserve the recorder's
+pre-1.41.3 behavior; fork shipping a different CAWL set should
+override via ``azt_collabd.configure(cawl_image_repo=…)`` or
+``AZT_CAWL_IMAGE_REPO``.
+
+**Buildozer:**
+
+- ``server_apk/buildozer.spec`` and ``buildozer.spec.tmpl`` add
+  ``json`` to ``source.include_exts`` so the bundled seed lands
+  in the APK. No other build-config changes; new seed
+  directories under ``azt_collabd/data/cawl/`` are picked up
+  automatically.
+
+**What's NOT bundled, and why:**
+
+The image binaries themselves are explicitly **not** in the
+seed. 1701 images at 50–200 KB each ≈ 100–300 MB per APK
+release — wrong trade for a one-time first-launch UX gain.
+Image rendering on day-one without connectivity simply doesn't
+happen; the user gets illustrations once the device first
+reaches ``raw.githubusercontent.com``, with the daemon-side
+lazy cache (shipped in 0.38.0) covering steady-state perfectly
+fine. If a future session proposes "bundle the whole CAWL
+image set in the APK", that's a re-litigation of a 2026-05-12
+decision — answer is no.
+
+**Floor:** patch bump (no wire-format change). The seed is
+purely additive on the daemon side; pre-0.38.1 clients get
+exactly the same wire shape from ``GET /v1/projects/<lang>/
+cawl/index`` — they just benefit from a populated cache they
+didn't have to fetch themselves.
+
+### azt_collabd 0.38.0 / azt_collab_client 0.38.0 — CAWL Stage 2: per-project image_repo, image-binary RPC, first non-JSON endpoint
+
+Completes the CAWL daemon-side migration that 0.37.0 started, and
+corrects 0.37.0's daemon-global ``cawl_image_repo`` stopgap to a
+per-project field on the Project record. CAWL is now a fully
+daemon-owned suite-scoped resource: peers consume both the index
+and the image binaries via the daemon, with one cache per repo
+per device regardless of peer count.
+
+**The reframing.** 0.37.0 used a daemon-global ``cawl_image_repo``
+configured at daemon startup. That conflicted with the
+"sole authoritative source" architectural invariant the recorder
+1.41.3 just established (NOTES_TO_DAEMON.md): per-project
+identity / configuration data belongs on the project record, not
+in peer prefs and not in daemon-global config. Different projects
+can legitimately point at different image sets (vanity fork,
+culturally specific imagery, etc.) so the slug is a per-project
+override with a daemon-global fallback.
+
+**Project record (azt_collabd/projects.py):**
+
+- New ``Project.cawl_image_repo`` field (string, default empty).
+  Empty falls back to the daemon-global default; non-empty
+  overrides for this project.
+- ``register(..., cawl_image_repo=None)`` accepts the kwarg.
+  ``None`` preserves any previously-set value across
+  re-registration; empty string explicitly clears.
+- New ``set_cawl_image_repo(langcode, repo)`` setter for the
+  endpoint.
+- Client-side ``Project`` mirror gains the field with default
+  empty (forward-compat with pre-0.38 daemons that don't emit it).
+
+**Cache module (azt_collabd/cawl.py):**
+
+- ``get_index(repo)`` now takes a repo slug. Cache moves to
+  ``$AZT_HOME/cawl/<owner>/<repo>/index.json`` so multiple
+  projects pointing at the same image_repo share one cache
+  directory.
+- New ``get_image_path(repo, basename)``: lazy fetch from
+  ``raw.githubusercontent.com``, cache at
+  ``<owner>/<repo>/images/<basename>``, return absolute
+  filesystem path. Path-traversal-safe basename validation.
+  ``None`` when fetch fails and no prior cached copy exists.
+- New ``resolve_image_repo(langcode)``: per-project value
+  preferred; daemon-global ``config.cawl_image_repo()`` is the
+  fallback for projects without an override.
+- Lock-coalesced fetches keyed by cache file path (not module-
+  wide), so two repos can fetch in parallel without
+  serializing.
+
+**Endpoints:**
+
+- ``GET /v1/projects/<lang>/cawl/index`` (replaces the 0.37.0
+  ``GET /v1/cawl/index``). Daemon resolves the project's
+  cawl_image_repo internally; response carries
+  ``index_repo`` alongside ``index`` so peers can see which
+  repo answered.
+- ``GET /v1/projects/<lang>/cawl/images/<basename>`` returns
+  **raw binary image bytes**. First non-JSON endpoint on the
+  loopback HTTP server; new ``_send_bytes`` handler bypasses
+  JSON dispatch (the dispatch table stays JSON-only). Content-
+  type derived from the file extension
+  (``image/jpeg``/``png``/``gif``/``webp`` known; falls back
+  to ``application/octet-stream``).
+- ``POST /v1/projects/<lang>/cawl_image_repo`` setter for the
+  per-project override. Body ``{cawl_image_repo: 'owner/repo'}``;
+  empty string explicitly clears.
+
+**ContentProvider (azt_collabd/android_cp/service.py):**
+
+- ``_resolve_path`` extended with two new shapes:
+  ``<lang>/cawl/index.json`` (3-seg, triggers lazy index fetch)
+  and ``<lang>/cawl/images/<basename>`` (4-seg, triggers lazy
+  image fetch).
+- CAWL paths resolve to ``$AZT_HOME/cawl/<owner>/<repo>/...``
+  (away from the per-project working_dir) so the dedup-by-repo
+  property of the cache layer is preserved on Android.
+- Write modes (``w``/``a``) rejected — peers don't write CAWL
+  files. Returns ``None`` so the Java side surfaces
+  ``FileNotFoundException``.
+
+**Client side:**
+
+- ``cawl_index()`` → ``cawl_index(langcode)``. The 0.37.0
+  shape is gone; pre-0.38 callers must pass a langcode.
+- New ``set_cawl_image_repo(langcode, repo)`` wrapper.
+- New ``CAWLHandle(langcode, basename).open_read()`` —
+  binary file-like for a CAWL image. Branches transport
+  internally: Android opens the ContentProvider URI
+  (zero-copy via kernel FD); desktop hits the loopback HTTP
+  endpoint and returns ``io.BytesIO`` wrapping the response.
+  Read-only (peers don't write CAWL images). Raises
+  ``FileNotFoundError`` on 404 / no cached copy / fetch
+  failure; raises ``ServerUnavailable`` on transport failure.
+- All exposed via ``__all__`` and re-exported.
+
+**What's left (not in 0.38.0):**
+
+- ⏳ APK-bundled INDEX seed (independent piece; ~50 KB asset
+  in ``server_apk/assets/cawl/index.json`` so install-day-no-
+  network gets a populated index without GitHub access).
+  Image binaries are NOT bundled — a 100–300 MB per-release
+  payload is the wrong trade; lazy daemon caching covers the
+  steady state. Filed in NOTES_TO_DAEMON.md.
+- ⏳ Peer migration in the recorder (swap direct
+  ``urllib.request.urlopen(raw_url)`` + per-peer cache for
+  ``CAWLHandle.open_read()``; UI affordance to set
+  ``cawl_image_repo`` per project). Lives in the recorder
+  repo; not blocked on anything here.
+
+**Floor:** neither MIN_SERVER_VERSION nor MIN_CLIENT_VERSION
+bump. The 0.38.0 endpoints are net-new; pre-0.38 clients
+calling them get 404, the wrappers return ``{}`` / ``None``,
+peers continue to use their pre-migration paths. Older clients
+talking to a 0.38 daemon work unchanged — they just don't call
+the new endpoints. The 0.37.0 ``GET /v1/cawl/index`` endpoint
+is removed; no peer has adopted it yet (0.37.0 didn't ship a
+real release).
+
+**Bootstrap decline cadence: one-shot, not permanent.**
+``bootstrap()``'s self-update decline mechanism (the "Not now"
+button on the peer self-update prompt and the
+already-declined branch of the server-too-old install prompt)
+is now **one-shot**. Recording a decline suppresses exactly
+the next launch's prompt and clears, so the cadence is
+prompt → decline → skip → prompt → decline → skip → … rather
+than the previous "never ask again for this version" shape.
+A new upstream version still invalidates the stored value
+the same way (exact-string compare).
+
+Motivation: permanent decline-by-version painted users into
+a corner where reconsidering required waiting for the next
+upstream tag. One-shot gives the user a launch's breathing
+room without trapping them. Implementation: new
+``_consume_decline(repo, version)`` does the read-then-clear
+in one step; ``_declined_version`` stays as a non-destructive
+peek for tests / diagnostic use.
+
+### azt_collabd 0.37.0 / azt_collab_client 0.37.0 — daemon-owned CAWL image-URL index cache
+
+Moves CAWL image-URL index ownership from the peer to the daemon
+to close out the 60/hr GitHub rate-limit symptom reported in
+NOTES_TO_DAEMON.md (filed 2026-05-11). The fundamental reframing:
+the index is *suite-scoped* shared infrastructure, not
+peer-scoped, so it belongs on the daemon and peers consume it.
+
+**Why this is needed.** Pre-0.37, each peer hit
+``api.github.com/repos/<image_repo>/git/trees/HEAD?recursive=1``
+directly on every project load and cached the result in a
+per-peer in-memory dict. GitHub caps unauthenticated REST at
+60 requests / hour / IP, which a dev rebuild loop, CI run, or
+multi-peer device blows trivially. Once exhausted, the
+resolver returns empty for the rest of the session and entries
+without a locally-cached image render with no illustration.
+Three structural failure modes flow from peer ownership:
+
+1. **Rate limit exhaustion** — described above.
+2. **Per-peer duplication** — N peers on the same device each
+   do the same work; Android's sandbox prevents sharing even
+   the cache file.
+3. **Install-day-no-network** — a fresh install with no
+   connectivity has no way to populate the index, so
+   first-launch UX is "no illustrations" regardless of what's
+   on disk.
+
+The recommendation discussion (transcript 2026-05-12) ranked
+three hosting fixes (bundle in APK / proxy through daemon /
+sign with GitHub App token) and then re-framed: the deeper
+problem is *where the cache lives*. Moving ownership to the
+daemon serves the same data, removes the per-peer fan-out,
+and lets the time-bounded refresh policy do the rate-limit
+work once per device per day.
+
+**Daemon side (`azt_collabd/cawl.py`):**
+
+- New module owns ``$AZT_HOME/cawl/index.json``.
+  ``get_index(force_refresh=False)`` returns the index dict,
+  refreshing from GitHub on cache miss / past-TTL / explicit
+  force. TTL is 24h (``_INDEX_TTL_SECONDS``).
+- Lock-coalesced fetch: two peers calling ``get_index`` on a
+  cold cache result in exactly one network round-trip; the
+  second caller reads the freshly-written file.
+- Stale-cache fallback: a network failure with a cached copy
+  on disk returns the cached copy (even if past TTL). A
+  network failure with no cache returns ``{}``. Peer code
+  treats ``{}`` the same way it treated its pre-migration
+  empty resolver dict, so there's no new "daemon failed"
+  branch to write.
+- Daemon stays naming-convention-agnostic. The wire shape is
+  ``{repo, branch='HEAD', fetched_at, files: [{path, url}]}``.
+  Peers do the filename → CAWL-identifier mapping themselves
+  (the recorder has its own convention; future peers may
+  differ).
+
+**Config (`azt_collabd/config.py`):**
+
+- New ``cawl_image_repo`` config kwarg on ``configure()``,
+  with ``AZT_CAWL_IMAGE_REPO`` env-var override. Empty
+  default — peers must configure it before any fetch
+  happens. An unconfigured daemon short-circuits
+  ``get_index()`` to ``{}`` without any network call, so a
+  misconfigured launch doesn't silently hammer the wrong
+  GitHub repo.
+
+**Wire shape:**
+
+```
+GET /v1/cawl/index
+→ {
+    "ok": true,
+    "index": {
+        "repo":       "<owner>/<repo>",
+        "branch":     "HEAD",
+        "fetched_at": <unix-seconds>,
+        "files": [
+            {"path": "cawl-1234.jpg",
+             "url":  "https://raw.githubusercontent.com/.../cawl-1234.jpg"},
+            ...
+        ]
+    }
+  }
+```
+
+Empty dict at ``index`` (``{}``) means "no images known" —
+same shape peers got from an empty pre-migration resolver,
+so no new failure branch is required.
+
+**Client side:**
+
+- New ``cawl_index()`` wrapper in
+  ``azt_collab_client/__init__.py``. Returns the dict on
+  success, ``{}`` on transport failure or empty daemon
+  response. No raw ``ServerUnavailable`` reaches the caller.
+- Re-exported from ``__all__``.
+
+**What this fixes vs. what's left.**
+
+- ✅ Index fetch no longer per-peer. One daemon-side fetch
+  per device per 24h TTL.
+- ✅ Rate-limit blow-up under dev rebuild / multi-peer use.
+- ✅ Stale-cache survival across GitHub outages.
+- ⏳ Image *binaries* still fetched by peers directly from
+  ``raw.githubusercontent.com``. That endpoint is on a much
+  more permissive rate-limit domain (effectively unmetered
+  for normal use), so it isn't the bottleneck. Migration to
+  a daemon-served provider URI for binaries is Stage 2 — same
+  shape (suite-scoped resource, daemon ownership, peer
+  consumes via provider) but a larger touch (every peer's
+  image-resolution path). Filed as the remaining piece in
+  NOTES_TO_DAEMON.md after the 0.37.0 cut.
+- ⏳ Install-day-with-no-network still has no bundled
+  index seed. ~50 KB index JSON shipped as a server APK
+  asset would close the gap; daemon copies into
+  ``$AZT_HOME/cawl/`` on first start if empty. NOT
+  bundling image binaries — 100–300 MB per release is
+  the wrong shape for Android distribution; daemon-side
+  lazy caching (Stage 2 RPC) is how the binary
+  deduplication / cross-peer-sharing wins land.
+
+**Floor:** neither MIN_SERVER_VERSION nor MIN_CLIENT_VERSION
+is bumped. The endpoint is purely additive — a pre-0.37 client
+calling ``cawl_index()`` gets ``{}`` from a 0.37 daemon and is
+fine; a 0.37 client calling ``cawl_index()`` against a pre-0.37
+daemon hits a 404, the wrapper falls back to ``{}``, and the
+peer continues to resolve illustrations from its own legacy
+fetch path. Peers migrate at their own pace; no hard cut-over.
+
+### azt_collabd 0.36.0 / azt_collab_client 0.36.0 — `atomic_commit` RPC for URI atomic writes, MIN_SERVER_VERSION lifted hard to 0.36.0
+
+Closes the last cross-process atomic-write gap: peers writing
+LIFT / audio / image bytes through a ``content://`` URI on
+Android now ship the full payload to the daemon, which performs
+the tempfile + ``os.replace`` atomic write in its own process.
+
+**Why this is needed.** On Android the daemon's working_dir
+lives in the standalone server APK's private filesDir. Peers
+write to it via ``ContentResolver.openFileDescriptor``, which
+returns an FD into the daemon's filesystem. ``ftruncate(fd, 0)``
++ subsequent writes through that FD are NOT atomic from any
+other observer's perspective: a concurrent peer write, or the
+daemon's own merge-output write, can see torn bytes mid-write.
+The 2026-05-12 ``baf`` repro showed exactly this — two peer
+serializations interleaved through the FD path produced
+malformed XML which the daemon then misparsed catastrophically.
+
+The 0.35.4 client added a path-keyed lock so a single peer
+process can't race with itself, but cross-peer-process and
+peer-vs-daemon races stayed open. 0.36.0 closes them.
+
+**Wire shape:**
+
+```
+POST /v1/projects/<lang>/atomic_commit
+{
+  "path": "<rel_path>",
+  "data_b64": "<base64-encoded-bytes>"
+}
+```
+
+``rel_path`` is one of ``<file>.lift``, ``audio/<file>``,
+``images/<file>`` — same whitelist as the ContentProvider's
+``_resolve_path``. Path-traversal and out-of-whitelist shapes
+return 400 before any filesystem touch.
+
+The daemon serializes the write through ``project_lock`` (so it
+can't overlap with a sync's merge-output write or another
+atomic_commit) and writes via tempfile + ``os.replace`` in its
+own process. The destination is always a complete copy of one
+version, never a torn mix.
+
+Response: ``{ok: True, result: {statuses: [{code: 'ATOMIC_COMMITTED',
+params: {bytes_written, sha256}}]}}``. The sha256 lets the peer
+verify the bytes that landed match what it sent.
+
+**Client side:**
+
+- New ``atomic_commit_bytes(langcode, rel_path, data) -> Result``
+  wrapper in ``azt_collab_client/__init__.py``. Transport
+  failures translate to ``SERVER_UNAVAILABLE`` / ``SERVER_ERROR``
+  per the existing contract; the peer never sees a raw
+  ``ServerUnavailable``.
+- New ``_UriAtomicWriteFile`` in ``lift_io.py`` buffers writes
+  in memory and ships them on commit. Memory cost: ~1.33× the
+  file size (base64 encoding) during the encode-and-send window.
+  For LIFT (tens of MB at worst) this is fine.
+- ``LiftHandle.atomic_open_write`` on a URI now returns
+  ``_UriAtomicWriteFile`` (the 0.35.4 fallback to plain
+  ``open_write`` is gone). Filesystem-path callers still get
+  the local ``_AtomicWriteFile`` (tempfile + ``os.replace`` in
+  the peer process).
+- ``MediaHandle`` inherits the same shape — audio and image
+  atomic writes also go through the RPC on URI projects.
+
+**Floor:** ``MIN_SERVER_VERSION 0.35.4 → 0.36.0`` (hard).
+Peers rebuilt against 0.36.0 clients won't pair with pre-0.36.0
+daemons, so the install/update prompt fires before any sync
+attempt. Pre-0.36.0 clients are still allowed against a 0.36.0
+daemon — they just don't get the atomic-URI-write benefit (the
+old client doesn't know about the endpoint). MIN_CLIENT_VERSION
+does NOT bump for that reason: the new endpoint is additive,
+not breaking.
+
+### azt_collabd 0.35.4 / azt_collab_client 0.35.4 — atomic LIFT writes from peers, forensic dumps on every guard trip, MIN_SERVER_VERSION lifted to 0.35.4
+
+Two complementary pieces from the same investigation:
+
+**Client side (`azt_collab_client/lift_io.py`):**
+
+- `LiftHandle.open_write` is now **serialized within the peer
+  process via a path-keyed reentrant lock**. Two threads of the
+  same peer calling `open_write` on the same target queue
+  rather than race. Pre-0.35.4 a rapid-succession `open_write`
+  pattern (e.g., the recorder serializing the LIFT twice in
+  close succession after two audio captures) could interleave
+  at the byte level — each `open_write` opens an independent FD
+  and `ftruncate(0)`s the file, so two writes from offset 0
+  produce malformed bytes with torn tag boundaries. The
+  `baf` 2026-05-12 repro shows two same-lang `<gloss>` elements
+  with one's `<text>` mid-stream embedded in the other's; that's
+  the signature.
+- New `LiftHandle.atomic_open_write` context manager. Writes go
+  to a sibling tempfile with a random suffix; on clean exit
+  (`__exit__` with no exception), `os.replace` atomically renames
+  the tempfile over the destination. On exception, tempfile is
+  removed and the destination is untouched. Filesystem paths get
+  true atomic semantics; content:// URIs fall back to the
+  lock-protected `open_write` (ContentResolver has no clean
+  atomic-rename for arbitrary Provider URIs). Two concurrent
+  `atomic_open_write` calls on the same destination are safe:
+  each writes its own random-suffixed tempfile, and whichever
+  `os.replace` runs last wins — the destination is *always* a
+  complete copy of one version, never torn.
+- `MediaHandle` inherits both behaviors transparently
+  (audio and image writes also benefit).
+
+**Daemon side (`azt_collabd/lift_merge.py` + `repo.py`):**
+
+- New `build_diagnostic_xml` / `diagnostic_filename` /
+  `is_guard_kind` / `DIAGNOSTICS_SUBDIR` helpers in
+  `lift_merge.py`. The diagnostic XML schema captures:
+  - `guard` kind, daemon version, UTC timestamp.
+  - `merge-context`: lift path + the three commit SHAs
+    (local / remote / base) so the bytes are reachable via
+    `git show` from any clone.
+  - `process`: pid, ppid, executable, cwd.
+  - `thread`: name + ident of the thread that hit the guard,
+    plus the names + idents of every other live thread (so
+    a concurrent-call hypothesis can be tested from the
+    dump).
+  - `caller-stack`: the `traceback.extract_stack` slice at
+    guard-fire time, file + line + function for each frame.
+  - `filesystem-state`: stat results for the working-tree
+    LIFT path, .git directory, and `.azt-collab/diagnostics`
+    so disk-full or permission anomalies are recoverable.
+  - `inputs`: per side, byte length, sha256, parsed entry
+    count, parse-error message (when parsing failed).
+  - `merged`: byte length, sha256, entry count, parse-error
+    (when applicable).
+  - `conflict-fields`: the diagnostic strings the guard
+    produced (e.g., the `_looks_truncated` or
+    `_looks_catastrophic_output` message).
+  - `recent-trace`: a slice of the in-process ring buffer
+    (`_TRACE_RING_SIZE = 500` entries, default last 120 s)
+    capturing the daemon's pre-guard activity. Every
+    `[sync-trace]` / `[merge-trace]` / `[merge-diag]` line
+    in `azt_collabd` now routes through `lift_merge.trace()`,
+    which appends to the ring AND prints to stderr — so
+    dumps carry the same time-precise log slice that logcat
+    would have shown if anyone had been looking.
+- `repo._merge_diverged` now dumps the diagnostic to
+  `<working_dir>/.azt-collab/diagnostics/<utc>-<guard>-<nonce>.xml`
+  whenever a guard fires on a .lift merge. The file gets staged
+  into the merge commit by the existing `_stage_all` call and
+  pushed to the remote alongside the safe merge result. A
+  pre-existing `_write_merge_diagnostic` helper does the write
+  via tempfile + `os.replace` so a half-written diagnostic can't
+  be staged.
+
+  Best-effort: a diagnostic-write failure logs to stderr and
+  the merge proceeds. We don't want the audit trail to block
+  the merge if e.g. the disk is full.
+
+  **User isn't bothered.** The file lives under a hidden
+  `.azt-collab/` directory and is mentioned only in
+  `[merge-diag]` log lines. The intent is forensic — when a
+  guard fires (rare; ideally never), the daemon team or a
+  future-LLM analysis can `git log .azt-collab/diagnostics/`
+  on any clone of the repo, find the dump, and reconstruct
+  exactly what the merger saw. No console prompts, no UI
+  surfacing.
+
+**Versioning + floor:**
+
+- `azt_collabd 0.35.3 → 0.35.4`.
+- `azt_collab_client 0.35.3 → 0.35.4`.
+- `MIN_SERVER_VERSION 0.35.3 → 0.35.4` hard. Pre-0.35.4 daemons
+  still have all the guards (those landed in 0.35.1–0.35.3) but
+  log guard trips to stderr only — Android logcat is ephemeral
+  and not retrievable. The user explicitly asked that every
+  guard firing be recoverable from the repo for post-hoc
+  analysis; pinning the floor here is the discipline that
+  enforces it.
+
+**Why this is the right shape, in one sentence:** any future
+guard firing automatically leaves a small structured XML file
+in git that says exactly what the merger saw — without the
+user having to do anything, and without polluting their LIFT
+or audio data.
+
+### azt_collabd 0.35.3 / azt_collab_client 0.35.3 — output-side catastrophic-loss guard, MIN_SERVER_VERSION lifted hard to 0.35.3
+
+The closed merge note (filed 2026-05-11, "merge driver reorders
+entries to guid order") was reopened on 2026-05-12 with new
+commit-level evidence from the `baf` project: merge commit
+`679c102` produced 1 entry from inputs of 1702 and 1700 entries
+(base ~1700). The input-side truncation guard added in 0.35.1
+**cannot have fired** for these inputs (both well above the
+threshold). Yet the daemon's `lift_merge.three_way_merge`
+committed a 1-entry merge result, annotated `azt-lift-conflict
+value="theirs"` on the surviving entry, with the original guid.
+
+**Bug-shape analysis** (recorded so the institutional
+knowledge survives even if the proximate cause is never
+narrowed):
+
+The surviving entry's annotation form — single entry,
+`value="theirs"`, original (non-`-theirs`-suffixed) guid — is
+produced by exactly one pre-v3 code path: the `delete-modify`
+branch, which fires when `ours_entries.get(guid) is None`
+while `theirs_entries.get(guid)` is present (with content
+differing from base). For 1699 of the 1700 entries to be
+dropped through that branch's sibling code (`if _canon(b) ==
+_canon(t): continue   # they didn't change it; we deleted`),
+**the merger's internal `ours_entries` view had to be
+near-empty at the moment of the merge**. Yet `git show
+dc69264:baf.lift | grep -c '<entry '` shows 1702 entries in
+the committed blob.
+
+That contradiction — committed blob is full, the merger's view
+was near-empty — points at a non-deterministic ordering
+problem we can't reproduce without the daemon logs from the
+exact minute (`Tue May 12 13:17:40 UTC 2026`). Plausible
+proximate causes ranked by likelihood:
+
+1. **Two `_merge_diverged` calls raced.** Concurrent syncs
+   (the auto-sync on project select + a manual sync, or two
+   peers' sync requests on the daemon, or any debounce race)
+   each independently called `_walk_tree` on a working-tree
+   snapshot. If one snapshot caught a mid-write LIFT (peer's
+   `MediaHandle.open_write` had `ftruncate(0)`'d the file at
+   `lift_io._open_content_uri` line 211 but the subsequent
+   write hadn't completed), the merger saw a truncated ours
+   and committed the destructive merge. The OTHER call (with
+   the full file) then committed `dc69264` on top — making
+   the committed blob look healthy in retrospect.
+2. **Mid-write commit, immediately rewritten.** A peer's
+   write to the LIFT was interrupted (process killed, OOM,
+   activity teardown) right after `ftruncate(0)` and before
+   the bulk write completed. The daemon's commit_audio_and_sync
+   captured the truncated state, merged, and committed
+   `679c102`. The peer restarted, finished writing, and
+   committed `dc69264` later — making the "before" commit
+   look healthy in retrospect.
+3. **A path-level cache or staging issue** in
+   `_merge_diverged` returning blob bytes that don't match
+   what's now at `git show dc69264:baf.lift`. Less likely
+   given dulwich reads commit→tree→blob deterministically,
+   but not ruled out.
+
+Without the daemon logs of that minute, we cannot prove
+which (if any) of these was the proximate cause. **What we
+CAN do is make the next occurrence harmless.**
+
+**Most likely proximate cause** (refined after the user's
+follow-up observation that the surviving entry shape —
+single entry, `value="theirs"`, ORIGINAL guid — uniquely
+identifies the **delete-modify** branch, not modify-modify
+— which forces the conclusion that `ours_entries` was empty
+at merge time):
+
+`grep -c '<entry '` is a regex line count, not an XML
+validator. If `dc69264:baf.lift` had 1702 `<entry ` text
+matches AND a structural XML defect somewhere (unclosed tag,
+embedded null byte, bad encoding sequence, anything ET
+refuses), `git show` prints the raw bytes (succeeds — git
+doesn't validate) but `ET.fromstring` raises `ParseError`.
+The pre-0.35.2 `_parse` caught `ParseError` and **silently
+returned an empty LIFT doc with no signal back to the
+caller** — so the merger's `ours_entries` came back empty,
+every guid hit the delete-modify branch (1699 dropped via
+`continue   # they didn't change it; we deleted`, 1 emitted
+as a theirs-annotated entry).
+
+That fits the evidence exactly without invoking races or
+staging mysteries. The pre-0.35.2 silent-ParseError-masking
+was already addressed by 0.35.2's `_parse` returning
+`(root, error_msg)` — the merger now refuses to commit when
+ours/theirs fails to parse. The output-side guard in 0.35.3
+is a complementary defense: catches the symptom whatever the
+proximate cause, including ones we haven't thought of.
+
+**Forensic trace added.** `three_way_merge` now logs
+`[merge-trace] path=... base=N ours=M theirs=K
+ours_err='...'` at the start of every invocation. Next
+time anything looks weird, the logs themselves answer "did
+`_parse` mask an error, or did the merger genuinely see N
+entries?" without needing forensic git archaeology.
+
+**Output-side `_looks_catastrophic_output` guard.** Refuses
+to commit a merge whose entry count is < 1/4 of the smaller
+healthy input. Skips small projects (base < 50 entries; the
+ratio doesn't generalize at small scale) and skips when an
+input was itself tiny relative to base (input-side guard had
+jurisdiction; don't double-attribute). When triggered: keeps
+the larger input intact verbatim, emits a single
+`catastrophic-merge-output` Conflict carrying the full count
+diagnostic. Defense-in-depth: catches the symptom regardless
+of which proximate cause produced the algorithmic loss inside
+the merger.
+
+For the actual `baf` numbers (1, 1702, 1700, 1700): the guard
+fires unambiguously. Even if a future bug produces some other
+algorithmic loss, as long as the output is dramatically
+smaller than the inputs, the guard catches it.
+
+**Why this isn't redundant with the input guard.** The input
+guard (`_looks_truncated`) checks the SHAPE of the inputs —
+useful when one input arrived obviously truncated. The output
+guard checks the SHAPE of the result — useful when both
+inputs looked healthy at parse time but the algorithm lost
+data internally. They're independent layers. The bug repro
+above is the canonical case where input-side guard CANNOT
+fire (both 1700-ish) but output-side guard MUST fire (1).
+
+**`MIN_SERVER_VERSION` lifted 0.35.1 → 0.35.3 (hard).** The
+proximate cause for the 0.35.1 collapse is undetermined and
+could recur; forcing the floor ensures every peer paired with
+a daemon has the output guard. Standard discipline matching
+prior hard floors (0.34.0 sync, 0.34.1 reorder, 0.35.1
+input-truncation).
+
+**Tests** (`tests/test_lift_merge.py`):
+
+- `test_full_sides_one_entry_differs_keeps_all_entries`:
+  100-entry base/ours/theirs where only one entry differs.
+  Output must contain 100 entries (with a field-level
+  conflict on the differing one). Locks in the v3 recursive
+  merge's correctness for this case, and via the output
+  guard ensures even a regression in the recursive merge
+  doesn't slip past.
+- `test_catastrophic_output_guard_fires_directly`: direct
+  unit tests of `_looks_catastrophic_output` covering: the
+  bug numbers (trip), healthy output (skip), 50%-delete
+  (skip), small project (skip), already-tiny-input (skip,
+  input guard's territory).
+
+**Wire-compat.** Additive: existing conflict kinds and
+result shape unchanged. New `catastrophic-merge-output`
+Conflict kind shows up only if the guard fires. Existing
+peers see this as a generic CONFLICTS result; new peers can
+distinguish via `Conflict.kind`.
+
+### azt_collabd 0.35.2 — LIFT merge: recursive field-level conflict resolution + parse-error guard
+
+The v1/v2 merge produced "two whole entries with synthetic
+``-theirs`` guid suffix" on every modify-modify conflict — correct
+but unresolvable in practice. A 1700-line entry conflict where the
+only divergence is a `<text>` byte is invisible to the user; they
+won't sit and diff two thousand lines to find the one that
+differs. Field reports confirmed: nobody resolves these.
+
+**v3 recursive merge.** Conflicts now express at the **narrowest
+LIFT-multi level** that contains the divergence. A same-lang
+``<text>`` conflict produces two same-lang ``<form>`` siblings each
+carrying its own text and a single ``<annotation
+name="azt-lift-conflict" value="ours|theirs"/>`` marker — one
+``<entry>``, one ``<lexical-unit>``, two ``<form>``s. A
+``<pronunciation>`` conflict duplicates at pronunciation level
+(entry-level otherwise stays single). A gloss-text conflict
+duplicates at the ``<gloss>`` level inside a single sense. Only
+when a conflict genuinely can't be narrowed (entry-attribute
+differences with no element-children divergence) does the
+whole-entry duplication fallback kick in — with the synthetic
+guid suffix kept for that rare case.
+
+Implementation: ``_merge_pair`` + ``_walk_children`` recursive
+helpers, plus a ``_MULTI`` policy table mapping
+``(parent_tag, child_tag)`` → schema multiplicity. Unknown pairs
+default to multi (safer to over-allow than under-allow). The
+entry-level ``<annotation name="azt-lift-conflict" value="conflict">``
+marker now carries a ``<trait name="azt-lift-conflict-fields"
+value="...">`` listing slash-delimited paths from the entry root
+to each conflict site (e.g.,
+``lexical-unit/form[lang=en],sense[id=A]/gloss[lang=en]``) — peer-
+side resolvers can jump to the conflicting sub-elements without
+re-walking the merged tree.
+
+**Parse-error guard.** ``_parse`` no longer masks
+``ET.ParseError`` silently. When ``ours`` or ``theirs`` fails to
+parse (mid-write truncation that breaks XML, etc.), the merge
+refuses entirely — keeps the side that parsed cleanly, surfaces
+a ``parse-error`` Conflict in the result. Pre-0.35.2 the silent
+mask + the merge body's "absent from ours = ours deleted" rule
+combined to produce catastrophically destructive merges when
+the input was structurally invalid. Detection is now at the
+input layer where the data still tells us what's wrong.
+
+**Empty-side guard, small-project case.** The 0.35.1 truncation
+guard only triggered on ≥50-entry projects (the ratio threshold
+needs absolute size to avoid false-positives on legitimate small
+edits). The empty-side case — ours has 0 entries while base has
+any and theirs has any — now triggers regardless of project
+size. Catches a 5-entry project where one peer's write got
+``ftruncate(0)``'d mid-flight. False-positive only for users
+who *intentionally* clear every entry, which doesn't happen in
+this suite's peer flows.
+
+**Wire-compat.** Same shape: emits LIFT bytes, peers read them
+as normal LIFT. Old peers reading the v3 output see the
+duplicated forms/glosses as normal LIFT content (forms ARE
+schema-multi inside multitext containers; same-lang siblings are
+schema-valid even if semantically "one per writing system"
+conventionally) — no crashes, just a peer that doesn't recognise
+the new annotation pattern. The ``conflict-fields`` trait value
+changed from flat tag names to slash-delimited paths; peers
+parsing it should treat the value as opaque text or a
+comma-separated path list. No ``MIN_SERVER_VERSION`` bump —
+peers don't actively consume the conflict format yet.
+
+**Tests.** ``tests/test_lift_merge.py`` adds coverage for the
+same-lang text case, pronunciation case, parse-error case,
+empty-side small-project case, one-sided-change-no-conflict
+clean path, and the entry-level marker's path-list trait.
+
+### azt_collab_client 0.35.2 — peers may write image bytes through the provider (gate removed)
+
+`MediaHandle(path_or_uri, kind='image').open_write()` no longer
+raises `PermissionError`. 0.18.0 through 0.35.1 raised under an
+"images are read-only from peers; the daemon owns image
+additions" rule, which on inspection turned out to be an
+**unsubstantiated policy** — every mention of it (`lift_io.py:149-170`,
+`CLAUDE.md`'s cross-package-access section, the 0.18.0 CHANGELOG
+entry) asserted the rule but none cited a driving concern.
+The recorder team filed a NOTES_TO_DAEMON entry (2026-05-12)
+showing that the rule made the entire in-app image-selection
+feature silently no-op on URI projects, with four call sites
+gated off (`_download_and_set`, `_copy_and_set`,
+`_save_remote_image`, and the workers under it).
+
+**Decision:** symmetry with audio. The daemon's provider
+already supports image writes (`_resolve_path`'s
+`_ALLOWED_MEDIA_DIRS = ('audio', 'images')` whitelist
+auto-mkdirs the parent on first write). The two-write pattern
+(image bytes through `MediaHandle`, illustration ref through
+`LiftHandle`) is the same shape audio uses today and has
+worked correctly in the field. Binary-conflict resolution on
+basename collisions falls through to `repo._merge_diverged`'s
+existing `non-lift-modify-modify` branch (merging-side wins
+on disk, both versions remain in git history) — same handling
+audio's `.wav` files get.
+
+**Wire-compat:** purely client-side change. Daemon-side
+provider already supports image writes; no daemon code changed.
+Older peers paired with 0.35.2+ daemons keep their old
+`PermissionError` gate (they bundle the old client) so no
+behavior change there. Newer peers paired with older daemons:
+the daemon's provider has always allowed image writes through
+`_resolve_path`, so this works wire-side, but pre-0.35.1
+daemons have the merge-truncation gap — the existing 0.35.1
+`MIN_SERVER_VERSION` hard floor blocks that pairing anyway. No
+floor bump for 0.35.2.
+
+**Peer call-site cleanup** (recorder, viewer, future peers):
+drop the `is_uri: return` gates that were routing around the
+removed PermissionError. Use the same `MediaHandle` shape as
+audio. No new endpoint, no wrapper, no recorder-side
+infrastructure work beyond removing the gates.
+
+### azt_collabd 0.35.1 / azt_collab_client 0.35.1 — LIFT merge: truncation guard + field-level conflict annotations; MIN_SERVER_VERSION lifted hard to 0.35.1
+
+Field-reported 2026-05-12 (NOTES_TO_DAEMON.md, closed): a peer's
+post-merge LIFT shrank from ~1700 entries to 1, leaving only the
+single conflicting entry annotated `azt-lift-conflict="theirs"`.
+The reporter hypothesized a sibling bug to the closed reorder-by-guid
+issue ("union computed wrong"); the current code actually walks
+`union(ours, theirs)` correctly, so that hypothesis didn't fit. The
+real shape: `ours` arrived at the merge with a near-empty entry
+list while `base` and `theirs` had the full template. Every base
+entry absent from `ours` and unchanged in `theirs` then took the
+"they didn't change it; we deleted it" branch — correctly, given
+the inputs — producing the 1-entry destructive merge. The merge
+algorithm wasn't lying; the **inputs** were corrupted upstream
+(peer-side write race, partial commit, or sandbox sync hiccup
+between recorder and daemon — not narrowed in this session).
+
+**Defensive guard (`_looks_truncated`).** When all three sides
+have non-trivial entry counts AND one side's count is less than
+1/50 of the other AND the larger side has ≥50 entries, refuse
+the destructive merge. Keep the larger side intact (unchanged
+bytes; whatever was in the merge commit before this fix would
+have been destructive, so we bias toward preserving data), and
+return a single `Conflict(kind='truncation-suspected', fields=[…])`
+in the result. Upstream callers see `S.CONFLICTS` and surface
+the diagnostic; nothing destructive lands in git. Thresholds
+are intentionally conservative — legitimate large-scale
+deletions still go through (you can delete up to 98% of a
+project in one commit without tripping the guard).
+
+**Field-level conflict info.** Per-entry conflicts (modify-modify,
+add-add) now annotate the `<annotation name="azt-lift-conflict">`
+element with a `<trait name="azt-lift-conflict-fields" value="…">`
+sub-element listing the LIFT child-element keys that actually
+diverged — `lexical-unit`, `citation`, `field[type=SILCAWL]`,
+`sense[id=…]`, `pronunciation`, etc. The `Conflict` dataclass
+gains a `fields: list[str]` parallel field, surfaced via
+`to_dict()` for any peer-side merge UI. Lets a recorder
+(re-recording audio for a sense) ignore conflicts that don't
+touch `pronunciation`; lets a viewer (or future merge resolver)
+focus the user on the specific sub-elements that need attention
+instead of asking them to diff the whole entry by eye.
+
+Modify-delete / delete-modify conflicts don't carry field info —
+the conflict there is "entry exists vs doesn't," not
+sub-element divergence.
+
+**Wire-compat:** additive. Older peers see the new trait as
+unknown LIFT content (which their LIFT readers tolerate by
+design — annotations are extensible) and the new
+`truncation-suspected` Conflict kind as just another conflict
+they surface generically.
+
+**`MIN_SERVER_VERSION` raised 0.35.0 → 0.35.1 (hard).** Per the
+reporter's ask #5: pre-0.35.1 daemons have no truncation guard,
+so a peer paired with one can still hit the destructive merge.
+The floor bump prevents that pairing — sync refuses with
+`server_too_old` until the user updates the server APK. Same
+discipline as the 0.34.1 reorder fix.
+
+### azt_collabd 0.35.0 / azt_collab_client 0.35.0 — surface broken GitHub refresh-token state with a deadline-aware toast; codify auto/user sync contract
+
+Field-observed in this session's first sync trace: the daemon's
+``get_valid_github_token`` had been silently swallowing
+``incorrect_client_credentials`` from the OAuth refresh endpoint
+("Return the old token — it might still work"). That's a humane
+fallback in the short term, but it converts an 8-hour countdown
+into a silent cliff: once the existing access token expires, every
+authenticated git op starts failing with no user-visible warning
+that the user needs to re-auth.
+
+**Daemon side.** ``azt_collabd/store.py``:
+``get_valid_github_token`` now records ``refresh_broken=True`` +
+the error string + the check timestamp on refresh failure, and
+clears the flag on a subsequent successful refresh.
+``set_github_tokens`` (called by the device-flow completion path)
+also clears the flag — fresh tokens supersede any prior
+refresh-failure state. ``get_status`` exposes
+``github.refresh_broken`` and ``github.access_token_expires_at``
+(unix timestamp = ``token_time + 8h``) so peers can read the
+state via the existing credentials-status RPC without polling a
+new endpoint. New helper ``github_refresh_state()`` returns the
+same fields for daemon-internal use.
+
+**New status code:** ``S.AUTH_REFRESH_STALE`` (mirrored in
+``azt_collab_client/status.py``). Carries
+``params['expires_at']``. Appended to every sync result —
+``_h_project_sync`` and ``scheduler._run_sync`` both call a
+shared ``server._annotate_with_auth_health(res)`` after running
+the sync, so the status piggybacks on whatever the underlying op
+returned (typically ``PUSHED + AUTH_REFRESH_STALE`` during the
+access-token's last hour of life).
+
+**Client side.** ``azt_collab_client/translate.py`` adds a
+handler for ``S.AUTH_REFRESH_STALE`` that renders
+"GitHub session needs re-authentication — current access
+expires {deadline}. Open GitHub Connect and tap Re-authenticate."
+``_format_deadline`` converts ``expires_at`` to a relative
+phrase ("in 47 minutes", "in 3 hours", "now (already expired)")
+so the user reads how much runway they have without dragging
+timezone / locale plumbing into a one-shot string. The
+"refresh-broken" state is also visible to peers via
+``get_credentials_status() → github.refresh_broken`` for
+peers that want a startup banner.
+
+**Peer contract.** Documented in
+``azt_collab_client/CLAUDE.md`` § "Peer contract: routing on
+sync results" — auto-sync silences this code (per the existing
+auto/user contract; we don't disrupt mid-flow); user-initiated
+sync surfaces ``translate_status(status)`` as a toast. No
+routing — the toast text already names GitHub Connect /
+Re-authenticate as the next step. The state clears when the
+user completes a fresh device flow.
+
+**Wire compatibility.** Purely additive at the wire layer:
+older peers paired with a 0.35.0 daemon see the new code as
+an unknown status (verbose-but-non-fatal translate fallback);
+older daemons paired with a 0.35.0 peer never emit the code,
+so the peer never branches on it.
+
+**``MIN_SERVER_VERSION`` raised 0.34.1 → 0.35.0** anyway, as a
+*soft* requirement (no wire incompatibility to enforce). The
+real reason: the peer contract changes in CLAUDE.md (auto-sync
+silencing config-class codes, user-initiated routing /
+toasting, deadline-aware ``AUTH_REFRESH_STALE`` handling) need
+peer rebuilds to take effect. Bumping the floor forces every
+peer paired with a 0.35.0+ daemon to rebuild against the
+0.35.0 client, where the contract is documented and the
+``AUTH_REFRESH_STALE`` translation is wired. Without the bump,
+peers can keep running their pre-0.35.0 client and silently
+disrupt project flows on auto-sync — the exact symptom that
+surfaced as the "selected B got A" picker complaint earlier
+in the 0.34.x development cycle.
+
+### azt_collabd 0.34.1 / azt_collab_client 0.34.1 — LIFT merge preserves document order, MIN_SERVER_VERSION lifted to 0.34.1
+
+Field-reported by the recorder team (NOTES_TO_DAEMON.md, 2026-05-11):
+the very first real merge on any project rewrites the LIFT file
+into guid-alphabetical order, irreversibly destroying the project's
+semantic document order (template-driven SILCAWL order for new
+projects; whatever the contributor established otherwise). The
+change is committed and pushed before any peer can observe it, and
+ElementTree round-trips preserve whatever order they parse, so all
+subsequent edits cement the scrambled order. Repro confirmed
+against `kent-rasmussen/sw-US-x-kent`: the merge commit `29d1266`
+puts the entry whose guid sorts first (`002b6d2c-…` → SILCAWL
+1572) at the top of the file, with every entry following in strict
+guid order.
+
+**Root cause.** `azt_collabd/lift_merge.py:three_way_merge`
+walked `sorted(all_guids)` and appended to `merged_root` in that
+order. Deterministic, yes — but the wrong determinism.
+
+**Fix.** Walk `ours` in document order, then theirs-only entries
+in theirs's document order. Anchoring on `ours` is the
+conventional "the merging side keeps the order it was already
+working against" pick, and it makes merge commits diffable: only
+actually-changed entries move, instead of the whole 1700-entry
+file appearing to be rewritten. Base-only guids (deleted on both
+sides) are naturally excluded — they were a `continue` no-op in
+the old loop body anyway. Same body, new traversal.
+
+**MIN_SERVER_VERSION raised 0.34.0 → 0.34.1.** Pre-0.34.1 daemons
+will commit and push a scrambled file on the next merge, with no
+peer-visible warning before the damage hits git history. Hard
+gate is preferable to silent fallback. Peers paired with a 0.34.0
+daemon get the standard `server_too_old` bootstrap prompt.
+
+**Repair for already-scrambled projects is deliberately manual**,
+not automated, and unlikely ever to be. The natural order is
+application-meaningful (SILCAWL row for template-derived projects;
+headword for free-form lexica; sometimes a contributor's
+deliberate manual sequence). A unilateral "re-sort everyone's
+LIFT" utility can't know which of those applies, and silently
+re-ordering a contributor's intentional sequence is the same
+class of damage as the original bug. Project owners who want to
+restore a known template order on a scrambled project do it by
+hand, as one explicit commit, with explicit understanding of
+what they're choosing to lose.
+
+### azt_collabd 0.34.0 / azt_collab_client 0.34.0 — sync correctness: three load-bearing fixes, MIN_SERVER_VERSION lifted to 0.34.0
+
+Two-device sync between Android peers was silently broken across the
+entire 0.33.x line: after the first race between two phones pushing,
+the daemon entered a state where every subsequent sync attempt
+acted on a phantom remote, produced malformed merge commits, lost
+the same race three times, and finally surfaced `PUSH_FAILED` or
+(worse) a misleading `REPO_NOT_AUTHORIZED` against an unrelated
+GitHub install. Three independent bugs were stacked; fixing one only
+exposed the next. They're shipped together as a single minor bump.
+
+`azt_collab_client.MIN_SERVER_VERSION` is raised from `0.31.0` to
+`0.34.0`. A peer that gets through bootstrap will refuse to talk to
+any older daemon — the user is forced to install/update the server
+APK before sync re-engages. This is intentional: pre-0.34 daemons
+*appear* to work and quietly corrupt local repo state by accumulating
+malformed merge commits and never advancing
+`refs/remotes/origin/<branch>`, so silent fallback is worse than the
+hard gate.
+
+**(1) `_merge_diverged` now produces real two-parent merge commits.**
+The pre-0.34 code called `porcelain.commit(repo, merge_heads=[remote_sha], ...)`,
+but dulwich 1.2.1's `porcelain.commit` doesn't expose `merge_heads`
+as a public kwarg (it's an internal-only path used by `amend=True`).
+The call raised `TypeError`, fell into a legacy graft-the-parent-
+after-the-fact fallback (commit without merge_heads, then mutate
+`commit.parents` post-hoc + re-add to the object store), which
+silently produced a commit whose stored parents were `[local_sha]`
+only. GitHub's `git-receive-pack` correctly rejected the push as
+`DivergedBranches` because the "merge" commit didn't actually
+contain `remote_sha` as an ancestor. Fix: drop down to
+`repo.get_worktree().commit(merge_heads=[remote_sha])` —
+the worktree-level API DOES accept `merge_heads` and sets
+`c.parents = [old_head, *merge_heads]` atomically before writing
+the object and advancing the ref. The graft fallback is removed;
+the worktree API is in dulwich's public surface since 1.0.
+
+**(2) HTTP 403 detection no longer false-positives on hex SHAs.**
+The pre-0.34 code checked `'403' in str(exc)` to decide whether a
+dulwich push exception was a real auth failure. dulwich's
+`DivergedBranches.__str__` expands to `"(b'<current_sha>', b'<new_sha>')"`
+— two 40-char hex SHAs. Random hex contains the trigraph `'403'`
+~1 push in 250 by chance; the field trace had
+`e41db428f68e9f7f6334`**`037`**`345d6450...`, which matched. The
+false positive routed a diverged-branch failure through
+`diagnose_403`, exiting the sync flow with a bogus
+`REPO_NOT_AUTHORIZED` before the retry/merge could run. Fix:
+`re.search(r'\b403\b', str(exc))` via a new `_is_http_403` helper
+applied to all four call sites. Word boundaries don't fire inside
+an all-word-char hex SHA but do fire in dulwich's
+`"unexpected http resp 403 for <url>"` `GitProtocolError` message.
+
+**(2b) `diagnose_403` now scopes by repo owner.**
+When a real 403 *does* happen, `diagnose_403` was calling
+`check_app_installed(token)` without `account_login`, so it grabbed
+the first install in `/user/installations` whose `app_slug` matched.
+A user who's a collaborator on five orgs that each installed
+azt-collaboration got the first listed (`MattGyverLee` in the field
+trace, install id 121228993, `selected` repos) instead of the
+repo's own owner (`kent-rasmussen`, install 130605088, `all` repos),
+and the follow-on `check_repo_in_installation` correctly answered
+"no" — surfacing `REPO_NOT_AUTHORIZED` for a repo the user actually
+has access to via their personal install. Fix: parse the repo
+owner from `remote_url` first and pass it as `account_login` so
+the install inspected is the one that should host the repo.
+
+**(3) `porcelain.fetch` / `porcelain.pull` are called with the
+remote NAME, not the URL.** Dulwich's `porcelain/__init__.py:fetch`
+only runs `_import_remote_refs` (which writes
+`refs/remotes/<name>/<branch>`) when `get_remote_repo` could resolve
+the first positional arg back to a configured `[remote "<name>"]`
+section. Passing a URL always misses (no section is named
+`https://...`), so `remote_name = None` and the gate at line 4550
+skips the ref import. The pack transferred successfully (HTTP 200
+in logs) but the local tracking ref stayed frozen at whatever
+`porcelain.clone` wrote at project-create time. Every subsequent
+sync read a stale `remote_sha` from `refs/remotes/origin/<branch>`
+and acted on a phantom state of the world. Field trace: actual
+remote tip moved to `76201a5d…` ~25 minutes before the user opened
+the recorder, but the daemon kept reading
+`new_remote=42535766…` (the clone-time SHA) on every retry fetch,
+merged against the phantom, and lost the push race three times in
+a row. Fix: pass `'origin'` to every `porcelain.fetch` / `pull`
+call site in `azt_collabd/repo.py`. Dulwich resolves `'origin'` via
+`[remote "origin"]` (which `_init_repo_locked` /
+`_clone_repo_locked` always populate), uses the `username` /
+`password` kwargs we still pass explicitly, and — critically — runs
+`_import_remote_refs` so the tracking ref advances on each fetch.
+Push paths are unchanged: they already advance the tracking ref
+manually via `repo.refs[remote_ref] = local_sha` after a successful
+push (the line landed earlier for the `(+N)`-counter regression).
+
+**Observability.** The retry-path fetch + merge in
+`_sync_repo_locked` was wrapped in a bare `except Exception: pass`
+— failures inside `_merge_diverged` were swallowed. Added
+`[sync-trace]` lines for the retry fetch SHA, the retry merge SHA,
+and any exception so future divergence loops are diagnosable from
+logcat alone. (Reading the field trace was load-bearing for
+isolating bugs 2 and 3.)
+
+**(4) Auto-update download URL now matches the actually-published
+asset name — and tolerates peer literals that drift from it.** The
+recorder's bootstrap was wired with
+`peer_asset_filename='azt_recorder.apk'` (Python-pkg underscore
+form), but the published GitHub asset for `kent-rasmussen/azt-recorder
+v1.39.0` is `aztrecorder.apk` (Android-package-segment form, no
+underscore — matches `buildozer.spec → package.name`). The
+`releases/latest/download/<wrong-name>` redirect 404'd; users got
+"Download failed: HTTP Error 404" on tapping Update. The convention
+itself is consistent (published name = `package.name`); only two
+call sites typed the wrong form.
+
+Two-layer fix in the client so peer-side typos can't break this
+again:
+
+- `default_asset_filename()` helper in `azt_collab_client.ui.update`
+  derives ``<activity.getPackageName().rsplit('.', 1)[-1]>.apk`` from
+  the running peer at runtime. `asset_filename` /
+  `peer_asset_filename` in `check_for_update` /
+  `install_apk_from_url` / `bootstrap` / `share_running_apk` are
+  now keyword-optional and default to that helper. The recorder's
+  call sites drop their explicit literals; new peers don't need
+  to pass the name at all.
+- **Resilient fallback** for peers that DO pass an explicit name
+  (forks, older peer code rebuilt against the new client without
+  having dropped the literal): the asset-lookup paths in
+  `check_for_update` and `install_apk_from_url` now retry with
+  the runtime-derived name when the explicit name isn't found in
+  the release. `install_apk_from_url` further sources the download
+  URL from the release JSON's `browser_download_url` rather than
+  the caller-baked `releases/latest/download/<name>` URL, so a
+  wrong peer-baked literal can't poison the actual download.
+  Logged via `[update] explicit asset … not in release; falling
+  back to derived …` so the drift is visible in logcat.
+- Forks publishing under a non-default scheme still pass
+  `asset_filename=` and get exactly that — fallback only fires
+  when the explicit name returns no match.
+
+### azt_collab_client 0.33.7 — docs/ cleanup: prune shipped plans, organise residual work
+- **``docs/daemon_boot_plan.md``** rewritten as status-first.
+  Phase A and Phase B2 marked SHIPPED with measured outcomes;
+  Phase B1 + Phase C trimmed to "not shipped / not worth
+  shipping unless …" notes with the trigger conditions
+  spelled out. Cost-model speculation replaced with measured
+  numbers from R500-class slow tablet (2026-05-09 harness
+  run).
+- **``docs/github_connect_ux_audit.md``** —
+  recommended-implementation-order list at the bottom
+  refreshed: items #1–#7 are done/declined (audit-trail
+  strikethroughs preserved per the doc's own rule); items
+  #8–#13 re-prioritised in current order. No content removed.
+- **``docs/p4a_hook_picker_intent.md``** reduced to a redirect
+  stub. The PICK_PROJECT intent-filter injection it described
+  shipped in v0.28.x and is now in
+  ``p4a_hook.py:_inject_pick_project``.
+- **``docs/STATUS.md``** added. One-page index of "what
+  shipped recently" + "what's open, prioritised" across all
+  the docs in this directory. Reference docs
+  (``research_notes_2026-05.md``, ``test_plan.md``,
+  ``CLIENT_INTEGRATION.md``) listed but not duplicated.
+
+### azt_collab_client 0.33.6 — measurement-driven decisions documented (Q2 + Q3 answered)
+- **Q2 (doze) ANSWERED.** Measured on R500 tablet
+  post-Phase-B2: doze runs (peer wait 49-68ms, daemon boot
+  600-770ms) statistically indistinguishable from baseline
+  (45-66ms / 593-1131ms). The Android-15 issue was the
+  freezer, not doze proper. Phase B2's
+  ``BIND_ABOVE_CLIENT`` is sufficient; no
+  foreground-service-with-type variant needed.
+- **Q3 (prewarm) ANSWERED.** Daemon Python boot ~600ms
+  steady-state, ~1.1s first-cold-of-session. Prewarm
+  overlap window ~1.9s. With prewarm, daemon boot fits
+  entirely inside Kivy init; peer wait is **~50–60ms**.
+  Without prewarm, peer wait would be the full
+  ~600–1000ms.
+- ``CLIENT_INTEGRATION.md`` § 3 reframed: prewarm in
+  ``App.build()`` is now **required** for every peer (was
+  "optional, measure first"). Cost of always calling it is
+  essentially zero on devices where it doesn't help, and
+  it's a 10× UX improvement on slow tablets.
+- ``docs/daemon_boot_plan.md`` Q2 + Q3 marked answered with
+  the measured numbers; remaining content kept for context.
+
+### azt_collabd 0.33.0 + azt_collab_client 0.33.5 — bindService alone bootstraps Python (Service.onCreate self-delivers onStartCommand)
+- **0.33.4 wasn't enough.** The connector's peer-side
+  ``startService`` ALSO threw
+  ``BackgroundServiceStartNotAllowedException``: cold-start
+  ``App.build()`` fires before the peer's UID has been
+  promoted to foreground (logcat shows
+  ``UidRecord{...CEM bg:+50ms}``). Android 12+ blocks even
+  cross-package starts from that state.
+- **Real fix: server APK side.**
+  ``AZTServiceProviderhost.onCreate`` now overrides Service
+  lifecycle to self-deliver ``onStartCommand`` with
+  ``getDefaultIntent(this, "")``. PythonService's normal start
+  path runs on every Service creation, including from
+  ``bindService`` with ``BIND_AUTO_CREATE``. So peers can
+  start the daemon with ``bindService`` alone — which
+  Android allows from background contexts. No more
+  cross-package ``startService`` needed at all.
+- **Connector simplified.**
+  ``AZTServiceConnector.ensureBound`` no longer constructs
+  Intent extras or calls ``startService``. Just one
+  ``bindService`` with ``BIND_AUTO_CREATE | BIND_ABOVE_CLIENT``.
+  All the Python-startup logic lives in the server APK's
+  Service ``onCreate`` override.
+- **Both APKs need rebuild + reinstall.** Server APK gets the
+  new ``onCreate``; peer gets the simplified connector. Server
+  APK bumped to 0.33.0 (lock-step with this change set).
+- **Backward compat.** Legacy callers that still call
+  ``startService`` (e.g., ``AZTCollabProvider.onCreate``'s
+  fallback start, foreground caller paths) hit
+  ``PythonService.onStartCommand`` which short-circuits when
+  ``mService != null`` — Python only starts once regardless of
+  start-path mix.
+
+### azt_collab_client 0.33.4 — connector also startService (Android 12+ background-start fix)
+- **Smoking gun on R500.** Logcat showed
+  ``W ActivityManager: Background start not allowed: service
+  Intent { cmp=...AZTServiceProviderhost }`` followed by
+  ``E AZTCollabProvider:
+  BackgroundServiceStartNotAllowedException`` thrown from
+  ``AZTServiceProviderhost.start`` invoked from
+  ``AZTCollabProvider.onCreate``. Android 12+ blocks
+  ``startService`` from background contexts; the server APK's
+  ``:provider`` lazy-spawn is a background context, so the
+  Provider's ``onCreate`` self-start has been silently failing
+  on every cold call. Python never started → no
+  ``[boot-trace-daemon]`` lines, every peer compat probe got
+  ``daemon_not_ready``, every B2 test was running against a
+  daemon that had never finished init.
+- **Fix.** ``AZTServiceConnector.ensureBound`` now does a two-
+  step startup from the peer's *foreground* context (which
+  Android allows): (1) ``startService`` with the full
+  PythonService Intent extras (``serviceEntrypoint=service.py``
+  etc., mirrored from
+  ``AZTServiceProviderhost.getDefaultIntent`` on the server APK
+  side; ``createPackageContext`` resolves the server APK's
+  ``filesDir`` so ``androidPrivate`` / ``pythonHome`` /
+  ``pythonPath`` aim at the right tree); (2) ``bindService``
+  for OOM priority + freezer mitigation as before. The
+  Provider's onCreate self-start stays in place as a no-op
+  fallback for non-peer callers but is no longer load-bearing.
+- **Why ``Provider.onCreate``'s start fails but the connector's
+  start succeeds.** The Provider's runs in the server APK's
+  own background process; the connector's runs in the peer's
+  foreground process. Android 12+ allows the latter.
+
+### azt_collab_client 0.33.3 — prewarm now binds on the main thread (worker JNI classloader scope fix)
+- **Symptom.** R500 logcat showed
+  ``[android_cp] AZTServiceConnector.ensureBound failed:
+  ClassNotFoundException`` from the prewarm worker even after
+  the connector ``.java`` was confirmed compiled into the APK
+  (verified by ``unzip -p classes.dex | grep AZTServiceConnector``).
+  The bind eventually succeeded — but only later, from the main
+  thread via some other ``rpc.call`` path. So prewarm wasn't
+  actually doing its B2 job: by the time the bind landed, the
+  daemon's ``:provider`` process had already started cold-spawn
+  with no priority hint.
+- **Cause.** ``threading.Thread`` workers on Android attach to
+  the JVM with the system bootclassloader, not the app
+  classloader; pyjnius's ``autoclass`` calls from those workers
+  can't find app-defined classes like our connector.
+- **Fix.** ``prewarm()`` now does the autoclass + ``ensureBound``
+  call synchronously on the caller's thread (typically the
+  peer's ``App.build()`` main-thread context) BEFORE spawning
+  the worker that does ``check_server_compat``. The bind is
+  active at the earliest possible cold-start moment instead of
+  racing the daemon's lazy-spawn. Worker still calls
+  ``check_server_compat`` so the daemon-warmup retry loop has
+  something to do; its (still failing) autoclass in
+  ``discover()`` is a logged no-op since the bind is already
+  in place.
+
+### azt_collab_client 0.33.2 — point peer's android.add_src at canonical path, not the symlink
+- 0.33.1 said ``android.add_src = android/src/main/java`` (via
+  the peer's ``android/`` symlink). User report: still
+  ``ClassNotFoundException`` on rebuild. Diagnosis: buildozer's
+  ``android.add_src`` does not reliably follow symlinks; the
+  copy/merge step lands an empty tree (or a broken symlink) in
+  the dist's ``src/main/java/``.
+- ``CLIENT_INTEGRATION.md`` § 2 now mirrors the server APK's
+  approach: ``android.add_src = ../azt-collab/android/src/main/java``
+  — pointing at the canonical filesystem path directly,
+  bypassing the symlink. Brute-force fallback (copy the file
+  into the peer repo) documented but flagged as brittle.
+
+### azt_collab_client 0.33.1 — document peer's android.add_src requirement for B2
+- 0.33.0 framing said "no peer code change required" — true for
+  Python source, but peers DO need a one-line ``buildozer.spec``
+  addition (``android.add_src = android/src/main/java``) for the
+  new Java connector to compile into their APK. Otherwise:
+  ``[android_cp] AZTServiceConnector.ensureBound failed:
+  ClassNotFoundException`` on every cold start, bind never
+  happens, freezer mitigation degrades to pre-B2.
+- ``CLIENT_INTEGRATION.md`` § 2 now lists the line as required;
+  § 3's "Automatic since 0.33.0" subsection points at the spec
+  line when troubleshooting the ClassNotFoundException symptom.
+- Server APK already had the equivalent line
+  (``android.add_src = ../android/src/main/java`` in
+  ``server_apk/buildozer.spec.tmpl``); peers historically didn't
+  need one because the suite's Java tree was server-internal.
+  B2 makes it shared.
+
+### azt_collab_client 0.33.0 — Phase B2: peer holds bindService for OOM priority
+- **Symptom this fixes.** R500-class Android-15 tablets showed
+  endless ``daemon_not_ready`` 503s on cold start: peers
+  triggered ``:provider`` lazy-spawn fine (Java provider
+  responded), but Python's ``install_callbacks()`` never
+  completed because the OS's app freezer suspended the cached
+  ``:provider`` process mid-init. User-visible "AZT
+  Collaboration not responding" + the manual "Open AZT
+  Collaboration" workaround that papered over it.
+- **Fix.** New peer-side Java connector
+  ``android/src/main/java/org/atoznback/aztcollab/
+  AZTServiceConnector.java`` issues ``bindService`` against
+  the server APK's existing ``AZTServiceProviderhost`` with
+  ``BIND_AUTO_CREATE | BIND_ABOVE_CLIENT``. Inheriting the
+  peer's foreground priority defeats the freezer; the
+  ``:provider`` process stays alive and Python finishes init.
+  Bonus: ``:provider`` stays warm across the peer's session,
+  so 2nd / 3rd / Nth RPCs in the same session don't re-pay
+  daemon-cold-start.
+- **Wire-up.** ``azt_collab_client/transports/android_cp.py``'s
+  ``discover()`` calls ``Connector.ensureBound(activity)`` after
+  the canonical ping succeeds. Idempotent; the connector is a
+  static singleton. Async — we don't wait for
+  ``onServiceConnected``; the existing compat-probe retry loop
+  handles the bind-vs-Python-init race naturally.
+- **No peer code change required.** Every peer that imports
+  the client gets the new behaviour by virtue of bumping the
+  bundled client. ``CLIENT_INTEGRATION.md`` § 3 documents the
+  automatic behaviour + the diagnostic surface
+  (``AZTServiceConnector.isBound()`` and ``dumpsys activity
+  processes`` priority bucket).
+- **No server APK change required.** ``AZTServiceProviderhost.
+  onBind`` was already returning a stub ``Binder`` and tracking
+  ``sBoundCount`` from the original sticky-bound design;
+  peers were just never binding. Server APK can stay at 0.32.1.
+- **Plan-doc** (``docs/daemon_boot_plan.md``) updated to mark
+  B2 shipped + record the verification commands.
+
+### azt_collab_client 0.32.2 — document prewarm + boot-trace harness in CLIENT_INTEGRATION.md
+- New § 3 sub-section "Optional: pre-warm in ``App.build()``"
+  documenting the ``prewarm()`` hook, its tradeoff, and the
+  sentinel / env-var toggles for measurement runs. Peers
+  considering cold-start tuning find the integration shape
+  here rather than having to read ``bootstrap.py`` source.
+- New § 13 sub-section "Boot-trace instrumentation" listing
+  the peer + daemon phase labels and warning maintainers not
+  to filter ``[boot-trace-*]`` lines out of their logcat
+  pipelines.
+- New § 13 sub-section "Cold-start measurement harness"
+  pointing at ``tests/integration/measure_boot.sh`` +
+  ``tests/integration/README.md`` and giving a default
+  threshold (`peer wait` > 5 s on the slow-tablet target) for
+  when to wire ``prewarm()`` before tagging a peer release.
+- Also: ``measure_boot.sh`` switched from ``monkey`` to
+  ``am start -W`` for launching the peer (with monkey as a
+  fallback). monkey reports nonzero exits in cases that are
+  actually fine — its exit code reflects internal event
+  counts, not just dispatch success — and the script's
+  ``set -e`` was killing the run after iteration 1.
+  ``am force-stop`` and ``adb logcat -c`` now also tolerate
+  nonzero exits.
+
+### azt_collabd 0.32.1 + azt_collab_client 0.32.1 — boot-trace instrumentation + prewarm hook + measurement harness
+- **Daemon-side ``_boot_trace``** in ``server_apk/service.py``
+  emits ``[boot-trace-daemon] phase=<label> t=<elapsed>`` at
+  every cost-center: ``module_loaded``, ``main_entered``,
+  ``before_import_azt_collabd`` /
+  ``after_import_azt_collabd``, ``configured``,
+  ``before_install_callbacks`` / ``after_install_callbacks``,
+  ``before_reconcile`` / ``after_reconcile``,
+  ``entering_idle_loop``. Cheap; safe to leave on (≈ 10 lines
+  per cold start).
+- **Peer-side ``_boot_trace``** in
+  ``azt_collab_client/ui/bootstrap.py`` mirrors with
+  ``[boot-trace-peer] phase=<label>``: ``bootstrap_called``,
+  ``compat_probe attempt=N``, ``compat_ok``,
+  ``bootstrap_done``, plus prewarm phases.
+- **New ``azt_collab_client.ui.bootstrap.prewarm()`` hook**:
+  peers call it from ``App.build()`` to fire a single
+  ``check_server_compat`` on a background thread, overlapping
+  daemon lazy-spawn with Kivy initialisation. Idempotent;
+  no-op on non-Android. Toggleable for measurement via
+  ``$AZT_HOME/_no_prewarm`` sentinel or ``AZT_BOOT_PREWARM=0``
+  env var so the harness can compare scenarios on the same
+  APK without rebuilding.
+- **Measurement harness** at
+  ``tests/integration/measure_boot.sh`` drives a real device
+  through ``baseline``, ``doze``, ``prewarm``, and
+  ``doze+prewarm`` scenarios, capturing logcat boot-trace
+  lines and producing per-iteration summaries via
+  ``tests/integration/parse_boot_traces.py``. Doze is forced
+  via ``dumpsys deviceidle force-idle``; prewarm toggling via
+  the sentinel file (peer must be debuggable for ``run-as``).
+  README at ``tests/integration/README.md`` documents
+  prerequisites + scenario semantics.
+- **Plan-doc updated** (``docs/daemon_boot_plan.md``):
+  open-questions Q2 (doze) and Q3 (prewarm) now have explicit
+  measurement plans pointing at the harness; Q1 (loopback
+  ``kind``) remains as a deferred Phase A loose end.
+
+### azt_collab_client 0.32.0 — daemon-warmup Phase A: adaptive backoff, diagnostic surface, fail-fast on null bundle
+- **Adaptive backoff** in ``bootstrap._check_server``'s warmup
+  retry loop. Replaces the fixed 2s interval with a schedule
+  that ramps short → long: 0.2s, 0.4s, 0.8s, 1.6s, then plateaus
+  at 2.0s. Fast devices that have a daemon ready by attempt 2
+  now land in <1s instead of paying 2s+; slow devices keep the
+  same ~60s total budget.
+- **Diagnostic surface in the connecting popup.** New detail
+  line under the "Connecting to AZT Collaboration service…"
+  header shows ``Attempt N of 30  ·  Xs elapsed  ·  <kind>``
+  where ``<kind>`` is the transport's coarse failure category
+  (``daemon_not_ready`` while Python boots, ``null_bundle`` on
+  signature-grant denial, etc.). Updates each retry. The
+  unresponsive popup also surfaces last-error kind, total wait,
+  and ``PackageManager``-reported server APK versionName, so the
+  user / maintainer-email loop has actionable detail without
+  needing adb access.
+- **Fail-fast on ``null_bundle``.** Previously every
+  ``ServerUnavailable`` was retried for the full 60s budget,
+  including ``ContentResolver.call`` returning ``null`` — which
+  is structurally unrecoverable (signature mismatch, provider
+  authority missing). After 3 consecutive ``null_bundle``
+  responses (≈0.6s on the new schedule) we jump to the
+  unresponsive popup so the user can act on the real problem.
+  ``daemon_not_ready`` and any other progress-bearing kind reset
+  the streak — those still get the full warmup.
+- **``ServerUnavailable.kind``** added to
+  ``azt_collab_client.transports``. Recognised values:
+  ``daemon_not_ready``, ``null_bundle``,
+  ``server_apk_not_installed``, ``http_5xx``, ``transport_error``,
+  ``http`` (loopback), ``''`` (unspecified). Existing call sites
+  that ``except ServerUnavailable`` keep working; new sites can
+  read ``ex.kind`` for fail-fast vs keep-retrying decisions.
+  ``check_server_compat`` threads it into the result dict
+  (``compat['kind']``).
+- **Phase B + C planned** in ``docs/daemon_boot_plan.md``:
+  provider-state in 503 body, ``bindService`` for OOM priority,
+  optional daemon-side lazy imports if the new diagnostics show
+  ``import azt_collabd`` is the dominant cost on slow tablets.
+
+### azt_collab_client 0.31.5 — reframe smooth-UI section as a principle, not a recipe
+- Per maintainer ask: § "Smooth UI across reloads" in
+  ``CLIENT_INTEGRATION.md`` was framed as a
+  recorder-specific recipe. Rewritten to lead with the
+  **principle** (peers across the suite, whatever their
+  model layer): same context; visible changes evident
+  (including real upstream deletions, which propagate
+  normally — LIFT workflows rarely delete but the principle
+  doesn't paper over it); no other navigation; **suspend
+  client-side filters that would hide the current view**
+  (the failure mode is e.g. a "don't show past data" toggle
+  excluding an entry the user is mid-edit because the data
+  clock advanced — drop the filter for this view rather
+  than swap the entry out). Recorder-flavoured snippet
+  retained as one concrete realisation, not the contract.
+
+### azt_collabd 0.31.2 + azt_collab_client 0.31.4 — sync fast-forward writes working tree; clone URL prefilled
+- **Bug.** User report: "collaboration between clients on a
+  project on two different phones is not smooth — each phone
+  tracks its own changes but is unaware of others, even
+  apparently when the user clicks on sync."
+- **Cause.** ``_sync_repo_locked``'s fast-forward branch
+  updated ``repo.refs[branch_ref] = remote_sha`` but never
+  materialised the new tree to the working directory. Phone B
+  fetched Phone A's commits, fast-forwarded the branch ref,
+  but the LIFT file on disk stayed at Phone B's pre-sync
+  bytes. Peers reading via ``LiftHandle`` got stale content
+  and the UI looked unchanged. The diverged-merge branch was
+  fine (``_merge_diverged`` already writes blobs to the
+  working tree); only the fast-forward branch was the
+  silently-broken case.
+- **Fix.** New helper
+  ``azt_collabd.repo._apply_tree_to_workdir(repo, project_dir,
+  old_sha, new_sha)`` walks the diff between the two trees,
+  writes added/modified blobs to the working tree, removes
+  files that are gone in the new tree, and resets the index
+  via ``repo.reset_index(new_tree)`` (with a ``_stage_all``
+  fallback for older dulwich). Called from the fast-forward
+  branch after the ref update. Diff-driven so unrelated
+  untracked files (audio recordings the user just made and
+  hasn't committed yet) aren't disturbed.
+- **Peer-side principle documented** (peer follow-up, not in
+  this bump). When the on-disk bytes change underneath a
+  peer (``S.PULLED`` after sync, future ``MERGED_REMOTE``,
+  re-clone, etc.), the user's view refreshes *in place*:
+  same screen / entry / scroll position, fresh content,
+  nothing else moves. If the entry the user is viewing was
+  deleted upstream, keep the in-memory copy visible with a
+  non-blocking notice rather than yanking them to a blank
+  state. Sync is a refresh, not a navigation event. Spelled
+  out as a principle (not a recipe) in § "Smooth UI across
+  reloads" of ``CLIENT_INTEGRATION.md`` so each peer
+  implements it through whatever model layer it has.
+- **Clone-URL popup pre-fill.** ``clone_url_popup``'s URL
+  field is now pre-populated with ``https://github.com/`` so
+  phone-keyboard users can paste / type just ``owner/repo``
+  instead of the full URL. Cursor lands at the end on open
+  via ``Clock.schedule_once``. Submit-time guards: refuse
+  empty / prefix-only input; if the user pasted a full URL
+  *after* the prefix without first overwriting (so the field
+  reads ``https://github.com/https://github.com/owner/repo``),
+  take the rightmost protocol marker as the real URL start.
+
+### azt_collab_client 0.31.3 — document grant_collaborator in CLIENT_INTEGRATION.md
+- New § 10 "Granting collaborator access" in
+  ``azt_collab_client/CLIENT_INTEGRATION.md``: covers the peer
+  integration pattern (per-project settings only, never global),
+  the project-disambiguation guarantee (peers pass langcode, the
+  daemon resolves the repo — peers must NOT pre-resolve URLs),
+  the full Result-status code list, translation pointer, and
+  v1 scope (GitHub-only, invite-only, default ``push``).
+- ``grant_collaborator_popup`` added to the "What the suite does
+  *for* you" reference list at the bottom of the contract.
+- Recovery / Testing sections renumbered 11 / 12.
+
+### azt_collabd 0.31.1 + azt_collab_client 0.31.2 — grant-collaborator endpoint + popup
+- **New endpoint** ``POST /v1/projects/<lang>/collaborators`` —
+  invites a GitHub user as a collaborator on the repo backing
+  ``langcode``. Looks the repo up via the project's
+  ``remote_url`` so peers only have to pass a langcode (project
+  disambiguation guaranteed server-side; no chance of peer-side
+  URL handling targeting the wrong repo). Body:
+  ``{username, level='push'}``.
+- **Refactored** ``auth.add_collaborator`` to return ``'invited'``
+  / ``'already'`` and raise on real errors (was: silent print +
+  swallowed). The internal caller in ``repo._publish_repo``
+  already wraps in ``try/except`` so its fire-and-forget
+  semantics are preserved.
+- **Status codes added** in both ``azt_collabd/status.py`` and
+  ``azt_collab_client/status.py``:
+  ``COLLABORATOR_INVITED``, ``COLLABORATOR_ALREADY``,
+  ``COLLABORATOR_INVITE_FAILED``, ``INVALID_USERNAME``,
+  ``NOT_GITHUB_REMOTE``. Plus translations in
+  ``azt_collab_client/translate.py``.
+- **Client wrapper** ``azt_collab_client.grant_collaborator(
+  langcode, username, level='push')`` returns a ``Result``;
+  re-exported from ``__all__``.
+- **Reusable popup** ``azt_collab_client.ui.grant_collaborator_popup(
+  langcode, on_done=None, font_name=...)``. Opens a popup that
+  displays the project's langcode + remote URL prominently
+  (project disambiguation is the load-bearing UX guarantee
+  here), takes a username, calls ``grant_collaborator``, and
+  surfaces translated outcomes. Auto-dismisses 2 s after
+  success / "already a collaborator"; stays up on failures so
+  the user can retry.
+- **Peer integration** is per-peer (recorder / viewer / future):
+  add a button to the project-context settings surface that
+  calls ``grant_collaborator_popup(langcode=<current>)``. The
+  button belongs in *project* settings, not global settings —
+  the operation is meaningless without a specific project.
+- **v1 scope.** GitHub-only (GitLab has different invite
+  semantics; can be added by extending
+  ``_parse_github_owner_repo`` and the dispatch). Invite-only
+  (no list-existing or revoke yet, but the popup screen leaves
+  room for either if you want them later).
+
+### azt_collab_client 0.31.1 — Android 15 process-freezer workaround
+- **Symptom.** On a budget Android 15 tablet (R500_V_US),
+  cold-start peers showed "Connecting to AZT Collaboration
+  service…" for the full 60 s daemon-warm-up budget, then
+  fell through to "AZT Collaboration not responding."
+  Verified: with the server APK launcher activity in the
+  foreground, the same peer reaches the daemon in 5–10 s.
+- **Cause.** Android 15's app freezer keeps the server APK's
+  ``:provider`` process frozen even after a peer's
+  ``ContentResolver.call`` triggers lazy-spawn — Python
+  callbacks never finish registering inside the warm-up
+  budget. Yesterday-vs-today framing was inconclusive; this
+  is plausibly always-broken on certain ROMs and only
+  surfaced today.
+- **Workaround.** ``install_server_apk_popup`` gains an
+  ``on_open_app`` parameter; when set it adds an "Open AZT
+  Collaboration" button. ``_prompt_server_unresponsive``
+  wires this to a callback that fires
+  ``PackageManager.getLaunchIntentForPackage`` for
+  ``org.atoznback.aztcollab``, then re-enters ``_check_server``
+  on a 2 s delay with a fresh retry budget + a re-shown
+  connecting popup. The launcher activity foregrounding
+  un-freezes the package's process group, so when the user
+  switches back to the peer, the next compat probe lands.
+  Cheaper recovery than reinstalling the server APK.
+- **Real fix later.** Peers should ``bindService`` to
+  ``AZTServiceProviderhost`` while foregrounded so OOM
+  priority prevents freezer interference in the first place.
+  That's a Java change; deferred.
+
 ### azt_collabd 0.31.0 + azt_collab_client 0.31.0 — minor bump for pre-distribution test
 - Lock-step minor bump on both packages, with both floors moved
   to 0.31.0 (``MIN_CLIENT_VERSION`` on the daemon,

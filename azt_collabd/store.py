@@ -111,7 +111,9 @@ def set_github_tokens(*, access_token, refresh_token='', username='',
                      token_time=None):
     """Replace the GitHub token block. Resets ``confirmed`` to False —
     fresh credentials must pass a live test before the UI re-shows
-    the verified badge."""
+    the verified badge. Clears ``refresh_broken`` and its diagnostic
+    fields: fresh tokens were just minted, so the prior
+    refresh-failure state no longer applies."""
     def mut(d):
         block = dict(d.get('github', {}))
         block['access_token'] = access_token
@@ -121,8 +123,64 @@ def set_github_tokens(*, access_token, refresh_token='', username='',
         if username:
             block['username'] = username
         block['confirmed'] = False
+        block.pop('refresh_broken', None)
+        block.pop('refresh_error', None)
+        block.pop('refresh_checked_at', None)
         d['github'] = block
     _update(mut)
+
+
+def _set_github_refresh_broken(error):
+    """Record that the most recent refresh attempt failed with
+    ``error``. The access token is still in the store and (until its
+    8h-from-issuance expiry) still works, but the refresh path
+    cannot mint a replacement — the user must re-run the device
+    flow. Surfaced to peers via ``get_status()`` and via the
+    ``AUTH_REFRESH_STALE`` status code on every sync result that
+    touched ``get_valid_github_token`` afterwards."""
+    def mut(d):
+        block = dict(d.get('github', {}))
+        block['refresh_broken'] = True
+        block['refresh_error'] = str(error)
+        block['refresh_checked_at'] = time.time()
+        d['github'] = block
+    _update(mut)
+
+
+def _clear_github_refresh_broken():
+    def mut(d):
+        block = dict(d.get('github', {}))
+        if not block.get('refresh_broken'):
+            return
+        block.pop('refresh_broken', None)
+        block.pop('refresh_error', None)
+        block['refresh_checked_at'] = time.time()
+        d['github'] = block
+    _update(mut)
+
+
+def github_refresh_state():
+    """Return ``{'broken': bool, 'error': str, 'expires_at': float}``
+    describing the persisted refresh-token health.
+
+    ``expires_at`` is ``token_time + 8h`` — GitHub access tokens
+    are 8h from issuance, and ``token_time`` is stamped by every
+    successful issue (device-flow exchange OR refresh). Zero when
+    no token has ever been stored. Peers translate to a relative
+    deadline phrase via ``translate._format_deadline``.
+
+    ``broken`` flips True on the first refresh failure and only
+    clears when fresh tokens are written via ``set_github_tokens``
+    (or, defensively, when a subsequent refresh attempt succeeds —
+    handled inside ``get_valid_github_token``)."""
+    block = get_github()
+    token_time = float(block.get('token_time', 0) or 0)
+    expires_at = (token_time + 8 * 3600) if token_time else 0.0
+    return {
+        'broken': bool(block.get('refresh_broken', False)),
+        'error': block.get('refresh_error', '') or '',
+        'expires_at': expires_at,
+    }
 
 
 def set_github_app_installed(installed):
@@ -167,7 +225,17 @@ def get_valid_github_token():
     token_time = block.get('token_time', 0)
     if not token:
         return '', ''
-    # Access tokens last 8 hours; refresh proactively at 7h
+    # Access tokens last 8 hours; refresh proactively at 7h.
+    #
+    # On success: ``set_github_tokens`` re-stamps ``token_time`` and
+    # clears any prior ``refresh_broken`` flag, so a transient refresh
+    # failure that later resolves silently clears the warning.
+    #
+    # On failure: keep the existing access token in play (it's still
+    # valid until its 8h cliff), but record ``refresh_broken`` so
+    # peers' user-initiated sync surfaces an ``AUTH_REFRESH_STALE``
+    # toast with the deadline. The user-actionable path is re-running
+    # device flow at the Connect screen.
     if time.time() - token_time > 7 * 3600 and refresh:
         try:
             new_data = refresh_access_token(refresh)
@@ -179,7 +247,8 @@ def get_valid_github_token():
             token = new_data['access_token']
         except Exception as ex:
             print(f'[collab.store] github refresh failed: {ex}')
-            # Return the old token — it might still work
+            _set_github_refresh_broken(ex)
+            # Return the old token — it might still work until cliff.
     return username, token
 
 
@@ -259,6 +328,8 @@ def get_status():
     gl = data.get('gitlab', {}) or {}
     gh_connected = bool(gh.get('access_token'))
     gh_app_installed = bool(gh.get('app_installed', False))
+    gh_token_time = float(gh.get('token_time', 0) or 0)
+    gh_expires_at = (gh_token_time + 8 * 3600) if gh_token_time else 0.0
     return {
         'host': data.get('collab_host', 'github'),
         'contributor': get_contributor(),
@@ -267,6 +338,13 @@ def get_status():
             'username': gh.get('username', ''),
             'app_installed': gh_app_installed,
             'confirmed': bool(gh.get('confirmed', False)),
+            # Refresh-token health, surfaced so peers can show a
+            # "Please re-authenticate by <deadline>" banner / toast
+            # without polling a separate endpoint. Both fields are
+            # always present (False / 0 when no token is stored)
+            # so peers don't need defensive .get() everywhere.
+            'refresh_broken': bool(gh.get('refresh_broken', False)),
+            'access_token_expires_at': gh_expires_at,
         },
         'gitlab': {
             'connected': bool(gl.get('token')),

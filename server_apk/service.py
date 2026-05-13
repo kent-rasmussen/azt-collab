@@ -109,6 +109,28 @@ def _bridge_stdio_to_logcat():
 
 _bridge_stdio_to_logcat()
 
+
+# Boot-timing instrumentation. Anchored at module load so each
+# trace line is relative to "Python service entered". Both the
+# peer (azt_collab_client.ui.bootstrap) and this daemon-side
+# emit ``[boot-trace-*]`` lines; the parser at
+# ``tests/integration/parse_boot_traces.py`` joins them on
+# logcat wall-clock timestamps.
+_proc_start_monotonic = time.monotonic()
+
+
+def _boot_trace(phase, **fields):
+    elapsed = time.monotonic() - _proc_start_monotonic
+    extras = ''
+    if fields:
+        extras = ' ' + ' '.join(f'{k}={v}' for k, v in fields.items())
+    print(f'[boot-trace-daemon] phase={phase} t={elapsed:.3f}{extras}',
+          flush=True)
+
+
+_boot_trace('module_loaded')
+
+
 # Idle-stop policy. Tunable but sized for typical SIL field-recorder
 # sessions: a quick edit-record-pick burst easily fits in 5 minutes,
 # while a longer offline-edit-then-go-online flow doesn't keep the
@@ -145,9 +167,12 @@ def _bound_count():
 
 
 def main():
+    _boot_trace('main_entered')
     print('[service] AZTServiceProviderhost: starting Python body',
           flush=True)
+    _boot_trace('before_import_azt_collabd')
     import azt_collabd
+    _boot_trace('after_import_azt_collabd')
     azt_collabd.configure(
         app_slug=os.environ.get('AZT_GITHUB_APP_SLUG',
                                 'azt-collaboration'),
@@ -156,18 +181,24 @@ def main():
         collaborator=os.environ.get('AZT_GITHUB_COLLABORATOR',
                                     'kent-rasmussen'),
     )
+    _boot_trace('configured')
 
     # Wire the AZTCollabProvider Java callbacks. Idempotent.
     from azt_collabd.android_cp import service as cp_service
+    _boot_trace('before_install_callbacks')
     cp_service.install_callbacks()
+    _boot_trace('after_install_callbacks')
 
     # Reconcile any in-flight scheduler jobs left over from the
     # previous daemon process (kill -9, OOM, etc.). Marks PENDING /
     # RUNNING jobs as DONE+JOB_INTERRUPTED so peer poll_job calls
     # surface a typed transient-failure result.
     from azt_collabd import scheduler
+    _boot_trace('before_reconcile')
     scheduler.reconcile_on_startup()
+    _boot_trace('after_reconcile')
 
+    _boot_trace('entering_idle_loop')
     # Idle-stop loop. Stays alive while peers are bound or the
     # provider is in active use; stops the service when both
     # conditions clear for IDLE_TIMEOUT_SECONDS. Android may also

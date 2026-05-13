@@ -1,0 +1,21 @@
+wall	proc	phase	t_proc	extras
+05-09 10:55:37.214	peer	prewarm_called	0.068	
+05-09 10:55:37.236	peer	prewarm_worker_start	0.072	
+05-09 10:55:38.441	peer	prewarm_worker_done	1.296	
+05-09 10:55:38.684	peer	bootstrap_called	1.539	
+05-09 10:55:38.686	peer	compat_probe	1.541	attempt=0
+05-09 10:55:38.964	peer	compat_probe	1.819	attempt=1
+05-09 10:55:39.390	peer	compat_probe	2.245	attempt=2
+05-09 10:55:40.226	peer	compat_probe	3.081	attempt=3
+05-09 10:55:41.854	peer	compat_probe	4.709	attempt=4
+05-09 10:55:43.891	peer	compat_probe	6.746	attempt=5
+05-09 10:55:45.930	peer	compat_probe	8.786	attempt=6
+05-09 10:55:47.968	peer	compat_probe	10.823	attempt=7
+05-09 10:55:50.013	peer	compat_probe	12.868	attempt=8
+05-09 10:55:52.048	peer	compat_probe	14.903	attempt=9
+05-09 10:55:54.083	peer	compat_probe	16.939	attempt=10
+05-09 10:55:56.117	peer	compat_probe	18.972	attempt=11
+05-09 10:55:58.152	peer	compat_probe	21.008	attempt=12
+05-09 10:56:00.196	peer	compat_probe	23.051	attempt=13
+05-09 10:56:02.234	peer	compat_probe	25.089	attempt=14
+05-09 10:56:04.269	peer	compat_probe	27.124	attempt=15

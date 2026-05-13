@@ -59,6 +59,60 @@ def _fmt(template, params):
         return template
 
 
+def _format_deadline(expires_at):
+    """Render an ``expires_at`` unix timestamp as a human-facing
+    deadline phrase.
+
+    ``S.AUTH_REFRESH_STALE`` carries the absolute unix timestamp at
+    which the running access token expires. The user-visible toast
+    wants something digestible — "in 47 minutes", "in 3 hours", or
+    "already expired" — without dragging in timezone/locale
+    machinery for a one-shot phrase. Returns the translated phrase
+    directly; the surrounding message template embeds it as
+    ``{deadline}``.
+
+    Empty / missing / non-numeric ``expires_at`` returns the
+    translated "soon" fallback so the surrounding template still
+    reads gracefully."""
+    import time
+    try:
+        deadline_ts = float(expires_at or 0)
+    except (TypeError, ValueError):
+        return _tr('soon')
+    if deadline_ts <= 0:
+        return _tr('soon')
+    remaining_s = deadline_ts - time.time()
+    if remaining_s <= 0:
+        return _tr('now (already expired)')
+    minutes = int(remaining_s // 60)
+    if minutes < 60:
+        return _fmt(_tr('in {n} minute(s)'), {'n': minutes})
+    hours = remaining_s / 3600
+    # One decimal under 10h, integer above — "in 2.4 hours" is more
+    # accurate than "in 2 hours" when the user has limited time;
+    # "in 14 hours" is fine without the .x precision.
+    if hours < 10:
+        return _fmt(_tr('in {n} hour(s)'),
+                    {'n': f'{hours:.1f}'.rstrip('0').rstrip('.')})
+    return _fmt(_tr('in {n} hour(s)'), {'n': int(hours)})
+
+
+def _refresh_stale_message(params):
+    """Compose the AUTH_REFRESH_STALE toast: action + deadline.
+
+    The daemon supplies ``expires_at`` (unix timestamp); we render
+    the relative-time phrase via ``_format_deadline`` and embed it
+    in a translated action template. The action template stays
+    translation-friendly (one sentence, one placeholder)."""
+    deadline = _format_deadline((params or {}).get('expires_at'))
+    return _fmt(
+        _tr(
+            'GitHub session needs re-authentication — current '
+            'access expires {deadline}. Open GitHub Connect and '
+            'tap Re-authenticate.'),
+        {'deadline': deadline})
+
+
 # Each entry: code → function(params) → translated string. Using a
 # function keeps the _tr call lazy so translations pick up the current
 # language at render time, not at import time.
@@ -109,10 +163,27 @@ _HANDLERS = {
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),
     S.ACCESS_DENIED:          lambda p: _fmt(_tr('Access denied (403). Check app permissions at {url}'), p),
+    S.AUTH_REFRESH_STALE:     lambda p: _refresh_stale_message(p),
 
     S.AUTH_EXPIRED:           lambda p: _tr('Authorization expired. Please try again.'),
     S.AUTH_DENIED:            lambda p: _tr('Authorization denied by user.'),
     S.AUTH_TIMEOUT:           lambda p: _tr('Authorization timed out.'),
+
+    S.COLLABORATOR_INVITED:   lambda p: _fmt(_tr(
+        'Invited {username} as a collaborator on {owner_repo}. '
+        'They must accept the invitation on GitHub before they '
+        'can clone or sync.'), p),
+    S.COLLABORATOR_ALREADY:   lambda p: _fmt(_tr(
+        '{username} already has access to {owner_repo} '
+        '(or a pending invitation).'), p),
+    S.COLLABORATOR_INVITE_FAILED: lambda p: _fmt(_tr(
+        'Could not invite {username} to {owner_repo}: {error}'), p),
+    S.INVALID_USERNAME:       lambda p: _tr(
+        'Enter a GitHub username.'),
+    S.NOT_GITHUB_REMOTE:      lambda p: _fmt(_tr(
+        'This project is not hosted on GitHub ({remote_url}). '
+        'Collaborator invites are only supported for GitHub '
+        'repositories.'), p),
 
     S.BUSY:                   lambda p: _tr('Another sync is in progress. Try again in a moment.'),
     S.CONFLICTS:              lambda p: (_fmt(_tr('Merge conflicts in {paths}'), p)

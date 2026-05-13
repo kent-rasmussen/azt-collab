@@ -582,6 +582,21 @@ msgstr "Application non autorisée pour {owner_repo}. Ajoutez-le à {url}"
 msgid "Access denied (403). Check app permissions at {url}"
 msgstr "Accès refusé (403). Vérifiez les permissions de l'application à {url}"
 
+msgid "GitHub session needs re-authentication — current access expires {deadline}. Open GitHub Connect and tap Re-authenticate."
+msgstr "La session GitHub doit être ré-authentifiée — l'accès actuel expire {deadline}. Ouvrez GitHub Connect et appuyez sur Ré-authentifier."
+
+msgid "soon"
+msgstr "bientôt"
+
+msgid "now (already expired)"
+msgstr "maintenant (déjà expiré)"
+
+msgid "in {n} minute(s)"
+msgstr "dans {n} minute(s)"
+
+msgid "in {n} hour(s)"
+msgstr "dans {n} heure(s)"
+
 msgid "Authorization expired. Please try again."
 msgstr "Autorisation expirée. Veuillez réessayer."
 
@@ -936,3 +951,122 @@ msgstr "Impossible de partager l'APK :\n{error}"
 
 msgid "APK sharing is only available on Android."
 msgstr "Le partage de l'APK n'est disponible que sur Android."
+
+# ── Drift placeholders appended by tests/add_missing_msgids.py ──
+# Translate the msgstr values when ready; empty msgstr falls back to the msgid (English) at runtime, same as the pre-add behaviour.
+
+#: azt_collab_client/translate.py:172
+msgid "Invited {username} as a collaborator on {owner_repo}. They must accept the invitation on GitHub before they can clone or sync."
+msgstr ""
+
+#: azt_collab_client/translate.py:176
+msgid "{username} already has access to {owner_repo} (or a pending invitation)."
+msgstr ""
+
+#: azt_collab_client/translate.py:179
+msgid "Could not invite {username} to {owner_repo}: {error}"
+msgstr ""
+
+#: azt_collab_client/translate.py:181
+msgid "Enter a GitHub username."
+msgstr ""
+
+#: azt_collab_client/translate.py:183
+msgid "This project is not hosted on GitHub ({remote_url}). Collaborator invites are only supported for GitHub repositories."
+msgstr ""
+
+#: azt_collab_client/translate.py:192
+msgid "Sync was interrupted; please retry."
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:273
+msgid "Bootstrap failed: could not derive asset filename (running Activity unreachable). Pass peer_asset_filename= explicitly."
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:935
+msgid "Attempt {n} of {total}"
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:938
+msgid "{s}s elapsed"
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1517
+msgid "Last error: {kind}"
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1522
+msgid "Waited {s}s before giving up."
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1532
+msgid "Installed {name} version: {v}"
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1537
+msgid "The AZT Collaboration service ({name}) is installed but did not respond. Tap Open {name} to wake the service, then come back here. Or tap Install to reinstall it, or Quit to close this app and try again later."
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1556
+msgid "Could not open {name}."
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1583
+msgid "Open {name}"
+msgstr ""
+
+#: azt_collab_client/ui/bootstrap.py:1688
+msgid "A newer version of {name} is required. Tap Update to download and install it."
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:144
+msgid "Invite a collaborator to:"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:159
+msgid "(no remote configured)"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:168
+msgid "Enter the collaborator's GitHub username:"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:175
+msgid "e.g. octocat"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:198
+msgid "Invite"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:205
+msgid "Invite collaborator"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:222
+msgid "Sending invitation…"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:231
+msgid "Invite failed: {error}"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:356
+msgid "owner/repository"
+msgstr ""
+
+#: azt_collab_client/ui/popups.py:802
+msgid "Open AZT Collaboration"
+msgstr ""
+
+#: azt_collab_client/ui/update.py:704
+msgid "Update check failed: could not derive asset filename (running Activity unreachable). Pass asset_filename= explicitly."
+msgstr ""
+
+#: azt_collab_client/ui/update.py:1008
+msgid "Install failed: could not derive asset filename (running Activity unreachable). Pass asset_filename= explicitly."
+msgstr ""
+
+#: azt_collab_client/ui/update.py:1096
+msgid "Downloading…"
+msgstr ""

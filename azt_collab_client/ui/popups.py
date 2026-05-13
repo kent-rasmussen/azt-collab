@@ -100,6 +100,172 @@ def confirm_langcode_popup(initial, on_submit, font_name='Roboto'):
     return popup
 
 
+def grant_collaborator_popup(langcode, on_done=None, font_name='Roboto'):
+    """Popup for inviting a GitHub user as a collaborator on the repo
+    backing ``langcode``. Project disambiguation is the load-bearing
+    piece of the UX: the popup looks the project up via
+    ``project_status(langcode)`` and shows the langcode + remote URL
+    prominently so the user can confirm they're acting on the right
+    repo before tapping Invite.
+
+    Peer integration shape (recorder / viewer / future peers):
+
+        from azt_collab_client.ui import grant_collaborator_popup
+        grant_collaborator_popup(
+            langcode=self._current_langcode,
+            font_name=_FONT_NAME,
+        )
+
+    The button that opens this popup belongs in the peer's per-
+    project settings surface — *not* a global setting — because the
+    operation is meaningless without a specific project context.
+
+    On success / "already a collaborator" the popup auto-dismisses
+    after 2 s so the user sees the confirmation message; on errors
+    it stays up for retry. ``on_done(result)`` fires after the
+    popup dismisses (success path only) so the host can refresh
+    any local UI that displays collaborators.
+
+    Returns the Popup object."""
+    from kivy.clock import Clock
+    from .. import grant_collaborator, project_status, S
+    from ..translate import translate_result
+
+    ps = project_status(langcode)
+    remote_url = (ps.remote_url if ps else '') or ''
+
+    content = BoxLayout(
+        orientation='vertical', spacing=dp(10), padding=dp(12))
+
+    # Project disambiguation header — make it impossible for the
+    # user to misread which repo they're acting on. Bold project
+    # langcode, dim line for the remote URL.
+    content.add_widget(Label(
+        text=_tr('Invite a collaborator to:'),
+        size_hint_y=None, height=dp(22),
+        font_size=sp(13), color=theme.TEXT, font_name=font_name,
+        halign='left', valign='middle',
+    ))
+    proj_label = Label(
+        text=str(langcode),
+        size_hint_y=None, height=dp(28),
+        font_size=sp(15), bold=True, color=theme.ACCENT,
+        font_name=font_name,
+        halign='left', valign='middle',
+    )
+    proj_label.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    content.add_widget(proj_label)
+    url_label = Label(
+        text=remote_url or _tr('(no remote configured)'),
+        size_hint_y=None, height=dp(20),
+        font_size=sp(11), color=theme.TEXT_DIM, font_name=font_name,
+        halign='left', valign='middle',
+    )
+    url_label.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    content.add_widget(url_label)
+
+    content.add_widget(Label(
+        text=_tr("Enter the collaborator's GitHub username:"),
+        size_hint_y=None, height=dp(24),
+        font_size=sp(12), color=theme.TEXT_DIM, font_name=font_name,
+        halign='left', valign='middle',
+    ))
+    user_input = TextInput(
+        text='',
+        hint_text=_tr('e.g. octocat'),
+        multiline=False, size_hint_y=None, height=dp(48),
+        font_size=sp(14), font_name=font_name,
+    )
+    content.add_widget(user_input)
+
+    # Status / outcome line. Reused for both errors and the
+    # transient success message so the user always has one place
+    # to look.
+    status_label = Label(
+        text='',
+        size_hint_y=None, height=dp(60),
+        font_size=sp(12), color=theme.TEXT, font_name=font_name,
+        halign='left', valign='top',
+    )
+    status_label.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    content.add_widget(status_label)
+
+    btn_row = BoxLayout(
+        size_hint_y=None, height=dp(48), spacing=dp(12))
+    cancel_btn = Button(
+        text=_tr('Cancel'), font_size=sp(14), font_name=font_name)
+    invite_btn = Button(
+        text=_tr('Invite'), font_size=sp(14), font_name=font_name,
+        background_color=theme.ACCENT)
+    btn_row.add_widget(cancel_btn)
+    btn_row.add_widget(invite_btn)
+    content.add_widget(btn_row)
+
+    popup = Popup(
+        title=_tr('Invite collaborator'),
+        content=content,
+        size_hint=(0.9, None), height=dp(360),
+        auto_dismiss=False,
+    )
+
+    def _set_status(text, error=False):
+        status_label.text = text or ''
+        status_label.color = (theme.RED if error else theme.TEXT)
+
+    def _do_invite(*_):
+        username = user_input.text.strip()
+        if not username:
+            _set_status(_tr('Enter a GitHub username.'), error=True)
+            return
+        invite_btn.disabled = True
+        cancel_btn.disabled = True
+        _set_status(_tr('Sending invitation…'))
+
+        def _worker(_dt):
+            # Run the RPC on a Clock callback (small) — the call is
+            # blocking but typically sub-second; the disabled
+            # buttons + "Sending…" status cover the wait visually.
+            try:
+                result = grant_collaborator(langcode, username)
+            except Exception as ex:
+                _set_status(_tr(
+                    'Invite failed: {error}'
+                ).format(error=ex), error=True)
+                invite_btn.disabled = False
+                cancel_btn.disabled = False
+                return
+            text = translate_result(result) or _tr('Done.')
+            success = result.has_any(
+                S.COLLABORATOR_INVITED, S.COLLABORATOR_ALREADY)
+            _set_status(text, error=not success)
+            if success:
+                # Brief pause so the user sees the confirmation,
+                # then dismiss + fire on_done. Peer can refresh
+                # any collaborator-list UI from on_done.
+                def _finish(_dt2):
+                    try:
+                        popup.dismiss()
+                    except Exception:
+                        pass
+                    if on_done is not None:
+                        try:
+                            on_done(result)
+                        except Exception as ex:
+                            print('[grant_collaborator_popup] on_done '
+                                  f'raised: {ex}')
+                Clock.schedule_once(_finish, 2.0)
+            else:
+                invite_btn.disabled = False
+                cancel_btn.disabled = False
+
+        Clock.schedule_once(_worker, 0)
+
+    cancel_btn.bind(on_release=lambda *_: popup.dismiss())
+    invite_btn.bind(on_release=_do_invite)
+    popup.open()
+    return popup
+
+
 def _derive_langcode_from_url(url):
     """Cheap default langcode for a clone URL: repo basename minus
     ``.git``. Mirrors the daemon's ``projects.derive_langcode`` URL
@@ -177,9 +343,17 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     code_row.add_widget(change_btn)
     content.add_widget(code_row)
 
+    # Pre-populate the host prefix so users on a phone keyboard
+    # only have to type the ``owner/repo`` segment instead of the
+    # full ``https://github.com/`` URL — a common SIL-field paper-
+    # cut. Cursor lands at end of text via the on-open hook below
+    # so typing immediately appends. Pasting a full URL works
+    # too: the user can long-press → Paste over the prefix or
+    # select-all and overwrite it.
+    _CLONE_URL_PREFIX = 'https://github.com/'
     url_input = TextInput(
-        text='',
-        hint_text=_tr('Paste the repository URL here'),
+        text=_CLONE_URL_PREFIX,
+        hint_text=_tr('owner/repository'),
         multiline=False, size_hint_y=None, height=dp(48),
         font_size=sp(14), font_name=font_name,
     )
@@ -264,9 +438,22 @@ def clone_url_popup(on_submit, font_name='Roboto'):
 
     def _do_clone(*_args):
         clone_url = url_input.text.strip()
-        popup.dismiss()
-        if not clone_url:
+        # Empty / prefix-only — user opened the popup, didn't type
+        # anything actionable. Dismiss without firing on_submit.
+        if not clone_url or clone_url == _CLONE_URL_PREFIX:
+            popup.dismiss()
             return
+        # Handle prefix-doubling: if the user pasted a full URL
+        # *after* the pre-populated prefix instead of selecting +
+        # overwriting, the field reads
+        # ``https://github.com/https://github.com/owner/repo``.
+        # Take the rightmost protocol marker as the real start.
+        for marker in ('https://', 'http://', 'git@'):
+            idx = clone_url.rfind(marker)
+            if idx > 0:
+                clone_url = clone_url[idx:]
+                break
+        popup.dismiss()
         if not clone_url.endswith('.git'):
             clone_url += '.git'
         langcode = _resolve_langcode()
@@ -280,6 +467,17 @@ def clone_url_popup(on_submit, font_name='Roboto'):
     ok_btn.bind(on_release=_enter_mode_a)
     cancel_btn.bind(on_release=popup.dismiss)
     clone_btn.bind(on_release=_do_clone)
+
+    # Position the cursor at the end of the pre-populated prefix
+    # so typing immediately appends (the common case). Schedule on
+    # the next frame so Kivy's TextInput initialisation completes
+    # first; setting cursor in the constructor doesn't stick.
+    def _focus_url(_dt):
+        url_input.cursor = (len(url_input.text), 0)
+        url_input.focus = True
+    from kivy.clock import Clock as _Clock
+    _Clock.schedule_once(_focus_url, 0)
+
     popup.open()
     return popup
 
@@ -297,6 +495,8 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                              dismiss_label=None,
                              dismiss_action='quit',
                              on_retry=None,
+                             on_open_app=None,
+                             open_app_label=None,
                              repo=None):
     """Single canonical popup for "the suite needs the server APK
     (or a newer one) before this app can do anything useful". Used
@@ -589,6 +789,21 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
             halign='center', valign='middle',
         )
 
+    # Optional "Open <server app>" button — Android-15 process-
+    # freezer workaround. The :provider process gets frozen by the
+    # OS while the peer is foregrounded, so peer-driven lazy-spawn
+    # times out. Launching the server APK's launcher activity
+    # un-freezes the package's processes. Caller wires
+    # ``on_open_app`` to a function that fires the launch Intent +
+    # restarts the compat-probe retry cycle.
+    open_app_btn = None
+    if on_open_app is not None:
+        open_app_btn = Button(
+            text=open_app_label or _tr('Open AZT Collaboration'),
+            font_size=sp(13), font_name=font_name,
+            halign='center', valign='middle',
+        )
+
     # Bind text_size to size so labels wrap inside their button
     # bounds rather than spilling / clipping.
     def _bind_wrap(b):
@@ -597,10 +812,14 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         _bind_wrap(b)
     if retry_btn is not None:
         _bind_wrap(retry_btn)
+    if open_app_btn is not None:
+        _bind_wrap(open_app_btn)
 
     btn_row.add_widget(quit_btn)
     if retry_btn is not None:
         btn_row.add_widget(retry_btn)
+    if open_app_btn is not None:
+        btn_row.add_widget(open_app_btn)
     btn_row.add_widget(open_page_btn)
     btn_row.add_widget(install_btn)
     content.add_widget(btn_row)
@@ -755,5 +974,13 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
             except Exception as ex:
                 print(f'[install_popup] on_retry raised: {ex}')
         retry_btn.bind(on_release=_retry)
+    if open_app_btn is not None:
+        def _open_app(*_):
+            popup.dismiss()
+            try:
+                on_open_app()
+            except Exception as ex:
+                print(f'[install_popup] on_open_app raised: {ex}')
+        open_app_btn.bind(on_release=_open_app)
     popup.open()
     return popup

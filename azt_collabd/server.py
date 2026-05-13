@@ -29,6 +29,8 @@ Endpoints:
                                               — creds come from the store
 """
 
+import base64
+import hashlib
 import http.server
 import json
 import os
@@ -38,10 +40,13 @@ import socketserver
 import sys
 import threading
 
+from . import auth
+from . import cawl as _cawl
 from . import config as _config
 from . import projects
 from . import scheduler
 from . import store
+from .locks import project_lock
 from .net import _has_internet
 from .paths import azt_home, server_info_path
 from .repo import sync_repo as _sync_repo, repo_status_summary as _repo_status
@@ -299,6 +304,148 @@ def _h_get_ui_language(_body):
         return 200, {"ok": True, "language": ''}
     lang = ((cfg.get('ui') or {}).get('language', '') or '')
     return 200, {"ok": True, "language": str(lang)}
+
+
+def _h_cawl_index(langcode, _body):
+    """``GET /v1/projects/<lang>/cawl/index`` — serve the
+    daemon-owned CAWL image-URL index for ``langcode``'s repo.
+
+    Resolves the project's ``cawl_image_repo`` (per-project field,
+    falling back to the daemon-global default for projects without
+    an override), then returns the cached/fetched index dict for
+    that repo. Two projects pointing at the same repo share a
+    single cache directory under
+    ``$AZT_HOME/cawl/<owner>/<repo>/index.json``, so the dedup
+    happens transparently without the peer needing to know the
+    repo slug.
+
+    Why this lives on the daemon: peers used to hit GitHub
+    directly on every project load and the unauthenticated 60/hr
+    API rate limit got exhausted by even modest development /
+    multi-peer use. The daemon caches once per device per TTL
+    window (24h default), per repo, and a network failure falls
+    back to the stale cache rather than returning empty so peers
+    can resolve illustrations even when GitHub is unreachable.
+
+    Returns an empty ``index`` dict when no repo is configured for
+    this project — same shape peers got pre-migration from an
+    empty resolver, so no new failure branch is required."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
+    repo = _cawl.resolve_image_repo(langcode)
+    try:
+        index = _cawl.get_index(repo)
+    except Exception as ex:
+        return 500, {"ok": False, "error": str(ex)}
+    return 200, {"ok": True, "index": index, "image_repo": repo}
+
+
+def _h_cawl_image_bytes(langcode, basename):
+    """Return ``(status, content_type, data_bytes)`` for the cached
+    CAWL image binary, fetching it lazily if not yet on disk.
+
+    Not part of the JSON dispatch table because it returns binary
+    bytes, not a JSON dict. The HTTP handler routes the path
+    directly to this function (bypassing ``dispatch``) and emits
+    via ``_send_bytes``. The ContentProvider transport gets the
+    same bytes via ``openFile`` → ``_resolve_path`` returning the
+    cached file's absolute path, which calls into this function
+    indirectly through ``cawl.get_image_path``.
+
+    Status codes:
+        200 — bytes available (cache hit or successful fetch).
+        404 — project unknown, basename rejected, OR fetch failed
+              and no cached copy exists. Logged on stderr; the
+              peer should fall through to its no-image rendering.
+        500 — unexpected internal error.
+
+    No 502 distinct from 404: peers don't distinguish "image not
+    in repo" from "couldn't reach repo" — both end in "no
+    illustration for this entry", and the daemon's stale-cache
+    fallback already covers the recoverable case."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, 'application/json', \
+            b'{"ok":false,"error":"project_not_found"}'
+    _touch_project(langcode)
+    repo = _cawl.resolve_image_repo(langcode)
+    if not repo:
+        return 404, 'application/json', \
+            b'{"ok":false,"error":"no_image_repo_configured"}'
+    target = _cawl.get_image_path(repo, basename)
+    if target is None:
+        return 404, 'application/json', \
+            b'{"ok":false,"error":"image_unavailable"}'
+    try:
+        with open(target, 'rb') as f:
+            data = f.read()
+    except OSError as ex:
+        return 500, 'application/json', \
+            json.dumps({"ok": False,
+                        "error": f'cache_read: {ex}'}).encode()
+    return 200, _content_type_for(basename), data
+
+
+_CONTENT_TYPES = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+}
+
+
+def _content_type_for(basename):
+    ext = os.path.splitext(basename)[1].lower()
+    return _CONTENT_TYPES.get(ext, 'application/octet-stream')
+
+
+def _h_set_cawl_image_repo(langcode, body):
+    """``POST /v1/projects/<lang>/cawl_image_repo`` — persist the
+    per-project image_repo override. Body: ``{cawl_image_repo:
+    'owner/repo'}``. Empty string explicitly clears the override,
+    falling the project back to the daemon-global default."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    repo = body.get('cawl_image_repo')
+    if repo is None or not isinstance(repo, str):
+        return 400, {"ok": False, "error": "missing_cawl_image_repo"}
+    projects.set_cawl_image_repo(langcode, repo.strip())
+    return 200, {"ok": True, "project": _project_for_api(
+        projects.get(langcode))}
+
+
+def _h_set_repo_slug(langcode, body):
+    """``POST /v1/projects/<lang>/repo_slug`` — persist the
+    per-project GitHub-repo-name override for the publish path.
+    Body: ``{repo_slug: 'my-vanity-name'}``. Empty string
+    explicitly clears the override; callers should treat unset
+    / empty as equal to ``langcode``.
+
+    Used by peers (recorder ``CollabScreen.do_publish``) to
+    persist a textbox value the user typed before publishing.
+    The pre-1.41.3 recorder kept this as a suite-wide
+    ``peer_pref`` scalar; per the no-daemon-owned-caches rule
+    that was wrong (per-project data in a global pref, and
+    project-identity data on the peer side at all). This
+    endpoint is the canonical home."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    slug = body.get('repo_slug')
+    if slug is None or not isinstance(slug, str):
+        return 400, {"ok": False, "error": "missing_repo_slug"}
+    projects.set_repo_slug(langcode, slug.strip())
+    return 200, {"ok": True, "project": _project_for_api(
+        projects.get(langcode))}
 
 
 def _h_github_install_url(_body):
@@ -588,6 +735,32 @@ def _h_list_projects(_body):
             print(f'[server] list_projects: disk-scan failed: {ex}',
                   file=sys.stderr, flush=True)
     return 200, {"ok": True, "projects": items}
+
+
+def _annotate_with_auth_health(res):
+    """Append ``S.AUTH_REFRESH_STALE`` to *res* when the persisted
+    GitHub refresh state says the refresh path is broken.
+
+    Called on every sync result so peers running the user-initiated
+    sync path (per the auto/user contract in
+    ``azt_collab_client/CLAUDE.md``) can surface a deadline-aware
+    toast — the user has ~1h between the failed refresh attempt
+    and the access-token cliff, and the only useful action is
+    re-running the device flow at GitHub Connect.
+
+    Idempotent: re-syncs while the state is broken keep emitting
+    the status; ``set_github_tokens`` after a successful device
+    flow clears ``refresh_broken`` and the status stops appearing.
+
+    Auto-sync peers MUST silence this code (see the same contract);
+    nothing breaks if they don't, but the user gets a popup at an
+    inopportune moment."""
+    state = store.github_refresh_state()
+    if not state['broken']:
+        return
+    res.add(S.AUTH_REFRESH_STALE,
+            expires_at=state['expires_at'],
+            error=state['error'])
 
 
 def _touch_project(langcode):
@@ -986,6 +1159,7 @@ def _h_project_sync(langcode, body):
         print(f'[sync-rpc] {langcode!r} raised: {ex}',
               file=sys.stderr, flush=True)
         return 500, {"ok": False, "error": str(ex)}
+    _annotate_with_auth_health(res)
     codes = res.codes()
     print(f'[sync-rpc] {langcode!r} done: codes={codes!r}',
           file=sys.stderr, flush=True)
@@ -1019,6 +1193,11 @@ def _h_project_status(langcode, _body):
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
         "lift_path": api['lift_path'],
+        # Per-project metadata that peers occasionally need on the
+        # status response without a separate ``open_project`` call.
+        # Pre-0.39 callers ignore unknown keys.
+        "repo_slug": p.repo_slug,
+        "cawl_image_repo": p.cawl_image_repo,
     }
 
 
@@ -1026,6 +1205,87 @@ def _h_set_project_last_sync(langcode, body):
     ts = body.get('timestamp')
     projects.set_last_sync(langcode, ts)
     return 200, {"ok": True}
+
+
+def _parse_github_owner_repo(remote_url):
+    """Extract ``(owner, repo)`` from a GitHub remote URL. Returns
+    ``None`` if the URL isn't a recognisable GitHub remote.
+
+    Accepted shapes:
+      - ``https://github.com/<owner>/<repo>`` (with or without ``.git``)
+      - ``http://github.com/<owner>/<repo>``
+      - ``git@github.com:<owner>/<repo>``"""
+    if not remote_url:
+        return None
+    import re
+    url = remote_url.strip().rstrip('/')
+    if url.endswith('.git'):
+        url = url[:-4]
+    m = re.match(r'^https?://github\.com/([^/]+)/([^/]+)$', url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r'^git@github\.com:([^/]+)/([^/]+)$', url)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _h_grant_collaborator(langcode, body):
+    """``POST /v1/projects/<lang>/collaborators``. Invite a GitHub
+    user as a collaborator on the repo backing ``langcode``.
+
+    Looks the repo up via the project's ``remote_url`` so the peer
+    only has to pass a langcode — the server-side lookup eliminates
+    any "wrong project" risk from peer-side URL handling. Returns
+    a Result-shaped response with one of:
+    ``COLLABORATOR_INVITED``, ``COLLABORATOR_ALREADY``,
+    ``INVALID_USERNAME``, ``NO_REMOTE``, ``NOT_GITHUB_REMOTE``,
+    ``AUTH_REQUIRED``, or ``COLLABORATOR_INVITE_FAILED``.
+
+    Permission level defaults to ``push`` (matches typical SIL
+    collaborator flow); callers can override via ``body['level']``."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    _touch_project(langcode)
+    username = (body.get('username') or '').strip()
+    permission = (body.get('level') or 'push').strip() or 'push'
+    if not username:
+        res = Result().add(S.INVALID_USERNAME)
+        return 200, {"ok": True, "result": res.to_dict()}
+    if not p.remote_url:
+        res = Result().add(S.NO_REMOTE)
+        return 200, {"ok": True, "result": res.to_dict()}
+    parsed = _parse_github_owner_repo(p.remote_url)
+    if parsed is None:
+        res = Result().add(S.NOT_GITHUB_REMOTE,
+                           remote_url=p.remote_url)
+        return 200, {"ok": True, "result": res.to_dict()}
+    owner, repo_name = parsed
+    _git_user, token = store.get_sync_credentials(p.remote_url)
+    if not token:
+        res = Result().add(S.AUTH_REQUIRED)
+        return 200, {"ok": True, "result": res.to_dict()}
+    try:
+        outcome = auth.add_collaborator(
+            owner, repo_name, username, token, permission=permission)
+    except Exception as ex:
+        print(f'[collab-grant] {langcode!r} {owner}/{repo_name} '
+              f'{username!r} → {type(ex).__name__}: {ex}',
+              file=sys.stderr, flush=True)
+        res = Result().add(
+            S.COLLABORATOR_INVITE_FAILED, error=str(ex),
+            owner_repo=f'{owner}/{repo_name}', username=username)
+        return 200, {"ok": True, "result": res.to_dict()}
+    res = Result()
+    if outcome == 'already':
+        res.add(S.COLLABORATOR_ALREADY, username=username,
+                owner_repo=f'{owner}/{repo_name}')
+    else:
+        res.add(S.COLLABORATOR_INVITED, username=username,
+                owner_repo=f'{owner}/{repo_name}',
+                permission=permission)
+    return 200, {"ok": True, "result": res.to_dict()}
 
 
 def _h_project_sync_async(langcode, body):
@@ -1048,6 +1308,141 @@ def _h_get_job(job_id, _body):
     if job is None:
         return 404, {"ok": False, "error": "job_not_found"}
     return 200, {"ok": True, **job.to_dict()}
+
+
+# ── Atomic file write ─────────────────────────────────────────────────────
+#
+# Peers on Android reach the daemon's filesystem via the
+# ContentProvider's openFileDescriptor — they receive an FD into a
+# file under the daemon's private filesDir. ``ftruncate(fd, 0)`` +
+# write through that FD is NOT atomic from the perspective of any
+# other reader (another peer, the daemon's own merge-output writer):
+# a concurrent observer can see torn bytes mid-write. The
+# 2026-05-12 ``baf`` repro is one realization of this — two LIFT
+# serializations interleaved through the FD path and produced
+# malformed XML.
+#
+# The endpoint below closes the gap: the peer sends the full file
+# bytes inline (base64 in the JSON body), the daemon serializes
+# the write through the project lock, and writes via tempfile +
+# os.replace. The destination is always a complete copy of one
+# version, never a torn mix.
+
+_ATOMIC_COMMIT_ALLOWED_DIRS = ('audio', 'images')
+
+
+def _resolve_atomic_commit_path(working_dir, rel):
+    """Validate ``rel`` against the atomic-commit whitelist and
+    return the absolute path under *working_dir*, or None if the
+    shape is rejected.
+
+    Allowed shapes (mirror of the ContentProvider's
+    ``_resolve_path`` whitelist, scoped to a known working_dir):
+
+    - ``<file>.lift``           — top-level LIFT file
+    - ``audio/<file>``          — sibling audio
+    - ``images/<file>``         — sibling image
+
+    Any other shape — empty segments, ``..``, three-level paths —
+    is rejected before any filesystem touch. A final
+    ``os.path.commonpath`` check guards against symlink-based
+    escapes."""
+    if not rel or not isinstance(rel, str):
+        return None
+    rel = rel.lstrip('/')
+    parts = rel.split('/')
+    if any(p in ('', '..', '.') for p in parts):
+        return None
+    if len(parts) == 1:
+        if not parts[0].lower().endswith('.lift'):
+            return None
+    elif len(parts) == 2:
+        if parts[0] not in _ATOMIC_COMMIT_ALLOWED_DIRS:
+            return None
+    else:
+        return None
+    base = os.path.realpath(working_dir)
+    target = os.path.realpath(os.path.join(base, *parts))
+    try:
+        if os.path.commonpath([base, target]) != base:
+            return None
+    except ValueError:
+        return None
+    return target
+
+
+def _h_project_atomic_commit(langcode, body):
+    """POST /v1/projects/<lang>/atomic_commit
+
+    Request body::
+
+        {"path": "<rel_path>", "data_b64": "<base64-encoded-bytes>"}
+
+    Writes the bytes atomically to ``<working_dir>/<rel_path>``.
+    The write goes through a sibling tempfile + ``os.replace``,
+    serialized via ``project_lock`` so it can't overlap with a
+    sync's merge-output write or another atomic_commit. The
+    destination is never torn.
+
+    Returns ``ATOMIC_COMMITTED`` (with ``bytes_written`` and
+    ``sha256``) on success. Path-validation failures return 400;
+    filesystem failures return 500."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    rel = body.get('path') or ''
+    data_b64 = body.get('data_b64') or ''
+    if not isinstance(rel, str) or not rel:
+        return 400, {"ok": False, "error": "missing_path"}
+    if not isinstance(data_b64, str):
+        return 400, {"ok": False, "error": "invalid_data"}
+    try:
+        data = base64.b64decode(data_b64, validate=True)
+    except Exception as ex:
+        return 400, {"ok": False, "error": f"base64_decode: {ex}"}
+    target = _resolve_atomic_commit_path(p.working_dir, rel)
+    if target is None:
+        return 400, {"ok": False, "error": "path_rejected"}
+    _touch_project(langcode)
+    tmp = f'{target}.tmp.{os.getpid()}.{secrets.token_hex(8)}'
+    try:
+        with project_lock(p.working_dir):
+            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+    except Exception as ex:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        return 500, {"ok": False, "error": str(ex)}
+    res = Result().add(S.ATOMIC_COMMITTED,
+                       bytes_written=len(data),
+                       sha256=hashlib.sha256(data).hexdigest())
+    return 200, {"ok": True, "result": res.to_dict()}
+
+
+def _match_cawl_image_path(path):
+    """If ``path`` is ``/v1/projects/<lang>/cawl/images/<basename>``,
+    return ``(langcode, basename)``. Else ``None``. Strict shape:
+    exactly six segments, ``cawl`` + ``images`` in positions 4/5,
+    no trailing slashes."""
+    if not path.startswith('/v1/projects/'):
+        return None
+    parts = path.split('/')
+    if len(parts) != 7:
+        return None
+    if parts[4] != 'cawl' or parts[5] != 'images':
+        return None
+    langcode = parts[3]
+    basename = parts[6]
+    if not langcode or not basename:
+        return None
+    return langcode, basename
 
 
 def dispatch(method, path, body):
@@ -1087,6 +1482,9 @@ def dispatch(method, path, body):
                 return _h_get_project(parts[3], body)
             if len(parts) == 5 and parts[4] == 'status':
                 return _h_project_status(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'cawl' \
+                    and parts[5] == 'index':
+                return _h_cawl_index(parts[3], body)
         if path.startswith('/v1/jobs/'):
             parts = path.split('/')
             if len(parts) == 4 and parts[3]:
@@ -1138,8 +1536,16 @@ def dispatch(method, path, body):
                 return _h_project_sync(parts[3], body)
             if len(parts) == 5 and parts[4] == 'sync_async':
                 return _h_project_sync_async(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'atomic_commit':
+                return _h_project_atomic_commit(parts[3], body)
             if len(parts) == 5 and parts[4] == 'last_sync':
                 return _h_set_project_last_sync(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'collaborators':
+                return _h_grant_collaborator(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'cawl_image_repo':
+                return _h_set_cawl_image_repo(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'repo_slug':
+                return _h_set_repo_slug(parts[3], body)
         return 404, {"ok": False, "error": "not_found"}
 
     return 405, {"ok": False, "error": "method_not_allowed"}
@@ -1174,6 +1580,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_bytes(self, status, content_type, data):
+        """Binary response. Used by the CAWL-image endpoint; the
+        dispatch table is JSON-only so this is the only non-JSON
+        path in the server. Adopted to avoid base64-wrapping
+        image payloads, which would inflate them ~1.33× for no
+        useful purpose."""
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _read_json(self):
         n = int(self.headers.get('Content-Length', '0') or '0')
         if n <= 0:
@@ -1199,6 +1620,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(status, response)
 
     def do_GET(self):
+        # Binary endpoint: route directly so we can stream raw
+        # image bytes (the dispatch table is JSON-only).
+        binary_match = _match_cawl_image_path(self.path)
+        if binary_match is not None:
+            if not self._auth_ok():
+                return self._send_json(
+                    401, {"ok": False, "error": "unauthorized"})
+            langcode, basename = binary_match
+            try:
+                status, content_type, data = _h_cawl_image_bytes(
+                    langcode, basename)
+            except Exception as ex:
+                return self._send_json(
+                    500, {"ok": False, "error": str(ex)})
+            return self._send_bytes(status, content_type, data)
         self._serve('GET', None)
 
     def do_POST(self):
