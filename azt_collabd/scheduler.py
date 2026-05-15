@@ -1,20 +1,31 @@
 """
-Async sync scheduler.
+Async commit scheduler + push drain loop.
 
-Three responsibilities:
+Four responsibilities:
 
-1. **Debounced job queue.** ``request_sync(langcode, contributor)``
-   schedules a sync to run after ``settings.debounce_ms``. Subsequent
-   calls within the window reset the timer (trailing-edge debounce) so
-   bursts of rapid edits — recording a clip writes both the .wav and
-   the .lift — collapse into one commit/push.
+1. **Debounced commit queue.** ``commit_project(langcode)``
+   schedules a commit to run after ``settings.debounce_ms``.
+   Subsequent calls within the window reset the timer (trailing-edge
+   debounce) so bursts of rapid edits — recording a clip writes both
+   the .wav and the .lift — collapse into one commit. As of 0.43.0
+   the queue no longer attempts push; push is driven entirely by the
+   connectivity watcher's drain loop based on online state +
+   post-online grace + work_offline. Peers call ``commit_project``
+   per group of related changes; the daemon decides when to push.
 
 2. **Connectivity watcher.** A background thread polls
    ``net._has_internet`` every ``settings.connectivity_poll_s``. On
-   the offline → online edge, projects flagged ``pending_push`` get
-   re-synced.
+   the offline → online edge a timestamp is recorded; the drain only
+   fires once ``now - online_since >= settings.post_online_grace_s``
+   so brief tethers the user enabled for some other reason don't
+   immediately burn their MB on pending pushes.
 
-3. **Disk-persisted job table.** Jobs are mirrored to
+3. **Push drain loop.** Every watcher tick, if online for >= grace
+   AND ``sync.work_offline`` is False, projects with unpushed
+   commits get pushed. Stuck-commit retry continues to run on every
+   tick (no online gate — the commit half is local).
+
+4. **Disk-persisted job table.** Jobs are mirrored to
    ``$AZT_HOME/jobs.json`` at every state transition so ``poll_job``
    from a peer still works after the daemon was killed (Android OOM,
    ``kill -9``, container restart) and respawned by the next client
@@ -41,7 +52,11 @@ from . import settings as _settings
 from . import status as S
 from .net import _has_internet
 from .paths import azt_home
-from .repo import sync_repo as _sync_repo
+from .repo import (
+    commit_repo as _commit_repo,
+    push_repo as _push_repo,
+    sync_repo as _sync_repo,
+)
 from .status import Result, Status
 from .store import get_sync_credentials
 
@@ -113,6 +128,12 @@ _jobs: "OrderedDict[str, Job]" = OrderedDict()
 _watcher_thread = None
 _watcher_stop = None
 _last_online_state = None      # None until first probe
+# Wall-clock seconds at which we last observed an offline → online
+# transition (or watcher startup with online == True). Reset to
+# None when we go offline. The push-drain loop gates on
+# now - _online_since >= settings.post_online_grace_s so a brief
+# blip doesn't immediately fire pending pushes.
+_online_since = None
 
 
 def _store_job(job):
@@ -227,16 +248,21 @@ def _set_pending_push(langcode, value):
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def request_sync(langcode):
-    """Schedule a debounced sync for *langcode*. Returns the job id of
-    the eventual run (the same id is returned for subsequent calls
-    within the debounce window — the timer just resets).
+def commit_project(langcode):
+    """Schedule a debounced commit for *langcode*. Returns the
+    job id of the eventual run (the same id is returned for
+    subsequent calls within the debounce window — the timer just
+    resets).
 
-    As of 0.40.0 the contributor name is no longer a parameter —
-    ``_run_sync`` reads it from ``store.get_contributor()`` at exec
-    time. The "last-call-wins" debounce that used to overwrite the
-    pending job's contributor goes away naturally; there's no
-    per-call value to overwrite."""
+    Commit-only: does NOT attempt push. Push is driven by the
+    connectivity watcher's drain loop (online + post-online grace
+    + work_offline=False). Peers call this per group of related
+    changes; the daemon decides when to push. Pre-0.43 this was
+    ``request_sync`` and did both halves.
+
+    Contributor is read from ``store.get_contributor()`` at exec
+    time. Unset contributor → the job result carries
+    ``S.CONTRIBUTOR_UNSET``; peers poll via ``poll_job(job_id)``."""
     debounce_s = _settings.debounce_ms() / 1000.0
     with _lock:
         existing_timer = _pending_timers.pop(langcode, None)
@@ -247,19 +273,22 @@ def request_sync(langcode):
             job = Job(langcode)
             _pending_jobs[langcode] = job
             _store_job(job)
-        print(f'[sync-debounce] {langcode!r} debounce={debounce_s}s '
+        print(f'[commit-debounce] {langcode!r} debounce={debounce_s}s '
               f'job_id={job.id!r}',
               file=sys.stderr, flush=True)
         if debounce_s <= 0:
-            # Run immediately on a worker thread so request_sync stays
-            # non-blocking for the caller.
+            # Run immediately on a worker thread so commit_project
+            # stays non-blocking for the caller. Named so a crash
+            # backtrace in this thread identifies the commit flow.
             t = threading.Thread(
-                target=_fire, args=(langcode,), daemon=True)
+                target=_fire, args=(langcode,), daemon=True,
+                name=f'commit-fire-{langcode}')
             t.start()
         else:
             t = threading.Timer(
                 debounce_s, _fire, args=(langcode,))
             t.daemon = True
+            t.name = f'commit-fire-{langcode}'
             _pending_timers[langcode] = t
             t.start()
         return job.id
@@ -270,11 +299,11 @@ def _fire(langcode):
         _pending_timers.pop(langcode, None)
         job = _pending_jobs.pop(langcode, None)
     if job is None:
-        print(f'[sync-fire] {langcode!r} debounce timer fired but '
+        print(f'[commit-fire] {langcode!r} debounce timer fired but '
               f'no pending job — already drained?',
               file=sys.stderr, flush=True)
         return
-    print(f'[sync-fire] {langcode!r} debounce timer fired, '
+    print(f'[commit-fire] {langcode!r} debounce timer fired, '
           f'running job_id={job.id!r}',
           file=sys.stderr, flush=True)
     with _lock:
@@ -283,9 +312,9 @@ def _fire(langcode):
         _persist_locked()
 
     try:
-        result = _run_sync(job.langcode)
+        result = _run_commit(job.langcode)
     except Exception as ex:
-        result = Result().add(S.PUSH_FAILED, error=str(ex))
+        result = Result().add(S.COMMIT_FAILED, error=str(ex))
     with _lock:
         job.result = result
         job.state = JobState.DONE
@@ -293,68 +322,41 @@ def _fire(langcode):
         _persist_locked()
 
     codes = result.codes()
-    if 'PUSHED' in codes or 'COMMITTED_AND_PUSHED' in codes:
-        _set_pending_push(langcode, False)
-    elif 'COMMITTED_OFFLINE' in codes or 'COMMITTED_NO_REMOTE' in codes \
-            or 'COMMITTED_LOCAL' in codes:
+    # commit_project does not push. Any successful commit means
+    # there's now (or already was) a local commit waiting for the
+    # drain loop to push. NOTHING_TO_COMMIT means the index was
+    # clean — leave pending_push as-is (a prior commit may still
+    # be waiting; the drain loop already knows from commits_ahead).
+    if 'COMMITTED_LOCAL' in codes:
         _set_pending_push(langcode, True)
 
 
-def _run_sync(langcode):
+def _run_commit(langcode):
+    """Debounced-commit worker. Reads contributor at exec time,
+    invokes commit_repo, stamps last_commit on success. No network
+    activity — push is the drain loop's job."""
     from . import store as _store
-    # 0.40.0: contributor read at exec time from store, not passed
-    # in. Defence-in-depth — request_sync's upfront refusal at
-    # ``_h_project_sync_async`` should catch unset-contributor
-    # before a job is enqueued, but a long-running debounce window
-    # plus a user clearing their name mid-flight could land us
-    # here without one. Refuse rather than emit a meaningless
-    # commit.
     contributor = _store.get_contributor()
     if not contributor:
-        print(f'[sync] {langcode!r} → CONTRIBUTOR_UNSET '
+        print(f'[commit] {langcode!r} → CONTRIBUTOR_UNSET '
               f'(refused at exec time)',
               file=sys.stderr, flush=True)
         return Result().add(S.CONTRIBUTOR_UNSET)
-    # Async sync runs from a worker thread well after the request_sync
-    # call returned, so the request-time _touch_project on the server
-    # handler has already fired. We re-touch here just to keep the
-    # invariant "every sync attempt marks the project recent" — the
-    # write is cheap and idempotent.
+    # Re-touch project as recent — cheap, idempotent, and keeps the
+    # invariant "every commit attempt marks the project recent".
     _store.set_last_langcode(langcode)
-    print(f'[sync] {langcode!r} contributor={contributor!r} starting',
+    print(f'[commit] {langcode!r} contributor={contributor!r} starting',
           file=sys.stderr, flush=True)
     p = projects.get(langcode)
     if p is None:
-        print(f'[sync] {langcode!r} → NO_REPO',
+        print(f'[commit] {langcode!r} → NO_REPO',
               file=sys.stderr, flush=True)
         return Result().add(S.NO_REPO)
-    git_user, token = get_sync_credentials(p.remote_url)
-    if not token:
-        print(f'[sync] {langcode!r} → AUTH_REQUIRED (no token for '
-              f'remote_url={p.remote_url!r})',
-              file=sys.stderr, flush=True)
-        return Result().add(S.AUTH_REQUIRED)
-    if not _has_internet():
-        print(f'[sync] {langcode!r} → COMMITTED_OFFLINE',
-              file=sys.stderr, flush=True)
-        return Result().add(S.COMMITTED_OFFLINE)
-    res = _sync_repo(p.working_dir, git_user, token, contributor)
-    # Mirror the user-initiated path: append AUTH_REFRESH_STALE
-    # when the persisted refresh state says the refresh path is
-    # broken. Peers in the auto-sync path silence this code per
-    # the auto/user contract; including it in the result keeps
-    # the daemon's emission uniform regardless of which side
-    # fired the sync.
-    from .server import _annotate_with_auth_health
-    _annotate_with_auth_health(res)
+    res = _commit_repo(p.working_dir, contributor)
     codes = res.codes()
-    print(f'[sync] {langcode!r} done: codes={codes!r}',
+    print(f'[commit] {langcode!r} done: codes={codes!r}',
           file=sys.stderr, flush=True)
-    if 'PUSHED' in codes or 'PULLED' in codes \
-            or 'COMMITTED_AND_PUSHED' in codes:
-        projects.set_last_sync(langcode)
-    if ('COMMITTED_LOCAL' in codes or 'COMMITTED_NO_REMOTE' in codes
-            or 'COMMITTED_AND_PUSHED' in codes):
+    if 'COMMITTED_LOCAL' in codes:
         projects.set_last_commit(langcode)
     return res
 
@@ -368,11 +370,12 @@ def get_job(job_id):
 
 def start_watcher():
     """Start the offline→online watcher. Idempotent."""
-    global _watcher_thread, _watcher_stop, _last_online_state
+    global _watcher_thread, _watcher_stop, _last_online_state, _online_since
     if _watcher_thread is not None and _watcher_thread.is_alive():
         return
     _watcher_stop = threading.Event()
     _last_online_state = None
+    _online_since = None
     _watcher_thread = threading.Thread(
         target=_watcher_loop, daemon=True, name='azt_collabd-watcher')
     _watcher_thread.start()
@@ -383,8 +386,37 @@ def stop_watcher():
         _watcher_stop.set()
 
 
+def is_online_cached():
+    """Return the watcher's most recent online observation, or
+    None if it hasn't probed yet. Cheap: a module-global read.
+    Up to ``settings.connectivity_poll_s`` seconds stale; callers
+    that need a fresh probe should call ``_has_internet`` directly
+    (paying the 3–6 s TCP-timeout cost on offline networks).
+    """
+    return _last_online_state
+
+
+def drain_pushes_now():
+    """Public entry point: fire a push-drain pass immediately,
+    bypassing the post-online grace gate. Called when the user
+    toggles work_offline OFF — they just expressed intent to push,
+    so waiting for the next watcher tick is the wrong UX.
+
+    Respects work_offline (no-op if still on) and online state
+    (no-op if offline)."""
+    if _settings.work_offline():
+        return
+    if not _has_internet():
+        return
+    try:
+        _drain_pending_push()
+    except Exception as ex:
+        print(f'[scheduler] drain_pushes_now failed: {ex}',
+              file=sys.stderr, flush=True)
+
+
 def _watcher_loop():
-    global _last_online_state
+    global _last_online_state, _online_since
     while _watcher_stop is not None and not _watcher_stop.is_set():
         try:
             online = _has_internet()
@@ -392,20 +424,199 @@ def _watcher_loop():
             online = False
         prev = _last_online_state
         _last_online_state = online
-        # Offline → online edge: drain pending_push projects
+        now = time.time()
+        # Track offline → online edges with a timestamp so the
+        # push drain can enforce a grace period before firing.
+        if online and prev is not True:
+            _online_since = now
+        elif not online:
+            _online_since = None
+        # On offline → online edge, nudge CAWL to retry any prefetch
+        # that was offline-skipped or circuit-broken while we were
+        # offline. Push drain has its own gate (grace + work_offline)
+        # and runs every tick, not just on edges.
         if prev is False and online is True:
-            _drain_pending_push()
+            try:
+                from . import cawl as _cawl
+                _cawl.on_online_edge()
+            except Exception as ex:
+                print(f'[cawl] on_online_edge dispatch failed: {ex}',
+                      file=sys.stderr, flush=True)
+        # Push drain: every tick, gated by online + post-online
+        # grace + work_offline. The grace gate avoids burning the
+        # user's MB if they enabled a brief tether for some other
+        # reason.
+        if online and not _settings.work_offline():
+            grace = _settings.post_online_grace_s()
+            if _online_since is not None and (now - _online_since) >= grace:
+                try:
+                    _drain_pending_push()
+                except Exception as ex:
+                    print(f'[scheduler] _drain_pending_push failed: {ex}',
+                          file=sys.stderr, flush=True)
+        # Every tick (not just on edges): retry stuck commits with
+        # exponential backoff so an idle device discovers a
+        # persistent failure without needing the user to gesture
+        # the peer. The drain itself enforces the per-project
+        # backoff and no-ops projects that aren't stuck. Local-
+        # only — no network required.
+        try:
+            _drain_stuck_commits()
+        except Exception as ex:
+            print(f'[scheduler] _drain_stuck_commits failed: {ex}',
+                  file=sys.stderr, flush=True)
+        # Every tick: walk each project's .azt_atomic_pending/ for
+        # orphans (atomic_open_write Phase 1 completed, Phase 2
+        # never ran). Auto-merge recoverable orphans into the
+        # current LIFT; delete confirmed-garbage orphans; stash
+        # unmergeable orphans for manual inspection. No-op when
+        # no orphans are present (single os.listdir on a
+        # typically-empty directory).
+        try:
+            _drain_atomic_orphans()
+        except Exception as ex:
+            print(f'[scheduler] _drain_atomic_orphans failed: {ex}',
+                  file=sys.stderr, flush=True)
         # Sleep with periodic checks of the stop event
         interval = max(5.0, float(_settings.connectivity_poll_s()))
         if _watcher_stop.wait(timeout=interval):
             break
 
 
-def _drain_pending_push():
+# Doubling backoff for stuck-commit retry, capped at 1 hour. Base
+# pegged to ``connectivity_poll_s`` so retries align with the
+# watcher tick: first retry ~30 s after the failure, then 60,
+# 120, 240, … s. After roughly half an hour of failing we settle
+# at one retry per hour — enough to catch a self-healing
+# condition (disk freed, lock released, daemon restarted) without
+# spamming the log forever.
+_STUCK_COMMIT_BACKOFF_CAP_S = 3600
+
+
+def _stuck_commit_backoff_s(count):
+    base = max(5.0, float(_settings.connectivity_poll_s()))
+    # 2 ** (count-1): 1, 2, 4, 8, … ; clamp the exponent to keep
+    # the product in int range for very large stuck counts.
+    shift = min(max(int(count) - 1, 0), 20)
+    return min(base * (1 << shift), _STUCK_COMMIT_BACKOFF_CAP_S)
+
+
+def _drain_atomic_orphans():
+    """Walk every registered project for orphaned
+    ``.azt_atomic_pending/<token>`` LIFT scratches and dispose
+    of them per the contract in ``atomic_recovery.py``. Cheap
+    when nothing is pending (one ``os.listdir`` on an empty
+    directory). Logs each non-trivial outcome."""
+    from . import atomic_recovery
     try:
         data = projects._load_raw()
     except Exception:
         return
     for langcode, entry in list(data.items()):
-        if entry.get('pending_push'):
-            request_sync(langcode, 'Recorder')
+        working_dir = entry.get('working_dir') or ''
+        lift_path = entry.get('lift_path') or ''
+        if not working_dir or not lift_path:
+            continue
+        try:
+            summary = atomic_recovery.recover_project_orphans(
+                working_dir, lift_path, langcode)
+        except Exception as ex:
+            print(f'[scheduler] recover_project_orphans '
+                  f'{langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            continue
+        if summary.get('recovered') or summary.get('unmergeable') \
+                or summary.get('errors'):
+            print(f'[scheduler] atomic orphans {langcode!r}: '
+                  f'{summary!r}',
+                  file=sys.stderr, flush=True)
+
+
+def _drain_stuck_commits():
+    """Find any project with ``commit_failure_count >= 1`` whose
+    backoff window has elapsed and re-attempt the commit. Local-
+    only — push will happen on the next drain pass when conditions
+    allow. ``commit_repo`` handles the stage + commit and the
+    failure-counter bookkeeping in repo.py.
+    """
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return
+    now = time.time()
+    candidates = []
+    for langcode, entry in data.items():
+        count = int(entry.get('commit_failure_count', 0) or 0)
+        if count < 1:
+            continue
+        last = float(entry.get('last_commit_failure_at', 0.0) or 0.0)
+        if (now - last) < _stuck_commit_backoff_s(count):
+            continue
+        candidates.append(langcode)
+    if not candidates:
+        return
+    print(f'[scheduler] retry stuck commits: '
+          f'{candidates!r}', file=sys.stderr, flush=True)
+    from . import store as _store
+    contributor = _store.get_contributor()
+    if not contributor:
+        # No contributor yet — every retry would emit
+        # CONTRIBUTOR_UNSET. Wait until the user sets one (a
+        # subsequent gesture will trigger the user-visible
+        # refusal explicitly).
+        return
+    for langcode in candidates:
+        p = projects.get(langcode)
+        if p is None:
+            continue
+        try:
+            res = _commit_repo(p.working_dir, contributor)
+        except Exception as ex:
+            print(f'[scheduler] retry stuck commit {langcode!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+            continue
+        codes = res.codes()
+        print(f'[scheduler] retry stuck commit {langcode!r} '
+              f'codes={codes!r}', file=sys.stderr, flush=True)
+        if 'COMMITTED_LOCAL' in codes:
+            _set_pending_push(langcode, True)
+
+
+def _drain_pending_push():
+    """Push any project flagged ``pending_push`` (or with local
+    commits ahead of remote). Called every watcher tick from
+    ``_watcher_loop`` once the post-online grace has elapsed and
+    ``sync.work_offline`` is off. Skips projects with no
+    contributor / no credentials / no remote — they'll get
+    surfaced through a future user gesture instead."""
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return
+    candidates = [lang for lang, entry in data.items()
+                  if entry.get('pending_push')]
+    if not candidates:
+        return
+    print(f'[scheduler] drain pushes: {candidates!r}',
+          file=sys.stderr, flush=True)
+    for langcode in candidates:
+        p = projects.get(langcode)
+        if p is None:
+            continue
+        git_user, token = get_sync_credentials(p.remote_url)
+        if not token:
+            # No credentials — leave pending_push set; next user
+            # gesture will route the AUTH_REQUIRED prompt.
+            continue
+        try:
+            res = _push_repo(p.working_dir, git_user, token)
+        except Exception as ex:
+            print(f'[scheduler] drain push {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            continue
+        codes = res.codes()
+        print(f'[scheduler] drain push {langcode!r} codes={codes!r}',
+              file=sys.stderr, flush=True)
+        if 'PUSHED' in codes:
+            _set_pending_push(langcode, False)
+            projects.set_last_sync(langcode)

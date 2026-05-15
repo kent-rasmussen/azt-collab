@@ -461,16 +461,36 @@ def _get_repo(project_dir):
 
 
 def _stage_all(repo, project_dir):
-    """Stage all modified and untracked files (equivalent to git add -A)."""
+    """Stage all modified and untracked files (equivalent to git add -A),
+    EXCEPT the daemon-internal scratch dir ``.azt_atomic_pending/``.
+
+    The scratch dir holds in-flight ``atomic_open_write`` files between
+    phase 1 (peer wrote bytes via FD) and phase 2 (daemon renames to
+    final). A peer crash / network failure between the two phases leaves
+    the scratch file orphaned. ``_stage_all`` used to pick those up and
+    commit them — the symptom was ``.azt_atomic_pending/<token>`` blobs
+    landing in the GitHub repo instead of the audio/LIFT files they
+    were supposed to become. Filtering them here is the
+    belt-and-braces alongside the ``.gitignore`` entry on repo init.
+    """
     from dulwich import porcelain
     status = porcelain.status(repo)
     paths = []
 
+    def _should_stage(rel):
+        s = rel if isinstance(rel, str) else rel.decode(
+            'utf-8', errors='replace')
+        return not (s == '.azt_atomic_pending'
+                    or s.startswith('.azt_atomic_pending/'))
+
     for f in status.unstaged:
-        paths.append(_bytes_path(f))
+        if _should_stage(f):
+            paths.append(_bytes_path(f))
 
     for f in status.untracked:
         rel = f if isinstance(f, str) else f.decode('utf-8', errors='replace')
+        if not _should_stage(rel):
+            continue
         full = os.path.join(project_dir, rel)
         if os.path.isfile(full):
             paths.append(_bytes_path(rel))
@@ -481,7 +501,8 @@ def _stage_all(repo, project_dir):
                 for name in files:
                     fp = os.path.join(root, name)
                     rp = os.path.relpath(fp, project_dir)
-                    paths.append(_bytes_path(rp))
+                    if _should_stage(rp):
+                        paths.append(_bytes_path(rp))
 
     if paths:
         porcelain.add(repo, paths=paths)
@@ -760,8 +781,9 @@ def _init_repo_locked(project_dir, remote_url, username, token,
         )
         sha_str = sha[:8].decode() if isinstance(sha, bytes) else str(sha)[:8]
         result.add(S.COMMITTED, sha=sha_str)
+        _clear_commit_failure_count(project_dir)
     except Exception as exc:
-        result.add(S.COMMIT_FAILED, error=str(exc))
+        _surface_commit_failure(result, project_dir, exc)
 
     try:
         existing = repo.get_config().get((b'remote', b'origin'), b'url').decode()
@@ -976,12 +998,13 @@ def _commit_and_push_branch_locked(project_dir, username, token,
             author=author, committer=committer,
         )
         result.add(S.COMMITTED)
+        _clear_commit_failure_count(project_dir)
     except Exception as exc:
         msg = str(exc).lower()
         if 'nothing' in msg or 'empty' in msg or 'no changes' in msg:
             result.add(S.NOTHING_TO_COMMIT)
         else:
-            result.add(S.COMMIT_FAILED, error=str(exc))
+            _surface_commit_failure(result, project_dir, exc)
 
     refspec = _enc(f'refs/heads/{branch_name}:refs/heads/{branch_name}')
     try:
@@ -998,8 +1021,127 @@ def _commit_and_push_branch_locked(project_dir, username, token,
     return result
 
 
+def commit_repo(project_dir, contributor_name):
+    """Stage + commit any working-tree changes for *project_dir*.
+    No network — push must be requested separately via push_repo
+    or sync_repo. Returns a Result with COMMITTED_LOCAL /
+    NOTHING_TO_COMMIT / COMMIT_FAILED / COMMIT_REPEATEDLY_FAILED /
+    DATA_LOSS_RISK / NOT_A_REPO.
+
+    This is the daemon-side primitive the new commit_project RPC
+    routes through. The split from sync_repo lets a peer call
+    'commit-on-every-change' cheaply without engaging the network
+    layer; push is driven by the connectivity watcher's drain
+    instead. See azt_collab_client/CLAUDE.md "Sync flow"."""
+    _ensure_ssl()
+    try:
+        with project_lock(project_dir):
+            return _commit_repo_locked(project_dir, contributor_name)
+    except LockTimeout:
+        return _busy_result(project_dir)
+
+
+def _commit_repo_locked(project_dir, contributor_name):
+    from dulwich import porcelain
+    result = Result()
+    repo = _get_repo(project_dir)
+    if repo is None:
+        result.add(S.NOT_A_REPO)
+        return result
+    _commit_step_locked(repo, project_dir, contributor_name, result)
+    return result
+
+
+def _commit_step_locked(repo, project_dir, contributor_name, result):
+    """Stage + commit on an already-opened repo. Mutates *result*
+    in place (adds COMMITTED_LOCAL / NOTHING_TO_COMMIT / etc.).
+    Caller holds the project lock."""
+    from dulwich import porcelain
+    _stage_all(repo, project_dir)
+    # Diagnostic: walk for any file outside the staging filter
+    # (peer-write-to-unexpected-location class). The walk runs
+    # both here and inside ``_stage_audio`` because either entry
+    # point can be the one a peer hits.
+    uncommittable = _detect_uncommittable(project_dir)
+    if uncommittable:
+        for rel in uncommittable[:20]:
+            print(f'[data-loss-risk] uncommittable file in '
+                  f'project_dir: {rel!r}',
+                  file=sys.stderr, flush=True)
+        result.add(S.DATA_LOSS_RISK,
+                   count=len(uncommittable),
+                   sample=uncommittable[:5])
+    st = porcelain.status(repo)
+    has_staged = any(st.staged.get(k) for k in ('add', 'modify', 'delete'))
+    if has_staged:
+        author = _default_author(contributor_name)
+        committer = _app_committer()
+        try:
+            porcelain.commit(
+                repo,
+                message=_enc(f'Audio recordings by {contributor_name}'),
+                author=author, committer=committer,
+            )
+            result.add(S.COMMITTED_LOCAL)
+            _clear_commit_failure_count(project_dir)
+        except Exception as exc:
+            _surface_commit_failure(result, project_dir, exc)
+    else:
+        result.add(S.NOTHING_TO_COMMIT)
+        # Index is clean — whatever caused a prior stuck-commit
+        # state has resolved itself (e.g. a peer recovered the
+        # commit on another path). Clear the counter so the
+        # scheduler's retry loop and project_status polling stop
+        # alarming.
+        _clear_commit_failure_count(project_dir)
+
+
+def push_repo(project_dir, username, token):
+    """Fetch + merge + push for *project_dir*. No commit step —
+    caller is responsible for having committed local changes (via
+    commit_repo or commit_audio_and_sync). Returns a Result with
+    PUSHED / PULLED / PULL_FAILED / PUSH_FAILED / NO_REMOTE / etc.
+
+    This is the daemon-side primitive the scheduler's drain loop
+    calls when conditions allow (online + post-online grace +
+    work_offline=False). Caller is also responsible for checking
+    is_online — push_repo will attempt the network operation
+    unconditionally so user-gestured 'try anyway' paths work."""
+    _ensure_ssl()
+    try:
+        with project_lock(project_dir):
+            return _push_repo_locked(project_dir, username, token)
+    except LockTimeout:
+        return _busy_result(project_dir)
+
+
+def _push_repo_locked(project_dir, username, token):
+    from dulwich import porcelain
+    result = Result()
+    repo = _get_repo(project_dir)
+    if repo is None:
+        result.add(S.NOT_A_REPO)
+        return result
+    try:
+        remote_url = repo.get_config().get(
+            (b'remote', b'origin'), b'url'
+        ).decode('utf-8')
+    except KeyError:
+        result.add(S.NO_REMOTE)
+        return result
+    _push_step_locked(repo, project_dir, username, token, remote_url, result)
+    return result
+
+
 def sync_repo(project_dir, username, token, contributor_name):
-    """Pull + commit + push. Returns Result."""
+    """Combined commit + push under a single project lock.
+
+    Legacy entry point — kept for callers that want both halves
+    atomically (e.g. ``commit_audio_and_sync``, the user-Sync
+    button before the commit-driven model fully lands). New code
+    paths should call ``commit_repo`` and ``push_repo``
+    separately so the commit cadence stays decoupled from push
+    cadence (the connectivity watcher drives push)."""
     _ensure_ssl()
     try:
         with project_lock(project_dir):
@@ -1026,24 +1168,16 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
 
     # Stage + commit local changes BEFORE the merge so they're a
     # proper commit on local <branch>, not just dirty working tree.
-    _stage_all(repo, project_dir)
-    st = porcelain.status(repo)
-    has_staged = any(st.staged.get(k) for k in ('add', 'modify', 'delete'))
-    if has_staged:
-        author = _default_author(contributor_name)
-        committer = _app_committer()
-        try:
-            porcelain.commit(
-                repo,
-                message=_enc(f'Audio recordings by {contributor_name}'),
-                author=author, committer=committer,
-            )
-            result.add(S.COMMITTED_LOCAL)
-        except Exception as exc:
-            result.add(S.COMMIT_FAILED, error=str(exc))
-    else:
-        result.add(S.NOTHING_TO_COMMIT)
+    _commit_step_locked(repo, project_dir, contributor_name, result)
+    _push_step_locked(repo, project_dir, username, token, remote_url, result)
+    return result
 
+
+def _push_step_locked(repo, project_dir, username, token, remote_url, result):
+    """Fetch + merge + push on an already-opened repo. Mutates
+    *result* in place. Caller holds the project lock and has
+    already validated remote_url (NO_REMOTE check)."""
+    from dulwich import porcelain
     try:
         branch = porcelain.active_branch(repo).decode('utf-8', errors='replace')
     except Exception:
@@ -1205,22 +1339,212 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
                 lift_merge.trace(
                     f'[sync-trace] retry fetch new_remote={new_remote!r} '
                     f'local_sha={local_sha!r}')
-                if new_remote and new_remote != local_sha and \
-                        not _is_ancestor(repo, local_sha, new_remote):
+                if (new_remote
+                        and new_remote != local_sha
+                        and not _is_ancestor(repo, local_sha, new_remote)
+                        and not _is_ancestor(repo, new_remote, local_sha)):
+                    # Truly diverged — fetch brought commits we don't
+                    # have AND our local has commits the remote doesn't.
+                    # Pre-fix the second ``not _is_ancestor`` check was
+                    # missing, so the "remote is already an ancestor of
+                    # local" case (e.g. a transient push rejection that
+                    # the retry fetched into a stale ref state)
+                    # produced a no-op merge commit — two parents, zero
+                    # files changed — cluttering history with
+                    # `Merge origin/main into main` commits that
+                    # didn't actually merge anything.
                     merged_sha, _ = _merge_diverged(
                         repo, project_dir, branch, local_sha, new_remote)
                     lift_merge.trace(
                         f'[sync-trace] retry merge done '
                         f'merged_sha={merged_sha!r}')
                     local_sha = merged_sha
+                else:
+                    lift_merge.trace(
+                        '[sync-trace] retry fetch: no merge needed '
+                        f'(new_remote ancestor relationship makes '
+                        f'merge a no-op)')
             except Exception as ex:
                 lift_merge.trace(
                     f'[sync-trace] retry fetch/merge failed: {ex!r}')
     return result
 
 
+_KNOWN_PATH_PREFIXES = (
+    'audio/', 'audio\\',
+    'images/', 'images\\',
+    '.git/', '.git\\',
+    '.azt_atomic_pending/', '.azt_atomic_pending\\',
+    '.azt-collab/', '.azt-collab\\',
+)
+_KNOWN_TOPLEVEL_FILES = frozenset((
+    '.gitignore', 'README', 'README.md', '.gitattributes',
+))
+
+
+_COMMIT_REPEATEDLY_FAILED_THRESHOLD = 2
+
+
+def _bump_commit_failure_count(project_dir, error_msg=''):
+    """Increment the persisted commit-failure counter for the project
+    registered at ``project_dir``.
+
+    Also stamps ``last_commit_failure_at`` (unix timestamp) and
+    ``last_commit_error`` (the dulwich message) so the scheduler's
+    retry loop can backoff-throttle re-attempts and peers polling
+    ``project_status`` can surface a useful explanation without
+    parsing the daemon log.
+
+    Lives in ``projects.json :: <langcode>.commit_failure_count``
+    so the count survives daemon restarts. The reverse lookup
+    keeps the helper callable from the working_dir-keyed APIs
+    (``sync_repo``, ``commit_audio_and_sync``) without
+    threading langcode through every signature. Returns the
+    post-increment value (or 0 when the project isn't registered
+    yet — typical on first publish, where ``init_repo`` runs
+    before ``register``).
+    """
+    from . import projects
+    import time
+    langcode = projects.find_langcode_by_working_dir(project_dir)
+    if not langcode:
+        return 0
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return 1   # be loud rather than swallow — caller will surface
+    entry = dict(data.get(langcode, {}))
+    n = int(entry.get('commit_failure_count', 0)) + 1
+    entry['commit_failure_count'] = n
+    entry['last_commit_failure_at'] = time.time()
+    if error_msg:
+        entry['last_commit_error'] = error_msg
+    data[langcode] = entry
+    try:
+        projects._save_raw(data)
+    except Exception:
+        pass
+    return n
+
+
+def _clear_commit_failure_count(project_dir):
+    """Reset the persisted commit-failure counter (and its
+    accompanying timestamp + error message) on a successful
+    commit. Safe to call when the counter is already zero or the
+    project isn't registered."""
+    from . import projects
+    langcode = projects.find_langcode_by_working_dir(project_dir)
+    if not langcode:
+        return
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return
+    entry = dict(data.get(langcode, {}))
+    changed = False
+    for key in ('commit_failure_count', 'last_commit_failure_at',
+                'last_commit_error'):
+        if entry.pop(key, None) is not None:
+            changed = True
+    if not changed:
+        return
+    data[langcode] = entry
+    try:
+        projects._save_raw(data)
+    except Exception:
+        pass
+
+
+def _surface_commit_failure(result, project_dir, exc):
+    """Bookkeep a COMMIT_FAILED on ``result`` plus the persisted
+    counter. After ``_COMMIT_REPEATEDLY_FAILED_THRESHOLD`` (2)
+    successive failures, ALSO add ``S.COMMIT_REPEATEDLY_FAILED``
+    so the peer's UI surfaces a data-loss-class toast rather
+    than the more routine single-attempt ``COMMIT_FAILED`` line.
+    Note: there is no in-process retry on commit failure; the
+    next commit attempt arrives whenever the peer next calls
+    ``commit_audio_and_sync`` (typically after the next recording
+    or sync gesture).
+    The catchup-commit pattern (one big commit after a long
+    failure streak — N stranded recordings landing as a single
+    blob) is exactly what the threshold catches: each prior
+    failed attempt bumps the counter, and the second-or-later
+    failure surfaces the loud status so the user is told to
+    investigate before more files pile up uncommitted.
+    """
+    err_str = str(exc)
+    result.add(S.COMMIT_FAILED, error=err_str)
+    n = _bump_commit_failure_count(project_dir, error_msg=err_str)
+    if n >= _COMMIT_REPEATEDLY_FAILED_THRESHOLD:
+        result.add(S.COMMIT_REPEATEDLY_FAILED,
+                   count=n, error=err_str)
+
+
+def _surface_uncommittable(result, repo):
+    """Read the uncommittable list ``_stage_audio`` stashed on the
+    repo object and convert it to a ``DATA_LOSS_RISK`` status on
+    ``result``. No-op when the list is empty / missing.
+
+    ``count`` and ``sample`` (up to 5 paths) are carried as
+    params so the peer's renderer can produce a useful toast /
+    banner without parsing the daemon log."""
+    uncommittable = getattr(repo, '_azt_uncommittable', None) or []
+    if uncommittable:
+        result.add(S.DATA_LOSS_RISK,
+                   count=len(uncommittable),
+                   sample=uncommittable[:5])
+
+
+def _detect_uncommittable(project_dir):
+    """Walk project_dir for files that won't get staged by
+    _stage_all / _stage_audio because they sit outside the
+    known directories (audio/, images/, *.lift, .git/, etc.).
+
+    Returns a list of relative paths. Empty list is the common
+    case — a peer that uses ``LiftHandle`` / ``MediaHandle``
+    correctly always writes under ``audio/`` or ``images/`` or
+    the LIFT file itself. A non-empty list means a peer wrote
+    to an unexpected location and the file will silently never
+    be backed up — a data-loss-class risk the daemon must
+    surface loudly.
+    """
+    out = []
+    for root, _dirs, files in os.walk(project_dir):
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, project_dir)
+            # Normalise to forward-slash for prefix checks.
+            rel_check = rel.replace('\\', '/')
+            if rel.endswith('.lift') and '/' not in rel_check:
+                continue
+            if any(rel_check.startswith(p.replace('\\', '/'))
+                   for p in _KNOWN_PATH_PREFIXES):
+                continue
+            if '/' not in rel_check and name in _KNOWN_TOPLEVEL_FILES:
+                continue
+            out.append(rel)
+    return out
+
+
 def _stage_audio(repo, project_dir):
-    """Stage only new/modified audio files (audio/ + images/ + .lift)."""
+    """Stage only new/modified audio files (audio/ + images/ + .lift).
+
+    Verbose-logs counts so remote-tester reports with only the
+    daemon log file can disambiguate "user recorded 1000 but only
+    146 committed" between:
+
+    - peer write path dropped bytes (on-disk count low),
+    - ``porcelain.status`` truncates large untracked sets
+      (on-disk count ≫ status.untracked count),
+    - sync ran too rarely / files sat untracked between syncs
+      (consistent gap across multiple sync passes).
+
+    Also flags any file in project_dir that isn't under our known
+    directories — that's a peer writing to an unexpected location
+    and is a data-loss class risk (the file will never reach git).
+    Emits ``[data-loss-risk] <rel_path>`` per file plus a
+    summary status code peers can surface to the user.
+    """
     from dulwich import porcelain
     status = porcelain.status(repo)
     paths = []
@@ -1249,8 +1573,59 @@ def _stage_audio(repo, project_dir):
                     rp = os.path.relpath(fp, project_dir)
                     paths.append(_bytes_path(rp))
 
+    # Independent on-disk walk for diagnostic comparison vs.
+    # status.untracked. If these diverge substantially, dulwich
+    # is missing files (its status walk truncated / cached out of
+    # date / index corruption), not our filter.
+    audio_dir = os.path.join(project_dir, 'audio')
+    images_dir = os.path.join(project_dir, 'images')
+    on_disk_audio = sum(
+        1 for _root, _dirs, files in os.walk(audio_dir) for _ in files
+    ) if os.path.isdir(audio_dir) else 0
+    on_disk_images = sum(
+        1 for _root, _dirs, files in os.walk(images_dir) for _ in files
+    ) if os.path.isdir(images_dir) else 0
+    status_unstaged = len(status.unstaged)
+    status_untracked = len(status.untracked)
+    import sys
+
+    # Theory-2 detection: anything under project_dir that isn't
+    # in a known directory and isn't the LIFT itself is a peer
+    # writing to an unexpected location — file will never be
+    # committed (won't be backed up). Log per-file at high
+    # severity AND attach a one-line summary to the diagnostic
+    # status line, so a daemon log shared by the tester contains
+    # both the count and the specific paths a maintainer can act
+    # on. Suppress per-file logging if there are many (cap at
+    # the first 20) to avoid drowning the log.
+    uncommittable = _detect_uncommittable(project_dir)
+    if uncommittable:
+        for rel in uncommittable[:20]:
+            print(f'[data-loss-risk] uncommittable file in '
+                  f'project_dir: {rel!r}',
+                  file=sys.stderr, flush=True)
+        if len(uncommittable) > 20:
+            print(f'[data-loss-risk] ... and '
+                  f'{len(uncommittable) - 20} more',
+                  file=sys.stderr, flush=True)
+
+    print(f'[stage-audio] project_dir={project_dir!r} '
+          f'on_disk_audio={on_disk_audio} '
+          f'on_disk_images={on_disk_images} '
+          f'status.unstaged={status_unstaged} '
+          f'status.untracked={status_untracked} '
+          f'paths_to_add={len(paths)} '
+          f'uncommittable={len(uncommittable)}',
+          file=sys.stderr, flush=True)
+
     if paths:
         porcelain.add(repo, paths=paths)
+    # Stash the uncommittable list on the repo object for the
+    # caller (``_commit_audio_and_sync_locked`` /
+    # ``_sync_repo_locked``) to read and surface as a Result
+    # status. Repo objects are short-lived (one per sync call),
+    # so attaching is safe.
+    repo._azt_uncommittable = uncommittable
     return len(paths)
 
 
@@ -1268,14 +1643,25 @@ def commit_audio_and_sync(project_dir, contributor_name, username, token):
 def _commit_audio_and_sync_locked(project_dir, contributor_name,
                                   username, token):
     from dulwich import porcelain
+    import sys
+    print(f'[commit-audio] start project_dir={project_dir!r} '
+          f'contributor={contributor_name!r}',
+          file=sys.stderr, flush=True)
     result = Result()
     repo = _get_repo(project_dir)
     if repo is None:
+        print(f'[commit-audio] NO_REPO project_dir={project_dir!r}',
+              file=sys.stderr, flush=True)
         result.add(S.NO_REPO)
         return result
 
     n = _stage_audio(repo, project_dir)
+    _surface_uncommittable(result, repo)
+    print(f'[commit-audio] _stage_audio returned n={n}',
+          file=sys.stderr, flush=True)
     if n == 0:
+        print(f'[commit-audio] NO_AUDIO — nothing new to commit',
+              file=sys.stderr, flush=True)
         # Nothing new to commit; still try to sync if online
         if _has_internet():
             try:
@@ -1293,13 +1679,22 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
     author = _default_author(contributor_name)
     committer = _app_committer()
     try:
-        porcelain.commit(
+        commit_sha = porcelain.commit(
             repo,
             message=_enc(f'Audio recordings by {contributor_name}'),
             author=author, committer=committer,
         )
+        try:
+            sha_str = commit_sha.decode('ascii', errors='replace')[:12]
+        except Exception:
+            sha_str = repr(commit_sha)[:14]
+        print(f'[commit-audio] committed n={n} sha={sha_str}',
+              file=sys.stderr, flush=True)
+        _clear_commit_failure_count(project_dir)
     except Exception as exc:
-        result.add(S.COMMIT_FAILED, error=str(exc))
+        print(f'[commit-audio] COMMIT_FAILED error={exc!r}',
+              file=sys.stderr, flush=True)
+        _surface_commit_failure(result, project_dir, exc)
         return result
 
     if not _has_internet():

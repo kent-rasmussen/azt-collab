@@ -78,7 +78,7 @@ When adding a new suite component:
 
 6. **Per-project advisory locks.** `azt_collabd/locks.py` provides reentrant `flock`-backed locks keyed by working_dir. Re-entry within the same process is required so helpers like `commit_audio_and_sync` can call `sync_repo` without deadlocking.
 
-7. **Sync flow: commit-first → fetch → ff/merge → push,** with `merge_retry_max` race retries. Debounced (default 500 ms) when called via `request_sync` so bursts of edits collapse into one commit. Async jobs are mirrored to `$AZT_HOME/jobs.json` on every state transition; `scheduler.reconcile_on_startup()` (called from `server.run` and the Android service entry) marks any `PENDING` / `RUNNING` jobs found there as `DONE` + `JOB_INTERRUPTED` because their worker thread died with the previous daemon process. Peers polling on a stale `job_id` after a daemon respawn receive a typed transient-failure result they can retry, instead of silence.
+7. **Commit / push split (0.43.0).** Peers fire `commit_project(langcode)` per group of related changes — debounced (default 500 ms) so bursts collapse to one commit. The RPC is commit-only: stage + `porcelain.commit`, never fetch / merge / push. Push is driven by the scheduler's drain loop (`_drain_pending_push` in `_watcher_loop`) which gates on: online (`is_online_cached`) + post-online grace (`sync.post_online_grace_s`, default 60 s — avoids burning a brief tether's MB) + `sync.work_offline` off (user-controlled daemon-wide toggle). The user-gestured Sync button (`sync_project`) still does commit + push under one lock and is the only path that surfaces `S.WORK_OFFLINE_ENABLED`. Async commit jobs are mirrored to `$AZT_HOME/jobs.json` on every state transition; `scheduler.reconcile_on_startup()` marks `PENDING` / `RUNNING` entries as `DONE` + `JOB_INTERRUPTED` after a daemon respawn so peers polling on a stale `job_id` receive a typed transient-failure result instead of silence. (Pre-0.43 this was one RPC named `request_sync` that did both halves; that name is kept as a peer-side alias for backwards compat.)
 
 8. **LIFT-aware merge by `<entry guid="...">`.** Per-entry, not per-field, in v1. Conflicts get `<annotation name="azt-lift-conflict" value="ours|theirs">`; both versions are kept side by side. The "theirs" copy gets a synthetic guid suffix to keep the document valid. See `azt_collabd/lift_merge.py`.
 
@@ -92,8 +92,9 @@ python -m azt_collabd
 python -m azt_collabd ui          # standalone Kivy settings UI
 python -m azt_collabd help
 
-# Run the sister-app demo end-to-end
-python examples/sister_app.py /path/to/some_lift_project
+# Read-only sister-app survey (everything the client gets from the daemon;
+# p/s open the picker / settings UI subprocesses)
+python examples/sister_app.py
 ```
 
 ## Tests
@@ -107,7 +108,7 @@ Daemon-touching changes still get a manual smoke against `examples/sister_app.py
 ```bash
 cd ../azt_recorder
 source env/bin/activate
-python ../azt-collab/examples/sister_app.py /tmp/some_lift_project
+python ../azt-collab/examples/sister_app.py
 ```
 
 ## Runtime config

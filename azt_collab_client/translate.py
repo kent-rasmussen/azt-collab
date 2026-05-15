@@ -125,6 +125,11 @@ _HANDLERS = {
     S.COMMITTED_LOCAL:        lambda p: _tr('Committed local changes.'),
     S.COMMITTED_OFFLINE:      lambda p: _tr('Committed locally (offline)'),
     S.COMMITTED_NO_REMOTE:    lambda p: _tr('Committed (no remote configured)'),
+    S.DATA_LOSS_RISK:         lambda p: _fmt(_tr(
+        'Data-loss risk: {count} file(s) written to your project '
+        "aren't being backed up. Please enable Settings → "
+        'Diagnostic log → Log server activity = yes, then Share '
+        'daemon log so we can investigate.'), p),
     S.COMMITTED_AND_PUSHED:   lambda p: _fmt(_tr('Committed and pushed {n} file(s)'), p),
     S.NOTHING_TO_COMMIT:      lambda p: _tr('Nothing new to commit.'),
     S.REMOTE_SET:             lambda p: _fmt(_tr('Remote set to {url}'), p),
@@ -148,6 +153,12 @@ _HANDLERS = {
     S.NOT_A_REPO:             lambda p: _tr('Not a git repository. Publish the project first.'),
     S.NO_REMOTE:              lambda p: _tr('No remote configured. Publish the project first.'),
     S.COMMIT_FAILED:          lambda p: _fmt(_tr('Commit: {error}'), p),
+    S.COMMIT_REPEATEDLY_FAILED: lambda p: _fmt(_tr(
+        'Saving to git has failed {count} times in a row '
+        '({error}). Your recordings are still on the device '
+        "but aren't being backed up. Please enable Settings → "
+        'Diagnostic log → Log server activity = yes, then Share '
+        'daemon log so we can investigate.'), p),
     S.PUSH_FAILED:            lambda p: _fmt(_tr('Push failed: {error}'), p),
     S.PULL_FAILED:            lambda p: _fmt(_tr('Pull failed: {error}'), p),
     S.CLONE_FAILED:           lambda p: _fmt(_tr('Clone failed: {error}'), p),
@@ -161,6 +172,8 @@ _HANDLERS = {
     S.AUTH_REQUIRED:          lambda p: _tr('Not connected to GitHub. Go to Setup > Connect to GitHub.'),
     S.CONTRIBUTOR_UNSET:      lambda p: _tr(
         'Please set your name in the sync settings before publishing or syncing.'),
+    S.WORK_OFFLINE_ENABLED:   lambda p: _tr(
+        'Work-offline mode is on. Turn it off in sync settings to push.'),
     S.APP_NOT_INSTALLED:      lambda p: _fmt(_tr('App not installed. Visit {url} and select "All repositories".'), p),
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),

@@ -555,6 +555,31 @@ def set_last_langcode(langcode):
     _save_config_file(cfg)
 
 
+# ── CAWL prefetch policy ────────────────────────────────────────────────────
+#
+# ``$AZT_HOME/config.json :: cawl.prefetch_all_variants`` controls how many
+# images per CAWL id the daemon warms. The canonical CAWL repo carries
+# multiple variants per id (line-art, colour, simplified, …) named with a
+# ``__`` marker convention; the default policy is "one variant per id"
+# (the file containing ``__`` in its basename), which keeps the warm
+# bounded to ~one-per-line. Switching to ``True`` warms every variant —
+# heavier on network and disk but useful when bandwidth is cheap and
+# the user wants the broader image set available offline.
+
+def get_cawl_prefetch_all_variants():
+    """Read the prefetch policy. Default False (preferred-only)."""
+    return bool(
+        (_load_config_file().get('cawl') or {}).get(
+            'prefetch_all_variants', False))
+
+
+def set_cawl_prefetch_all_variants(enabled):
+    """Persist the prefetch policy."""
+    cfg = _load_config_file()
+    cfg.setdefault('cawl', {})['prefetch_all_variants'] = bool(enabled)
+    _save_config_file(cfg)
+
+
 # ── migration from recorder's legacy prefs.json ─────────────────────────────
 
 _LEGACY_GITHUB = {

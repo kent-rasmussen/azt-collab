@@ -11,6 +11,976 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.43.0 / azt_collab_client 0.43.0 — Split commit and push; daemon-driven push policy; ``sync.work_offline`` toggle
+
+Closes the NOTES_TO_DAEMON.md item filed by azt-recorder
+1.43.1 (2026-05-15): debounced ``request_sync`` skipped the
+commit step entirely while offline, so a field-session of
+swipes piled up dirty files with ``commits_ahead=0,
+n_changes=N`` rather than the per-swipe commits a user
+expects. Synchronous ``sync_project`` (Sync button) committed
+fine under the same offline conditions, proving the commit
+step itself wasn't network-gated — only the debounced
+pipeline was misordered.
+
+Rather than patch the early-return inside ``_run_sync``, the
+whole commit/push relationship is rethought: peers decide
+where to cut a commit, the daemon decides when (and whether)
+to push.
+
+- **``commit_project(langcode)`` replaces ``request_sync``**
+  (client + daemon). Same debounce / async / job_id /
+  poll_job machinery — narrower contract. The RPC is now
+  commit-only: it stages, commits, marks ``pending_push``,
+  and returns. No fetch, no merge, no push. The old
+  ``request_sync`` name kept as a backwards-compat alias in
+  the client; the old ``/v1/projects/<lang>/sync_async``
+  URL routes to the new ``commit`` handler on the server.
+  Old peer code keeps working — the only behavioural change
+  is the result no longer carries ``PUSHED``. Migrate
+  result-handling that polls for ``PUSHED`` over to the
+  scheduler-driven model.
+- **Push moves entirely to the scheduler's drain loop**
+  (``azt_collabd/scheduler.py``). The connectivity watcher
+  tracks ``_online_since`` on offline→online edges and only
+  fires the drain once ``now - _online_since >=
+  settings.post_online_grace_s`` (default 60 s). Brief
+  tethers the user enabled for something else don't burn
+  their MB on pending pushes. The drain also respects the
+  ``sync.work_offline`` master toggle.
+- **``sync.work_offline`` toggle** —
+  ``GET/POST /v1/config/work_offline``, persisted to
+  ``$AZT_HOME/config.json``. When on, the watcher drain is
+  a no-op and the user-gestured Sync button (``sync_project``)
+  returns ``S.WORK_OFFLINE_ENABLED`` without attempting
+  any push. Commits via ``commit_project`` are unaffected;
+  only push is suppressed. Toggling OFF fires an immediate
+  drain so the user doesn't wait a full
+  ``connectivity_poll_s`` tick.
+- **``S.WORK_OFFLINE_ENABLED`` status code** (mirrored
+  daemon + client). Peers route the same way they handle
+  ``AUTH_REQUIRED``: toast + ``open_server_ui()`` to the
+  daemon settings screen anchored on the toggle.
+- **Daemon settings UI**: new "Work offline" section with
+  yes/no buttons, in ``azt_collabd/ui/app.py`` (above
+  Diagnostic log). State refreshes on screen entry; toggling
+  OFF fires the immediate drain server-side.
+- **``ProjectStatus.work_offline``** carries the
+  daemon-wide bool on every ``project_status`` response so
+  peers can render a badge alongside ``commits_ahead`` —
+  "5 commits waiting · offline mode" — without a second
+  RPC.
+- **``repo.py`` factored** into ``commit_repo``
+  (stage + commit, no network) and ``push_repo`` (fetch +
+  merge + push, no commit). ``sync_repo`` kept as the
+  combined entry point for the user-gestured Sync button and
+  legacy ``commit_audio_and_sync``; internally it now calls
+  ``_commit_step_locked`` then ``_push_step_locked`` under
+  one project lock.
+- **``scheduler._drain_stuck_commits`` is now commit-only**
+  (calls ``commit_repo`` instead of ``sync_repo``). Push for
+  recovered commits happens via the regular drain pass.
+- **``scheduler.is_online_cached()``** exposes the watcher's
+  most recent observation as a module-level bool read —
+  callers that don't need a fresh 3–6 s TCP probe should
+  use this instead of ``net._has_internet``. Internal
+  caller-only for now; not on the wire.
+- **MIN_CLIENT_VERSION / MIN_SERVER_VERSION** lock-stepped
+  at 0.43.0. Hard requirement: a 0.43 peer against a pre-
+  0.43 daemon would still lose offline commits (the bug
+  this release fixes); a pre-0.43 peer against a 0.43
+  daemon would never observe ``PUSHED`` codes from
+  ``commit_project`` and could mis-render its sync state.
+
+### azt_collabd 0.42.0 / azt_collab_client 0.42.0 — Package-replacement: receiver reaps in-APK; drop peer KILL_BACKGROUND_PROCESSES; installed-vs-running reboot prompt
+
+Follow-up to 0.41.28's suite-wide ``SuiteSelfReplaceReceiver``.
+The earlier design paired a manifest receiver in every APK with a
+peer-side ``killBackgroundProcesses(<server_pkg>)`` backstop on the
+Check-again paths to handle OEMs that don't auto-kill the old
+process during a package replace. The backstop required peers to
+declare ``KILL_BACKGROUND_PROCESSES`` in their own
+``android.permissions``, which is one more permission to explain
+if/when the suite ever goes through a store review.
+
+The new design moves the reap into the receiver itself: the
+freshly-installed APK's receiver calls
+``killBackgroundProcesses(getPackageName())`` (its own package's
+old-code processes) before the self-kill. No cross-package kill;
+no peer permission needed. A small peer-side reboot prompt
+covers the migration window for users whose currently-installed
+daemon is pre-0.42 (no in-receiver reap).
+
+Minor bump because the receiver behaviour change is observable
+across the suite and the peer permission surface area shrinks —
+worth lock-stepping daemon + client at 0.42.0 to make the
+"upgrade past this line" point unambiguous.
+
+- **``SuiteSelfReplaceReceiver``** now calls
+  ``ActivityManager.killBackgroundProcesses(getPackageName())``
+  before ``Process.killProcess(myPid())``. ``SecurityException``
+  is caught and logged — if the permission injection were to fail
+  for any reason, the receiver still self-kills (i.e. degrades to
+  the 0.41.28 behaviour on that APK).
+- **``p4a_hook.py:_inject_self_replace_receiver``**: the
+  ``<receiver>`` block stays on every suite APK; the
+  ``<uses-permission android:name=
+  "android.permission.KILL_BACKGROUND_PROCESSES" />`` element
+  is gated on ``dist_name == 'aztcollab'`` so only the server
+  APK ends up with the permission in its merged manifest. Peers
+  compile the same Java receiver class but their manifest
+  declares only the ``<receiver>``; at runtime the receiver's
+  reap call hits ``SecurityException``, is caught, and it falls
+  through to its self-kill — same net behaviour as the 0.41.28
+  peer receiver, with no peer permission to explain. Anchor
+  fixed to ``<application `` (with trailing space) so the
+  injection doesn't land inside the explanatory comment in
+  ``server_apk/manifest_extras.xml`` (whose prose mentions the
+  literal ``<application>``). Idempotent via the
+  ``self-replace-permission-injection`` sentinel.
+  Reported by azt_recorder 1.42.29 via NOTES_TO_DAEMON.md.
+- **Peer-side backstop removed.**
+  ``azt_collab_client.ui.bootstrap._kill_server_background`` is
+  deleted. The Check-again paths simply invalidate the release
+  cache and re-enter ``_check_server`` — the next bind picks up
+  the new code from the freshly-installed APK whose receiver did
+  the reap during install.
+- **Installed-on-disk vs. running detection.**
+  ``azt_collab_client.ui.bootstrap._installed_server_version``
+  reads the server APK's ``versionName`` via
+  ``PackageManager.getPackageInfo``. ``_prompt_server_update``
+  compares that to the version /v1/health reports; if installed
+  > running, the user has sideloaded the new APK but Android
+  kept the old daemon process alive (the pre-0.42 case where
+  the receiver doesn't auto-reap). Instead of asking the user
+  to re-download, ``_prompt_server_reboot_to_apply`` surfaces a
+  "You have {installed} installed; running process is {running}.
+  Restart your device to switch to the newer version." popup
+  (Check again + Quit + maintainer mailto). Pure transition
+  helper — once every field daemon is at 0.42 or newer the
+  receiver's in-APK reap fires and the comparison should never
+  trigger.
+- **§ 2 (peer permissions)** updated: ``KILL_BACKGROUND_PROCESSES``
+  no longer listed. The new note explicitly tells peer maintainers
+  not to add it themselves.
+- **§ 19 (package-replacement contract)** rewritten: the
+  two-step receiver contract (reap then self-kill), the
+  permission injection model, and the "peers MUST NOT add this
+  permission" rule replace the prior peer-backstop section. The
+  rollout-window note covers what happens for users still on
+  pre-0.42 server APKs — peer surfaces the reboot prompt
+  automatically.
+
+No wire-format change. ``MIN_SERVER_VERSION`` / ``MIN_CLIENT_VERSION``
+unchanged — the new behaviour is internal to the Java receiver,
+the build-time manifest injection, and the peer-side bootstrap
+flow.
+
+### azt_collabd 0.41.29 / azt_collab_client 0.41.27 — Atomic-write orphan auto-recovery
+
+Background. The ``atomic_open_write`` protocol is two-phase: peer
+streams full LIFT bytes into ``<working_dir>/.azt_atomic_pending/
+<token>``, then a separate ``atomic_finalize`` RPC renames the
+scratch over the real LIFT. A crash, daemon kill, or transport
+break between the two phases leaves the scratch on disk —
+complete, well-formed LIFT, but never landed. The two orphans
+field-reported in this session were exactly that: complete LIFT
+files, sitting in ``.azt_atomic_pending/``, never finalized.
+
+- **New module** ``azt_collabd/atomic_recovery.py``. Scans each
+  registered project's ``.azt_atomic_pending/`` directory for
+  orphan files ≥ 60 s old (skip in-flight Phase-1 writes) and
+  classifies each:
+
+  - Hash-equal to current LIFT → delete (confirmable garbage).
+  - All shared guids byte-identical in canonical XML AND no
+    orphan-only entries → delete (subset; no new info).
+  - Otherwise → run ``lift_merge.three_way_merge(base=b'',
+    ours=current, theirs=orphan)``. Write merged bytes
+    atomically to the LIFT path, commit as ``"Recovered orphan
+    from <iso-timestamp>"`` (author + committer = suite bot,
+    same identity used for cross-peer merges). Conflicts get
+    the existing ``<annotation name="azt-lift-conflict">``
+    treatment — peers / viewers that already surface those
+    annotations see recovery conflicts without any new code.
+  - Merge raises (corrupt XML, broken byte stream from an
+    interrupted Phase-1 write that *looked* > 60 s old) or
+    any of lift_merge's guard kinds fire (parse-error,
+    truncation-suspected, catastrophic-output) → move the
+    orphan to ``.azt_atomic_orphans/unmergeable/<token>.lift``
+    for manual inspection.
+
+- **Scheduler integration.** ``scheduler._drain_atomic_orphans``
+  runs every watcher tick (default 30 s) alongside the existing
+  stuck-commit drain. Cheap when nothing is pending (single
+  ``os.listdir`` on a typically-empty directory). Each
+  non-trivial outcome logs to the daemon log.
+
+- **ProjectStatus diagnostic.** New field
+  ``n_recovered_today: int`` on the project_status response and
+  the client-side ``ProjectStatus`` dataclass — purely
+  informational, zero on healthy projects, positive when
+  Phase-1-only writes were merged back in. Resets at the day
+  boundary via ``last_recovery_day`` in projects.json.
+
+- **No user-facing prompt.** In a no-delete-of-LIFT-entries world
+  the merge is unambiguously lossless (orphan only ever has
+  guids that current also has, plus potentially new field
+  content); a "Merge or Discard?" prompt would ask users a
+  question most aren't competent to answer, and the safe answer
+  ("merge") is the only reasonable default anyway. Conflicts
+  flow through the existing annotation channel.
+
+- Versions: daemon 0.41.29 / client 0.41.27. Additive on the
+  wire (new ProjectStatus field; pre-0.41.27 clients ignore
+  unknown keys; pre-0.41.29 daemons emit nothing for it). No
+  MIN floor bumps needed.
+
+### azt_collabd 0.41.28 / azt_collab_client 0.41.26 — Suite-wide package-replacement handling: APK install now reaches the running process
+
+Symptom this closes: a user sideloads the required server APK in
+response to the peer's ``client_too_old`` prompt, relaunches the
+peer, and still hits the same "AZT collab x.y.z or newer is
+required" popup. The new APK is on disk; the OLD process is
+still serving the provider with the OLD version. "Wait for an
+update" is the wrong instruction — the update is right there.
+
+- **Suite-wide ``MY_PACKAGE_REPLACED`` receiver.** New Java class
+  ``org.atoznback.aztcollab.SuiteSelfReplaceReceiver`` at
+  ``android/src/main/java/...`` handles the broadcast by
+  self-killing the receiving process. ``p4a_hook.py`` grows
+  ``_inject_self_replace_receiver`` to inject the manifest
+  ``<receiver>`` into every APK in the suite (NOT gated on
+  ``dist_name`` — server + every peer get it). Manifest receiver,
+  NOT runtime: some Android versions / OEMs kill the old process
+  as part of the replace, so a runtime-registered receiver
+  wouldn't be alive to receive the broadcast; manifest receivers
+  cold-start the new APK's code to deliver, which is exactly
+  what we want.
+- **Peer-side backstop.**
+  ``azt_collab_client.ui.bootstrap._kill_server_background``
+  dispatches
+  ``ActivityManager.killBackgroundProcesses(<server package>)``
+  from the Check-again paths in ``_do_check_again``. Belt-and-
+  braces for the rollout window before every field server APK
+  ships the receiver, and for the rare case where the
+  ``MY_PACKAGE_REPLACED`` broadcast didn't fire. Harmless when
+  the server is healthy (the next call lazy-spawns from the
+  current APK either way), curative when it's stale.
+- **Peer permission.** ``KILL_BACKGROUND_PROCESSES`` added to
+  the required peer permissions in ``CLIENT_INTEGRATION.md``
+  § 2. Normal-protection, no runtime grant prompt. Without it
+  the helper raises and falls through to the legacy behaviour
+  (user's next launch eventually picks up the new code once
+  the OS recycles the old process for its own reasons).
+- **Contract codification.** New § 19 "Package-replacement
+  handling" in ``CLIENT_INTEGRATION.md`` formalises the rule:
+  every suite APK MUST self-handle ``MY_PACKAGE_REPLACED``;
+  peers MAY backstop with ``killBackgroundProcesses``; peers
+  MUST NOT assume on-disk APK matches the running server
+  process without verifying.
+
+### azt_collabd 0.41.27 / azt_collab_client 0.41.25 — COMMIT_REPEATEDLY_FAILED + scheduler-driven retry: catch the "164 files in one commit" pattern even when the user is idle
+
+User report: production commits arriving with ~164 files apiece, hours
+or days of recording sessions, after long silent stretches where
+nothing pushed at all. The pattern is "failure to commit for some
+time, followed by a successful catchup commit." Until now the daemon
+shipped a one-shot ``S.COMMIT_FAILED`` per failed attempt with no
+across-attempts memory, so a streak of failures looked indistinguish-
+able from one unlucky retry — the user kept recording, files piled up
+on the device's daemon-private filesDir, and the eventual catchup
+commit hid the magnitude of the gap.
+
+- New status code ``S.COMMIT_REPEATEDLY_FAILED``: surfaced when the
+  same project has hit ``S.COMMIT_FAILED`` two-or-more times in a
+  row. Counter persisted at ``projects.json :: <langcode>
+  .commit_failure_count``, bumped on every COMMIT_FAILED branch,
+  cleared on every successful commit. Threshold = 2 because
+  dulwich's ``porcelain.commit`` essentially only raises on
+  persistent conditions (index corruption, refs problem, disk
+  full, broken repo state); one failure can be a fluke, two means
+  the underlying problem isn't self-healing. ``count`` and the
+  last dulwich ``error`` ride the status params.
+- **Scheduler-driven retry.** The connectivity-watcher loop now
+  also drains stuck commits every tick (default 30 s) with
+  exponential backoff (30, 60, 120, … s, capped at 1 hour). An
+  idle device with a failed commit gets a second look without
+  the user having to gesture the peer; recovery from a
+  transient cause (lock released, disk freed, daemon restart)
+  clears the counter automatically. Implementation:
+  ``scheduler._drain_stuck_commits`` in
+  ``azt_collabd/scheduler.py``.
+- **``ProjectStatus`` exposes the streak (diagnostic).** The
+  ``project_status`` RPC response gains
+  ``commit_failure_count`` + ``last_commit_failure_at`` +
+  ``last_commit_error`` for diagnostic surfaces (settings
+  screens showing "last commit error: …"). The alarm itself
+  still flows through ``result.statuses`` only — the counter
+  persists between gestures, so the next peer-driven sync
+  after a background failure naturally sees the elevated
+  counter and carries ``COMMIT_REPEATEDLY_FAILED`` on its
+  result. Peers do not need to synthesize the alarm from the
+  polled count; § 17a in ``CLIENT_INTEGRATION.md``
+  documents this explicitly.
+- Routing: ``CLIENT_INTEGRATION.md`` § 17 lands the code in the
+  same never-silenced bucket as ``DATA_LOSS_RISK`` — auto-sync
+  still must surface it (silencing would hide active data loss
+  in exactly the catchup-commit pattern the bug was filed
+  against). The auto-sync code shape now iterates and surfaces
+  both codes before the silencing branches consume the result.
+- Translation: client catalog + French ``.po`` carry a
+  data-loss-class user-visible message that names "Settings →
+  Diagnostic log → Log server activity = yes, then Share daemon
+  log so we can investigate" — same shape as the
+  ``DATA_LOSS_RISK`` message, since the investigation surface
+  is identical (the daemon log will show *why* the commits
+  failed).
+- ``MIN_CLIENT_VERSION`` ↑ 0.41.25, ``MIN_SERVER_VERSION``
+  ↑ 0.41.27 — new status code + new ProjectStatus fields;
+  pre-this-version clients have no translation and no
+  poll-surface, falling back to the auto-sync result iteration
+  alone.
+
+### azt_collabd 0.41.21 / azt_collab_client 0.41.21 — Scan QR: fix IntentIntegrator autoclass path + bundle AndroidX transitively; multi-density server-APK presplash
+
+Plus, adopting the multi-density splash pattern from
+``NOTES_TO_DAEMON.md`` "be eager when you have room to" §9 for the
+server APK itself:
+
+- ``generate_presplash.py`` rewritten to emit one PNG per Android
+  density bucket (ldpi 0.75x → xxxhdpi 4x, mdpi 320×533 baseline)
+  under ``server_apk/presplash_variants/drawable-<bucket>/presplash.png``.
+  Fonts and icon are scaled per bucket so each variant is sharp
+  at its native size. The legacy hdpi-sized
+  ``server_apk/presplash.png`` is also rewritten as the
+  ``presplash.filename`` rare-fallback.
+- ``server_apk/buildozer.spec.tmpl`` grows an
+  ``android.add_resources`` listing pointing at the six bucket
+  variants, so Android's resource resolver picks the right one at
+  install / launch time. No runtime PIL-resize on first boot.
+
+Run ``python generate_presplash.py`` once before each release
+build to refresh the version stamp; the produced
+``presplash_variants/`` is build output (gitignore candidate) but
+the spec entry is permanent.
+
+Plus the rest of the "be eager when you have room to" asks
+filed under the same note:
+
+- **``CLIENT_INTEGRATION.md`` § 18 "Low-power adaptive policy"**
+  documents the three rules (OS signals not user toggle;
+  automatic for resource decisions, user-facing for content /
+  workflow; pre-built variants beat runtime regeneration),
+  the gate-vs-don't-gate inventory, the multi-density
+  ``android.add_resources`` recipe, the verification block,
+  and the diagnostic-logging shape. ``CLAUDE.md`` carries the
+  rationale (why automatic, why build-time-work-in-the-build).
+- **``azt_collab_client.lowpower``** ships as a new module —
+  the JNI plumbing peers were duplicating, plus a single source
+  of truth for the thresholds (3 GB / 6 GB tier cuts, 0.15
+  availMem ratio, 720 px lowMemory downsample). API:
+  ``total_ram_mb()``, ``memory_state()``, ``is_low_memory()``,
+  ``is_metered_network()``, ``have_room_for_prefetch()``,
+  ``ram_tier()``, ``densityDpi()``, ``dpi_to_bucket()``,
+  ``identify_drawable_variant()``, ``log_presplash_variant()``.
+  Thresholds are module-level constants, override before first
+  call. ``AZT_FORCE_LOW_MEMORY=1`` env flips every signal to its
+  budget-device value for local testing.
+- **Diagnostic recipe corrected.** The first-pass recipes
+  (``Drawable.getIntrinsicWidth/Height()``,
+  ``BitmapDrawable.getBitmap().getDensity()``) both reported
+  device-scaled state and silently collapsed every bucket on
+  any given device. ``identify_drawable_variant`` uses
+  ``BitmapFactory.decodeResource`` with ``inJustDecodeBounds=
+  true`` + ``inScaled=false`` instead — ``opts.outWidth`` /
+  ``opts.inDensity`` then carry the native pixel width / source
+  folder density of the file Android actually picked, so the
+  bucket name can be identified unambiguously.
+- **Server APK logs its own variant.** ``server_apk/main.py``
+  calls ``log_presplash_variant(tag='presplash:server')`` at
+  startup; sister apps log under their own distinct tag (e.g.
+  ``'presplash'``) so combined logcat is grep-able.
+
+**Daemon-driven CAWL prefetch: offline-gate + circuit breaker.**
+0.41.4 added daemon-side offline backoff; 0.41.8 dropped it
+because "the peer has a circuit breaker"; 0.41.11 moved iteration
+into the daemon's ``_prefetch_worker`` and the peer's circuit
+breaker silently stopped applying (it lived in the old per-image
+peer iteration model). Net result on an offline boot: the daemon
+hammered DNS for every entry in the requested paths list,
+producing logcat spam shaped like ``[cawl] image fetch failed for
+… URLError: <urlopen error [Errno 7] No address associated with
+hostname>`` repeated N times in ~40 ms intervals.
+
+``_prefetch_worker`` now:
+
+1. Checks ``net._has_internet()`` once at start. If offline,
+   marks state ``skipped_offline=True`` / ``finished=True`` and
+   returns immediately — no iteration, no spam.
+2. Tracks consecutive failures inside the loop. After
+   ``_PREFETCH_CONSECUTIVE_FAIL_LIMIT`` (3) back-to-back
+   ``get_image_path`` failures, marks ``circuit_open=True`` /
+   ``finished=True`` and bails. Real fetches succeed in
+   <500 ms; three offline-class failures bunched together mean
+   the device dropped connectivity, not three individually
+   missing files.
+
+``_make_prefetch_state`` grows two fields (``skipped_offline``,
+``circuit_open``) and a ``started_at`` timestamp.
+
+**``cache_status`` surface widened.** ``cache_status(repo)`` now
+returns a dict instead of a ``(cached, total)`` tuple:
+
+```
+{'cached': int, 'total': int,
+ 'offline': bool, 'circuit_open': bool,
+ 'finished': bool}
+```
+
+The ``GET /v1/projects/<lang>/cawl/cache_status`` HTTP response
+gains the same three flags. When the worker was offline-skipped,
+``cached`` falls back to the actually-on-disk count via
+``_walk_image_count`` — so a device with prior cache shows e.g.
+"1247 / 3000 (offline)" instead of "0 / 3000" each offline boot.
+
+**Daemon settings UI banner** rendered three ways now:
+
+- normal: ``Caching images: M / N (network in use — please stay online)``
+- offline-skipped: ``Image cache: M / N (offline — will resume when online)``
+- circuit-broken: ``Image cache: M / N (paused — connectivity lost)``
+
+Old peers reading only ``cached`` / ``total`` from the response
+keep working — the new flags are additive.
+
+**Stage A: daemon-driven auto-prefetch.** The daemon now owns
+the "warm the CAWL image cache" decision instead of waiting
+for a peer-driven ``cawl/prefetch`` POST. ``_touch_project``
+(which fires on every langcode-bound endpoint) now also calls
+``cawl.auto_prefetch(repo)``. ``auto_prefetch``:
+
+- Resolves the full index image path set via the cached
+  index (no network).
+- Throttles to at most one trigger per repo per 30 s, so the
+  1 Hz cache-status poll doesn't re-probe ``_has_internet``
+  every second.
+- Defers to ``start_prefetch``'s existing idempotency. A
+  running prefetch with matching paths is a no-op; a finished
+  prefetch (success OR offline-skipped) restarts, which is the
+  natural retry path when connectivity may have returned.
+
+Peers may continue to POST ``cawl/prefetch`` with their own
+working-set list — useful when the peer wants to warm a
+subset different from the full index. The endpoint is
+backward-compatible. Stage B (peer-side removal of the POST)
+ships in a later peer release; today's change is additive.
+
+**Offline → online auto-resume.** The scheduler's
+connectivity watcher already fires on the offline → online
+edge (every ``connectivity_poll_s``, default 30 s). On that
+edge it now also calls ``cawl.on_online_edge()`` which clears
+the auto_prefetch throttle for any repo whose last state was
+``skipped_offline`` or ``circuit_open`` and re-fires
+``auto_prefetch``. Cache warming resumes within ~30 s of
+network return with no user action required.
+
+The cache-status banner poll **stays at 1 Hz** even on
+offline / circuit_open state — the response is just
+in-memory dict lookups, and the ``[first-try]`` probe for the
+cache_status path is already suppressed (see below). Keeping
+the poll running is what makes the banner auto-update from
+"offline — will resume" to live progress when
+``on_online_edge`` does its work.
+
+**CAWL prefetch policy: one variant per id (default) vs. all
+variants.** New config knob
+``$AZT_HOME/config.json :: cawl.prefetch_all_variants``,
+default ``False`` — daemon's auto_prefetch warms one image
+per CAWL id (the file whose basename contains the canonical
+``__`` preferred-variant marker, falling back to the first
+file in the id directory if no variant carries the marker).
+Set to ``True`` to warm every image-shaped index entry —
+heavier on network and disk but useful for users who want
+the full set offline.
+
+API surface:
+
+- Daemon: ``store.get_cawl_prefetch_all_variants`` /
+  ``store.set_cawl_prefetch_all_variants(bool)``.
+- HTTP: ``GET / POST /v1/config/cawl_prefetch_all_variants``,
+  body ``{enabled: bool}``.
+- Client: ``azt_collab_client.get_cawl_prefetch_all_variants``
+  / ``set_cawl_prefetch_all_variants``.
+- Filter logic: ``cawl._filter_preferred_variant_per_id``
+  applied inside ``_index_image_paths`` whenever
+  ``prefetch_all_variants`` is False.
+
+Flipping the policy doesn't retroactively re-warm an
+in-flight worker; the next ``auto_prefetch`` trigger
+(project-load, scheduler edge) picks up the new path set.
+Existing on-disk cache entries are kept either way.
+
+**Daemon SettingsScreen highlights missing contributor on
+entry.** Peers that route a ``S.CONTRIBUTOR_UNSET`` sync
+failure through ``open_server_ui()`` previously dropped the
+user onto the settings page with no indication of *which*
+field was the blocker — the peer-side translated toast
+("Please set your name…") could flash for under a second
+and be eaten by the screen transition. On screen entry, if
+``contributor_input`` is empty and not already focused, the
+input now takes focus (keyboard pops up on Android) and the
+inline hint reads "Required: your name is used for commit
+authorship; sync and publish refuse until this is set." in
+the red status colour. Saving a non-empty value clears the
+hint back to the normal "Saved." confirmation.
+
+**``[data-loss-risk]`` detection + new ``S.DATA_LOSS_RISK``
+status.** ``_stage_audio`` and ``_sync_repo_locked`` now walk
+``project_dir`` for any file outside the staging filter
+(``audio/`` / ``images/`` / ``*.lift`` / ``.git/`` /
+``.azt_atomic_pending/`` / ``.azt-collab/`` / known top-level
+files like ``.gitignore``). Anything else is a peer writing
+to a path the daemon won't commit — silent data loss class.
+Each finding emits ``[data-loss-risk] uncommittable file in
+project_dir: <rel>`` to stderr (so a tester-shared daemon log
+makes the issue obvious), and the sync ``Result`` carries
+``S.DATA_LOSS_RISK`` with ``count`` and ``sample`` (up to 5
+paths) params.
+
+**Peer contract** (``CLIENT_INTEGRATION.md`` § 17): this status
+is **never silenced**. Auto-sync and user-initiated sync both
+surface the translated toast unconditionally, urging the user
+to enable "Log server activity" and share the daemon log.
+Status is bucketed separately from the config-class /
+transport-class statuses that auto-sync silences, because this
+one represents active data loss, not a configuration glitch.
+
+**``[stage-audio]`` / ``[commit-audio]`` diagnostic logs.**
+Field report: testers record 1000+ audio files but only ~146
+land in each commit (and only 4 commits total). Without
+``adb`` access to the remote testers' phones we can't run
+``ls audio/`` or ``git status`` directly. Daemon-side logging
+in ``_stage_audio`` now emits a one-liner per pass with the
+counts that disambiguate the gap:
+
+```
+[commit-audio] start project_dir='…/projects/baf' contributor=…
+[stage-audio]  project_dir='…/projects/baf'
+               on_disk_audio=1042 on_disk_images=12
+               status.unstaged=0 status.untracked=898
+               paths_to_add=898
+[commit-audio] _stage_audio returned n=898
+[commit-audio] committed n=898 sha=abc123def456
+```
+
+- ``on_disk_audio`` ≫ ``status.untracked`` → ``porcelain.status``
+  is truncating large untracked sets; the gap is dulwich's,
+  not the peer's.
+- ``on_disk_audio`` ≈ ~146 → peer write path is dropping
+  bytes; gap is upstream.
+- ``status.untracked`` ≈ ~146 and ``on_disk_audio`` ≈ ~146
+  ≈ ``paths_to_add`` over multiple syncs → user's record
+  count is overcounting attempts vs. successes.
+
+Remote tester recipe: daemon settings UI → "Log server
+activity: yes" → record + sync → "Email daemon log". ``<_PickerRoot>`` hardcodes ``back_to:
+'picker'`` on the SettingsScreen instance — correct in
+external mode (settings reached from picker via the gear,
+back should pop to picker), but wrong in internal mode:
+settings is the root the user reached from outside the
+Activity (launcher tap or peer's ``open_server_ui()``), so
+the KV Back button navigating to picker dumped the user on
+a screen they never asked for. ``PickerApp.build`` now
+clears ``back_to`` on the settings screen in internal mode,
+which trips the KV's
+``height: dp(48) if root.back_to else 0`` gating and hides
+the button entirely. The OS back path (``_navigate_back``
+internal branch) remains the only way to leave settings,
+letting Android finish() the Activity and return the user
+to wherever they came from.
+
+**``Switch project`` button promoted out of the gated row.**
+Previously sat alongside Grant collaborator + Share repo QR
+inside ``project_actions_row``, which is hidden when the
+current project has no remote. Switch is meaningful before
+publish too (user may want to abandon an unpublished project
+for another), so it now lives in its own always-visible RecBtn
+directly under the gated row — same vertical position
+relative to the rest of the screen, but unconditionally
+tappable.
+
+**``project_actions_row`` hides via detach instead of just
+``height: 0``.** Same Kivy touch-intercept bug ``publish_row``
+already worked around: a BoxLayout with ``height: 0, opacity:
+0`` still has its children at their declared sizes in the
+widget tree, so their ``on_press`` handlers receive taps at
+coordinates that visually belong to buttons higher up.
+Symptoms: tapping ``Connect to GitHub`` fired
+``grant_collaborator()`` (the row's first button), tapping
+``Publish`` (when present) fired ``switch_project()`` (the
+row's third button), tapping ``Connect to GitLab`` looked
+like a no-op (Share-repo-QR's ``_pick_publish_candidate``
+returned ``None``). ``_refresh_project_actions_row`` now
+detaches all three children when hiding and reattaches when
+showing — mirror of ``_detach_publish_children`` /
+``_reattach_publish_children`` already in place.
+
+**Edge-to-edge: status bar no longer hides the picker's gear
+icon.** Android 15+ enforces edge-to-edge by default — the
+status bar overlays the app window unless we opt back into
+the pre-API-35 reserved-inset behaviour. Top-of-screen
+widgets (the picker's gear, every screen's TopBar) sat
+under the status bar; bottom-anchored widgets would have
+sat under the gesture bar the same way. ``PickerApp.on_start``
+now calls ``WindowCompat.setDecorFitsSystemWindows(window,
+True)`` on the Activity's UI thread (via p4a's
+``android.runnable.run_on_ui_thread`` helper), restoring
+inset reservation. Available because we already pull
+``androidx.appcompat`` (which transitively brings
+``androidx.core.view``).
+
+**``PickerApp.font_name`` alias.** Settings UI code that opens
+modals (``share_repo_qr``, ``grant_collaborator``) reads
+``App.get_running_app().font_name`` directly — fine under the
+old ``CollabUIApp`` which exposed ``font_name`` as a class
+attribute, but ``PickerApp`` only had the private ``_font_name``.
+Under the unified PickerApp on Android, tapping ``Share this
+repo (QR)`` (and ``Grant collaborator access``) raised
+``AttributeError: 'PickerApp' object has no attribute
+'font_name'`` and Kivy's event-loop catch buried it — the user
+saw "tap does nothing." New ``@property font_name``  on
+PickerApp returns ``_font_name`` so both callsites resolve
+identically across host App classes.
+
+**UX cleanup after the picker+settings merge.**
+
+- **Share-repo QR popup** — dropped the "Copy URL" button.
+  Close is the only remaining action; the URL is visible
+  above the QR for users who'd rather read it than scan it.
+- **Install / update popup** — "Open install page" relabeled
+  to ``More info`` and moved RIGHT of the Install button so
+  the affirmative action lands where the eye expects.
+- **Install / update popup status line** — split out of
+  ``body_label`` into a dedicated ``status_label`` rendered
+  in the ACCENT colour, bold, sp(15). "Tap install again to
+  confirm" and other transient status messages now read as
+  the current call-to-action instead of vanishing into the
+  wall of explanatory text above.
+- **Contributor input hint** — changed from a specific
+  example name to ``first_name last_name`` (generic).
+- **Contributor "Required" message** — ``contributor_msg``
+  label now auto-grows on ``texture_size`` so the multi-line
+  warning isn't truncated when the SettingsScreen surfaces
+  it on entry.
+
+**Ungraceful-shutdown detection via sentinel file.** New
+``azt_collabd/crash_marker.py``: on startup, writes
+``$AZT_HOME/process_running.json`` with this process's pid +
+started_at, registers an ``atexit`` hook to delete it on
+clean shutdown. On the NEXT startup, a leftover sentinel
+means the previous process bypassed atexit (SIGSEGV, SIGKILL,
+OOM-kill, ``os._exit``, kernel-level kill); a one-line
+summary lands in ``$AZT_HOME/last_native_crash.json``.
+
+``GET /v1/health`` now surfaces it alongside the existing
+``last_crash``:
+
+```
+{"ok": true, ...,
+ "last_native_crash": {
+   "detected_at": 1747234567.123,
+   "previous_pid": 12917,
+   "previous_started_at": 1747234389.456,
+   "signal": "",
+   "thread_name": "",
+   "approx_pc": "",
+   "detection_source": "ungraceful-shutdown sentinel"}}
+```
+
+``last_crash`` and ``last_native_crash`` are complementary:
+the former is written by the daemon's Python excepthook from
+the dying process (caught exception, Python alive to write
+it); the latter is detected on the *next* startup from
+sentinel-file diff (signal handler bypassed Python entirely).
+A peer's `[server-crash]` log helper can mirror both.
+
+Closes NOTES_TO_DAEMON.md "Daemon-side surface for native
+crashes" by the pragmatic route — no JNI sigaction handler,
+no async-signal-safe C extension. ``signal`` / ``thread_name``
+/ ``approx_pc`` ship as empty strings reserved for a future
+sigaction-driven shape: when a real handler lands, it
+populates them in the dying process before ``_exit()``, peers
+see richer detail with no schema change.
+
+**"Switch project" button on the daemon settings UI + unified
+picker/settings Kivy app.** New ``Switch project`` button in
+the "Current project" row, sibling to Grant collaborator and
+Share-repo-QR. Tapping it navigates to the project picker
+in-process — no Intent, no Activity transition — and the
+picker's submit handler stamps the new langcode via
+``set_last_project`` and navigates back to settings.
+
+The unification: the server APK used to run two separate
+Kivy Apps (``CollabUIApp`` for settings, ``PickerApp`` for the
+picker), one chosen at startup from the launching Intent
+action. With ``PythonActivity`` being ``singleTask`` (p4a
+default), firing PICK_PROJECT on ourselves wouldn't spawn a
+fresh Activity — Android would route through
+``onNewIntent`` on the existing one. So the only path to an
+in-process switch is one Kivy App that hosts both screen
+sets. ``PickerApp`` (which already had ``SettingsScreen`` as
+a sibling for the picker → gear → settings flow) is the
+unified home; ``server_apk/main.py`` always invokes it now,
+passing ``launch_mode='external'`` for PICK_PROJECT Intents
+(existing peer-driven behaviour, picker is initial screen,
+submit fires setResult/finish) or ``launch_mode='internal'``
+otherwise (settings is initial screen, picker submit writes
+``last_project`` + navigates back to settings).
+
+``_navigate_back`` branches on ``_launch_mode``:
+- external: existing behaviour (back from picker exits the
+  Activity with setResult, etc.).
+- internal: back from settings returns False so Android
+  closes the Activity (matching pre-0.41.22 ``CollabUIApp``
+  semantics); back from picker / langpicker navigates to
+  settings instead of finishing the Activity.
+
+``PickerApp.on_resume`` added: refreshes the active screen
+when the Activity comes back to the foreground.
+
+**Pairs with the peer-side ``CLIENT_INTEGRATION.md`` § 14a
+contract.** The daemon-side button is a no-op for the peer's
+loaded view until peers ship the ``App.on_resume`` ↔
+``last_project()`` reconciliation hook documented there. Ship
+the daemon button now; peers adopt the on_resume hook in
+their next release; the UX is coherent end-to-end at that
+point. Mismatched timing degrades gracefully — the user
+lands back on the previous project (the old pre-button
+behaviour), nothing destructive.
+
+**Diagnostic log section follows the same binary-toggle
+pattern.** The single ``Save daemon log to file`` /
+``Stop saving daemon log`` button is replaced by a row reading
+``Log server activity:`` followed by two side-by-side buttons
+— ``yes`` and ``no`` — with the active state highlighted in
+the GREEN accent. Status line underneath is preserved (it
+shows the log file path / "log capture is off" / byte count
+on screen entry). Share + Email buttons below stay disabled
+while logging is off and re-enable once the user picks
+``yes``. Same convention as the wordlist row, the language
+selector, etc.
+
+**Daemon settings UI exposes the toggle.** New section on the
+SettingsScreen, between "Refresh Status" and "Diagnostic log".
+Section label reads ``Wordlist ({name}) images`` where
+``{name}`` is the active project's wordlist (derived from the
+image-repo slug — ``kent-rasmussen/images_CAWL`` →
+``CAWL`` — via the new ``cawl.wordlist_name`` helper). Row
+underneath reads ``Cache images:`` followed by two side-by-
+side buttons — ``1 per line`` and ``all`` — with the active
+mode highlighted in the GREEN accent (matching the language-
+selector row's convention). Label updates on each
+``refresh()`` so switching projects between visits to the
+SettingsScreen renames the section to match.
+
+**``cache_status`` cached count capped at ``requested`` in
+offline-skipped state.** The walk-count fallback I introduced
+this release (so an offline boot with prior cache shows e.g.
+"1247 / 3000 (offline)" instead of "0 / 3000") counts every
+file in the on-disk cache directory, which accumulates across
+working sets and past sessions. Peer-reported case had the
+disk holding 2220 files while the current ``requested`` was
+1661, producing a "cache warm: 2220/1661" banner that tripped
+peer-side "fully warm, hide and stop polling" logic and
+looked like a daemon accounting bug. ``cache_status`` now
+returns ``min(walk_image_count, requested)`` in the
+offline-skipped branch; the active and circuit_open branches
+were already accurate.
+
+**jnius pre-warm at server-APK startup (main thread).** A
+tombstone caught during the intermittent ``:provider`` crash
+showed ``art::JNI::CallObjectMethodA`` SEGV at NULL on
+``Thread-4`` (an unnamed Python-spawned thread, NOT our
+prefetch worker). Two daemon-side helpers — ``paths.azt_home``
+and ``store._autodetect_device_name`` — do their first jnius
+work lazily on whichever thread happens to need the value
+first. Python-spawned threads attach to the JVM via
+pyjnius's auto-attach with the bootclassloader; first-time
+``CallObjectMethodA`` on app-context fields from those
+threads is the leading suspect for the NULL deref (per the
+0.33.x classloader-attach precedent).
+
+``server_apk/main.py`` now calls ``azt_home()`` and
+``get_device_name()`` once on the main thread, immediately
+after ``install_callbacks``. Both then serve from cached
+state (process memory / config.json) for every subsequent
+caller on any thread — no JNI dispatch from background
+workers needed.
+
+**Named all unnamed daemon-side worker threads.** The
+``Thread-4`` in the tombstone could have been any of several
+unnamed ``threading.Thread`` / ``threading.Timer`` spawns in
+the daemon. Naming them lets the next crash backtrace
+identify the worker directly:
+
+- ``sync-fire-<langcode>`` (Timer / immediate sync workers
+  in ``scheduler.py``)
+- ``gh-device-flow-<id>`` (GitHub device-flow OAuth polling)
+- ``clone-<id>`` (clone-job worker)
+- ``httpd-shutdown`` (graceful loopback HTTP shutdown)
+
+The CAWL prefetch worker was already named.
+
+**``start_prefetch`` no longer spawns a second worker while
+one is already running.** Pre-fix: a different ``requested``
+count between calls would replace the state dict and start a
+new thread; the old worker kept iterating and writing to the
+new dict via ``_prefetch_state.get(repo)``. With Stage A
+shipping ``auto_prefetch`` from every ``_touch_project``
+*and* pre-Stage-B peers still POSTing their own
+``cawl_prefetch`` working set, two workers regularly arrived
+on overlapping timelines — both doing urllib/SSL fetches +
+jnius-cached class work simultaneously. Leading suspect for
+a NULL-deref SIGSEGV in the daemon's ``:provider`` process
+~2 s after the second prefetch POST.
+
+New behaviour: if an unfinished worker exists for the repo,
+``start_prefetch`` returns its state and does NOT start
+another. Different repos still proceed independently
+(``_prefetch_state`` is repo-keyed). The peer's working
+subset of a daemon-warmed full index will see its targets
+populated by the running worker — no semantic loss.
+
+**Bootstrap self-update no longer proposes installing an older
+release over a locally-installed newer build.** The probe used
+``needs_update = version_newer OR digest_changed OR mandatory``,
+where ``digest_changed`` would trip on any GitHub-side asset
+change. When a developer adb-sideloads a version newer than the
+latest published tag and then any GitHub release publishes a
+new digest, the probe would propose downgrading. New
+``local_newer`` gate suppresses ``digest_changed`` when the
+installed version is strictly above the latest tag. ``mandatory``
+overrides remain unchanged — server-told-too-old still prompts
+regardless. Diagnostic ``[bootstrap] _probe`` log line now
+includes the ``local_newer`` boolean.
+
+**Server APK no longer ships maintainer scripts.** The
+``source.include_exts = py`` glob was sweeping two
+maintainer-only Python files into ``classes.dex`` /
+``private.tar``:
+
+- ``server_apk/test_install.py`` — desktop integration
+  smoke-test for the kill-recovery flow; sibling to
+  ``test_install.sh``.
+- ``azt_collabd/data/cawl/generate_seed.py`` — script that
+  regenerates the bundled CAWL index JSON from GitHub at
+  release-cut time.
+
+Neither has any runtime role; both are now in
+``source.exclude_patterns`` so they stay out of the APK.
+
+**``[first-try]`` probe suppressed for cache_status polls.**
+The always-on first-try diagnostic probes added in 0.41.16
+were valuable for the no-adb field tester but emitted two
+lines per cache_status poll at 1 Hz — pure noise on a normal
+session. Transport now suppresses the probe when
+``path.endswith('/cawl/cache_status')``. "First-try"
+semantically doesn't apply to the Nth call of a polling
+loop; all other RPC calls remain fully instrumented.
+
+**Docs reorg — NOTES_TO_DAEMON.md is a live queue only.** The
+two "standing notice" items that had accumulated there are
+promoted to canonical homes:
+
+- "Daemon is the sole authoritative source" (daemon-owned
+  state table + four daemon obligations) → ``CLAUDE.md`` hard
+  rule #8 + new "Daemon-owned state" section. It's an
+  architectural invariant the client architecture depends on;
+  ``CLAUDE.md`` is the right shelf.
+- "Project-bound surfaces now in daemon UI (Phase 3)" →
+  ``CLIENT_INTEGRATION.md`` § 12b "Project-bound actions live
+  in the daemon settings UI", with the Phase-1 / Phase-3
+  sequencing constraint preserved. It's peer-facing direction;
+  the contract is the right shelf.
+
+NOTES preamble tightened to call out the antipattern
+explicitly: standing rules belong in ``CLAUDE.md`` /
+``CLIENT_INTEGRATION.md``, not in the queue file. Otherwise
+the queue silently turns into a reference shelf and stops
+being a queue.
+
+---
+
+Two coupled bugs surfaced when testing the picker's "Scan QR"
+affordance against the 0.41.20 server APK. The first masked the
+second; both had to be fixed to make the button work.
+
+Two coupled bugs surfaced when testing the picker's "Scan QR"
+affordance against the 0.41.20 server APK. The first masked the
+second; both had to be fixed to make the button work.
+
+**1. Autoclass path corrected** in
+``azt_collab_client/ui/qr_scan.py``. Was
+``com.journeyapps.barcodescanner.IntentIntegrator``; the class
+actually lives at
+``com.google.zxing.integration.android.IntentIntegrator`` — the
+journeyapps AAR re-ships ZXing's original IntentIntegrator at its
+historical package path even though the rest of the library is
+under ``com.journeyapps.barcodescanner``. Module docstring updated
+to call out the mismatch.
+
+**2. AndroidX transitive deps listed explicitly** in
+``server_apk/buildozer.spec.tmpl``. The zxing-android-embedded
+4.3.0 POM declares its AndroidX deps (fragment, appcompat) as
+``implementation`` rather than ``api``, so Gradle uses them to
+compile the AAR's own classes but does NOT propagate them to the
+consuming APK's classes.dex. Result: the journeyapps classes
+reference ``androidx.fragment.app.Fragment`` /
+``FragmentActivity`` / ``AppCompatActivity`` but the Android
+verifier can't resolve those references at class-load time, and
+``autoclass(...IntentIntegrator)`` raises
+``NoClassDefFoundError: Landroidx/fragment/app/Fragment;`` even
+with the autoclass path fix in (1).
+
+New ``android.gradle_dependencies``:
+
+```
+com.journeyapps:zxing-android-embedded:4.3.0,
+androidx.appcompat:appcompat:1.6.1,
+androidx.fragment:fragment:1.6.2,
+org.jetbrains.kotlin:kotlin-stdlib:1.8.20,
+org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.20,
+org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.20
+```
+
+Listing appcompat + fragment explicitly forces Gradle to pull them
+into the project classpath, so the dex actually carries the
+``Landroidx/...`` implementations the journeyapps code references.
+
+The three kotlin-stdlib pins resolve a transitive-version conflict
+that surfaced as ``:checkReleaseDuplicateClasses`` failing with
+``Duplicate class kotlin.collections.jdk8.CollectionsJDK8Kt``:
+``androidx.fragment:1.6.2 → lifecycle-runtime:2.6.2`` pulls
+``kotlin-stdlib:1.8.20`` (the post-merge artifact that already
+ships the JDK7/JDK8 helper classes), while the same lifecycle-
+runtime transitively pulls ``kotlinx-coroutines-android:1.6.4 →
+kotlin-stdlib-jdk{7,8}:1.6.21`` (the pre-merge split artifacts
+that also ship them). Forcing the ``-jdk7`` / ``-jdk8`` resolution
+up to 1.8.20 lands on the empty metadata-only redirect artifacts
+Kotlin started shipping at 1.8 once the split was deprecated, so
+the duplicate-class collision disappears with no functional
+change to anything else in the build.
+
+**Build note.** Re-run ``server_apk/build_buildozer_spec.sh`` to
+regenerate ``buildozer.spec`` from the template after pulling, then
+``buildozer android clean && buildozer android release`` — the dist
+tree caches Gradle resolution, so a clean is required to pick up the
+new dependency list.
+
+**Floor:** no bumps. Server APK rebuild required to ship the fix
+since qr_scan runs inside the picker subprocess hosted by the server
+APK, and the AndroidX deps need to be in *that* APK's dex.
+
 ### azt_collabd 0.41.20 / azt_collab_client 0.41.20 — docs: routing table moves to contract; atomic_open_write note added
 
 Docs-only release closing two long-standing gaps between

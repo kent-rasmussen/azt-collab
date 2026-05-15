@@ -17,7 +17,7 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.41.20"
+__version__ = "0.43.0"
 
 # Floor on the azt_collab_client version this daemon is willing to talk
 # to. Published on /v1/health so the client compares locally and a peer
@@ -60,7 +60,30 @@ __version__ = "0.41.20"
 # requirement) — final test pass for the mandatory-self-update
 # path. Drop back to a real-world floor before any release
 # that ships in the public update channel.
-MIN_CLIENT_VERSION = "0.31.0"
+#
+# 0.41.24 floor: deliberate bump, test scaffolding. Set to the
+# current ``azt_collab_client.__version__`` so a one-sided
+# rebuild (peer rebuilt, server stale, or vice versa) trips
+# the bootstrap install/update popup — the only way to
+# trigger ``install_server_apk_popup`` without uninstalling
+# the server APK. Drop back to a real-world floor before any
+# release that ships in the public update channel.
+#
+# 0.43.0 floor: HARD requirement. 0.43.0 splits commit and push
+# into separate paths: ``commit_project`` (the renamed
+# ``request_sync``) is commit-only, and push is driven by the
+# scheduler's drain loop based on online state +
+# ``sync.post_online_grace_s`` + ``sync.work_offline``. Pre-0.43
+# clients calling ``sync_async`` get routed to the new ``commit``
+# handler transparently (URL alias kept) but their result-handling
+# logic expects ``PUSHED`` codes from that path that will never
+# come — they sit waiting on a pending_push the daemon now drains
+# separately. Forcing the floor flushes the install/update popup so
+# peers rebuild against the client wrapper that understands the
+# split. Also lifts the always-skip-commit-when-offline bug filed
+# in NOTES_TO_DAEMON.md (2026-05-15) — pre-0.43 daemons skip the
+# commit step entirely on offline ``request_sync``.
+MIN_CLIENT_VERSION = "0.43.0"
 
 from . import config
 from . import net
@@ -84,6 +107,7 @@ from .store import save_tokens, get_valid_token
 from .repo import (
     repo_status_summary, init_repo, clone_repo, pull_repo,
     commit_and_push_branch, sync_repo, commit_audio_and_sync,
+    commit_repo, push_repo,
 )
 
 

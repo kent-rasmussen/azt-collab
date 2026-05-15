@@ -1,43 +1,33 @@
 """
-Minimal sister-app demo for the A-Z+T suite.
+Minimal sister-app demo for the A-Z+T suite — read-only daemon
+survey.
 
-What this shows: how a second app on the same device — separate from
-``azt_recorder`` — wires itself into the shared collaboration backend.
+What this shows: everything an app on the same device sees from
+``azt_collabd`` through ``azt_collab_client``. No writes. No
+``register_project``. The daemon's picker and settings UI are
+the canonical places for those — bound to the ``p`` and ``s``
+keys here so you can launch them from the same session.
 
-Flow
-----
-1.  Identify ourselves (so logs / device_flow / commit identity are
-    sensible). The defaults match azt-recorder; override here for
-    illustration.
-2.  Confirm the daemon is reachable (auto-spawn handles "not running
-    yet"; this just prints a hello).
-3.  List the projects already known to the daemon.
-4.  Register a project working tree we already have on disk.
-5.  Stage a small change to the project's working_dir from this app
-    (a tiny LIFT edit), then ask the daemon to sync.
-6.  Poll for the resulting job and print the structured Result.
+Run::
 
-Run it like this (with the recorder's venv on PATH or activated)::
+    python examples/sister_app.py
 
-    python examples/sister_app.py /path/to/some_lift_project
+Then:
+    p ⏎   — open the project picker (daemon UI)
+    s ⏎   — open the daemon settings UI
+    r ⏎   — refresh the survey
+    q ⏎   — quit
 
-The argument is a directory containing a ``.lift`` file. If the dir
-isn't a git repo yet, the script `git init`s it before registering;
-that lets the example work standalone for first-time experimentation.
-
-The example does not write credentials — those come from the recorder's
-``Connect to GitHub`` / GitLab PAT flow. Without credentials configured,
-the sync result will contain ``AUTH_REQUIRED`` (translated as
-"Not connected to GitHub. Go to Setup > Connect to GitHub.").
+If no project has been registered yet, the survey shows the
+daemon's empty state; pressing ``p`` walks you through the
+picker / publish flow exactly the way a real peer would.
 """
 
 import os
 import sys
-import time
 
-# Run cold from anywhere: prepend the project root so azt_collabd /
-# azt_collab_client are importable even when this file is invoked
-# directly (Python's default sys.path[0] is examples/, not the repo).
+# Run cold from anywhere: prepend the project root so
+# azt_collab_client is importable when invoked directly.
 _PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..'))
 if _PROJECT_ROOT not in sys.path:
@@ -45,133 +35,182 @@ if _PROJECT_ROOT not in sys.path:
 
 import azt_collabd
 from azt_collab_client import (
-    Result, S,
     configure as client_configure,
+    check_server_compat,
+    get_contributor,
     get_credentials_status,
+    get_device_name,
+    get_work_offline,
     is_online,
+    last_project,
     list_projects,
     open_project,
-    poll_job,
+    open_server_ui,
+    pick_project,
     project_status,
-    register_project,
-    request_sync,
-    translate_result,
+    MIN_SERVER_VERSION,
+    __version__ as _CLIENT_VERSION,
 )
 
 
-def _ensure_git_repo(working_dir):
-    if os.path.isdir(os.path.join(working_dir, '.git')):
-        return
-    from dulwich import porcelain
-    porcelain.init(working_dir)
+def _h1(text):
+    print()
+    print(text)
+    print('─' * max(40, len(text)))
 
 
-def _find_lift(working_dir):
-    for name in os.listdir(working_dir):
-        if name.endswith('.lift'):
-            return os.path.join(working_dir, name)
-    return None
+def _kv(label, value, indent=2):
+    print(f'{" " * indent}{label:<22} {value}')
 
 
-def _ensure_lift(working_dir, langcode):
-    lift = _find_lift(working_dir)
-    if lift:
-        return lift
-    lift = os.path.join(working_dir, f'{langcode}.lift')
-    with open(lift, 'wb') as f:
-        f.write(
-            b'<?xml version="1.0" encoding="utf-8"?>'
-            b'<lift version="0.13"></lift>'
-        )
-    return lift
+def _yes_no(b):
+    return 'yes' if b else 'no'
 
 
-def _touch_lift(lift_path):
-    """Append a benign annotation so there's always something to commit."""
-    import datetime
-    marker = (f'<!-- sister_app touched at '
-              f'{datetime.datetime.now().isoformat(timespec="seconds")} -->\n')
-    with open(lift_path, 'rb') as f:
-        body = f.read()
-    closing = b'</lift>'
-    if closing in body:
-        body = body.replace(closing, marker.encode() + closing)
+def _print_reachability():
+    _h1('daemon reachability')
+    compat = check_server_compat()
+    _kv('online (cached)', _yes_no(is_online()))
+    _kv('client version', _CLIENT_VERSION)
+    _kv('min server version', MIN_SERVER_VERSION)
+    _kv('server reachable', _yes_no(compat.get('ok')))
+    if compat.get('ok'):
+        _kv('server version', compat.get('server_version', '(unknown)'))
     else:
-        body += marker.encode()
-    with open(lift_path, 'wb') as f:
-        f.write(body)
+        _kv('compat error', compat.get('error', '(none)'))
 
 
-def main(working_dir):
-    working_dir = os.path.abspath(working_dir)
-    if not os.path.isdir(working_dir):
-        sys.exit(f'not a directory: {working_dir}')
+def _print_identity_and_creds():
+    _h1('identity + credentials')
+    contributor = get_contributor() or '(unset)'
+    device = get_device_name() or '(unset)'
+    creds = get_credentials_status() or {}
+    github = creds.get('github') or {}
+    gitlab = creds.get('gitlab') or {}
+    _kv('contributor', contributor)
+    _kv('device_name', device)
+    _kv('credentials host', creds.get('host') or '(none)')
+    _kv('github connected', _yes_no(github.get('connected')))
+    _kv('github confirmed', _yes_no(github.get('confirmed')))
+    _kv('github refresh_broken', _yes_no(github.get('refresh_broken')))
+    _kv('gitlab confirmed', _yes_no(gitlab.get('confirmed')))
 
-    # 1. Identify this app to the backend. Defaults match the recorder;
-    #    override for a real sister app.
+
+def _print_sync_policy():
+    _h1('sync policy (daemon-wide)')
+    _kv('work_offline', _yes_no(get_work_offline()))
+
+
+def _print_projects_summary():
+    _h1('registered projects')
+    projects = list_projects() or []
+    if not projects:
+        _kv('count', 0)
+        print('  (none registered — press p to pick / publish one)')
+        return
+    _kv('count', len(projects))
+    for p in projects:
+        _kv(p.langcode,
+            f'{p.working_dir!r}  remote={p.remote_url or "(none)"}',
+            indent=4)
+
+
+def _print_current_project():
+    _h1('current project (last_project)')
+    langcode = last_project()
+    if not langcode:
+        _kv('langcode', '(none)')
+        print('  (no project loaded yet — press p to pick one)')
+        return
+    _kv('langcode', langcode)
+    proj = open_project(langcode)
+    if proj is None:
+        print('  (daemon does not recognise this langcode — '
+              'projects.json drift)')
+        return
+    _kv('working_dir', proj.working_dir)
+    _kv('lift_path', proj.lift_path)
+    _kv('lift_exists', _yes_no(proj.lift_exists))
+    _kv('remote_url', proj.remote_url or '(none)')
+    _kv('repo_slug', proj.repo_slug or '(default = langcode)')
+    _kv('cawl_image_repo', proj.cawl_image_repo or '(daemon default)')
+    _kv('last_commit', proj.last_commit or '(never)')
+    _kv('last_sync', proj.last_sync or '(never)')
+    status = project_status(langcode)
+    if status is None:
+        print('  (project_status returned None — daemon offline?)')
+        return
+    print()
+    _kv('— project_status —', '')
+    _kv('branch', status.branch or '(none)')
+    _kv('n_changes', status.n_changes)
+    _kv('commits_ahead', status.commits_ahead)
+    _kv('work_offline', _yes_no(status.work_offline))
+    _kv('commit_failure_count', status.commit_failure_count)
+    if status.commit_failure_count:
+        _kv('last_commit_failure_at', status.last_commit_failure_at)
+        _kv('last_commit_error', status.last_commit_error)
+    if status.n_recovered_today:
+        _kv('n_recovered_today', status.n_recovered_today)
+
+
+def _print_survey():
+    _print_reachability()
+    _print_identity_and_creds()
+    _print_sync_policy()
+    _print_projects_summary()
+    _print_current_project()
+    print()
+
+
+def _run_picker():
+    print('opening picker… (close the window when done)')
+    result = pick_project()
+    if not result.get('ok'):
+        print(f'picker: {result.get("error", "(no detail)")}')
+        return
+    print(f'picker selected: {result.get("path")}')
+    print('(the daemon updates last_project on its own; refreshing…)')
+
+
+def _run_settings():
+    print('opening daemon settings UI… (close the window when done)')
+    result = open_server_ui(on_status=lambda s: print(f'  {s}'))
+    if not result.get('ok'):
+        print(f'settings: {result.get("error", "(no detail)")}')
+        if result.get('detail'):
+            print(f'  detail: {result["detail"]}')
+
+
+def main():
+    # 1. Identify ourselves to the backend. Defaults match the
+    #    recorder; override here for illustration.
     azt_collabd.configure(app_slug='azt-sister-app-demo')
     client_configure(app_id='azt-sister-app-demo')
 
-    # 2. Reachability — auto-spawn covers the "no daemon yet" case.
-    print(f'online via daemon: {is_online()}')
-    creds = get_credentials_status()
-    print(f'credentials: host={creds.get("host")} '
-          f'github_connected={creds.get("github", {}).get("connected")}')
+    print('A-Z+T sister-app survey — what the daemon reports.')
+    _print_survey()
 
-    # 3. What's the daemon already tracking?
-    existing = list_projects()
-    print(f'projects already registered: '
-          f'{[p.langcode for p in existing] or "(none)"}')
-
-    # 4. Register the working tree this app cares about.
-    _ensure_git_repo(working_dir)
-    langcode = os.path.basename(os.path.normpath(working_dir)) or 'demo'
-    lift_path = _ensure_lift(working_dir, langcode)
-    proj = register_project(langcode, working_dir, lift_path)
-    print(f'registered: langcode={proj.langcode} working_dir={proj.working_dir}')
-
-    # Sanity: open it back
-    again = open_project(langcode)
-    assert again is not None and again.langcode == langcode
-
-    status = project_status(langcode)
-    print(f'project status: branch={status.branch} '
-          f'remote={status.remote_url or "(none)"} '
-          f'changes={status.n_changes}')
-
-    # 5. Make a tiny edit, then request a sync.
-    # As of azt_collab_client 0.40.0, ``request_sync`` no longer
-    # takes a ``contributor`` argument — the daemon resolves the
-    # commit-author name from its store. Set it once via
-    # ``set_contributor`` (typically through the daemon settings
-    # UI) before running this demo, or the sync will refuse with
-    # ``S.CONTRIBUTOR_UNSET`` (visible via ``poll_job(...)['result']``).
-    _touch_lift(lift_path)
-    job_id = request_sync(langcode)
-    print(f'job_id: {job_id}')
-
-    # 6. Poll for completion.
-    deadline = time.time() + 10.0
-    info = None
-    while time.time() < deadline:
-        info = poll_job(job_id)
-        if info and info['state'] == 'DONE':
-            break
-        time.sleep(0.2)
-    if info is None:
-        sys.exit('job lookup failed')
-    result: Result = info['result']
-    print(f'state: {info["state"]}')
-    print(f'codes: {result.codes() if result else "(none)"}')
-    if result is not None:
-        print('translated:')
-        print(translate_result(result))
-    if result is not None and result.has(S.AUTH_REQUIRED):
-        print('\n(no credentials configured — connect from the recorder '
-              'or `python -m azt_collabd ui`)')
+    while True:
+        try:
+            choice = input('[p]icker  [s]ettings  [r]efresh  [q]uit > ')
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        choice = choice.strip().lower()
+        if choice in ('q', 'quit', 'exit'):
+            return
+        if choice in ('p', 'pick', 'picker'):
+            _run_picker()
+            _print_survey()
+        elif choice in ('s', 'settings'):
+            _run_settings()
+            _print_survey()
+        elif choice in ('', 'r', 'refresh'):
+            _print_survey()
+        else:
+            print(f'unknown: {choice!r}')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        sys.exit(f'usage: {sys.argv[0]} <project-dir>')
-    main(sys.argv[1])
+    main()

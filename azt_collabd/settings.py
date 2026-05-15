@@ -3,14 +3,25 @@ Runtime configuration backed by ``$AZT_HOME/config.json`` (separate
 from azt_collabd.config which holds the static GitHub App identity).
 
 Keys:
-    sync.debounce_ms          — debounce window for request_sync (ms)
+    sync.debounce_ms          — debounce window for commit_project (ms)
     sync.merge_retry_max      — placeholder for the merge driver step
     sync.connectivity_poll_s  — interval for the connectivity watcher (s)
+    sync.post_online_grace_s  — wait this long after an offline→online edge
+                                before the watcher drains pending pushes
+                                (avoids burning the user's MB on a brief
+                                tether they enabled for some other reason)
+    sync.work_offline         — daemon-wide bool. When true, the watcher's
+                                drain is a no-op and the user-initiated
+                                Sync button returns S.WORK_OFFLINE_ENABLED
+                                without attempting any push. Commits still
+                                happen normally; only push is suppressed.
 
 Env-var overrides take precedence at startup:
     AZT_SYNC_DEBOUNCE_MS
     AZT_SYNC_MERGE_RETRY_MAX
     AZT_SYNC_CONNECTIVITY_POLL_S
+    AZT_SYNC_POST_ONLINE_GRACE_S
+    AZT_SYNC_WORK_OFFLINE
 """
 
 import json
@@ -25,11 +36,15 @@ _DEFAULTS = {
     'sync.debounce_ms': 500,
     'sync.merge_retry_max': 3,
     'sync.connectivity_poll_s': 30,
+    'sync.post_online_grace_s': 60,
+    'sync.work_offline': False,
 }
 _ENV_MAP = {
     'sync.debounce_ms': 'AZT_SYNC_DEBOUNCE_MS',
     'sync.merge_retry_max': 'AZT_SYNC_MERGE_RETRY_MAX',
     'sync.connectivity_poll_s': 'AZT_SYNC_CONNECTIVITY_POLL_S',
+    'sync.post_online_grace_s': 'AZT_SYNC_POST_ONLINE_GRACE_S',
+    'sync.work_offline': 'AZT_SYNC_WORK_OFFLINE',
 }
 
 _lock = threading.Lock()
@@ -106,3 +121,18 @@ def merge_retry_max():
 
 def connectivity_poll_s():
     return max(5, int(get('sync.connectivity_poll_s', 30)))
+
+
+def post_online_grace_s():
+    return max(0, int(get('sync.post_online_grace_s', 60)))
+
+
+def work_offline():
+    return bool(get('sync.work_offline', False))
+
+
+def set_work_offline(value: bool):
+    """Persist the work-offline toggle. Triggering an immediate
+    drain on transition OFF is the scheduler's responsibility —
+    this setter just writes the bit."""
+    set_('sync.work_offline', bool(value))

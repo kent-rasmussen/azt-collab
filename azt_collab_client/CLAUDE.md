@@ -47,56 +47,19 @@ into here; this package owns:
    server endpoint instead.
 
 2. **No reading project state from the local filesystem either.**
-   This is a corollary of (1) but worth its own line because the
-   failure mode is silent on desktop and only surfaces on Android.
-   Anything that opens the project's working_dir to inspect it —
-   `dulwich.Repo(working_dir).get_config()` to check
-   `remote.origin.url`, `os.path.exists(os.path.join(working_dir,
-   '.git'))`, walking the audio dir for backup detection, etc. —
-   must instead go through `project_status(langcode)` (or a new
-   server endpoint if the field you need isn't there). Reason: on
-   Android the daemon's working_dir lives in the standalone server
-   APK's private filesDir; peer processes (recorder, viewer, ...)
-   have no UID-level read on it, so any local-filesystem check
-   raises or silently returns the empty/false answer regardless of
-   the actual project state. On desktop both processes share
-   $AZT_HOME and the local check happens to work, which makes this
-   an easy bug to merge without noticing.
-
-   The blast radius is wider than just the misleading warning. Any
-   peer flow that *gates* on a local-filesystem state check (e.g.
-   "only auto-sync if the project has a remote") will silently
-   skip the gated work on Android — symptom: the recorder
-   correctly publishes the repo and the daemon correctly receives
-   commit RPCs, but no `[sync]` / `[sync-rpc]` lines ever appear in
-   logcat because the recorder never asked.
-
-   The recorder's `_project_has_remote()` (`main.py:3865`) is the
-   canonical anti-pattern: it runs `dulwich.Repo(self.recorder.db.dir)`
-   to answer "is this project backed up?", which fails on Android
-   even after a successful publish and falsely shows the
-   "data isn't being backed up" warning. The fix shape (use this
-   pattern verbatim for any similar check):
-
-   ```python
-   def _project_has_remote(self):
-       if not self.recorder:
-           return False
-       langcode = getattr(self, '_current_langcode', '')
-       if not langcode:
-           return False
-       try:
-           from azt_collab_client import project_status
-           ps = project_status(langcode)
-       except Exception:
-           return False
-       return bool(ps and (ps.remote_url or '').strip())
-   ```
-
-   The same shape works for `last_commit` / `last_sync` /
-   `commits_ahead` queries — `project_status` carries them all and
-   the daemon already touches the project as recent on every call,
-   so peers don't have to manually mark recency.
+   Corollary of (1), worth its own line because the failure mode
+   is silent on desktop. On Android the daemon's working_dir lives
+   in the server APK's private filesDir; peer processes have no
+   UID-level read on it. Any `dulwich.Repo(working_dir)` /
+   `os.path.exists(working_dir + '/.git')` / audio-dir walk silently
+   returns false on Android regardless of actual state, so any peer
+   flow gated on such a check (e.g. "only auto-sync if remote exists")
+   silently skips the gated work. On desktop both processes share
+   $AZT_HOME and the local check happens to work — easy to merge
+   without noticing. Go through `project_status(langcode)` instead;
+   it carries `remote_url`, `last_commit`, `last_sync`,
+   `commits_ahead`, and the daemon touches the project as recent
+   on every call.
 
 3. **No `azt_collabd` import.** This package must keep working when
    the daemon is running in a separate process or a different APK.
@@ -134,6 +97,79 @@ into here; this package owns:
      leave it as a no-op; don't add side effects without a reason.
    - `azt_collabd.configure(app_slug=..., client_id=..., collaborator=...)`
      — server-side GitHub App identity (lives in the daemon package).
+
+8. **Daemon is the sole authoritative source for the state listed
+   in "Daemon-owned state" below — no peer-side fallback.** Peers
+   used to keep "just-in-case" mirrors (`peer_pref('vernlang')`,
+   defunct `App.list_projects` that scanned the peer's own sandbox);
+   those are gone, so a wrong/stale/empty daemon answer breaks the
+   user-visible flow with no peer copy to recover from. Client
+   wrappers surface daemon errors as typed errors (`SERVER_ERROR`,
+   typed `Status`) — never synthesize values, never substitute
+   placeholders. See the next section for the table and the four
+   daemon-side obligations that flow from this.
+
+## Daemon-owned state
+
+The daemon owns every field below. The client wraps the
+endpoint, decodes into a typed shape, and surfaces errors —
+nothing more. If a getter returns empty, the peer treats it as
+"user hasn't set it", so a daemon that silently returns empty
+on transient I/O failure manifests as user-visible data loss.
+
+| Field | Endpoint(s) | What breaks on wrong/empty |
+|---|---|---|
+| Project langcode (== LIFT vernlang) | `last_project`, `open_project`, `register_project`, `derive_langcode`, `project_status` | LIFT writes use the wrong `lang=` attribute; `progress_text` reads the wrong field; audio filenames are mis-tagged. |
+| Recent project (`last_project`) | `GET/POST /v1/recent/last_project` | Auto-resume on startup either skips a valid project or resumes a wrong one. |
+| Contributor name | `get_contributor` / `set_contributor` | Commit-issuing endpoints refuse with `CONTRIBUTOR_UNSET`; sync / init blocked. Strict daemon-owned since 0.40.0 (peers no longer pass it on the wire). |
+| Device name (commit author disambiguator) | `GET/POST /v1/config/device_name` | Git commit author email slot falls back to `@unknown` instead of disambiguating multi-device commits. Auto-populates from OS on first read; user-overridable via daemon settings UI. Since 0.40.0. |
+| UI language | `azt_collab_client.i18n.current_language()` / `set_language()` | UI lands on the wrong locale on every launch — no peer-side cache. |
+| Credentials (GitHub/GitLab/host) | `/v1/credentials/*` | Publish/sync silently fails; the peer cannot fall back to a local token store. |
+| Project registry (`working_dir`, `lift_path`, `remote_url`) | `list_projects`, `open_project`, `register_project` | Picker can't find the project; publish has no working_dir to push from. |
+| Repo slug (per-project override) | `Project.repo_slug` via `open_project` / `list_projects` / `project_status`; setter `POST /v1/projects/<lang>/repo_slug` | Override silently degrades to using `langcode` as the repo name. Since 0.39.0. |
+| CAWL image_repo (per-project) | `Project.cawl_image_repo` via `open_project` / `list_projects` / `project_status`; setter `POST /v1/projects/<lang>/cawl_image_repo` | Per-project image-set override silently degrades to the daemon-global default. Since 0.38.0. |
+| Work-offline mode (daemon-wide) | `get_work_offline` / `set_work_offline` (`/v1/config/work_offline`); also mirrored on `project_status.work_offline` | Push gets suppressed silently or run unintentionally on metered data. Since 0.43.0. |
+
+### Daemon obligations (load-bearing)
+
+These four invariants must hold on every release. They're not
+defensive nice-to-haves — the peer no longer has fallbacks for
+when they fail.
+
+1. **No silent empty.** If a getter can't answer (server
+   starting, transient I/O failure), return a clear error — not
+   an empty string. The peer reads empty as "user hasn't set
+   it" and degrades accordingly.
+
+2. **Setter durability.** Every setter that writes to
+   `$AZT_HOME/config.json` (or its Android-CP equivalent) must
+   land on disk before returning OK. Crash-during-write that
+   loses the value surfaces as user-visible data loss.
+
+3. **Project-langcode immutability without a rename RPC.** Peers
+   cache the langcode in-memory as `_current_langcode` for the
+   life of the load. If the daemon changes a project's langcode
+   under a loaded peer (e.g. during a merge), the peer's in-
+   memory copy goes stale and future writes go to the old tag.
+   If rename ever ships, surface it through `rename_project` and
+   notify open peers (or at minimum make the next
+   `project_status` reflect the new value so the peer can
+   refresh on its periodic poll).
+
+4. **Cross-peer convergence.** Setters from one peer must be
+   visible to every other peer's getter within "next RPC" time.
+   The Android ContentProvider gives us this for free today;
+   flagging so a future daemon refactor doesn't accidentally
+   introduce a per-process cache that breaks it.
+
+### When adding a new daemon-owned field
+
+Default placement: daemon-side, accessed by RPC each time. Do
+not invite the peer to cache it. If you add a new row to the
+table above, the client wrapper translates transport failure
+into a typed `Result` per the rules in "Public API surface"
+above; the peer treats the typed error as the answer, not as a
+prompt to synthesize.
 
 ## How the client reaches the daemon
 
@@ -181,65 +217,20 @@ how a freshly-installed server APK gets picked up after a session
 that started with no daemon, and how a client recovers when the APK
 hosting the ContentProvider is killed/uninstalled mid-session.
 
-## Public API surface (what to call from a sister app)
+## Public API surface
 
-All exposed by `azt_collab_client.__all__`. Patterns:
+The full surface peers call into is enumerated in
+`CLIENT_INTEGRATION.md` (§§ 3–17). For someone working inside the
+client, two design rules apply to every wrapper added to
+`azt_collab_client/__init__.py`:
 
-- **Health / version handshake.** Call `check_server_compat()` once
-  at startup — returns `{ok: True, server_version}` or
-  `{ok: False, error: 'server_too_old'|'server_unreachable', ...}`.
-  Subsequent rpc calls do not re-check (compat doesn't drift
-  mid-run). `MIN_SERVER_VERSION` is the floor the client supports.
-- **Connectivity.** `is_online()` asks the server (so all peers
-  share one connectivity oracle).
-- **Settings UI.** `open_server_ui()` spawns the standalone Kivy
-  settings UI on desktop (no-op-ish on Android until the server APK
-  exposes a launcher Intent).
-- **Credentials.** `get_credentials_status()`, `set_collab_host(host)`,
-  `github_app_install_url()`, `github_app_client_id()`,
-  `github_device_flow_start()` / `_status(job_id)`,
-  `save_github_tokens(...)`, `mark_github_app_installed(...)`,
-  `save_gitlab_credentials(...)`, `migrate_from_prefs(prefs_path)`.
-  Tokens are server-owned — these wrappers never return raw tokens.
-- **Projects.** `list_projects()` → `[Project]`,
-  `open_project(langcode)`, `register_project(...)`,
-  `derive_langcode(working_dir, lift_path='')`,
-  `init_project(working_dir, remote_url, branch='main')` → `Result`,
-  `create_project_from_template(vernlang, dest_dir, template_url='')`,
-  `clone_project(remote_url, dest_dir, on_progress=None, ...)` (synchronous;
-  use `clone_project_start` + `clone_project_status` for a
-  Clock-driven progress loop),
-  `project_status(langcode)` → `ProjectStatus | None`.
-  Each `Project` carries a `lift_exists` boolean — the daemon's stat
-  result against the project's LIFT path at API-response time. Peers
-  resolving a `last_project()` / favourite langcode to a `Project`
-  for auto-resume should check `lift_exists` before handing
-  `lift_path` to `LiftHandle`; a False value means the file was
-  deleted out-of-band (user wipe, external rm) and the peer should
-  fall through to the picker rather than crashing on a not-found.
-  The picker's host-side `list_projects()` filters missing entries
-  out automatically.
-- **Sync.** `sync_project(langcode)` blocks; returns `Result`.
-  `request_sync(langcode)` is fire-and-forget (returns a
-  `job_id`, debounced server-side). `poll_job(job_id)` returns
-  `{state, result, ...}` where `state` is
-  `'PENDING' | 'RUNNING' | 'DONE'`. Commit-author identity
-  is daemon-resolved (0.40+): set once via `set_contributor`
-  (typically through the daemon settings UI); peers don't pass
-  it per-call. If unset, the result carries
-  `S.CONTRIBUTOR_UNSET`.
-- **Bookkeeping.** `record_project_sync_time(langcode, timestamp=None)`.
-
-Wrappers must:
-
-- **Always** translate transport failure into a typed return: a
-  `Result` with `Status('SERVER_UNAVAILABLE'|'SERVER_ERROR', {...})`
-  for ops that nominally return `Result`, an empty/None equivalent
-  for ops that return data, never a raw `ServerUnavailable` to the
-  caller (except where documented, e.g. `rpc.call` itself).
-- **Never** raise on transport failure from a query-shaped wrapper.
-  UI code should be able to call `list_projects()` while offline and
-  get `[]`, not an exception.
+- **Translate transport failure into a typed return.** Ops that
+  nominally return `Result` get a `Result` carrying
+  `Status('SERVER_UNAVAILABLE'|'SERVER_ERROR', …)`. Ops that return
+  data get the empty/None equivalent. Never let `ServerUnavailable`
+  reach the caller from a wrapper (except `rpc.call` itself).
+- **Never raise from a query-shaped wrapper.** UI must be able to
+  call `list_projects()` offline and get `[]`, not an exception.
 
 ## When adding a new client API call
 
@@ -259,109 +250,48 @@ accessible in your tree, the daemon-side change has to happen in the
 canonical `azt-collab` repo first — don't try to fake the endpoint
 from inside the client.
 
-## Status codes & translation
+## Status codes
 
-- `azt_collab_client.status` is a **mirror**, not a re-export, of
-  `azt_collabd/status.py`. Adding a code requires editing both.
-- Codes are uppercase strings. Wire format is
-  `{'code': 'PUSHED', 'params': {...}}` per status, and `Result.from_dict({'statuses': [...]})`
-  decodes a list of them.
-- `Result.has(code)`, `Result.has_any(*codes)`, `Result.codes()` are
-  the supported predicates.
-- `translate.tr(msg)` is a module-level wrapper that always delegates
-  to the current `_tr`, useful for KV `#:import` so subsequent
-  `set_translator` calls take effect.
+`azt_collab_client.status` is a **mirror**, not a re-export, of
+`azt_collabd/status.py` — adding a code requires editing both, so
+the client doesn't depend on the daemon package (hard rule #3).
+Wire format is `{'code': 'PUSHED', 'params': {...}}` per status;
+`Result.has(code)` / `Result.has_any(*codes)` / `Result.codes()`
+drive logic. Translation lives in `translate.py` and is the
+*display* path — never substring-match on translated text;
+translations change per locale, codes don't.
 
-### Peer contract: routing on sync results
+The per-code routing table and constant reference live in
+`CLIENT_INTEGRATION.md` § 17.
 
-> **For the conformity contract** — the routing table, code
-> shape for auto-sync vs. user-initiated sync, and the `S.*`
-> constant reference — see `CLIENT_INTEGRATION.md` § 17. This
-> section is the *why*: per-code meanings, the pre-0.34.1
-> anti-pattern this rule closes, and the architectural reason
-> the auto/user distinction lives peer-side.
+### Peer contract: why auto-sync must be silent
 
-**Two contexts, two contracts.** ``sync_project`` /
-``request_sync`` results reach the peer from two different
-triggers and they need different responses. Auto-sync (peer-
-initiated, no gesture: project-select, post-edit debounce,
-background periodic) MUST be silent on configuration-class
-failures because the user is mid-flow doing something else;
-a sync popup / forced settings navigation in that moment
-*derails the flow they're in*, sometimes visibly enough to
-look like project selection itself "failed". User-initiated
-sync (the user tapped Sync) IS the gesture, so it routes to
-whatever fixes the problem — that's what the user asked for.
+> **The routing contract** (per-code rules + code shape) is in
+> `CLIENT_INTEGRATION.md` § 17. This section is the *why*.
 
-The peer is the only party that knows which trigger fired the
-sync — the daemon sees an ``RPC: sync`` and answers truthfully
-either way. So the auto/user distinction has to live on the
-peer side, typically as distinguishing methods (``do_sync()``
-vs. ``_auto_sync_on_load()``).
+`sync_project` / `request_sync` results reach the peer from two
+triggers and need different responses:
 
-**Pre-0.34.1 anti-pattern, fixed by following this contract.**
-Treating every sync failure as a user-facing error in the
-auto-sync path manifested intermittently as "I selected
-project B but ended up back on project A": the auto-sync on
-project-load returned ``NOT_A_REPO``, the peer's error path
-caused the project-load flow to bail / revert / show a dialog
-the user couldn't see while a screen transition was mid-
-animation, and the user landed on whatever project the peer
-had been showing before. Peer-side bug; daemon-side mitigation
-*by contract*. Silent auto-sync failures keep the user in the
-project they actually selected.
+- **Auto-sync** (peer-initiated; project-select, post-edit
+  debounce, background periodic) must be silent on
+  configuration-class failures. The user is mid-flow doing
+  something else; a popup or forced settings navigation derails
+  that flow, sometimes visibly enough to look like project
+  selection itself "failed."
+- **User-initiated sync** (the user tapped Sync) IS the gesture
+  and routes to whatever fixes the problem.
 
-**Per-code meanings:**
+The daemon sees only one shape — `RPC: sync` — so the auto/user
+distinction has to live peer-side as distinguishing methods.
 
-- ``S.NOT_A_REPO`` — project working dir is not a git repo
-  (never published).
-- ``S.NO_REMOTE`` — working dir is a git repo but has no
-  ``remote.origin.url``.
-- ``S.AUTH_REQUIRED`` — no GitHub / GitLab credentials
-  configured for this remote host.
-- ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` /
-  ``S.REPO_NOT_AUTHORIZED`` — credentials present but the
-  GitHub-side install is missing / suspended / doesn't cover
-  this repo. Each carries a ``url`` param pointing at the
-  page that fixes it.
-- ``S.CONTRIBUTOR_UNSET`` — user hasn't entered their display
-  name yet; commit-issuing endpoints refuse rather than
-  fall back to a placeholder (0.40.0 strict-daemon-owned).
-- ``S.JOB_INTERRUPTED`` — async job's worker thread died
-  (daemon respawned mid-job). Transient; retry.
-- ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` — daemon was
-  unreachable or returned a transport-level error. Wrappers
-  translate every transport failure (``ServerUnavailable``,
-  non-``ok`` response) into one of these codes, so peers
-  never see a raw exception from a query-shaped wrapper.
-  Distinct from the config-class codes: there's no user-
-  facing configuration that fixes a daemon that's currently
-  down. Constants exported from
-  ``azt_collab_client.status`` since 0.41.13.
-- ``S.AUTH_REFRESH_STALE`` — the daemon's last attempt to
-  refresh the GitHub access token failed (typically
-  ``incorrect_client_credentials`` from the OAuth endpoint).
-  The current access token is still valid until its 8 h-from-
-  issuance expiry, so sync keeps working in this session —
-  but the refresh path can't mint a replacement, so once the
-  access token expires every authenticated git op will start
-  failing with no user-visible warning unless this code is
-  surfaced. Carries ``params['expires_at']`` (unix timestamp
-  of the access token cliff) so ``translate_status`` can
-  render the relative deadline ("in 47 minutes", "in 3
-  hours") in the toast. Also surfaced via
-  ``get_credentials_status()`` → ``github.refresh_broken`` /
-  ``github.access_token_expires_at`` for peers that want a
-  startup-time banner. Cleared when the user completes a
-  fresh device flow at GitHub Connect (``set_github_tokens``
-  daemon-side, which clears ``refresh_broken`` atomically
-  with the token write).
-
-**Why "status code, not translated string".** Substring-
-matching the translated message
-(``if 'publish' in msg: route_to_settings``) is the
-regression this contract exists to avoid. Translations change
-per locale; codes don't.
+**Pre-0.34.1 anti-pattern, closed by this contract.** Treating
+every sync failure as a user-facing error in the auto-sync path
+manifested as "I selected project B but ended up back on project
+A": auto-sync on project-load returned `NOT_A_REPO`, the peer's
+error path bailed the project-load flow mid-transition, and the
+user landed back on the previously-displayed project. Silent
+auto-sync failures keep the user in the project they actually
+selected.
 
 ## Internationalization (i18n)
 
@@ -400,300 +330,93 @@ i18n.gettext_translation()             # underlying gettext.NullTranslations
 
 ### Peer integration
 
-**Peer with no own catalog** (a small viewer, the standalone picker
-subprocess): nothing to do. The default translator is the client
-catalog; UI strings translate automatically once a language is
-selected from the daemon's settings UI (`open_server_ui()`).
+Peer with no own catalog: nothing to do — the default translator
+is the client catalog. Peer with its own catalog chains via
+gettext's `add_fallback`; the code shape is in
+`CLIENT_INTEGRATION.md` § 6.
 
-**Peer with its own catalog** (the recorder, with `aztrecorder.po`):
-chain via gettext's native `add_fallback` so peer-owned strings
-resolve in the peer catalog and client-owned strings fall through
-to ours. Call `i18n.ensure_mo(...)` first so the peer can ship
-`.po`-only just like the client does — no external `msgfmt` build
-step:
-
-```python
-import gettext
-import azt_collab_client
-from azt_collab_client import i18n as collab_i18n
-
-def set_recorder_language(lang):
-    if lang == 'en':
-        recorder_t = gettext.NullTranslations()
-    else:
-        collab_i18n.ensure_mo(RECORDER_LOCALES, 'aztrecorder', lang)
-        recorder_t = gettext.translation(
-            'aztrecorder', localedir=RECORDER_LOCALES, languages=[lang],
-            fallback=True)
-    collab_i18n.set_language(lang)             # client catalog + persist
-    recorder_t.add_fallback(collab_i18n.gettext_translation())
-    azt_collab_client.set_translator(recorder_t.gettext)
-```
-
-`ensure_mo` writes the `.mo` next to the `.po`. On Android that's
-inside the APK's private filesDir (where p4a extracts Python source
-on first run — writable, so the lazy compile works the same way for
-peers as for the client).
-
-After this, `_(msg)` in recorder code resolves recorder strings
-first, then falls through to the client catalog. No string
-duplication; both catalogs stay single-source.
-
-`translate.tr` *also* has a software fallback in case the host
-forgets `add_fallback`: if `set_translator(host_tr)` is registered
-and `host_tr(msg)` returns `msg` unchanged, `tr` retries via the
-client catalog. So a misconfigured host still gets client strings
-translated for KV-rendered text. Don't rely on this in lieu of
-`add_fallback` — but it makes the failure mode "missing translation
-for client string" instead of "untranslated forever".
+`translate.tr` has a software fallback in case the host forgets
+`add_fallback`: if the host translator returns the msgid unchanged,
+`tr` retries via the client catalog. So a misconfigured host still
+gets client strings translated for KV-rendered text. The failure
+mode becomes "missing translation for client string" instead of
+"untranslated forever" — but rely on `add_fallback` for the
+non-degraded path.
 
 ### Live retranslation
 
-The daemon's settings UI (`python -m azt_collabd ui` /
-`open_server_ui()`) ships a language selector that calls
-`i18n.set_language(code)` and rebuilds its own ScreenManager so KV
-`text: _('...')` bindings re-evaluate.
+The daemon's settings UI calls `i18n.set_language(code)` and
+rebuilds its ScreenManager so KV `text: _('...')` bindings
+re-evaluate. Peers that want to live-retranslate while running
+poll `$AZT_HOME/config.json` mtime on a 1-second `Clock`
+interval and rebuild the relevant screens — pattern lives in
+`azt_collabd/ui/picker_app.py:_check_language_change`. Peers
+that skip the watcher just pick up the persisted language at
+next launch via the auto-init at import.
 
-For peers that want to live-retranslate while running (so a user
-flipping language in a settings subprocess updates the peer's open
-window without restart), poll `$AZT_HOME/config.json` mtime on a
-`Clock.schedule_interval(..., 1.0)` and rebuild the relevant
-screens. Pattern in `azt_collabd/ui/picker_app.py:_check_language_change`:
+### Adding strings / languages
 
-```python
-def _check_language_change(self, _dt):
-    new_mtime = self._get_config_mtime()
-    if new_mtime == self._config_mtime:
-        return
-    self._config_mtime = new_mtime
-    persisted = collab_i18n.language_pref()
-    if persisted == collab_i18n.current_language():
-        return
-    set_recorder_language(persisted)   # the chain shown above
-    # Then rebuild your ScreenManager (clear_widgets + re-add) so
-    # KV `text: _('...')` bindings re-evaluate.
-```
+- New translatable string: wrap in `_(...)` / `tr(...)`, add the
+  msgid to each `locales/<lang>/LC_MESSAGES/azt_collab_client.po`.
+  `_ensure_mo` recompiles `.mo` on mtime, so no `msgfmt` step.
+- New language: create the `.po` (copy `fr/` as template), add the
+  display name to `i18n._DISPLAY_NAMES` if BCP-47 doesn't already
+  cover it. `available_languages()` discovers it on next call.
 
-If a peer doesn't want live retranslation, it can skip the watcher;
-the persisted language is picked up at next launch via the auto-init
-at import.
+## LIFT-file access
 
-### Adding a translation
-
-1. Wrap the user-visible string in `_(...)` (KV) or
-   `azt_collab_client.translate.tr(...)` / `i18n._(...)` (Python).
-2. Add the msgid + translation to the relevant
-   `azt_collab_client/locales/<lang>/LC_MESSAGES/azt_collab_client.po`.
-3. Delete the stale `.mo` next to it (or just edit the `.po` and
-   trust mtime — `_ensure_mo` recompiles whenever the `.mo` is older
-   than the `.po`).
-4. No daemon-side change needed; translations are client-only.
-
-### Adding a new language
-
-1. Create `azt_collab_client/locales/<code>/LC_MESSAGES/azt_collab_client.po`
-   (copy `fr/.../azt_collab_client.po` as a template).
-2. Add the display name to `i18n._DISPLAY_NAMES` if the BCP-47 code
-   isn't already there.
-3. `available_languages()` discovers it on next call; the settings UI
-   adds a button automatically.
-
-## LIFT-file access — peers MUST go through `LiftHandle`
+> **For the conformity contract** — `LiftHandle` /
+> `atomic_open_write` usage code — see `CLIENT_INTEGRATION.md`
+> § 8. This section is the *why*.
 
 The daemon owns the canonical copy of every project's LIFT file
-under `$AZT_HOME/projects/<lang>/<file>.lift`. On the new Android
-model the daemon lives in the standalone server APK
-(`org.atoznback.aztcollab`) and that path is in the server APK's
+under `$AZT_HOME/projects/<lang>/<file>.lift`. On Android the
+daemon lives in the server APK and that path sits inside its
 private `filesDir` — peer packages **cannot** `open()` it (sandbox
-denies; you'll see `[Errno 2] No such file or directory` even when
-the file exists, because the recorder process is `org.atoznback.<peer>`
-and has no UID-level read on `/data/user/0/org.atoznback.aztcollab/`).
+denies; `[Errno 2] No such file or directory` even when the file
+exists, because the peer process has no UID-level read on the
+server APK's filesDir). The provider URI is the only legitimate
+read/write seam.
 
-### URI grants and provider availability are stable across server kills
+**Provider lifetime is stable across server kills.** The server
+APK is pinned by a sticky-bound service (`AZTServiceProviderhost`),
+so the URI grant the picker emits is reachable for as long as the
+receiving Activity is alive — Android scopes the grant to the
+receiver, not the source process. Under memory pressure Android
+may still kill the host; the next peer ContentResolver call
+auto-spawns it via the unconditional ContentProvider contract.
+Detached FDs survive the source kill (kernel-managed inode). Peers
+may safely defer `LiftHandle(uri).open_read()` to a later user
+gesture, and audio FDs may be held across a long recording —
+neither requires the picker to still be in view.
 
-From client 0.20.0 / server APK 0.16.0+, the server APK is pinned by
-a sticky-bound service (`AZTServiceProviderhost`). Picker dismissal
-no longer brings the process down, so the URI grant the picker emits
-in its result Intent is reachable for as long as the receiving
-Activity is alive (Android scopes the grant to the receiver, not to
-the source process). Under memory pressure Android may still kill
-the host; the next peer ContentResolver call (read **or** write)
-auto-spawns it via Android's unconditional ContentProvider contract.
-Detached FDs survive the source kill (kernel-managed inode).
+**Don't cache.** A peer-side cache (download → edit → push back)
+breaks the single-source-of-truth promise. Two peers reading at
+T0 and writing at T1 / T2 race; the later writer clobbers the
+earlier writer's edits and the daemon commits + pushes the
+corrupted state. Read and write through the provider every time;
+`LiftHandle` is cheap.
 
-What this means in practice:
+**The one peer-visible recovery surface** is
+`Result.has(S.JOB_INTERRUPTED)` from `request_sync` + `poll_job`
+— transient, retryable; treat as `S.SERVER_UNAVAILABLE`.
+Synchronous `sync_project` callers never see this code (the
+transport's retry loop absorbs a dead binder mid-call).
 
-- You may safely defer `LiftHandle(uri).open_read()` to a
-  `Clock.schedule_once` callback or any later user gesture. Pre-0.16
-  the source process exited synchronously with the picker, leaving a
-  ~600ms race window before Android cascade-SIGKILL'd the peer.
-- The "no caching" rule still stands. Reopen on every access not
-  because the URI expires (it doesn't, on 0.16+) but because the
-  daemon's copy is the single source of truth and another peer may
-  have written to it.
-- If a peer holds an audio FD across a long user interaction (60-s
-  recording), that's now safe. Pre-0.16 it depended on whether the
-  user re-opened the picker in the meantime.
-- If you observe a peer being SIGKILL'd by `appDiedLocked` and the
-  server APK is 0.16.0+, that's a regression — file it.
+**`atomic_open_write` vs. `open_write`.** Use
+`atomic_open_write` for any LIFT save that may race a sync's
+merge-output write or another peer; the wrapper uses
+sibling-tempfile + `os.replace` on filesystem paths and the
+daemon's two-phase FD + finalize protocol on URIs. Two concurrent
+writes are safe: whichever rename runs last wins, and the
+destination is always a complete copy of one version, never torn.
+`open_write` is the older path-lock-only contract — fine for
+same-process serialization, unsafe for cross-process races.
 
-### The one peer-visible recovery surface: `Result.has(S.JOB_INTERRUPTED)`
+### Audio + image cross-package access
 
-If your peer uses `request_sync` + `poll_job` (the fire-and-forget
-path), you may receive a `JOB_INTERRUPTED` status if the daemon was
-killed mid-job (OOM, kill -9, container restart) and respawned.
-Treat it identically to `S.SERVER_UNAVAILABLE`: transient, retryable.
-Synchronous `sync_project` callers never see this code — a dead
-binder mid-call surfaces as `ServerUnavailable` and the client
-transport's existing retry loop handles it transparently.
-
-```python
-result = poll_job(job_id)['result']
-if result and result.has(S.JOB_INTERRUPTED):
-    # retry the underlying operation; the daemon respawned and
-    # forgot the worker thread that was running this job_id.
-    new_id = request_sync(langcode)
-```
-
-### Don't cache. Use `ContentResolver` every time.
-
-A peer-side cache (download to `<peer>/filesDir/lift_cache/...`,
-edit it, push back) breaks the architecture's promise of a single
-source of truth. Two peers (or the same peer across two sessions)
-that read at T0 and write at T1 / T2 will race; the later writer
-clobbers the earlier writer's edits and the daemon happily commits
-+ pushes the corrupted state. **Read and write through the
-provider every time.**
-
-### `azt_collab_client.LiftHandle`
-
-The picker emits one of two shapes from `pick_project()['path']`:
-
-- **Filesystem path** (desktop, or any platform's open-file flow)
-  → peer uses regular `open(path, 'rb')`.
-- **`content://org.atoznback.aztcollab/<lang>/<file>.lift`** (Android
-  clone / template flow on the new model) → peer must use
-  `ContentResolver.openFileDescriptor(uri, 'r')` then
-  `os.fdopen(detached_fd, 'rb')`.
-
-`LiftHandle` papers over the difference so peer code stays uniform:
-
-```python
-from azt_collab_client import LiftHandle
-from xml.etree import ElementTree
-
-handle = LiftHandle(path_or_uri_from_picker)
-with handle.open_read() as f:
-    tree = ElementTree.parse(f)        # accepts file-like
-...
-with handle.open_write() as f:
-    tree.write(f, encoding='utf-8', xml_declaration=True)
-```
-
-Both `open_read()` and `open_write()` return binary file-likes
-usable as context managers. The picker side adds
-`FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION`
-to the result Intent so the URI grant is in place by the time
-`pick_project()` returns to the peer.
-
-### `atomic_open_write` — when peers need cross-process atomicity
-
-`LiftHandle.atomic_open_write()` (and `MediaHandle`) gives the
-peer an atomic-replace contract on both transports:
-
-- **Filesystem path**: writes a sibling tempfile and renames over
-  the destination via `os.replace`. Peer-process tempfile, peer-
-  process rename.
-- **`content://` URI** (daemon 0.36.0+): buffers bytes in memory
-  and ships them to `POST /v1/projects/<lang>/atomic_commit`. The
-  daemon writes a tempfile in its own process and renames; the
-  write is serialized via `project_lock` against the daemon's
-  own merge-output writes and any concurrent atomic_commit from
-  another peer.
-
-On exception, the destination is untouched in both cases. Two
-concurrent `atomic_open_write` calls on the same destination are
-safe: whichever rename runs last wins, and the destination is
-always a complete copy of one version, never torn.
-
-```python
-from azt_collab_client import LiftHandle
-
-handle = LiftHandle(path_or_uri_from_picker)
-with handle.atomic_open_write() as f:
-    tree.write(f, encoding='utf-8', xml_declaration=True)
-# On clean exit: destination is now the new bytes, atomically.
-# On exception during the with block: destination unchanged.
-```
-
-**When to use which.** Use `atomic_open_write` whenever the
-write needs to be safe against concurrent observers — most LIFT
-writes do, because the daemon's merge-output write can land at
-any moment. `open_write` is the older path-lock-only contract;
-it's safe for same-process serialization but not for cross-process
-races. Pre-0.36.0 the URI form of `atomic_open_write` fell back
-to `open_write` because there was no daemon-side RPC for the
-atomic-rename half of the contract; that gap is closed now and
-peers should prefer `atomic_open_write` for any URI write that
-could race.
-
-**Memory cost on URIs.** The peer holds ~1.33× the file size
-during base64 encoding + send (the request body is base64 inside
-the JSON envelope). For LIFT (≤ tens of MB at worst) this is
-fine. A future chunked-upload endpoint could shrink the working
-set if a much larger payload ever ships.
-
-### Recorder migration checklist
-
-When migrating a peer (the recorder is the first; viewer / future
-peers follow the same pattern):
-
-1. **Replace every `open(lift_path, ...)` site** with
-   ``with LiftHandle(p).open_read()/open_write() as f: ...``.
-   Particularly:
-   - `lift_api.LiftDoc.__init__` — `ElementTree.parse(path)` →
-     `with handle.open_read() as f: ElementTree.parse(f)`.
-   - The save / write-back path — `tree.write(path, ...)` →
-     `with handle.open_write() as f: tree.write(f, ...)`.
-   - Any `Path(lift_path).read_text()` etc.
-2. **Stop trying to compute auxiliary paths from the LIFT path.**
-   On a `content://` URI, ``os.path.dirname`` is meaningless.
-   Audio files / image references / any sibling resources should
-   also be resolved through the provider — either via their own
-   `content://` URIs or via the daemon's audio endpoints. If your
-   recorder branches on `os.path.exists(some_sibling)` keyed on
-   the LIFT path's directory, that branch goes wrong on Android.
-3. **Pass the original `path_or_uri` string to
-   `register_project(...)` / `derive_langcode(...)`** — the
-   daemon's wrappers already accept either shape (the daemon's
-   server-side `derive_langcode` handles relative-URI parsing too;
-   `register_project` stores it as-is in `projects.json`).
-4. **Don't introduce a `local_lift_cache_path` field.** If you find
-   yourself reaching for one, reread "Don't cache" above. The
-   write goes to the daemon's copy via `LiftHandle.open_write()`;
-   that *is* the canonical edit.
-5. **For binary auxiliary files (audio)** that the daemon also
-   serves through the same provider, mirror the same pattern with
-   a `LiftHandle`-equivalent (`LiftHandle` is named for the LIFT
-   case but doesn't validate file content; you can use it for any
-   provider-served file). A future helper `MediaHandle` may
-   formalize the audio case if it sprouts its own concerns.
-
-### What NOT to do
-
-- ❌ `shutil.copy(lift_path, local_cache)` followed by working from
-  the copy. Lost-update guaranteed.
-- ❌ `open(handle.path_or_uri, 'rb')` — the `content://` form is
-  not a filesystem path.
-- ❌ Treating the URI as a file via `pathlib.Path(uri)` then
-  calling its file methods. They'll silently produce nonsense.
-- ❌ Caching results of `LiftHandle(p).open_read()` past the
-  context-manager exit. The handle is cheap; reopen on each access.
-
-### Audio + image cross-package access — shipped
-
-**Daemon side:** `AZTCollabProvider` serves sibling files under the
-same authority as the LIFT URI:
+`AZTCollabProvider` serves sibling files under the same authority
+as the LIFT URI:
 
 ```
 content://org.atoznback.aztcollab/<lang>/audio/<basename>
@@ -701,63 +424,22 @@ content://org.atoznback.aztcollab/<lang>/images/<basename>
 ```
 
 Provider auto-creates `audio/` and `images/` on first write
-(`openFile(mode='w')` mkdir-p's the parent — see
-`azt_collabd/android_cp/service.py:_resolve_path`'s
-`_ALLOWED_MEDIA_DIRS = ('audio', 'images')` whitelist). Both
-audio and images are read+write from peers as of 0.35.2 (0.18.0
-through 0.35.1 gated image writes behind a `PermissionError`
-under an "daemon owns image additions" rule; tracing the history
-showed no concern actually driving that gate, and symmetry with
-audio is cleaner). The picker's result-Intent grant flags
+(whitelist `_ALLOWED_MEDIA_DIRS = ('audio', 'images')` in
+`azt_collabd/android_cp/service.py:_resolve_path`). Both kinds are
+read+write from peers; the picker's result-Intent grant flags
 (`FLAG_GRANT_READ_URI_PERMISSION | FLAG_GRANT_WRITE_URI_PERMISSION`)
 cover same-authority sibling URIs without per-file grants.
 
-**Client side (`azt_collab_client.lift_io`):**
+Client API: `MediaHandle(path_or_uri, kind='audio'|'image')` is a
+`LiftHandle` subclass — the `kind` is a log-line label, not a
+functional gate. `audio_uri_for(lift_path_or_uri, basename)` /
+`image_uri_for(...)` compose the sibling URI / filesystem path so
+callers stay blind to the path-vs-URI distinction.
 
-- `MediaHandle(path_or_uri, kind='audio'|'image')` — `LiftHandle`
-  subclass with a `kind` field used in log lines / error messages
-  only. Both kinds are read+write; the kind label doesn't gate
-  anything functionally.
-- `audio_uri_for(lift_path_or_uri, basename)` /
-  `image_uri_for(lift_path_or_uri, basename)` — compose the sibling
-  URI / filesystem path so callers stay blind to the path-vs-URI
-  distinction.
-
-**Recorder side (1.32.0):**
-
-- `LIFTDatabase.audio_target(basename)` /
-  `LIFTDatabase.image_target(basename)` — thin wrappers over
-  `audio_uri_for` / `image_uri_for`.
-- `LIFTDatabase._resolve_uri_image(href)` pulls a sibling image
-  from the daemon's provider into the peer's image cache dir
-  (`<image_cache_dir>/_uri_images/<href>`) the first time it's
-  rendered, so `AsyncImage` can render by path. Memoised per
-  LIFTDatabase instance.
-- `_start_android_recording` opens an audio URI through
-  `ContentResolver.openFileDescriptor('w')` and hands the Java
-  `FileDescriptor` straight to `MediaRecorder.setOutputFile(fd)`.
-  The pfd is held on `self._record_pfd` until stop+release, then
-  closed (Java owns the FD lifetime — we do *not* `detachFd()`).
-- `play_audio` resolves to `audio_uri_for(...)` on URI projects and
-  uses `MediaPlayer.setDataSource(ctx, Uri.parse(uri))` instead of
-  the path string overload.
-- Image *additions* go through `MediaHandle('content://…/images/<basename>',
-  'image').open_write()` since 0.35.2 — same shape as audio. Pre-0.35.2
-  the peer gated off image writes on URI projects under a now-removed
-  "daemon owns image additions" policy; the URL/cache fallback for
-  displaying images still works the same way (it has its own merits
-  for offline rendering), but the local-copy-into-`images/` step
-  now runs on URI projects too. Two-write race semantics on the
-  illustration ref (LIFT-side update via `LiftHandle.open_write`)
-  mirror audio's pre-existing pattern; binary-conflict resolution
-  on basename collisions surfaces as `non-lift-modify-modify`
-  Conflict per `repo._merge_diverged`.
-
-**Discovery:** no `list_audio` / `list_images` RPCs needed — both
-sets of basenames are already encoded in the LIFT XML (audio in
-`<citation><form>` audiolang text, images in
-`<illustration href=…/>`). If a future admin UI wants directory
-listing, add `/v1/projects/<lang>/list_images` separately.
+No `list_audio` / `list_images` RPCs needed — both sets of
+basenames are already encoded in the LIFT XML itself (audio in
+`<citation><form>` audiolang text, images in `<illustration
+href=…/>`).
 
 ## CAWL image access — architectural rationale
 
@@ -804,28 +486,15 @@ keyed by repo slug — so N projects sharing one image_repo share
 
 ### Why per-project `cawl_image_repo`
 
-CAWL repo selection is a per-project setting, not a daemon-
-global or peer-global one. Different projects can legitimately
-point at different image sets (fork, culturally specific
-imagery, internal mirror). The ``Project`` record carries the
-field; the daemon-global default is fallback.
-
-Resolution precedence:
-
-1. ``Project.cawl_image_repo`` — per-project override.
-2. ``azt_collabd.config.cawl_image_repo()`` — daemon-global
-   fallback. Default
-   ``_CAWL_IMAGE_REPO_DEFAULT`` lives in ``azt_collabd/
-   config.py`` and is the single source of truth for the
-   suite-canonical CAWL repo.
-3. Empty everywhere → daemon serves ``{}`` /
-   ``FileNotFoundError`` without any network call.
-
-The cache layer doesn't know whether the resolved slug came
-from per-project or from the global default. Both paths land
-on the same on-disk cache file when they resolve to the same
-slug — the dedup property is preserved across the
-configuration surface.
+CAWL repo selection is per-project, not daemon-global or
+peer-global. Different projects can legitimately point at
+different image sets (fork, culturally specific imagery, internal
+mirror). Resolution: per-project override → daemon-global default
+(`_CAWL_IMAGE_REPO_DEFAULT` in `azt_collabd/config.py`) → empty
+(daemon serves `{}` / `FileNotFoundError` with no network call).
+The cache layer is slug-keyed and doesn't know which level
+resolved the slug — dedup is preserved across the configuration
+surface.
 
 ### Why we don't bundle the image binaries
 
@@ -844,181 +513,411 @@ decision, not a fresh question.
 
 ### Why the two-stage migration matters
 
-Stage 1 (peer swaps its index fetch for ``cawl_index``) removes
-the user-visible rate-limit symptom (the 403). It feels like
-the migration is done. It isn't — Stage 2 (peer swaps its
-binary fetches for ``CAWLHandle``) is where the architectural
-wins land:
+Stage 1 (peer swaps index fetch for `cawl_index`) removes the
+rate-limit symptom (the 403). It feels like the migration is done.
+It isn't — Stage 2 (peer swaps binary fetches for `CAWLHandle`) is
+where the architectural wins land: cross-peer dedup, surviving
+peer uninstall, removing the per-peer 100–300 MB on-disk cost.
+The contract says both stages because both are needed for the
+architecture to be correct, not just for the surface symptom to
+go away.
 
-- Cross-peer dedup: one cache, N peers reading from it.
-- Survives peer uninstall: the daemon's cache outlives any
-  individual peer.
-- Removes the per-peer 100–300 MB on-disk cost.
+### Why daemon-driven prefetch + offline-aware (0.41.21)
 
-A half-migrated peer (Stage 1 only) loses none of these wins
-to the rate-limit *symptom* — but it still pays the
-architectural cost. The contract says both stages because both
-are needed for the architecture to be correct, not just for
-the surface symptom to go away. ``CLIENT_INTEGRATION.md`` § 10
-spells out the action items + verification.
+The same "daemon owns CAWL state" rule applies to the *trigger*
+for filling the cache, not just the cache itself. Pre-0.41.21 the
+peer iterated its working-set on each project-load and POSTed
+``cawl/prefetch`` — the daemon owned the bytes but the peer owned
+the decision of which bytes to warm and when. Two failure modes
+followed:
 
-### Wire-shape note
+1. **Peer drift.** Each peer picks "one variant per CAWL id" with
+   its own heuristic. Working-sets diverge across peers; the
+   on-disk cache splinters; progress indicators read against an
+   index-image-count baseline the working-set never matches.
+2. **Offline boot spam.** Peer-driven iteration in the old per-
+   image model had its own circuit breaker, but 0.41.11 moved
+   the loop to the daemon's ``_prefetch_worker`` and the peer-
+   side breaker silently stopped applying. An offline boot
+   produced ~1700 ``[cawl] image fetch failed`` lines in
+   ~40 ms intervals.
 
-``Project.cawl_image_repo`` and ``Project.repo_slug`` are
-plain string fields on the project record, returned by every
-``open_project`` / ``project_status`` / ``list_projects``
-response. The client-side ``Project`` dataclass mirrors them
-with empty-string defaults so pre-0.39 daemons that don't emit
-the fields still decode cleanly. No code changes are required
-on the client side to *read* the fields; the setters
-(``set_cawl_image_repo``, ``set_repo_slug``) are documented as
-part of the public API surface in ``CLIENT_INTEGRATION.md``
-§ 11.
+0.41.21 closes both: ``_touch_project`` calls
+``cawl.auto_prefetch(repo)`` (throttled to once per repo per
+30 s) which warms the full index in a background thread.
+``_prefetch_worker`` gates on ``_has_internet()`` at start
+(``skipped_offline=True``) and circuit-breaks after 3
+consecutive failures (``circuit_open=True``). The
+``cache_status`` HTTP response carries both flags so peers
+render an "offline — will resume" badge instead of misleading
+"0 / N" progress.
+
+**Why the scheduler edge fires the retry.** The connectivity
+watcher in ``scheduler._watcher_loop`` was already detecting
+offline → online edges for sync drain. Hooking
+``cawl.on_online_edge()`` into that same edge keeps the
+"recover when network returns" logic in one place — single
+authority for "did connectivity flip?", no second watcher
+polling. Recovery latency = one ``connectivity_poll_s`` poll
+interval, default 30 s.
+
+**Why the peer keeps polling at 1 Hz even while offline.** Two
+reasons. First, the auto-resume path needs the peer's banner
+to observe the next ``cache_status`` response to flip from
+"offline" to live progress; stopping the poll loses that
+observation. Second, after the ``[first-try]`` probe
+suppression for the cache_status path, the per-poll cost is
+in-memory dict lookups on the daemon side and one
+ContentResolver.call on the peer side — well under any
+threshold worth optimising. The "keep polling" choice trades
+a near-zero cost for a UX win.
+
+**Why two-stage migration for the trigger (Stage A / Stage
+B).** Same shape as the original CAWL Stage 1 / Stage 2: Stage
+A is additive on the daemon (auto_prefetch runs, peer's
+explicit ``cawl_prefetch`` still works, no breakage). Stage B
+removes the peer's explicit call once Stage A is widely
+deployed. Peers that strip their POST against a pre-0.41.21
+daemon get a stuck "no prefetch ever fires" — the migration
+checklist in ``CLIENT_INTEGRATION.md`` § 10 calls this out.
+
+## Sync flow: commit / push split — architectural rationale
+
+> **For the conformity contract** — peer-side migration,
+> ``commit_project`` vs. ``sync_project`` routing, work-offline
+> badge rendering — see ``CLIENT_INTEGRATION.md`` § 17b. This
+> section is the *why*.
+
+### Why split commit from push
+
+Pre-0.43 the same RPC (``request_sync`` → ``_run_sync``) did
+both halves. That conflation produced two distinct failure
+modes:
+
+1. **The bug from NOTES_TO_DAEMON.md (2026-05-15).** The
+   debounced path early-returned ``COMMITTED_OFFLINE``
+   when ``_has_internet()`` was False — *without ever calling
+   the commit step*. A field session of swipes piled up dirty
+   files; ``commits_ahead`` stayed at zero while ``n_changes``
+   climbed. The synchronous ``sync_project`` path was unaffected
+   because it didn't have the early return, so the Sync button
+   "worked" while auto-sync silently dropped commits on the
+   floor. The structural fix isn't "move the gate after the
+   commit step" (a one-line repair); it's removing the implied
+   coupling so the two concerns are gated independently.
+
+2. **MB-burning eager push.** Even when the offline-skip bug
+   wasn't biting, every debounced ``request_sync`` attempted a
+   push. A user on metered data who tethered briefly to look up
+   a phone number would burn part of their MB on every queued
+   commit's push — they had no signal that a non-trivial
+   network event was about to happen, and no toggle to stop it.
+
+The 0.43.0 model treats them as the two concerns they are:
+
+- **Commits are peer-driven.** The peer knows which edits
+  cohere ("I just recorded an audio clip and updated the LIFT
+  for the same entry — that's one logical change"). The
+  debounce collapses bursts; the rest is "stage + commit".
+  No network. ``commit_project`` is fire-and-forget from the
+  peer's perspective and never blocks on connectivity.
+- **Push is daemon-driven.** The daemon owns "are we online?"
+  (via the watcher's cached state), "have we been online long
+  enough that this isn't a flicker?" (post-online grace), and
+  "did the user say they're paying for data right now?"
+  (``sync.work_offline``). Peers don't reason about any of
+  this — they read ``project_status.commits_ahead`` and
+  ``project_status.work_offline`` to render a badge.
+
+### Why the post-online grace exists
+
+A user may flip cellular data on briefly for some other
+purpose (look up directions, send one SMS). Without a grace
+period the watcher's first tick after the online edge would
+fire every queued push — exactly the MB-burning surprise we
+want to avoid. The grace is a small social contract: "if
+you're online for a sustained moment, we infer you intended
+to be online and start pushing." Default 60 s; configurable
+via ``sync.post_online_grace_s``.
+
+The grace is **only** for the automatic drain. The user-
+gestured Sync button bypasses the grace — pressing Sync IS
+the gesture that says "yes I'm intentionally online now."
+
+### Why work-offline is a daemon-wide bool
+
+The toggle isn't per-project. A user who's on metered data
+is on metered data for *all* projects they're touching this
+session; a per-project toggle would have them flipping it
+project-by-project before every edit, which defeats the
+point. Daemon-wide also makes the UI obvious — one section
+in the settings screen, one toggle, one piece of state to
+reason about.
+
+Peer-side badges read from ``project_status.work_offline``,
+which carries the daemon-wide bool on every per-project
+status response. The duplication is intentional: peers get
+the badge without a second round-trip.
+
+### Why the Sync button respects the toggle (and what to do instead)
+
+The Sync button refuses with ``S.WORK_OFFLINE_ENABLED`` when
+work-offline is on. The user-flow that fixes this matches
+every other typed-refusal route in the suite: toast + open
+the daemon settings screen where the toggle lives. Pressing
+the toggle OFF fires an immediate drain server-side
+(``drain_pushes_now()``), so the user's next gesture in the
+sync settings is the one that pushes.
+
+The alternative — "Sync button bypasses the toggle as a
+manual escape hatch" — was considered and rejected: the user
+already has that escape hatch (turn off the toggle). Making
+Sync bypass would mean the toggle's effect is unobservable
+from the user's perspective when they press Sync, which is a
+confusing UX. Better to fail with a clear refusal and route
+to the fix.
+
+### Why ``sync_project`` keeps doing commit + push, not push-only
+
+By the time the user taps Sync, ``commit_project`` has been
+firing on every gesture, so there's normally nothing left to
+commit. But the suite has many entry points (recorder, future
+viewer, future tools), and not all of them necessarily call
+``commit_project`` aggressively. A user-gestured "do everything
+now" should be robust to a peer that fell behind on commits.
+``sync_project`` keeping the combined commit+push behavior is
+the belt-and-suspenders: ``commit_project`` is the primary
+commit path, and ``sync_project`` is the rescue.
+
+### Why we don't probe ``_has_internet`` on the hot path
+
+The TCP probe to GitHub costs ~50–200 ms when online and
+up to 6 s when offline (two 3-s timeouts, plus DNS slop).
+Per-commit probing would make ``commit_project`` feel
+sluggish at best and unusable at worst on a flaky cellular
+connection. The scheduler watcher polls once per
+``connectivity_poll_s`` (default 30 s) and parks the result
+in ``_last_online_state``; ``is_online_cached()`` exposes
+that bool to internal callers. The drain reads the cached
+state, not a fresh probe. The user-gestured Sync button is
+the one place where a fresh probe is acceptable — that's a
+deliberate user action, and a 3-second wait is exactly what
+they'd expect from "force a sync now."
+
+## Stuck-commit retry — architectural rationale
+
+> **For the conformity contract** — peer-side handling of
+> ``COMMIT_REPEATEDLY_FAILED`` and the diagnostic-only
+> ``ProjectStatus`` fields — see ``CLIENT_INTEGRATION.md``
+> §§ 17 + 17a. This section is the *why*.
+
+### Why scheduler-driven retry alongside the auto-sync surface
+
+The peer-driven path was sufficient to *report* the alarm —
+each call to ``sync_project`` / ``request_sync`` already
+iterates ``result.statuses`` and would catch
+``COMMIT_REPEATEDLY_FAILED`` whenever the counter hit 2 on a
+peer-initiated attempt. What the peer-driven path can't do is
+*recover* from a transient cause: if commit fails at T0 and the
+user doesn't gesture again until T+5 min, the broken state
+persists silently for those 5 min and accumulates more uncomm-
+itted recordings. The scheduler retry runs in the background
+between user gestures so the daemon takes a second look on its
+own clock.
+
+The counter is shared between the two surfaces. Both increment
+on failure and clear on success via the same helpers in
+``repo.py``. Realistic timelines:
+
+- *Transient cause, scheduler succeeds.* Peer commit fails →
+  count=1. Scheduler retry 30 s later → succeeds → count=0.
+  Next peer commit → succeeds. User never sees the alarm,
+  correctly — there's nothing to alarm about.
+- *Persistent cause.* Peer commit fails → count=1. Scheduler
+  retry → fails → count=2 (alarm lands in the background
+  result, logged not transmitted). Peer commits next → fails
+  → count=3, ``COMMIT_REPEATEDLY_FAILED`` lands on the peer's
+  result. Toast fires.
+
+Compared to no scheduler retry, the user-visible alarm timing
+in the persistent case is the same (next peer gesture). The
+scheduler retry's value is solely in the transient-recovery
+case — it lets the daemon clear a stuck state without bugging
+the user, so we don't raise false alarms on issues that
+self-heal.
+
+### Why no separate peer-side poll surface
+
+An earlier draft of this feature also asked peers to poll
+``project_status`` and synthesize the alarm off
+``commit_failure_count >= 2``, so a foregrounded-idle peer
+would alarm without a gesture. That requirement is gone — the
+counter persists between gestures, so the very next peer-driven
+sync naturally carries the alarm. The polling layer was a
+second source of truth for the same fact (was the count ≥ 2
+when we last polled?) plus a peer-side de-duplication state to
+keep the 1 Hz poll from re-popping the toast every tick. The
+marginal UX gain ("see the alarm while idle and foregrounded")
+didn't justify the second-source-of-truth complexity. The
+``ProjectStatus`` fields stayed for diagnostic surfaces (a
+settings screen showing "last commit error: ...") but the
+alarm flows through ``result.statuses`` only.
+
+### Why exponential backoff (not fixed 1s retry)
+
+The first draft was "wait 1s and retry inside the same
+``commit_audio_and_sync`` call". Two problems:
+
+1. **Transient causes are rare in dulwich.** ``porcelain.commit``
+   essentially only raises on persistent conditions (index
+   corruption, refs problem, disk full, broken repo state). A
+   wait-and-retry-once inside the same call would catch the
+   *vanishingly rare* "index briefly locked by a concurrent
+   read" case at the cost of doubling commit latency on every
+   actual failure. The same-call latency hit is paid every
+   time; the rescue benefit applies maybe once a year.
+
+2. **The retry surface needs to outlive the calling RPC.** The
+   real problem isn't "this commit took 1.1 s instead of 1.0 s";
+   it's "this commit failed and no future commit was even
+   attempted." A second-attempt mechanism that lives inside the
+   originating RPC can't catch a peer that crashed mid-flight,
+   or a daemon process that respawned (sticky-bound service
+   killed by OOM, picker-Activity Python teardown). The scheduler
+   already owns the cross-RPC lifetime; that's the right home.
+
+Doubling backoff (30 s, 60 s, 120 s, … capped at 1 hour) gives
+fast retries for the easy cases (file briefly locked, transient
+disk issue) and tapers to "once an hour" for a genuinely-stuck
+repo — enough to catch self-healing (disk freed, lock
+released, daemon restarted by user) without spamming the log
+forever.
+
+### Why the threshold is 2, not 1 or 3
+
+One failure could be a fluke. Three would be *very* sure but
+delays the user-visible alarm by another poll cycle — the
+recorder may have written hundreds more files by then. Two is
+the smallest count that excludes one-shot transients while
+still firing the alarm fast enough to matter. Same rationale
+as the daemon-side threshold; the peer-side polling shape uses
+the same number for the same reason.
+
+### What this doesn't catch
+
+A daemon that's dead (no process, no scheduler ticks) won't
+retry stuck commits. That's fine — the next peer RPC
+lazy-spawns the daemon (sticky-bound service contract), and
+the spawn runs `scheduler.reconcile_on_startup()` to mark
+in-flight jobs as `JOB_INTERRUPTED`. The drain then resumes on
+the next watcher tick. The retry loop assumes the daemon is
+alive; daemon-resurrection lives elsewhere.
 
 ## Commit identity — architectural rationale
 
-> **For the conformity contract** — what peers must call, hard
-> rules, refusal-status handling — see ``CLIENT_INTEGRATION.md``
-> § 12 (Commit identity). This section is the *why*.
+> **For the conformity contract** — `set_contributor` /
+> `set_device_name` API + refusal-status handling — see
+> `CLIENT_INTEGRATION.md` § 12. This section is the *why*.
 
-The git commit author identity has two slots: NAME (human
-display name, used by GitHub for author-aggregation) and
-EMAIL (a stable per-identity string, used by git tooling for
-disambiguation). As of 0.40.0 the suite uses these as:
+The git commit author identity has two slots used as:
 
-- NAME = the user's display name verbatim. GitHub groups
-  commits by NAME, so one person committing from multiple
-  devices appears as one author in the project's contributor
-  list.
-- EMAIL = ``<safe_name>@<safe_device>``. ``git log
-  --format='%ae'`` differentiates by device when the same
-  human commits from a phone vs. a tablet vs. a laptop. The
-  email is non-routable; it's an identifier, not an address.
+- NAME = the user's display name verbatim. GitHub groups commits
+  by NAME, so one person committing from multiple devices appears
+  as one author in the project's contributor list.
+- EMAIL = `<safe_name>@<safe_device>`. `git log --format='%ae'`
+  differentiates the same human's commits across phone / tablet /
+  laptop. The email is non-routable; it's an identifier.
+
+**Why two fields, not one composed string.** "Marie Dubois
+(tablet)" would seem simpler but conflates two things — GitHub's
+author-aggregation can't group by "Marie Dubois" if some commits
+arrive as "Marie Dubois (tablet)" and others as "Marie Dubois
+(laptop)". Splitting into NAME and EMAIL leverages git's native
+distinction; correct GitHub UX is worth two store fields.
 
 **Why daemon-owned, no peer pass-through.** Pre-0.40 the
-contributor name lived in two places — peers passed it on
-every sync/init RPC, and the daemon also kept a stored
-fallback. The peer's pass-through won by default. That meant
-a user who typed their name in the daemon UI but had a peer
-hard-coding ``contributor='Recorder'`` got commits attributed
-to "Recorder" anyway, with no visible cause. 0.40 removes the
-wire surface entirely (peer wrappers drop the kwarg, daemon
-endpoints ignore body['contributor']) and forces unset state
-to surface explicitly as ``S.CONTRIBUTOR_UNSET`` rather than
-silently substituting a placeholder. Same architectural rule
-as the rest of the per-user state in NOTES_TO_DAEMON.md's
-sole-authoritative-source table.
+contributor name lived in two places — peers passed it on every
+sync/init RPC, and the daemon also kept a stored fallback. The
+peer's pass-through won by default. That meant a user who typed
+their name in the daemon UI but had a peer hard-coding a
+placeholder got commits attributed to the placeholder anyway,
+with no visible cause. 0.40 removes the wire surface entirely
+and forces unset state to surface explicitly as
+`S.CONTRIBUTOR_UNSET` rather than silently substituting. Same
+sole-authoritative-source rule as the rest of the per-user state
+in `NOTES_TO_DAEMON.md`.
 
 **Why device_name auto-populates.** Reading
-``Settings.Global.DEVICE_NAME`` (Android) or
-``socket.gethostname()`` (desktop) on first read gives a
-useful default without forcing the user through a settings
-screen on day one. The OS value is a known label (the user
-named their phone, or the manufacturer slug like
-``"SM-T580"`` is at least diagnosable). User can override via
-the settings UI for clarity / privacy. Empty stored value
-re-triggers detection on next read — a "reset to OS default"
-affordance.
+`Settings.Global.DEVICE_NAME` (Android) or `socket.gethostname()`
+(desktop) on first read gives a useful default without forcing
+the user through settings on day one — the OS value is at least
+diagnosable (user named the phone, or the manufacturer slug like
+`"SM-T580"`). User can override; empty stored value re-triggers
+detection on next read, a "reset to OS default" affordance.
 
-**Why no ``@unknown`` fallback in production.** The
-``unknown-device`` last-resort is the explicit "nothing
-worked" sentinel for the rare case where all autodetect
-probes fail (de-Googled Android with no settings provider, a
-chroot without ``socket.gethostname``). It's visibly a
-placeholder — the same philosophy as removing the
-``'Recorder'`` literal: if the system can't identify the
-device, the commit author should make that obvious, not
-pretend.
-
-**Decision log: why two fields, not one composed string.**
-Storing ``name + device`` as a single user-typed string
-("Marie Dubois (tablet)") would seem simpler but conflates
-two things — and GitHub's author-aggregation can't group by
-"Marie Dubois" if some commits arrive as
-"Marie Dubois (tablet)" and others as "Marie Dubois
-(laptop)". Splitting into NAME and EMAIL leverages git's
-native distinction; the cost is two store fields, the win is
-correct GitHub UX.
+**Why no `@unknown` fallback in production.** The `unknown-device`
+last-resort is the explicit "nothing worked" sentinel for the
+rare case where all autodetect probes fail (de-Googled Android,
+chroot without `socket.gethostname`). It's *visibly* a
+placeholder — same philosophy as removing the `'Recorder'`
+literal: if the system can't identify the device, the commit
+author should make that obvious, not pretend.
 
 ## UI submodule (`azt_collab_client.ui`)
 
 Shared Kivy screens (`LangPickerScreen`, `ProjectPickerScreen`) and
-helpers (`clone_url_popup`). Sister apps register these into their
-own `ScreenManager`. Translations route through
-`azt_collab_client.translate` — call `set_translator(...)` once at
-startup if your host has its own i18n module (the recorder does).
-
-Don't add Kivy imports outside `ui/`; see hard rule #3.
+helpers (`clone_url_popup`). Peers register these into their own
+`ScreenManager`. Translations route through
+`azt_collab_client.translate`; a peer with its own catalog calls
+`set_translator(...)` once at startup. Don't add Kivy imports
+outside `ui/` (hard rule #4).
 
 ### Shared assets — client-first model
 
-Anything *shared in shape* across the suite (gear, sync, share, future
-back/close arrows) lives at
-`azt_collab_client/ui/assets/icons/<name>.png` so every sister app
-that imports the client gets it for free. Resolve via
-`from azt_collab_client.ui import icon_path; icon_path('gear')` — the
-helper returns an absolute path (or `''` if not bundled). Standalone
-subprocess (picker, settings UI) and sister apps cannot use relative
+Anything *shared in shape* across the suite (gear, sync, share)
+lives at `azt_collab_client/ui/assets/icons/<name>.png` so every
+peer that imports the client gets it for free. Resolve via
+`icon_path('gear')` — returns an absolute path. Standalone
+subprocesses (picker, settings UI) and peers can't use relative
 paths; their cwd isn't the host's repo.
 
-Peer-specific icons stay in the peer (the recorder's
-`icons/microphone.png`, `icons/redo.png`, `icons/icon*.png` app-icon
-variants — these have no plausible second consumer and encode
-recorder-specific UX). Peers that want to override a shared icon with
-their own theming pass an explicit override path to whatever consumer
+Peer-specific icons (peer's own app-icon variants, single-consumer
+UX-specific icons) stay in the peer. Peers that want to override a
+shared icon pass an explicit override path to the consumer that
 takes one (e.g. `register_picker_kv(gear_icon=...)`); there is no
 implicit cwd-based search.
 
-When in doubt, **default to client-first**. It's easier to override
-locally later than to deduplicate parallel copies once they've drifted.
-The recorder's KV currently uses relative `'icons/<name>.png'` strings
-that resolve in its own cwd — that's fine, no migration required; the
-client-first rule applies to *new* shared-shape assets and to any
-asset whose move-to-shared is forced by a second consumer.
+When in doubt, **default to client-first**. It's easier to
+override locally later than to deduplicate parallel copies once
+they've drifted. The client-first rule applies to *new*
+shared-shape assets and to any asset whose move-to-shared is
+forced by a second consumer.
 
 ### Share helpers — `share.py`
 
-> **For the conformity contract** — what peers call, signatures,
-> error-handling shape — see ``CLIENT_INTEGRATION.md`` § 14b
-> (Sharing text / email helpers). This section is the *why*.
-
-Three Android Intent dispatches live in
-``azt_collab_client.ui.share``:
-
-- ``share_running_apk`` — share the host APK's own .apk via
-  MediaStore + ``ACTION_SEND``. Generic "share this app"
-  affordance every peer wants.
-- ``share_text`` — share a string via ``ACTION_SEND`` +
-  ``EXTRA_TEXT``. Used by the daemon UI's "Share daemon log"
-  button and any peer that needs a generic text-share affordance.
-- ``email_text`` — open an email composer via
-  ``ACTION_SENDTO`` + ``mailto:`` URI. Restricts the picker to
-  email apps only.
+> **For the conformity contract** — helper signatures —
+> see `CLIENT_INTEGRATION.md` § 14b. This section is the *why*.
 
 **Why centralised.** Each share dispatch is ~30 lines of jnius
-autoclass + Intent construction + error translation. Three
-surfaces would otherwise re-derive the same code (daemon UI,
-recorder status snapshot, future viewer). A peer-side
-divergence would also mean a peer can subtly break the share
-flow without anyone noticing until a user reports "share
-button does nothing on the viewer".
+autoclass + Intent construction + error translation. Multiple
+surfaces (daemon UI log share, peer diagnostic share, future
+viewer) would otherwise re-derive the same code; a peer-side
+divergence breaks the share flow on that peer alone, which is
+hard to notice until a user reports "share button does nothing."
 
-**Why ACTION_SEND vs. ACTION_SENDTO.** ``ACTION_SEND`` opens
-the generic share sheet — every text-handling app accepts
-(email, messaging, cloud-paste, file-saver). ``ACTION_SENDTO``
-with a ``mailto:`` URI scopes the picker to email apps only.
-The "Email log" button uses the latter because the user's
-intent there is specifically "send to a developer"; the
-generic share sheet would clutter with non-email targets the
-user has to navigate past.
+**Why ACTION_SEND vs. ACTION_SENDTO.** `ACTION_SEND` opens the
+generic share sheet — every text-handling app accepts.
+`ACTION_SENDTO` with a `mailto:` URI scopes the picker to email
+apps only. The "Email log" button uses the latter because the
+user's intent is specifically "send to a developer"; the generic
+share sheet would clutter with non-email targets to navigate past.
 
 **Size constraints, not enforced here.** Android Intent extras
-have a practical ~1 MB ceiling per transaction. Callers
-sharing > 256 KB should truncate first. Documented in the
-contract; not asserted in the helper because the helper
-doesn't know the caller's payload semantics (truncate head?
-tail? sample?). The daemon-log producer truncates to last
-256 KB at the source (``_h_get_daemon_log`` in server.py).
+have a practical ~1 MB ceiling per transaction; callers sharing
+> 256 KB should truncate first. Not asserted in the helper
+because the helper doesn't know the caller's payload semantics
+(truncate head? tail? sample?). The daemon-log producer
+truncates at source (`_h_get_daemon_log`).
 
 ### Diagnostic-log capture — `daemon_log_to_file`
 
@@ -1059,245 +958,195 @@ diagnostic-only surface, opt-in.
 
 ### Self-update — `check_for_update`
 
-`azt_collab_client.ui.check_for_update(...)` is a reusable updater
-each suite APK plugs into its settings screen. Identity is fully
-parametric so the same helper serves the server APK and every peer.
-
-**Helper contract.** Spawns a worker thread, marshals callbacks back
-to the Kivy UI thread via `Clock.schedule_once`, and on Android
-downloads + dispatches `ACTION_VIEW` with the
-`application/vnd.android.package-archive` MIME type so the system
-installer takes over. Non-Android hosts get a translated
-"APK install is only available on Android." through `on_error`.
-
-Required args (all keyword-only):
-
-- `repo` — `'owner/repo'` on GitHub. Hits
-  `GET /repos/<owner>/<repo>/releases/latest`.
-- `current_version` — caller's `__version__`; compared as a semver
-  tuple against the release's `tag_name` (`v` / `V` prefix tolerated).
-- `asset_filename` — exact name of the release asset to fetch. Each
-  app names its own (`azt_collab.apk`, `azt_recorder.apk`, …).
-- `on_status` — `callable(str)`; receives translated state strings
-  ("Checking for updates…", "Downloading {pct}%…", "Installing…").
-
-Optional: `on_no_update`, `on_error`, `download_dir` (defaults to
-`$AZT_HOME/updates`).
-
-**Server-APK adapter** (already shipped):
-
-```python
-# azt_collabd/ui/app.py — CollabUIApp.update_app
-from azt_collabd.config import update_repo  # 'kent-rasmussen/azt-collab'
-check_for_update(
-    repo=update_repo(),
-    current_version=azt_collabd.__version__,
-    asset_filename='azt_collab.apk',
-    on_status=self._set_update_msg,
-    on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
-    on_error=self._show_error,
-)
-```
-
-The repo defaults to `kent-rasmussen/azt-collab` and is overridable
-via `azt_collabd.configure(update_repo=...)` or the `AZT_UPDATE_REPO`
-env var, so a fork can ship the same code aimed at a different
-release feed.
-
-**Peer adapter pattern** (recorder, viewer, …):
-
-```python
-# In your App subclass (e.g. CollabApp.update_app for the recorder):
-def update_app(self):
-    from azt_collab_client.ui import check_for_update
-    check_for_update(
-        repo='kent-rasmussen/azt-recorder',   # or your fork
-        current_version=__version__,           # peer's own __version__
-        # asset_filename omitted — derived at runtime from the
-        # peer's own Android package name (e.g. aztrecorder.apk
-        # for org.atoznback.aztrecorder). Pass explicitly only if
-        # the fork publishes under a non-default scheme.
-        on_status=self._set_update_msg,
-        on_no_update=lambda: self._set_update_msg(_('Up to date.')),
-        on_error=self._show_error,
-    )
-```
-
-Wire the button into the peer's settings KV alongside the existing
-"Share this app" affordance — same shape, different `on_release`.
-
-**Manifest cost.** Each APK that exposes the button needs
-`REQUEST_INSTALL_PACKAGES` in `buildozer.spec → android.permissions`.
-Android 8+ also requires the user to flip the per-source
-"Install unknown apps" toggle the first time; the helper detects
-this via `PackageManager.canRequestPackageInstalls()` and routes to
-`Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` so the user lands on the
-right page in one tap.
+`azt_collab_client.ui.check_for_update` is a reusable GitHub-
+Releases-driven updater that every suite APK plugs into its
+settings screen. Identity is fully parametric (`repo`,
+`current_version`, `asset_filename`) so the same helper serves
+the server APK and every peer — no duplicated download/install
+plumbing per app.
 
 **No SHA verification in v1.** TLS to GitHub plus Android's
 signature-match install check (suite keystore enforced everywhere)
-are the integrity layers. A future hardening pass can add a `.sha256`
-companion asset if the release process publishes one.
+are the integrity layers. A future hardening pass can add a
+`.sha256` companion asset if the release process publishes one.
 
 ### Bootstrap — `bootstrap()`
 
 Suite invariant: **the user installs one APK** — the peer they
 opened. The standalone server APK and any subsequent updates are
-provisioned by the peer itself on first run.
+provisioned by the peer itself on first run. `bootstrap()` is the
+single entry point that implements this; the call shape is in
+`CLIENT_INTEGRATION.md` § 3.
 
-`azt_collab_client.ui.bootstrap(...)` is the single entry point that
-implements this. Each peer calls it once, early in startup
-(`App.on_start` is the natural seam). Recommended shape: a thin
-wrapper method on your `App` subclass that supplies identity, and a
-status sink that routes progress strings into your existing logging
-surface:
-
-```python
-# in your App class
-def on_start(self):
-    ...
-    # Schedule for next frame so the UI is up before any popup fires.
-    Clock.schedule_once(lambda dt: self._run_bootstrap(), 0)
-
-def _run_bootstrap(self):
-    # Deferred import keeps bootstrap.py + its Kivy/jnius deps out of
-    # the import graph until the peer actually fires it.
-    from azt_collab_client.ui import bootstrap
-    from appinfo import APP_NAME
-    bootstrap(
-        peer_repo='kent-rasmussen/azt-recorder',
-        peer_version=__version__,
-        # peer_asset_filename omitted — derived at runtime from the
-        # peer's own Android package name.
-        peer_display_name=APP_NAME,
-        on_status=self._log_bootstrap_status,
-        on_done=self._auto_load_last_project,
-        on_error=self._log_bootstrap_status,
-        font_name=_FONT_NAME,
-    )
-
-def _log_bootstrap_status(self, message):
-    """Surface bootstrap progress / errors through the peer's existing
-    in-app status channel. The recorder routes to its collab-screen
-    log; a viewer would route to its equivalent."""
-    print(f'[bootstrap] {message}', file=sys.stderr)
-    try:
-        sm = self.root.ids.sm
-        collab = sm.get_screen('collab')
-        collab._set_log(message)
-    except Exception:
-        pass
-
-def _auto_load_last_project(self):
-    """Wired as bootstrap()'s on_done. Client 0.28.5+ guarantees
-    on_done fires only when the daemon is reachable, so the first
-    daemon-touching RPC needs no defensive try/except."""
-    from azt_collab_client import last_project, open_project
-    langcode = last_project()
-    ...
-```
-
-The recorder (`azt_recorder/main.py: _run_bootstrap`,
-`_log_bootstrap_status`) is the canonical reference for this
-pattern — clone it verbatim and substitute your own
-`peer_repo` / `peer_asset_filename` / `peer_display_name` /
-status-screen lookup.
-
-The helper:
-
-1. Calls `check_server_compat()`. On `server_unreachable` it
-   prompts "Install AZT Collaboration?" and on Yes downloads
-   `azt_collab.apk` from `kent-rasmussen/azt-collab/releases/latest`
-   via `check_for_update`. `server_too_old` shows the matching
-   "Update AZT Collaboration?" prompt. `client_too_old` jumps to
-   step 2.
-2. Probes the peer's own latest release. If newer, prompts
-   "Update <peer name>?" and on Yes downloads + installs the peer's
-   own APK.
-3. Calls `on_done` **only on the healthy path** (server reachable +
-   peer up to date or self-update declined/no-op). Client 0.28.5+
-   contract: the `server_unreachable` / `server_too_old` prompts
-   are terminal and do **not** fire `on_done`; the install popup
-   stays modal until the user installs (or quits), and a fresh
-   bootstrap re-enters from the install-completion chain. So
-   if `on_done` fires, the daemon is reachable — the first RPC
-   wired to `on_done` doesn't need a defensive try/except for
-   "daemon not there yet."
-
-**Buildozer requirement.** The peer's `buildozer.spec` must list
-`REQUEST_INSTALL_PACKAGES` in `android.permissions` so the install
-intent fires. Without it the install silently no-ops. Android 8+
-also requires the user to flip the per-source "Install unknown
-apps" toggle the first time; the underlying `check_for_update`
-detects this and routes to `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES`
-with our package pre-scoped.
-
-**Defaults.** `server_repo` defaults to `kent-rasmussen/azt-collab`
-and `server_asset_filename` defaults to `azt_collab.apk`. A fork
-that ships its own service can override both.
+**Why `on_done` only fires on the healthy path.** The
+`server_unreachable` / `server_too_old` prompts are terminal: the
+install popup is modal (`auto_dismiss=False`) and the user can't
+reach the rest of the peer's UI until they install or quit; a
+fresh bootstrap re-enters from the install-completion chain. So
+if `on_done` fires, the daemon is reachable — peer code wired to
+`on_done` doesn't need a defensive try/except for "daemon not
+there yet." Before 0.28.5 this contract didn't hold and peers
+hand-rolled defensive guards that obscured real bugs.
 
 **Desktop hosts** call `on_done` immediately — there's no APK to
-install, so the bootstrap is a no-op outside Android.
+install, so bootstrap is a no-op outside Android.
 
-## Sister-app integration recap
+## Low-power adaptive policy
 
-> **Canonical client-integration checklist:**
-> [`CLIENT_INTEGRATION.md`](CLIENT_INTEGRATION.md) — the
-> single contract every peer follows. Read that first; this section
-> is the older / shorter overview kept for context.
+> **For the conformity contract** — three rules, the gate-vs-
+> don't-gate inventory, the multi-density splash + diagnostic
+> logging recipe, verification steps — see
+> `CLIENT_INTEGRATION.md` § 18. This section is the *why*.
 
-Setup is symlink-based, not pip-installed. From a sibling app's
-repo root (relative to `azt-collab/`):
+### Why automatic, not user-toggleable
 
-```bash
-for x in azt_collab_client examples android; do
-    ln -s "../azt-collab/$x" "$x"
-done
-# azt_collabd is also symlinked when the sister app embeds the daemon
-# (desktop & legacy Android); on the new Android model it lives in the
-# standalone server APK and is reached via the ContentProvider transport.
+Devices in the field span flagships to 2–3 GB budgets. A
+user-facing "low-power mode" toggle pushes the burden of
+device introspection onto users who don't know (and
+shouldn't have to learn) what `availMem / totalMem` means.
+Android already classifies the device through
+`ActivityManager.MemoryInfo.lowMemory`, `availMem`,
+`totalMem`, and `ConnectivityManager.isActiveNetworkMetered()`.
+Use those signals; let the user steer content and workflow.
 
-# AndroidManifest <queries> block needed on Android 11+ so the peer
-# can see the standalone server APK via PackageManager:
-ln -s ../azt-collab/android/manifest_extras_peer.xml manifest_extras.xml
-```
+The split — *resource decisions automatic, content/workflow
+decisions user-facing* — falls out of one question:
 
-In the peer's `buildozer.spec`:
+> Is this about what the device CAN do, or about what the
+> user WANTS?
 
-```
-android.extra_manifest_xml = %(source.dir)s/manifest_extras.xml
-```
+Image cache size, prefetch eagerness, prewarm gating, poll
+cadence: "can". Gloss-count display, sync-on-swipe: "wants".
+Mixing the two means the user has to think about both, which
+either crashes their budget phone or shows them controls they
+shouldn't care about.
 
-The key is `extra_manifest_xml` — `manifest_extra_xml` (different word
-order) is silently ignored by buildozer.
+### Why build-time work belongs in the build
 
-At startup, before the first client call:
+The anti-pattern we're explicitly rejecting: ship one
+high-resolution asset and ask the device to downscale at
+runtime. PIL-resize the presplash on first boot; regenerate
+density buckets in `App.build`; recompile gettext `.mo` on
+cold start. Each moves work onto the *least capable* devices
+at the *worst possible moment* (splash screen, before Python
+is warm; first-launch when the user is forming their first
+impression).
 
-```python
-import azt_collab_client
-azt_collab_client.configure(app_id='<your-app-id>')
+The discipline:
 
-# i18n: skip this block entirely if you don't have your own catalog —
-# azt_collab_client.i18n auto-applies the persisted UI language on
-# import, so the client catalog Just Works.
-#
-# If you DO have your own catalog (recorder pattern), chain it:
-#   import gettext
-#   from azt_collab_client import i18n as collab_i18n
-#   recorder_t = gettext.translation('aztrecorder', ...)
-#   recorder_t.add_fallback(collab_i18n.gettext_translation())
-#   azt_collab_client.set_translator(recorder_t.gettext)
-# See the "Internationalization (i18n)" section above.
+> The build is the right place to do work that depends on
+> the build artefact. The device is the right place to do
+> work that depends on runtime state.
 
-compat = azt_collab_client.check_server_compat()
-# branch on compat['ok'] / compat['error'] for install / update UX.
-# New error in 0.15.0+: 'client_too_old' — the server requires a
-# newer client than this peer ships. Surface "Please update this app".
-```
+Density buckets, gettext compilation, CAWL pre-rendering —
+all build-artefact-dependent. They belong in the build (or,
+for CAWL, in the daemon, which is the suite's "build for
+runtime data"). The device handles the runtime-state work:
+which project is loaded, which language the user just
+selected, which audio file was just recorded.
 
-If the sister app embeds the daemon (i.e., has a sibling
-`azt_collabd/` symlink), it should also call
-`azt_collabd.configure(app_slug=..., client_id=..., collaborator=...)`
-and, on Android,
-`azt_collabd.android_cp.service.install_callbacks()` in its startup
-hook (no-op on desktop).
+Same logic forbids "regenerate the CAWL cache from a tarball
+on first launch" (the daemon already ships it, pre-rendered)
+and "recompute the Charis SIL fallback on every cold start"
+(the `.mo` files are pre-bundled). When a tempting
+implementation has the shape "do build-artefact work at
+runtime on each device", the cost is exactly the
+distribution of work it implies — N devices × the per-device
+cost — and the build is doing it once.
+
+### Why `lowpower` helpers belong in the client, not each peer
+
+The JNI plumbing for `ActivityManager.MemoryInfo` and
+`ConnectivityManager.isActiveNetworkMetered()` plus the
+thresholds (`< 0.15` of total memory, `≤ 3072 MB` total, etc.)
+would drift between peer codebases if each peer re-derived
+them. `azt_collab_client.lowpower` (shipped 0.41.21) is the
+single source of truth: one tested jnius dance, one set of
+threshold constants overridable per peer if field data
+motivates. The diagnostic recipe (`identify_drawable_variant`
+/ `log_presplash_variant`) also lives here so a future
+correction (the kind that already happened to the first-pass
+`Drawable.getIntrinsicWidth/Height()` and
+`BitmapDrawable.getBitmap().getDensity()` recipes) ships in
+one place rather than waiting for N peers to update
+independently.
+
+### Why we sized the suite's presplash baseline at mdpi 320×533
+
+Android's resource resolver picks the bucket whose qualifier
+matches the device's `densityDpi`. For physical-size
+consistency across the suite, all peers + the server APK use
+mdpi 320×533 as the 1.0× baseline; bucket sizes scale by
+the standard Android factors (ldpi 0.75×, hdpi 1.5×,
+xhdpi 2×, xxhdpi 3×, xxxhdpi 4×). xxhdpi (the most common
+modern phone bucket) thus lands at 960×1599, matching the
+diagnostic line peers log at startup. A suite-wide baseline
+keeps splash visual sizing predictable across the recorder /
+viewer / server-APK boundary.
+
+## Project-switch reconciliation
+
+> **For the conformity contract** — when peers MUST reload,
+> exact ``on_resume`` shape, what comparison to make — see
+> `CLIENT_INTEGRATION.md` § 14a. This section is the *why*.
+
+The daemon owns ``last_project()`` (see "Daemon-owned state"
+above). Any RPC path that mutates a project's identity in a
+user-visible way — picker submission, future rename, future
+delete-then-pick-next — writes the new langcode to
+``$AZT_HOME/config.json :: recent.last_langcode`` server-side.
+Peers polling ``last_project()`` get the authoritative answer.
+
+What the daemon CANNOT do: push that change to the peer's
+loaded UI. The peer's view is built from the LIFT bytes plus
+peer-side caches (entry list, scroll position, open panels,
+filter state); only the peer can tear that down and rebuild
+against the new project's bytes. There's no Android channel
+the daemon can use to invoke a method on a Kivy App that
+happens to be in the background.
+
+So the contract has to live peer-side. The peer's `on_resume`
+is the natural hook: Android raises it whenever the peer
+Activity comes back to the foreground after another Activity
+(picker, daemon settings UI, other app) took focus. The peer
+reads `last_project()`, compares to its in-memory
+`_current_langcode`, and reloads if they differ. Same code
+path as the initial project-load; just a different trigger.
+
+### Why not poll on every cache_status tick
+
+The cache_status banner already polls at 1 Hz. Adding "and
+also reconcile project langcode" to that tick would work
+mechanically, but the user-facing "switch happened" gesture
+is bounded by Activity lifecycle — Android suspends the
+peer when another Activity takes the foreground, resumes
+when it leaves. Hooking lifecycle is cheaper than polling,
+and the daemon-side state is consistent by the time
+on_resume fires (the picker exit + last_project write are
+both on the picker Activity's main thread, completing
+before the picker finishes).
+
+A misbehaving peer that polls works too, just with more
+wakeups. on_resume is the *right* hook; polling is the
+permissible degradation.
+
+### Why the two-stage migration (peer contract first, daemon
+button second)
+
+Same shape as CAWL Stage A / Stage B. Until peers ship the
+``on_resume`` hook, a daemon-side "Switch project" button
+silently fails to take effect on resume — user lands back in
+the previous project. Documenting the contract first lets
+peer maintainers adopt the hook in their next release; the
+daemon-side button lights up cleanly once enough peers are
+on the new contract.
+
+Peers that miss the contract get exactly the old behaviour —
+the button is a no-op on resume but not destructive. The
+daemon doesn't lose data; the user just sees the previous
+project and learns to launch the picker the old way.
+
+## Sister-app integration
+
+See [`CLIENT_INTEGRATION.md`](CLIENT_INTEGRATION.md) — the single
+contract every peer follows.

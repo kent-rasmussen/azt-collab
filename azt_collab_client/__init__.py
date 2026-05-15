@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.41.20"
+__version__ = "0.43.0"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -147,7 +147,25 @@ __version__ = "0.41.20"
 # a pre-0.34 daemon will lose two-device sync silently after the
 # first race; the floor forces the user to update the server APK
 # before the peer will attempt a sync at all.
-MIN_SERVER_VERSION = "0.36.0"
+# 0.43.0 floor: HARD requirement. 0.43.0 daemons expose the new
+# ``commit_project`` (commit-only) RPC and own all push timing via
+# the scheduler's drain loop. Pre-0.43 daemons skip the commit
+# step entirely while offline (the bug filed in NOTES_TO_DAEMON.md
+# 2026-05-15) — a 0.43 peer running against a pre-0.43 daemon
+# would still lose offline commits. Also adds the
+# ``sync.work_offline`` toggle and ``S.WORK_OFFLINE_ENABLED``
+# status code; a 0.43 client paired with an older daemon would
+# render the work-offline UI but the toggle would have no effect.
+MIN_SERVER_VERSION = "0.43.0"
+# 0.41.24 floor: deliberate bump, test scaffolding to force the
+# bootstrap install/update popup to fire when one side is rebuilt
+# and the other isn't. Set to the current ``azt_collabd.__version__``
+# so a peer rebuilt at 0.41.24 calling a server still at 0.41.23
+# (or earlier) trips ``server_too_old`` in ``check_server_compat``
+# and ``install_server_apk_popup`` renders the "Update {name}?"
+# flavour. Drop back to a real-world floor (matching what we
+# actually require for correctness) before any release that ships
+# in the public update channel.
 # Public release page for the server APK. Tapping "Open install
 # page" in ``install_server_apk_popup`` opens this URL in the
 # browser so the user can read release notes / browse the project
@@ -276,6 +294,14 @@ def _open_server_ui_android(on_status):
         return {'ok': False, 'error': 'server_apk_not_installed',
                 'prompted': True}
     try:
+        # Tag the launch so the server APK can distinguish "peer
+        # opened me to expose settings" from "user tapped my
+        # launcher icon" — the former gets an unobtrusive
+        # update-available badge (peer already runs its own boot
+        # update flow against the server), the latter gets a
+        # popup-on-boot prompt (the user-direct launch path
+        # otherwise has no occasion to learn about updates).
+        intent.putExtra('azt_launch_source', 'peer')
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         ctx.startActivity(intent)
     except Exception as ex:
@@ -837,6 +863,37 @@ def set_device_name(name):
         pass
 
 
+def get_cawl_prefetch_all_variants():
+    """Read the daemon's CAWL prefetch policy.
+
+    Returns False (default) when the daemon warms one image
+    per CAWL id (the file whose basename contains ``__``).
+    Returns True when the daemon warms every image-shaped
+    index entry. False on RPC failure — matches the default
+    so peers reading this for display don't flip-flop on a
+    transient error."""
+    try:
+        resp = call('GET', '/v1/config/cawl_prefetch_all_variants')
+    except ServerUnavailable:
+        return False
+    if not resp.get('ok'):
+        return False
+    return bool(resp.get('enabled', False))
+
+
+def set_cawl_prefetch_all_variants(enabled):
+    """Persist the daemon's CAWL prefetch policy. The change
+    takes effect on the next ``auto_prefetch`` trigger (next
+    project-load, scheduler-edge retry, etc.) — flipping
+    doesn't retroactively re-warm an in-flight worker.
+    Best-effort: silently no-ops on transport failure."""
+    try:
+        call('POST', '/v1/config/cawl_prefetch_all_variants',
+             {'enabled': bool(enabled)})
+    except ServerUnavailable:
+        pass
+
+
 def get_server_ui_language():
     """Return the daemon-side persisted UI language (BCP-47 code,
     e.g. ``'fr'``) or ``''`` on RPC failure.
@@ -1241,14 +1298,28 @@ def project_status(langcode):
 
 
 def sync_project(langcode):
-    """Synchronous sync. Returns Result. Blocks until the server's
-    sync pass returns. Use ``request_sync`` for fire-and-forget
-    edits where the UI doesn't wait.
+    """Synchronous sync — the user-gestured "push pending commits
+    now" bump. Returns Result. Blocks until the server's drain
+    pass returns.
+
+    Sync button surface: peers usually display a status badge
+    (commits_ahead, work_offline) from ``project_status`` and call
+    this only when the user taps the badge. Per-edit commits go
+    through ``commit_project`` instead, which doesn't block on the
+    network.
+
+    Typed refusals the peer routes:
+        S.WORK_OFFLINE_ENABLED  → toast + open_server_ui() to the
+                                  sync settings screen (since
+                                  0.43.0). Auto-sync paths never
+                                  see this code because they go
+                                  through ``commit_project``.
+        S.CONTRIBUTOR_UNSET     → toast + open_server_ui() to set
+                                  the user's name.
+        S.AUTH_REQUIRED         → route to the credentials screen.
 
     As of 0.40.0 ``contributor`` is no longer a parameter — the
-    daemon uses its store-resident contributor name. If unset,
-    the daemon refuses with ``S.CONTRIBUTOR_UNSET`` (route the
-    user to the daemon settings UI via ``open_server_ui()``)."""
+    daemon uses its store-resident contributor name."""
     try:
         resp = call('POST', f'/v1/projects/{langcode}/sync', {})
     except ServerUnavailable as ex:
@@ -1260,37 +1331,87 @@ def sync_project(langcode):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
-def request_sync(langcode):
-    """Schedule a debounced sync server-side. Returns a job_id (str)
-    or None on transport failure. Multiple calls within the debounce
-    window collapse into one run; the server commits and pushes once.
+def commit_project(langcode):
+    """Schedule a debounced *commit* server-side. Returns a
+    job_id (str) or None on transport failure. Multiple calls
+    within the debounce window collapse into one commit.
 
-    As of 0.40.0 ``contributor`` is no longer a parameter — the
-    daemon uses its store-resident name. If the name is unset, the
-    enqueued job runs and refuses with ``S.CONTRIBUTOR_UNSET`` at
-    exec time; peers see the refusal via ``poll_job(job_id)`` in
-    the normal result shape (same as any other terminal status).
-    Route the user to set their name via ``open_server_ui()``
-    when ``CONTRIBUTOR_UNSET`` appears in a polled result."""
+    Since 0.43.0 the commit and push halves are split: this
+    endpoint commits only. Push is driven by the daemon's
+    connectivity watcher's drain loop (online + post-online
+    grace + ``sync.work_offline`` off). Peers call this per
+    group of related changes (e.g. recording a clip writes both
+    the .wav and the .lift — one debounce window collapses both
+    into one commit). The user-gestured Sync button —
+    ``sync_project`` — is the only path that triggers a push
+    immediately; everything else flows through the drain.
+
+    Pre-0.43 this RPC was ``request_sync`` and did both halves;
+    older peer code that still calls ``request_sync`` keeps
+    working (alias) but should migrate — the result no longer
+    carries ``PUSHED`` since this path doesn't push.
+
+    Contributor is read from the daemon store at exec time.
+    Unset name → ``S.CONTRIBUTOR_UNSET`` on poll_job(job_id);
+    route the user to ``open_server_ui()`` to set it."""
     import sys as _sys
-    print(f'[sync-client] request_sync({langcode!r}) sending',
+    print(f'[commit-client] commit_project({langcode!r}) sending',
           file=_sys.stderr, flush=True)
     try:
-        resp = call('POST', f'/v1/projects/{langcode}/sync_async', {})
+        resp = call('POST', f'/v1/projects/{langcode}/commit', {})
     except ServerUnavailable as ex:
-        print(f'[sync-client] request_sync({langcode!r}) → '
+        print(f'[commit-client] commit_project({langcode!r}) → '
               f'ServerUnavailable: {ex}',
               file=_sys.stderr, flush=True)
         return None
     if not resp.get('ok'):
-        print(f'[sync-client] request_sync({langcode!r}) → '
+        print(f'[commit-client] commit_project({langcode!r}) → '
               f'not ok, resp={resp!r}',
               file=_sys.stderr, flush=True)
         return None
     job_id = resp.get('job_id')
-    print(f'[sync-client] request_sync({langcode!r}) → job_id={job_id!r}',
+    print(f'[commit-client] commit_project({langcode!r}) → '
+          f'job_id={job_id!r}',
           file=_sys.stderr, flush=True)
     return job_id
+
+
+# Backwards-compat alias for peers that still import the old
+# name. Same wire path (the daemon routes the legacy
+# ``sync_async`` URL to the new ``commit`` handler), same
+# return shape, but the result no longer carries ``PUSHED`` —
+# push moved to the daemon's drain loop.
+request_sync = commit_project
+
+
+def get_work_offline():
+    """Read the daemon-wide work-offline toggle. Returns bool
+    (False on transport failure — safe default since the daemon
+    is the source of truth and the peer can't push without it
+    anyway)."""
+    try:
+        resp = call('GET', '/v1/config/work_offline')
+    except ServerUnavailable:
+        return False
+    if not resp.get('ok'):
+        return False
+    return bool(resp.get('work_offline', False))
+
+
+def set_work_offline(enabled: bool):
+    """Persist the daemon-wide work-offline toggle. Returns the
+    new value the daemon reports (or False on transport failure).
+    Toggling OFF triggers an immediate push-drain pass server-
+    side; toggling ON suppresses the watcher's drain and makes
+    the Sync button return ``S.WORK_OFFLINE_ENABLED``."""
+    try:
+        resp = call('POST', '/v1/config/work_offline',
+                    {'enabled': bool(enabled)})
+    except ServerUnavailable:
+        return False
+    if not resp.get('ok'):
+        return False
+    return bool(resp.get('work_offline', False))
 
 
 def cawl_index(langcode):
@@ -1713,6 +1834,7 @@ __all__ = [
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
+    'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',
     'save_github_tokens', 'mark_github_app_installed',
@@ -1724,7 +1846,9 @@ __all__ = [
     'create_project_from_template',
     'clone_project',
     'clone_project_start', 'clone_project_status',
-    'project_status', 'sync_project', 'request_sync', 'poll_job',
+    'project_status', 'sync_project',
+    'commit_project', 'request_sync', 'poll_job',
+    'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
     'set_daemon_log_to_file', 'get_daemon_log',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',

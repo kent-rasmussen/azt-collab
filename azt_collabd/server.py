@@ -259,6 +259,21 @@ def _h_health(_body):
     crash = _last_crash_summary()
     if crash is not None:
         payload['last_crash'] = crash
+    # Ungraceful-shutdown detection: the previous daemon process
+    # exited without running atexit (SIGSEGV / SIGKILL / OOM-kill /
+    # ``os._exit``). Surfaced separately from ``last_crash`` because
+    # ``last_crash`` is written by the Python excepthook (caught
+    # exception, daemon still alive to write it), while
+    # ``last_native_crash`` is detected on the NEXT startup from a
+    # sentinel-file diff (signal handler bypassed Python entirely).
+    # See ``azt_collabd/crash_marker.py``.
+    try:
+        from . import crash_marker
+        native = crash_marker.read_last_native_crash(azt_home())
+        if native is not None:
+            payload['last_native_crash'] = native
+    except Exception:
+        pass
     return 200, payload
 
 
@@ -302,6 +317,62 @@ def _h_set_device_name(body):
     name = body.get('device_name', '')
     store.set_device_name(name)
     return 200, {"ok": True, "device_name": store.get_device_name()}
+
+
+def _h_get_cawl_prefetch_all_variants(_body):
+    """Read the CAWL prefetch policy.
+
+    Response: ``{ok: True, enabled: bool}``. False (default)
+    means daemon prefetches one variant per CAWL id (the
+    preferred-variant filter in ``cawl._index_image_paths``).
+    True means prefetch every image-shaped index entry."""
+    return 200, {"ok": True,
+                 "enabled": store.get_cawl_prefetch_all_variants()}
+
+
+def _h_get_work_offline(_body):
+    """Read the daemon-wide work-offline toggle.
+
+    When true, the connectivity watcher's drain is a no-op and the
+    user-initiated Sync button returns ``S.WORK_OFFLINE_ENABLED``
+    without attempting any push. Commits via ``commit_project``
+    are unaffected; only push is suppressed."""
+    from . import settings as _settings
+    return 200, {"ok": True, "work_offline": _settings.work_offline()}
+
+
+def _h_set_work_offline(body):
+    """``POST /v1/config/work_offline`` with ``{enabled: bool}``.
+    Persists to ``$AZT_HOME/config.json :: sync.work_offline``.
+
+    Toggling OFF fires an immediate push-drain so the user doesn't
+    have to wait a full ``connectivity_poll_s`` tick to see their
+    pending commits go out."""
+    from . import settings as _settings
+    from . import scheduler as _scheduler
+    prev = _settings.work_offline()
+    enabled = bool(body.get('enabled', False))
+    _settings.set_work_offline(enabled)
+    if prev and not enabled:
+        try:
+            _scheduler.drain_pushes_now()
+        except Exception as ex:
+            print(f'[work_offline] drain_pushes_now failed: {ex}',
+                  file=sys.stderr, flush=True)
+    return 200, {"ok": True, "work_offline": enabled}
+
+
+def _h_set_cawl_prefetch_all_variants(body):
+    """``POST /v1/config/cawl_prefetch_all_variants`` with
+    ``{enabled: bool}``. Persists to
+    ``$AZT_HOME/config.json :: cawl.prefetch_all_variants``.
+
+    Flipping the policy doesn't retro-trigger a prefetch — the
+    next ``auto_prefetch`` (e.g. next project-load or
+    scheduler edge) will pick up the new path set."""
+    enabled = bool(body.get('enabled', False))
+    store.set_cawl_prefetch_all_variants(enabled)
+    return 200, {"ok": True, "enabled": enabled}
 
 
 def _h_get_ui_language(_body):
@@ -644,6 +715,7 @@ def _h_github_device_flow_start(_body):
         target=_device_flow_worker,
         args=(job_id, resp.get('device_code', ''), interval, expires_in),
         daemon=True,
+        name=f'gh-device-flow-{job_id[:8]}',
     )
     t.start()
     return 200, {
@@ -844,7 +916,8 @@ def _annotate_with_auth_health(res):
 
 
 def _touch_project(langcode):
-    """Stamp *langcode* as the device's most-recently-touched project.
+    """Stamp *langcode* as the device's most-recently-touched project,
+    and ask CAWL to auto-warm its image cache.
 
     Called from every langcode-bound endpoint so peers don't have to
     remember to write ``set_last_project``; opening a project to read
@@ -853,7 +926,14 @@ def _touch_project(langcode):
     naturally marks it recent. Single source of truth across peers
     and platforms — fixes the Android-sandbox split where the
     recorder's $AZT_HOME and the daemon's $AZT_HOME are different
-    files."""
+    files.
+
+    Also fires ``cawl.auto_prefetch(repo)`` so the daemon owns the
+    "warm the image cache" decision. The peer no longer has to
+    POST ``cawl/prefetch`` (though the endpoint still works for
+    peers that explicitly want a different working set than the
+    full index). ``auto_prefetch`` is throttled per repo so the
+    1 Hz cache-status poll doesn't re-trigger every second."""
     if not langcode:
         return
     try:
@@ -863,6 +943,13 @@ def _touch_project(langcode):
               file=sys.stderr, flush=True)
     except Exception as ex:
         print(f'[recent] _touch_project({langcode!r}) failed: {ex}',
+              file=sys.stderr, flush=True)
+    try:
+        repo = _cawl.resolve_image_repo(langcode)
+        if repo:
+            _cawl.auto_prefetch(repo)
+    except Exception as ex:
+        print(f'[recent] auto_prefetch({langcode!r}) failed: {ex}',
               file=sys.stderr, flush=True)
 
 
@@ -953,7 +1040,7 @@ def _h_init_project(body):
     #   * ``set_last_sync`` on PUSHED — without it the recorder's
     #     "not backed up" warning persists forever after a successful
     #     publish, because the indicator reads ``last_sync == 0`` as
-    #     "never synced." Sister handlers in ``scheduler._run_sync`` /
+    #     "never synced." Sister handlers in ``scheduler._run_commit`` /
     #     ``_h_project_sync`` already stamp this; init_project was the
     #     odd one out.
     #   * ``set_last_commit`` on COMMITTED / COMMITTED_AND_PUSHED —
@@ -1149,6 +1236,7 @@ def _h_clone_project(body):
         args=(job_id, remote_url, dest_dir, git_user, token),
         kwargs={'override_langcode': override_langcode},
         daemon=True,
+        name=f'clone-{job_id[:8]}',
     )
     t.start()
     return 200, {"ok": True, "job_id": job_id}
@@ -1237,6 +1325,17 @@ def _h_project_sync(langcode, body):
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
+    # 0.43.0: the Sync button is the user-gestured "bump push" —
+    # if work_offline is on, refuse with a typed status the peer
+    # routes to the settings screen. Auto-sync paths (which now
+    # go through commit_project, not this endpoint) never see
+    # this code because they don't push at all.
+    from . import settings as _settings
+    if _settings.work_offline():
+        print(f'[sync-rpc] {langcode!r} → WORK_OFFLINE_ENABLED',
+              file=sys.stderr, flush=True)
+        res = Result().add(S.WORK_OFFLINE_ENABLED)
+        return 200, {"ok": True, "result": res.to_dict()}
     # 0.40.0: contributor from store, not body. See _h_init_project.
     contributor = store.get_contributor()
     if not contributor:
@@ -1269,6 +1368,10 @@ def _h_project_sync(langcode, body):
     if ('COMMITTED_LOCAL' in codes or 'COMMITTED_NO_REMOTE' in codes
             or 'COMMITTED_AND_PUSHED' in codes):
         projects.set_last_commit(langcode)
+    if 'PUSHED' in codes or 'COMMITTED_AND_PUSHED' in codes:
+        scheduler._set_pending_push(langcode, False)
+    elif 'COMMITTED_LOCAL' in codes:
+        scheduler._set_pending_push(langcode, True)
     return 200, {"ok": True, "result": res.to_dict()}
 
 
@@ -1282,6 +1385,30 @@ def _h_project_status(langcode, _body):
     if summary is not None:
         branch, remote_url, n_changes, commits_ahead = summary
     api = _project_for_api(p)
+    # Stuck-commit telemetry: peers polling status surface
+    # COMMIT_REPEATEDLY_FAILED once count >= 2 (matches the
+    # daemon's own threshold). The scheduler retries failed
+    # commits in the background with exponential backoff, so
+    # ``commit_failure_count`` reflects the running streak of
+    # retries, not just the count at user-gesture time.
+    raw = projects._load_raw().get(langcode, {})
+    commit_failure_count = int(raw.get('commit_failure_count', 0) or 0)
+    last_commit_failure_at = float(
+        raw.get('last_commit_failure_at', 0.0) or 0.0)
+    last_commit_error = raw.get('last_commit_error', '') or ''
+    # Atomic-recovery diagnostic counter; resets at the day
+    # boundary. Purely informational — the recovery happens
+    # daemon-side without any user gesture; this field lets a
+    # settings / diagnostic screen show "we picked up N
+    # un-finalized writes today" without the peer needing to
+    # know the underlying protocol.
+    import time as _time
+    today = _time.strftime('%Y-%m-%d')
+    if raw.get('last_recovery_day') == today:
+        n_recovered_today = int(raw.get('recovered_today', 0) or 0)
+    else:
+        n_recovered_today = 0
+    from . import settings as _settings
     return 200, {
         "ok": True,
         "langcode": langcode,
@@ -1298,6 +1425,22 @@ def _h_project_status(langcode, _body):
         # Pre-0.39 callers ignore unknown keys.
         "repo_slug": p.repo_slug,
         "cawl_image_repo": p.cawl_image_repo,
+        # Stuck-commit telemetry (since 0.41.27). Pre-0.41.27
+        # callers ignore the unknown keys; the daemon emits zero
+        # values when the project is healthy.
+        "commit_failure_count": commit_failure_count,
+        "last_commit_failure_at": last_commit_failure_at,
+        "last_commit_error": last_commit_error,
+        # Atomic-recovery diagnostic (since 0.41.27): count of
+        # orphan LIFT scratches the daemon auto-recovered today.
+        # Zero on a healthy project; positive when Phase-1-only
+        # writes were merged back in.
+        "n_recovered_today": n_recovered_today,
+        # Work-offline state (since 0.43.0). Daemon-wide bool, not
+        # per-project; carried here so peers can render a badge
+        # alongside the per-project commits_ahead count without a
+        # second RPC. Pre-0.43 callers ignore the unknown key.
+        "work_offline": _settings.work_offline(),
     }
 
 
@@ -1388,22 +1531,25 @@ def _h_grant_collaborator(langcode, body):
     return 200, {"ok": True, "result": res.to_dict()}
 
 
-def _h_project_sync_async(langcode, _body):
+def _h_project_commit(langcode, _body):
+    """``POST /v1/projects/<lang>/commit`` — schedule a debounced
+    commit. As of 0.43.0 commit and push are split: this endpoint
+    only commits (replacing the old ``sync_async`` which did both).
+    Push happens on the connectivity watcher's drain loop based on
+    online state + post-online grace + work_offline. Peers call
+    this per group of related changes.
+
+    Contributor is read from the daemon's store at exec time; if
+    unset, the job result carries ``S.CONTRIBUTOR_UNSET``. Peers
+    poll via ``poll_job(job_id)``."""
     p = projects.get(langcode)
     if p is None:
-        print(f'[sync-async] {langcode!r} → project_not_found',
+        print(f'[commit-rpc] {langcode!r} → project_not_found',
               file=sys.stderr, flush=True)
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
-    # 0.40.0: contributor is no longer passed on the wire. The
-    # async endpoint enqueues unconditionally; if contributor is
-    # unset, ``scheduler._run_sync`` refuses at exec time and the
-    # job result carries ``S.CONTRIBUTOR_UNSET``. Peers polling
-    # via ``poll_job(job_id)`` see the same shape as any other
-    # terminal status — no special "upfront refusal vs job_id"
-    # branching on the peer side.
-    job_id = scheduler.request_sync(langcode)
-    print(f'[sync-async] {langcode!r} enqueued job_id={job_id!r}',
+    job_id = scheduler.commit_project(langcode)
+    print(f'[commit-rpc] {langcode!r} enqueued job_id={job_id!r}',
           file=sys.stderr, flush=True)
     return 200, {"ok": True, "job_id": job_id}
 
@@ -1592,21 +1738,25 @@ def _h_cawl_cache_status(langcode, _body):
     Response::
 
         {"ok": True,
-         "image_repo": "<owner/repo>",
-         "cached": <count of image files on disk>,
-         "total":  <count of image-shaped index entries>}
+         "image_repo":   "<owner/repo>",
+         "cached":       <int>,    # images on disk / completed
+         "total":        <int>,    # working-set size or index count
+         "offline":      <bool>,   # prefetch was skipped because offline
+         "circuit_open": <bool>,   # prefetch bailed on consecutive fails
+         "finished":     <bool>}   # worker idle for this repo
 
     Peers poll this on a short interval (5-10 s) while a CAWL
     prefetch is running so they can show a "Caching images: M / N"
-    indicator. The indicator's job is to tell the user the
-    daemon is still using network so they don't disconnect Wi-Fi
-    mid-fetch and end up with a half-warm cache.
+    indicator. When ``offline`` is true the peer should badge the
+    bar as "offline" rather than render "0 / N" as live progress.
 
     Both counts are cheap — index lookup is in-memory, on-disk
-    count is one ``os.walk`` over the daemon-owned images dir.
-    No network. Returns ``cached == 0`` and ``total == 0`` when
-    the project has no image_repo configured or the index isn't
-    yet loaded; peers should treat that as "nothing to show"."""
+    count is one ``os.walk`` over the daemon-owned images dir
+    (memoised under a short TTL). No network.
+
+    Returns ``cached == 0`` / ``total == 0`` when the project has
+    no image_repo configured or the index isn't yet loaded; peers
+    should treat that as "nothing to show"."""
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
@@ -1618,10 +1768,11 @@ def _h_cawl_cache_status(langcode, _body):
     repo = _cawl.resolve_image_repo(langcode)
     if not repo:
         return 200, {"ok": True, "image_repo": "",
-                     "cached": 0, "total": 0}
-    cached, total = _cawl.cache_status(repo)
-    return 200, {"ok": True, "image_repo": repo,
-                 "cached": cached, "total": total}
+                     "cached": 0, "total": 0,
+                     "offline": False, "circuit_open": False,
+                     "finished": True}
+    status = _cawl.cache_status(repo)
+    return 200, {"ok": True, "image_repo": repo, **status}
 
 
 def _h_set_daemon_log_to_file(body):
@@ -1860,6 +2011,10 @@ def dispatch(method, path, body):
             return _h_get_daemon_log(body)
         if path == '/v1/config/ui_language':
             return _h_get_ui_language(body)
+        if path == '/v1/config/cawl_prefetch_all_variants':
+            return _h_get_cawl_prefetch_all_variants(body)
+        if path == '/v1/config/work_offline':
+            return _h_get_work_offline(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -1887,6 +2042,10 @@ def dispatch(method, path, body):
             return _h_set_contributor(body)
         if path == '/v1/config/device_name':
             return _h_set_device_name(body)
+        if path == '/v1/config/cawl_prefetch_all_variants':
+            return _h_set_cawl_prefetch_all_variants(body)
+        if path == '/v1/config/work_offline':
+            return _h_set_work_offline(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':
@@ -1928,7 +2087,14 @@ def dispatch(method, path, body):
             if len(parts) == 5 and parts[4] == 'sync':
                 return _h_project_sync(parts[3], body)
             if len(parts) == 5 and parts[4] == 'sync_async':
-                return _h_project_sync_async(parts[3], body)
+                # 0.43.0: ``sync_async`` was renamed to ``commit``
+                # (commit-only — push moved to the daemon's drain
+                # loop). Old peers keep working as long as they're
+                # at MIN_CLIENT_VERSION or above; below that the
+                # bootstrap install-update popup forces a rebuild.
+                return _h_project_commit(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'commit':
+                return _h_project_commit(parts[3], body)
             if len(parts) == 5 and parts[4] == 'atomic_commit':
                 return _h_project_atomic_commit(parts[3], body)
             if len(parts) == 5 and parts[4] == 'atomic_finalize':
@@ -2230,7 +2396,8 @@ def run(host='127.0.0.1', port=0):
 
     def _graceful(signum, frame):
         print(f'[azt_collabd] signal {signum}, shutting down', flush=True)
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
+        threading.Thread(target=httpd.shutdown, daemon=True,
+                         name='httpd-shutdown').start()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:

@@ -1158,3 +1158,129 @@ msgstr ""
 #: azt_collab_client/translate.py:162
 msgid "Please set your name in the sync settings before publishing or syncing."
 msgstr ""
+
+msgid "Work-offline mode is on. Turn it off in sync settings to push."
+msgstr "Mode hors-ligne activé. Désactivez-le dans les paramètres de synchronisation pour pousser."
+
+msgid "Work offline"
+msgstr "Travailler hors-ligne"
+
+msgid "Suppress push:"
+msgstr "Suspendre l'envoi :"
+
+msgid "Push suppressed. Commits will accumulate locally until you turn this off."
+msgstr "Envoi suspendu. Les modifications s'accumuleront localement jusqu'à ce que vous désactiviez cela."
+
+msgid "Pushing enabled. Pending commits will go out when the network is reachable."
+msgstr "Envoi activé. Les modifications en attente partiront dès que le réseau sera accessible."
+
+msgid "Failed to update work-offline setting: {error}"
+msgstr "Échec de la mise à jour du paramètre hors-ligne : {error}"
+
+msgid "More info"
+msgstr ""
+
+msgid ""
+"You have {name} {installed} installed, but the version currently running is "
+"{running}. Restart your device to switch to the newer version, then reopen "
+"this app.\n"
+"\n"
+"If reboot doesn't help, [ref=email][color=4ea1ff][u]send the developer an "
+"Email[/u][/color][/ref]."
+msgstr ""
+
+# ── 0.41.22: QR scan, share-repo popup, switch-project, wordlist row ──
+
+msgid "Scan QR"
+msgstr "Scanner QR"
+
+msgid "Point camera at a repo QR code"
+msgstr "Pointez la caméra vers un code QR de dépôt"
+
+msgid "Settings"
+msgstr "Paramètres"
+
+msgid "Share project {langcode}"
+msgstr "Partager le projet {langcode}"
+
+msgid "Scan with another device to clone the repo."
+msgstr "Scannez avec un autre appareil pour cloner le dépôt."
+
+msgid "Copied to clipboard."
+msgstr "Copié dans le presse-papiers."
+
+msgid "Could not copy: {error}"
+msgstr "Impossible de copier : {error}"
+
+msgid "Copy URL"
+msgstr "Copier l'URL"
+
+msgid "Close"
+msgstr "Fermer"
+
+msgid "QR generation requires the \"segno\" package. Install with:\n\n    pip install segno"
+msgstr "La génération de QR nécessite le paquet « segno ». Installez avec :\n\n    pip install segno"
+
+msgid "Current project"
+msgstr "Projet actuel"
+
+msgid "Grant collaborator access"
+msgstr "Accorder l'accès collaborateur"
+
+msgid "Share this repo (QR)"
+msgstr "Partager ce dépôt (QR)"
+
+msgid "Switch project"
+msgstr "Changer de projet"
+
+msgid "Switch project is unavailable from this entry point."
+msgstr "Le changement de projet n'est pas disponible depuis ce point d'entrée."
+
+msgid "No project selected."
+msgstr "Aucun projet sélectionné."
+
+msgid "No remote URL — publish first."
+msgstr "Aucune URL distante — publiez d'abord."
+
+msgid "Project: {langcode}\nRemote: {remote_url}"
+msgstr "Projet : {langcode}\nDistant : {remote_url}"
+
+msgid "Required: your name is used for commit authorship; sync and publish refuse until this is set."
+msgstr "Requis : votre nom est utilisé pour la paternité des commits ; la synchronisation et la publication sont refusées tant que ceci n'est pas défini."
+
+# ── CAWL wordlist cache row ───────────────────────────────────────────
+
+msgid "Wordlist images"
+msgstr "Images de la liste de mots"
+
+msgid "Wordlist ({name}) images"
+msgstr "Images de la liste de mots ({name})"
+
+msgid "Cache images:"
+msgstr "Mettre en cache les images :"
+
+msgid "1 per line"
+msgstr "1 par ligne"
+
+msgid "all"
+msgstr "toutes"
+
+msgid "Image cache: {cached} / {total} (offline — will resume when online)"
+msgstr "Cache d'images : {cached} / {total} (hors ligne — reprendra une fois en ligne)"
+
+msgid "Image cache: {cached} / {total} (paused — connectivity lost)"
+msgstr "Cache d'images : {cached} / {total} (en pause — connectivité perdue)"
+
+# ── Daemon log section: binary-toggle layout ──────────────────────────
+
+msgid "Log server activity:"
+msgstr "Journaliser l'activité du serveur :"
+
+msgid "Data-loss risk: {count} file(s) written to your project aren't being backed up. Please enable Settings → Diagnostic log → Log server activity = yes, then Share daemon log so we can investigate."
+msgstr "Risque de perte de données : {count} fichier(s) enregistré(s) dans votre projet ne sont pas sauvegardés. Veuillez activer Paramètres → Journal de diagnostic → Journaliser l'activité du serveur = oui, puis Partager le journal du service pour que nous puissions investiguer."
+
+msgid "Saving to git has failed {count} times in a row ({error}). Your recordings are still on the device but aren't being backed up. Please enable Settings → Diagnostic log → Log server activity = yes, then Share daemon log so we can investigate."
+msgstr "L'enregistrement dans git a échoué {count} fois de suite ({error}). Vos enregistrements sont toujours sur l'appareil mais ne sont pas sauvegardés. Veuillez activer Paramètres → Journal de diagnostic → Journaliser l'activité du serveur = oui, puis Partager le journal du service pour que nous puissions investiguer."
+
+msgid "first_name last_name"
+msgstr "prénom nom"

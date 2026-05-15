@@ -242,6 +242,31 @@ def list_all():
             for code, entry in _load_raw().items()]
 
 
+def find_langcode_by_working_dir(working_dir):
+    """Return the registered langcode whose ``working_dir`` matches
+    ``working_dir``, or '' if none is registered. Used by helpers
+    that operate on ``project_dir`` (sync, commit-audio-and-sync,
+    init) but need the langcode to update langcode-keyed state
+    (e.g. ``commit_failure_count``)."""
+    if not working_dir:
+        return ''
+    try:
+        target = os.path.abspath(working_dir)
+    except Exception:
+        target = working_dir
+    for code, entry in _load_raw().items():
+        wd = entry.get('working_dir', '')
+        if not wd:
+            continue
+        try:
+            if os.path.abspath(wd) == target:
+                return code
+        except Exception:
+            if wd == working_dir:
+                return code
+    return ''
+
+
 def set_last_sync(langcode, ts=None):
     if ts is None:
         ts = time.time()

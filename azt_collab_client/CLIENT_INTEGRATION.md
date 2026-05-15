@@ -13,11 +13,10 @@
 
 Every AZT-suite peer is a thin ``azt_collab_client`` consumer.
 This doc is the **single contract** each peer follows so the
-suite stays coherent. Re-read it whenever you bump the bundled
-client; the contract evolves with the client and silent drift
-is what produced the v0.28.x bugs ("multiple stacked popups",
-"settings page reachable when no server", "no progress
-indicator", "Dismiss didn't quit when it should have").
+suite stays coherent. Silent drift from the contract is what
+produced the v0.28.x bugs ("multiple stacked popups", "settings
+page reachable when no server", "no progress indicator",
+"Dismiss didn't quit when it should have").
 
 If you're starting a brand-new peer, work through every section
 in order. If you're updating an existing peer, treat each
@@ -61,6 +60,14 @@ android.permissions = INTERNET, RECORD_AUDIO, …, REQUEST_INSTALL_PACKAGES, org
 - ``org.atoznback.AZT_COLLAB_ACCESS`` — signature-protected; the
   server APK declares it, peers ``<uses-permission>`` it.
 
+Peers do NOT need to declare ``KILL_BACKGROUND_PROCESSES``. The
+package-replacement-handling work (§ 19) used to ask peers to
+declare it for a peer-side `killBackgroundProcesses` backstop;
+that backstop is gone as of daemon 0.42 / client 0.42 —
+the server APK's own ``SuiteSelfReplaceReceiver`` reaps any
+old-code daemon process from inside the new APK using its own
+permission, so peers no longer need a permission to explain.
+
 **Manifest extras** — symlink the canonical peer extras:
 
 ```ini
@@ -75,35 +82,20 @@ of the server APK.)
 **Java sources from the suite** — required since 0.33.0 so the
 peer-side ``AZTServiceConnector`` (Phase B2 bindService for OOM
 priority + Android 15 freezer mitigation) compiles into the peer
-APK. **Point at the canonical filesystem path, not through your
-``android/`` symlink** — buildozer's ``android.add_src`` doesn't
-reliably follow symlinks across versions:
+APK:
 
 ```ini
-# Mirror what server_apk/buildozer.spec.tmpl does — relative path
-# that hits the canonical azt-collab tree directly.
-android.add_src = ../azt-collab/android/src/main/java
+android.add_src = android/src/main/java
 ```
 
-Adjust the ``..`` count if your peer doesn't sit as a sibling of
-``azt-collab/``. Without this line peers see ``[android_cp]
+The ``android/`` symlink already points at ``azt-collab/android/``,
+so this resolves to the canonical Java tree. Buildozer ``realpath``s
+the value before handing it to p4a — confirm the symlink target
+exists (a dangling symlink → empty srcDir → silent compile of zero
+classes). Without this line peers see ``[android_cp]
 AZTServiceConnector.ensureBound failed: ClassNotFoundException``
 in logcat on every cold start, the bind never happens, and the
 freezer issue is unmitigated.
-
-If that still fails (older buildozer / path-policing edge case),
-fall back to copying the file directly into the peer repo:
-
-```bash
-mkdir -p java_src/org/atoznback/aztcollab
-cp ../azt-collab/android/src/main/java/org/atoznback/aztcollab/\
-AZTServiceConnector.java java_src/org/atoznback/aztcollab/
-# in buildozer.spec:
-# android.add_src = java_src
-```
-
-Brittle (the copy goes stale when the canonical changes); only
-use if the relative-path approach doesn't work.
 
 **Sign with the suite keystore.** APKs signed with a different key
 install fine but the install-time grant for
@@ -554,63 +546,58 @@ of:
 
 ### Daemon-driven prefetch + progress indicator (required when prefetching)
 
-If the peer warms a working-set of CAWL images on project
-load, it MUST do so via the daemon's ``cawl_prefetch``
-endpoint AND surface a user-visible progress indicator while
-the warm runs. Without the indicator, users have no way to
-tell the daemon is using network in the background; they
-naturally disconnect Wi-Fi between gestures and end up with
-a half-warm cache that then blocks on demand-fetch for every
-uncached image.
+Image-cache warming is now **daemon-owned** (since 0.41.21).
+The peer MUST surface a user-visible progress indicator while
+the warm runs but does NOT need to trigger it — the daemon
+fires its own ``auto_prefetch`` from ``_touch_project`` on
+every langcode-bound endpoint, so the very act of opening a
+project warms its CAWL image cache. Without the indicator,
+users naturally disconnect Wi-Fi between gestures and end up
+with a half-warm cache that then blocks on demand-fetch for
+every uncached image — so the visual cue stays mandatory even
+though the trigger doesn't.
 
-**Daemon-driven, not peer-driven.** The peer used to iterate
-its working-set itself, calling ``CAWLHandle(...).open_read``
-once per image. That worked but left the daemon ignorant of
-how many images the peer was warming — its progress
-indicator could only count "files on disk vs. all image
-entries in the index", and the canonical CAWL repo has 2-4
-image variants per CAWL identifier so the index's total
-over-counts what the peer actually fetches. Result: a
-progress bar that plateaus far short of "100%" with no way
-for the user to tell whether it's done. Daemon-driven puts
-the iteration on the party that does the actual fetching,
-so progress is accurate by construction.
+**Why daemon-owned.** Pre-0.41.21 the peer iterated its
+working-set itself (``CAWLHandle(...).open_read`` per image,
+or an explicit ``cawl_prefetch`` POST). That left the daemon
+ignorant of the working-set size, gated correctness on the
+peer doing the right thing on every boot, and made the
+progress indicator unreliable when the peer's chosen variants
+didn't match the index's variants 1:1. Daemon-driven puts
+iteration on the party that does the actual fetching: progress
+is accurate, retry on connectivity edge is automatic, and the
+peer drops a code path it never benefited from owning.
 
-The split:
+The split (since 0.41.21):
 
-- **Bulk warming** → ``cawl_prefetch(langcode, paths)``. Peer
-  hands the daemon its working-set once; daemon iterates in a
-  background thread and reports progress.
+- **Bulk warming** → automatic. The daemon's ``_touch_project``
+  (every langcode-bound endpoint already fires it) calls
+  ``cawl.auto_prefetch(repo)`` which iterates the full index in
+  a background thread. The peer just polls ``cache_status``
+  for progress.
+- **Optional explicit override** → ``cawl_prefetch(langcode,
+  paths)``. Peers that want to warm a subset different from
+  the full index (e.g. a tighter working-set keyed to the
+  user's current view) may still POST this. Idempotent
+  against the daemon-driven prefetch; lock-coalescing per
+  target means no double-fetch.
 - **On-demand fetch** → ``CAWLHandle(...).open_read`` for any
-  individual image the peer needs to display *right now*
-  (current swipe target, etc.). Still daemon-served from
-  cache or fetched if missing — same backing store the bulk
-  warm populates.
+  individual image the peer needs to display *right now*.
+  Daemon-served from cache or fetched if missing — same
+  backing store the bulk warm populates.
 
-#### Wiring
+#### Wiring (typical peer)
 
 ```python
 from kivy.clock import Clock
-from azt_collab_client import (
-    cawl_index, cawl_prefetch, cawl_cache_status)
+from azt_collab_client import cawl_cache_status
 
 def _start_cawl_warm(self, langcode):
-    """Kick off the daemon-driven prefetch + the progress
-    indicator. Call once per project load."""
-    # 1. Compute the working set this peer cares about. The
-    # canonical CAWL repo has multiple variants per identifier;
-    # pick the one your UI will actually render.
-    index = cawl_index(langcode)
-    paths = self._choose_one_variant_per_cawl_id(
-        index.get('files') or [])
-    if not paths:
-        return  # no image_repo, nothing to do
-    # 2. Hand the list to the daemon. Returns immediately;
-    # warm runs in the daemon's background thread.
-    cawl_prefetch(langcode, paths)
-    # 3. Start the progress poll at 1 Hz.
+    """Start the progress indicator after a project load.
+    The daemon already auto-triggered the warm via
+    ``_touch_project``; we just render its progress."""
     self._cache_status_langcode = langcode
-    self._cache_status_last = (-1, -1)
+    self._cache_status_last = None
     self._cache_status_event = Clock.schedule_interval(
         lambda _dt: self._tick_cache_status(), 1.0)
     self._tick_cache_status()
@@ -618,12 +605,16 @@ def _start_cawl_warm(self, langcode):
 def _tick_cache_status(self):
     status = cawl_cache_status(self._cache_status_langcode)
     cached, total = status['cached'], status['total']
+    offline = status.get('offline', False)
+    circuit_open = status.get('circuit_open', False)
     # Log ONLY on state change so a 1 Hz poll doesn't fill
     # logcat with identical lines.
-    if (cached, total) != self._cache_status_last:
-        print(f'[cache-status] {cached}/{total}',
+    key = (cached, total, offline, circuit_open)
+    if key != self._cache_status_last:
+        print(f'[cache-status] {cached}/{total} '
+              f'offline={offline} circuit_open={circuit_open}',
               file=sys.stderr)
-        self._cache_status_last = (cached, total)
+        self._cache_status_last = key
     if total == 0:
         self._hide_cache_indicator()
         return
@@ -631,11 +622,38 @@ def _tick_cache_status(self):
         self._hide_cache_indicator()
         self._cache_status_event.cancel()
         return
-    self._show_cache_indicator(
-        _('Caching images: {cached} / {total} '
-          '(network in use — please stay online)').format(
-              cached=cached, total=total))
+    if offline:
+        # Worker bailed before iterating; banner stays polling
+        # so we auto-update when the daemon's scheduler edge
+        # fires on_online_edge → re-fires auto_prefetch. The
+        # 1 Hz cost is in-memory dict lookups; the [first-try]
+        # probe for this path is already suppressed in the
+        # transport.
+        self._show_cache_indicator(
+            _('Image cache: {cached} / {total} '
+              '(offline — will resume when online)').format(
+                  cached=cached, total=total))
+    elif circuit_open:
+        # Mid-prefetch connectivity loss. Same auto-resume
+        # path via the daemon's scheduler edge.
+        self._show_cache_indicator(
+            _('Image cache: {cached} / {total} '
+              '(paused — connectivity lost)').format(
+                  cached=cached, total=total))
+    else:
+        self._show_cache_indicator(
+            _('Caching images: {cached} / {total} '
+              '(network in use — please stay online)').format(
+                  cached=cached, total=total))
 ```
+
+**The `offline` / `circuit_open` / `finished` flags are
+additive (since 0.41.21).** Old peers reading only ``cached``
+and ``total`` keep working — when the daemon offline-skipped a
+prefetch, ``cached`` falls back to the actually-on-disk count
+so the displayed numbers stay honest. Peers that read the new
+flags can additionally badge the banner "offline" / "paused"
+instead of showing what looks like stuck progress.
 
 Where the indicator lives is peer-specific (collab screen
 status line, persistent toast, banner above the main
@@ -646,11 +664,28 @@ already assumes loading. The phrase to convey is "don't
 disconnect."
 
 **Polling cadence.** 1 Hz is the right interval — feels live,
-and the daemon's ``cache_status`` is O(1) (counter increment
-per fetch, no per-poll filesystem scan). Stop polling once
+and the daemon's ``cache_status`` is O(1) (in-memory dict
+lookups). Cancel the ``Clock.schedule_interval`` once
 ``cached >= total`` so an idle peer doesn't keep waking the
-daemon. Log only on state change; a fixed 1 Hz log of
-unchanged values is just noise.
+daemon for a completed prefetch. **Keep polling while
+``offline`` or ``circuit_open`` is true** — the daemon's
+scheduler watcher fires ``cawl.on_online_edge()`` on the
+offline → online edge (within
+``connectivity_poll_s`` ≈ 30 s) which re-triggers
+``auto_prefetch``; the running 1 Hz poll is what lets the
+banner flip from "offline — will resume" to live progress
+automatically when that happens. Log only on state change;
+a fixed 1 Hz log of unchanged values is just noise.
+
+**Auto-resume from offline.** No peer action required when
+the device goes from offline back to online. The daemon's
+``scheduler._watcher_loop`` detects the edge, calls
+``cawl.on_online_edge()`` which clears the auto_prefetch
+throttle for every repo in ``skipped_offline`` /
+``circuit_open`` state and re-fires ``auto_prefetch``. Worst-
+case latency is one ``connectivity_poll_s`` (default 30 s).
+Look for ``[cawl] online-edge retry: repo=...`` in logcat to
+confirm the edge fired.
 
 **On-demand still works.** Peers don't have to wait for the
 prefetch to finish before opening individual images. The
@@ -660,15 +695,37 @@ specific image yet but the user navigates to it, the
 on-demand request fetches it directly (and the worker will
 skip it later via the cache-hit fast path).
 
-**Backward compatibility.** Pre-0.41.11 daemons return
-``not_found`` for ``cawl_prefetch``; the wrapper returns
-``{requested: 0, completed: 0, finished: True}`` and the
-peer's progress poll sees the no-prefetch fallback semantics
-of ``cache_status``. Pre-0.41.9 daemons return ``not_found``
-for ``cache_status`` too; the wrapper returns
-``{cached: 0, total: 0}``, which trips the "nothing to show"
-branch and hides the indicator. Either way: no peer-side
-version pin needed; call sites degrade gracefully.
+**Backward compatibility.**
+
+- **Pre-0.41.21 daemon** doesn't auto-trigger via
+  ``_touch_project``. Peers that ship the new "no explicit
+  prefetch call" wiring against a pre-0.41.21 daemon will
+  see a stuck indicator at the index's no-prefetch fallback
+  counts (``files on disk`` vs. ``index image-shaped entries``).
+  Until your install base is on 0.41.21+, keep an explicit
+  ``cawl_prefetch(langcode, paths)`` call on project-load as a
+  fallback — it's idempotent against the daemon-driven
+  prefetch.
+- **Pre-0.41.21 daemon, ``cache_status`` flags.** ``offline``
+  / ``circuit_open`` / ``finished`` are absent in pre-0.41.21
+  responses. The peer pattern uses ``status.get(...)`` with
+  ``False`` defaults so the rendering degrades to the "active
+  progress" branch when the flags are missing — correct
+  behavior for pre-0.41.21 daemons (their iteration didn't
+  short-circuit on offline, so the active-progress branch is
+  what you want).
+- **Pre-0.41.11 daemon** returns ``not_found`` for
+  ``cawl_prefetch``; the wrapper returns
+  ``{requested: 0, completed: 0, finished: True}`` and the
+  peer's progress poll sees the no-prefetch fallback semantics
+  of ``cache_status``.
+- **Pre-0.41.9 daemon** returns ``not_found`` for
+  ``cache_status`` too; the wrapper returns
+  ``{cached: 0, total: 0}``, which trips the "nothing to show"
+  branch and hides the indicator.
+
+Either way: no peer-side version pin needed; call sites
+degrade gracefully.
 
 ## 11. Per-project overrides (`cawl_image_repo`, `repo_slug`)
 
@@ -757,10 +814,11 @@ across the same human's devices.
 
 - **Don't pass ``contributor=`` to any RPC wrapper.** The
   signature is gone from ``init_project``, ``sync_project``,
-  ``request_sync`` as of 0.40.0. Pre-migration peer code that
-  still passes it in the body will have the value silently
-  ignored by the daemon — but you should remove the call-site
-  arg as part of the upgrade so the code matches the wire.
+  ``commit_project`` (and its legacy ``request_sync`` alias)
+  as of 0.40.0. Pre-migration peer code that still passes it
+  in the body will have the value silently ignored by the
+  daemon — but you should remove the call-site arg as part of
+  the upgrade so the code matches the wire.
 - **Don't mirror ``contributor`` or ``device_name`` in peer
   prefs / config / globals.** Same single-source-of-truth
   rule as the per-project settings in § 11. Read each time
@@ -781,7 +839,7 @@ sync. The status is returned by:
 
 - ``init_project(...)`` synchronously (publish flow).
 - ``sync_project(langcode)`` synchronously.
-- ``poll_job(job_id)`` for an async ``request_sync`` that the
+- ``poll_job(job_id)`` for an async ``commit_project`` that the
   scheduler refused at exec time (defence-in-depth).
 
 **UI for setting these.** Both fields should live on the
@@ -792,6 +850,54 @@ MAY prompt for the contributor name inline to spare the user
 the round-trip to settings on day one, but the persist call
 goes through ``set_contributor`` exactly the same way; the
 data lives on the daemon.
+
+## 12b. Project-bound actions live in the daemon settings UI
+
+Since daemon 0.41.0, three project-bound actions are hosted in
+the daemon's settings UI (bound to ``last_project()``):
+
+- **Publish** — initialise the project's git repo and push to
+  a freshly-created GitHub repo. Was the original daemon-UI
+  resident; remains there.
+- **Grant collaborator access** — invite a GitHub user to the
+  current project (details in § 13).
+- **Share this repo (QR)** — render the remote URL as a QR for
+  pairing with another device. Paired with the picker's clone-
+  flow "Scan QR" affordance.
+
+Peers expose **one** "Open Sync Settings" button instead of
+maintaining per-peer sub-screens for these:
+
+```python
+from azt_collab_client import open_server_ui
+
+def _on_sync_settings_btn(self, *_):
+    open_server_ui(on_status=self._set_log)
+```
+
+The user lands on the SettingsScreen with the right
+project's langcode + remote URL already on display — no
+peer-side disambiguation needed.
+
+### Phase 1 / Phase 3 sequencing constraint
+
+**Do NOT ship a peer release that strips its old per-project
+sub-screens in the same version that first adopts the daemon-
+UI delegation.** A user still running the old server APK on
+the same device would lose the feature entirely — their peer
+no longer offers the action, and the daemon UI they could
+fall back on hasn't been deployed yet.
+
+The safe rollout is:
+
+- *Phase 1:* peer adopts ``open_server_ui()`` for the action
+  while keeping the legacy per-project sub-screen wired as
+  fallback.
+- *Phase 3:* one peer release later (after most users have
+  updated the server APK), strip the legacy sub-screen.
+
+If your peer hasn't shipped a Phase-1 release yet, do that
+first; combining the two into one release is the regression.
 
 ## 13. Granting collaborator access
 
@@ -970,6 +1076,95 @@ project, a daemon-restart notice, a future `MERGED_REMOTE`
 status. The user's anchor stays; the content under it
 refreshes; nothing else moves.
 
+## 14a. Reconciling project switches that happened elsewhere
+
+The user may switch projects from outside the peer — most
+commonly via the daemon settings UI's "Switch project"
+button (server-APK side, see daemon CHANGELOG 0.41.x), but
+also any future path that ends in
+``daemon.set_last_langcode(new)`` while the peer's
+``_current_langcode`` is still ``old`` in memory. Without a
+reconciliation hook, the peer comes back to the foreground
+still rendering ``old`` — opposite of what the user just
+asked for.
+
+**Peer contract** (since daemon 0.41.x):
+
+On ``App.on_resume``, the peer MUST:
+
+1. Read ``last_project()``.
+2. Compare against the peer's currently-loaded langcode.
+3. If they differ, reload the project the same way the
+   peer would on initial load (close current LIFT, open
+   the new one, refresh UI to the entry list / picker
+   resume point).
+
+```python
+from azt_collab_client import last_project
+
+class YourApp(App):
+    def on_resume(self):
+        try:
+            server_langcode = (last_project() or '').strip()
+        except Exception:
+            return  # transport failure — leave current view alone
+        if not server_langcode:
+            return
+        peer_langcode = (self._current_langcode or '').strip()
+        if server_langcode == peer_langcode:
+            return
+        # User switched projects elsewhere. Reload to match.
+        self._load_project(server_langcode)
+```
+
+The "same way as initial load" matters — every peer already
+has a `_load_project(langcode)` / equivalent for opening a
+project from the picker; reuse that path. The reconciliation
+is a *trigger*, not a separate code path.
+
+**What "differ" means.** Compare the daemon's stamped
+langcode to whatever the peer treats as its loaded-project
+identity (typically ``_current_langcode``, the langcode
+returned by the last ``open_project`` / picker result). A
+fresh server-side switch always lands ``last_project()`` on
+a value before the peer resumes, so the comparison is
+authoritative.
+
+**What NOT to do:**
+
+- ❌ Re-read on every cache_status poll or other 1 Hz tick.
+  The check is an Activity-resume event, not a constant
+  poll. The user's "switch happened" gesture is bounded by
+  Activity lifecycle.
+- ❌ Block ``on_resume`` on a slow RPC. ``last_project()``
+  is cheap (in-memory dict lookup daemon-side), but always
+  wrap in try / except — the daemon could be down or
+  the URI grant stale.
+- ❌ Silently swap the loaded project without reloading the
+  UI. The user's anchor (current entry, scroll, open
+  panels) is in a different project's coordinate space; a
+  full reload to the new project's natural entry-list
+  start is correct.
+- ❌ Ignore the case where the user switched in *and back
+  out* before resume. If they ended on ``old``, no reload
+  needed — the comparison handles this for free.
+
+**Why peer-side, not daemon-pushed.** The peer's loaded
+project is peer-side state (in-memory model, open LIFT
+handle, view caches). The daemon has no channel to push
+"reload now" — and even if it did, the peer's reload-from-
+disk path needs to run on the peer's UI thread. Hooking
+``on_resume`` is the natural seam. See ``CLAUDE.md``
+"Project-switch reconciliation" for the rationale.
+
+**Backward compatibility.** Peers that don't yet ship the
+``on_resume`` hook keep working the way they did pre-0.41.x —
+the user's "Switch project" tap silently fails to take
+effect, exactly the bad case the daemon-side "Switch
+project" button warns about. Daemon-side button is a no-op
+without peer-side adoption; ship both halves of the
+migration.
+
 ## 14b. Sharing text / email / log-file helpers
 
 Peers that need to dispatch a string or log file through
@@ -1119,30 +1314,48 @@ before tagging.
 
 ## 17. Routing on sync results
 
-How peers MUST respond to ``sync_project`` / ``request_sync``
+How peers MUST respond to ``sync_project`` / ``commit_project``
 result codes. Future peers (viewer, next sister app) match the
-recorder's existing behaviour by following this section —
-without it, every peer reverse-engineers the routing from
-recorder source and the behaviours drift.
+existing behaviour by following this section — without it, every
+peer reverse-engineers the routing from peer source and the
+behaviours drift.
+
+> **Naming note (0.43.0).** ``request_sync`` was renamed to
+> ``commit_project`` and narrowed: it is commit-only. Push is
+> driven entirely by the daemon's scheduler-drain loop (online +
+> ``sync.post_online_grace_s`` + ``sync.work_offline``). The old
+> ``request_sync`` name still works as a backwards-compat alias
+> in the client, but result-handling that polls for ``PUSHED``
+> on this path is now incorrect — ``commit_project`` never
+> emits ``PUSHED``. Peers MUST migrate their post-commit logic
+> off "did we push?" and onto the daemon's drain state via
+> ``project_status.commits_ahead`` / ``project_status.work_offline``.
 
 > **For the rationale** (what each code *means*, why
 > auto-sync must be silent, the pre-0.34.1 anti-pattern this
 > contract closes) — see ``CLAUDE.md`` "Peer contract: routing
 > on sync results". This section is the *contract*.
 
-**Two contexts, two contracts.** The same ``Result`` reaches
-the peer from two different triggers and they need different
-responses:
+**Two contexts, two contracts.** Two different RPCs surface
+``Result``-shaped responses, and even within one RPC the same
+``Result`` reaches the peer from two different triggers:
 
-1. **Auto-sync** — the peer fires ``request_sync`` itself,
+1. **Auto-commit** — the peer fires ``commit_project`` itself,
    without a user gesture: project-select, project-load,
    background periodic, post-edit debounce. The user did NOT
-   ask to sync.
+   ask to push. The result NEVER carries ``PUSHED`` — push is
+   the daemon scheduler's job — and configuration-class
+   failures MUST be silent.
 2. **User-initiated sync** — the user tapped a sync icon /
-   "Sync now" button. The user explicitly asked.
+   "Sync now" button. The user explicitly asked. The peer
+   calls ``sync_project`` (commit + push). Configuration-class
+   failures route to whatever fixes the problem.
 
-Auto-sync MUST be silent on configuration-class failures.
-User-initiated sync routes to whatever fixes the problem.
+Auto-commit MUST be silent on configuration-class failures.
+User-initiated sync routes. New in 0.43.0: ``S.WORK_OFFLINE_ENABLED``
+is a user-initiated-only refusal — the peer routes the user to
+the sync settings screen anchored on the work-offline toggle
+(same pattern as ``AUTH_REQUIRED`` → credentials).
 
 ### Routing table
 
@@ -1153,9 +1366,12 @@ User-initiated sync routes to whatever fixes the problem.
 | ``S.AUTH_REQUIRED`` | **Silent.** Log; sync doesn't happen until creds configured. | Route to GitHub Connect flow. |
 | ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` / ``S.REPO_NOT_AUTHORIZED`` | **Silent.** Log; project still usable. | Open the ``url`` param the Status carries. |
 | ``S.CONTRIBUTOR_UNSET`` | **Silent.** Log; sync refused until name set. | Route to daemon settings UI's contributor field. |
+| ``S.WORK_OFFLINE_ENABLED`` | n/a — auto-commit doesn't see this (only ``sync_project`` emits it). | Toast "Work-offline mode is on" + ``open_server_ui()`` to the sync settings screen. The user explicitly turned the toggle on; the Sync button is the only path that surfaces the refusal. (0.43.0+.) |
 | ``S.JOB_INTERRUPTED`` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails. |
 | ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` | **Silent.** Log; daemon will be reachable next time. | Transient-error toast. DO NOT route to settings — no user-fixable config here. |
 | ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
+| ``S.DATA_LOSS_RISK`` | **SURFACE (not silenced).** This is a data-loss-class signal — files written by a peer aren't reaching git. The auto/user distinction does NOT apply: ALWAYS render the translated toast / banner with the maintainer-contact wording. Params: ``count`` (int), ``sample`` (up to 5 paths). | Same surface as auto-sync. |
+| ``S.COMMIT_REPEATEDLY_FAILED`` | **SURFACE (not silenced).** Two-or-more successive ``COMMIT_FAILED`` for this project. Same data-loss-class severity as ``DATA_LOSS_RISK``: recordings are accumulating on the device but not entering git history. The catchup-commit pattern (one fat commit landing N stranded recordings after a long failure streak) is exactly what this catches — each prior failed attempt bumps the counter, and a second-or-later failure surfaces the loud status so the user is told to investigate before more files pile up uncommitted. Params: ``count`` (int, running streak), ``error`` (str, last dulwich message). Counter clears on the next successful commit. (The daemon also retries stuck commits in the background with exponential backoff, so the running ``count`` and the ``COMMIT_REPEATEDLY_FAILED`` your peer sees on the next sync attempt may reflect failures the peer never directly triggered. Peers don't need to do anything different — the existing result-iteration handles it.) | Same surface as auto-sync. |
 | Everything else (``PUSHED``, ``PULLED``, ``NOTHING_TO_COMMIT``, ``CONFLICTS``, …) | Translate to status line. | Translate to status line. |
 
 ### Code shape — both contexts
@@ -1166,6 +1382,14 @@ User-initiated sync routes to whatever fixes the problem.
 # whatever the user was doing.
 def _auto_sync(self, langcode):
     result = sync_project(langcode)
+    # DATA_LOSS_RISK / COMMIT_REPEATEDLY_FAILED are NEVER
+    # silenced — surface either before any other branch consumes
+    # the result. They're the two canaries for "data is
+    # accumulating on the device but not entering git history";
+    # silencing them would hide active data loss.
+    for s in result.statuses:
+        if s.code in (S.DATA_LOSS_RISK, S.COMMIT_REPEATEDLY_FAILED):
+            self.show_toast(translate_status(s))
     if result.has_any(S.NOT_A_REPO, S.NO_REMOTE,
                       S.AUTH_REQUIRED, S.CONTRIBUTOR_UNSET,
                       S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
@@ -1198,6 +1422,9 @@ def do_sync(self, langcode):
     if result.has_any(S.NOT_A_REPO, S.NO_REMOTE):
         self.open_publish_settings(langcode)
     elif result.has(S.CONTRIBUTOR_UNSET):
+        self.open_sync_settings()
+    elif result.has(S.WORK_OFFLINE_ENABLED):
+        self.show_toast(translate_result(result))
         self.open_sync_settings()
     elif result.has(S.AUTH_REQUIRED):
         self.open_github_connect()
@@ -1232,11 +1459,14 @@ S.NOT_A_REPO              # 'NOT_A_REPO'
 S.NO_REMOTE               # 'NO_REMOTE'
 S.AUTH_REQUIRED           # 'AUTH_REQUIRED'
 S.AUTH_REFRESH_STALE      # 'AUTH_REFRESH_STALE'
+S.DATA_LOSS_RISK          # 'DATA_LOSS_RISK'         ← never silenced
+S.COMMIT_REPEATEDLY_FAILED # 'COMMIT_REPEATEDLY_FAILED' ← never silenced
 S.APP_NOT_INSTALLED       # 'APP_NOT_INSTALLED'
 S.APP_SUSPENDED           # 'APP_SUSPENDED'
 S.REPO_NOT_AUTHORIZED     # 'REPO_NOT_AUTHORIZED'
 S.CONTRIBUTOR_UNSET       # 'CONTRIBUTOR_UNSET'
 S.JOB_INTERRUPTED         # 'JOB_INTERRUPTED'
+S.WORK_OFFLINE_ENABLED    # 'WORK_OFFLINE_ENABLED' ← 0.43.0+, sync_project only
 S.SERVER_UNAVAILABLE      # 'SERVER_UNAVAILABLE'  ← 0.41.13+
 S.SERVER_ERROR            # 'SERVER_ERROR'        ← 0.41.13+
 S.PUSHED / S.PULLED / S.NOTHING_TO_COMMIT / S.CONFLICTS / ...
@@ -1245,6 +1475,447 @@ S.PUSHED / S.PULLED / S.NOTHING_TO_COMMIT / S.CONFLICTS / ...
 Use the constants, not string literals. Substring-matching the
 translated message (``if 'publish' in msg: route_to_settings``)
 is the regression this section exists to avoid.
+
+## 17b. Commit / push split + work-offline (since 0.43.0)
+
+> **For the rationale** — why commits are peer-driven but
+> push is daemon-driven, why the post-online grace exists —
+> see ``CLAUDE.md`` "Sync flow: commit / push split". This
+> section is the contract.
+
+Peers decide where to cut a commit. The daemon decides when
+(and whether) to push.
+
+### Two RPCs
+
+```python
+from azt_collab_client import (
+    commit_project,     # debounced, commit-only, async
+    sync_project,       # synchronous, user-Sync-button only
+    get_work_offline,   # read daemon-wide toggle
+    set_work_offline,   # write daemon-wide toggle
+)
+```
+
+- ``commit_project(langcode)`` — what peers fire per group of
+  related changes (post-edit debounce, post-record, etc.).
+  Debounced server-side; bursts collapse into one commit.
+  Returns a ``job_id`` or ``None`` on transport failure.
+  Result codes peers poll via ``poll_job(job_id)``:
+  ``COMMITTED_LOCAL`` / ``NOTHING_TO_COMMIT`` /
+  ``COMMIT_FAILED`` / ``DATA_LOSS_RISK`` /
+  ``COMMIT_REPEATEDLY_FAILED`` / ``CONTRIBUTOR_UNSET`` /
+  ``NO_REPO``. **Never carries ``PUSHED``** — push happens on
+  the daemon's drain loop. Pre-0.43 peer code that polls for
+  ``PUSHED`` after ``request_sync`` will sit waiting forever;
+  migrate that logic onto ``project_status.commits_ahead``.
+- ``sync_project(langcode)`` — the user-gestured "push pending
+  commits now" RPC, bound to the Sync button. Does commit +
+  push under one project lock. Returns ``Result``
+  synchronously. New refusal: ``S.WORK_OFFLINE_ENABLED`` (see
+  routing in § 17).
+
+### What the daemon does behind the curtain
+
+The scheduler's connectivity watcher tracks
+``_online_since`` on offline→online edges. Every tick (default
+30 s), if online for ``≥ sync.post_online_grace_s`` (default
+60 s) AND ``sync.work_offline`` is off, projects with
+``pending_push`` get pushed. Peers don't poll this — the
+``project_status`` response carries the state peers need
+(``commits_ahead``, ``work_offline``).
+
+### Work-offline toggle
+
+Daemon-wide bool. When on:
+
+- The watcher's drain is a no-op.
+- ``sync_project`` returns ``Result().add(S.WORK_OFFLINE_ENABLED)``
+  without attempting any push.
+- ``commit_project`` is unaffected — local commits keep
+  happening per peer gesture.
+
+Toggling OFF (via ``set_work_offline(False)`` or the daemon
+settings UI) fires an immediate push-drain pass so the user
+doesn't wait a full ``connectivity_poll_s`` tick.
+
+```python
+# Render the badge from project_status without a second RPC.
+ps = project_status(langcode)
+if ps.work_offline:
+    sync_indicator.text = f"+{ps.commits_ahead} · offline"
+elif ps.commits_ahead:
+    sync_indicator.text = f"+{ps.commits_ahead}"
+else:
+    sync_indicator.text = ""  # all up to date
+```
+
+### Migration checklist (from pre-0.43 peer)
+
+1. Swap ``request_sync(langcode)`` for ``commit_project(langcode)``
+   (or keep ``request_sync`` — kept as an alias). Both go
+   through the new commit-only path.
+2. Strip any post-RPC code that polls for ``PUSHED`` /
+   ``COMMITTED_AND_PUSHED`` on the ``request_sync`` result.
+   Replace with periodic ``project_status`` reads of
+   ``commits_ahead``.
+3. Add ``S.WORK_OFFLINE_ENABLED`` to the user-initiated sync
+   routing table — toast + route to ``open_server_ui()``.
+4. Render the work-offline badge from
+   ``ProjectStatus.work_offline``.
+5. (Optional) Surface ``get_work_offline()`` /
+   ``set_work_offline()`` in a peer-side quick-toggle if your
+   UX wants the switch outside the daemon settings screen.
+   Most peers won't need this — the daemon settings UI hosts
+   the canonical toggle.
+
+## 17a. Stuck-commit + atomic-recovery telemetry on `ProjectStatus` (informational)
+
+Four fields on ``ProjectStatus`` expose daemon-side
+bookkeeping that peers MAY surface in diagnostic UI but are
+not load-bearing for any alarm path:
+
+```python
+ps = project_status(langcode)
+ps.commit_failure_count    # int — successive failed commit attempts (0.41.27+)
+ps.last_commit_failure_at  # float — unix timestamp of latest failure (0.41.27+)
+ps.last_commit_error       # str  — last dulwich error message (0.41.27+)
+ps.n_recovered_today       # int — orphan LIFT scratches auto-merged today (0.41.29+)
+```
+
+These fields are **diagnostic**, not load-bearing for any
+alarm path. The canonical surface for
+``COMMIT_REPEATEDLY_FAILED`` is the auto-sync result iteration
+described in § 17: the daemon emits the status on any sync
+attempt (peer-driven or scheduler-driven) where ``count >= 2``,
+and a peer-driven sync after a background failure naturally
+sees the elevated counter and carries the status on its
+result. Peers do not need to poll for the alarm.
+
+When to read these fields:
+
+- A diagnostic / settings screen rendering "last commit error:
+  foo" alongside other project state.
+- A status badge that wants to show "syncing has been failing"
+  without firing a modal toast (e.g. a small "!" next to the
+  last_commit timestamp).
+- A "we rescued some unsaved work today" badge driven by
+  ``n_recovered_today`` — purely a "you might notice some
+  azt-lift-conflict annotations in your data, here's why"
+  diagnostic. The recovery itself happens daemon-side without
+  any user gesture; conflicts (if any) flow through the
+  existing ``<annotation name="azt-lift-conflict">`` channel,
+  same as cross-peer merge conflicts.
+
+What NOT to do: don't synthesize ``COMMIT_REPEATEDLY_FAILED``
+toasts off the polled count. The auto-sync result iteration
+already fires the toast on the next sync attempt; a polling-
+based duplicate path complicates de-duplication for marginal
+UX gain. Same shape for ``n_recovered_today`` — it's a counter,
+not an event; rendering it as a count is fine, popping a modal
+"we rescued 3 files" toast is not (the user didn't ask to be
+told, and the data is already on disk where they expect it).
+
+## 18. Low-power adaptive policy
+
+Devices in the field span flagship phones / tablets down to
+2–3 GB budget hardware. The conformity contract is: **adapt
+resource decisions to the device automatically; only ask the
+user about content / workflow choices**.
+
+The principle:
+
+> When the device has memory + network headroom, **be eager**:
+> pre-warm caches, render full-resolution, hold persistent
+> background polls. When it doesn't, **degrade transparently**:
+> skip the bulk warm, downsample at display time, suspend
+> polling, ship pre-built variants instead of generating them
+> at boot. The user should not see a "low-power mode" toggle —
+> the peer reads OS signals and does the right thing.
+
+> **For the rationale** (why build-time work belongs in the
+> build, the runtime-rescale anti-pattern, what we explicitly
+> reject) — see ``CLAUDE.md`` "Low-power adaptive policy".
+
+### Three rules
+
+1. **Detect via OS signals, not user choice.** Android exposes
+   ``ActivityManager.MemoryInfo.lowMemory`` and ``availMem`` /
+   ``totalMem``. Trust the OS. A user-facing "low-power mode"
+   asks the user to know things about their hardware they
+   shouldn't have to.
+
+2. **Resource decisions are automatic; content / workflow
+   decisions remain user settings.** Distinguishing question:
+   "is this about what the device CAN do, or about what the
+   user WANTS?" Cache sizes, prefetch eagerness, prewarm
+   gating, poll cadence → automatic. Display-mode toggles,
+   sync-timing preferences → user-facing.
+
+3. **Pre-built variants > runtime regeneration.** When the
+   build can predict what the device will need, do that work
+   in the build. Examples: ``drawable-<bucket>/`` Android
+   resource buckets (Android picks at install time);
+   pre-bundled gettext ``.mo`` files; daemon-side pre-rendered
+   CAWL cache. Asking a budget device to PIL-rescale assets
+   during the splash — before Python is warm — is the
+   anti-pattern.
+
+### Inventory: gate vs. don't gate
+
+| Adaptation | Auto-gate? | Typical signal |
+|---|---|---|
+| Image cache size | yes | ``totalMem`` tiers (e.g. ≤3 GB / 3–6 GB / >6 GB) |
+| CAWL prefetch eager vs skip | yes | ``lowMemory`` ∨ ``availMem``/``totalMem`` ratio ∨ metered network |
+| Boot-time prewarm | yes | ``totalMem`` ≤ 3 GB → skip |
+| Image display rescale | yes | ``lowMemory`` → downsample (e.g. 720 px max) |
+| Cache-status poll cadence | yes | last-touch timestamp |
+| Sync-status poll lifecycle | yes (universal) | ``on_pause`` / ``on_resume`` |
+| Multi-density splash | n/a (install-time) | Android resource resolver |
+| Max-visible UI items | no | content choice — user setting |
+| Auto-sync-on-swipe | no | workflow choice — user setting |
+
+Use ``azt_collab_client.lowpower`` (since 0.41.21) — single
+source of truth for the JNI plumbing and the thresholds:
+
+```python
+from azt_collab_client.lowpower import (
+    total_ram_mb,            # one-shot, cached
+    memory_state,            # fresh: (low_memory, avail_ratio, avail_mb)
+    is_low_memory,           # combined predicate
+    is_metered_network,
+    have_room_for_prefetch,  # not low_memory and not metered
+    ram_tier,                # 'low' | 'mid' | 'high'
+    densityDpi,              # for diagnostic logging
+    dpi_to_bucket,
+)
+```
+
+Thresholds are module-level constants — override before first
+call if your peer has field data motivating a change:
+
+```python
+import azt_collab_client.lowpower as lp
+lp.RAM_TIER_LOW_MB = 4096    # treat 4 GB devices as low tier
+```
+
+For local testing of the gated paths on any platform, set
+``AZT_FORCE_LOW_MEMORY=1`` in the environment — every signal
+flips to its budget-device value (low_memory=True, ratio=0.05,
+metered=True, ram_tier='low').
+
+**Permission requirement: ACCESS_NETWORK_STATE.**
+``is_metered_network`` (and therefore ``have_room_for_prefetch``,
+which combines it with memory state) calls Android's
+``ConnectivityManager.isActiveNetworkMetered()``, which
+requires ``ACCESS_NETWORK_STATE``. Without the permission
+declared in the peer's ``buildozer.spec``, the JNI call raises
+``SecurityException: Neither user N nor current process has
+android.permission.ACCESS_NETWORK_STATE`` and the helper
+silently returns ``False`` (biasing toward "eager" — safer
+default than skipping work the user wanted, but masks the
+fact that we never checked). Add to peer's
+``android.permissions``:
+
+```ini
+android.permissions = INTERNET, ACCESS_NETWORK_STATE, ..., org.atoznback.AZT_COLLAB_ACCESS
+```
+
+This is a normal-protection-level permission (no runtime
+grant prompt; manifest entry alone is sufficient).
+
+### Multi-density assets
+
+For images that get a runtime-meaningful size (splash, large
+illustrations), ship one PNG per density bucket under
+``presplash_variants/drawable-<bucket>/<name>.png``. Scales
+relative to mdpi (1.0×): ldpi 0.75×, hdpi 1.5×, xhdpi 2×,
+xxhdpi 3×, xxxhdpi 4×.
+
+Wire them through ``android.add_resources`` in
+``buildozer.spec``:
+
+```ini
+android.add_resources =
+    %(source.dir)s/presplash_variants/drawable-ldpi/presplash.png:drawable-ldpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-mdpi/presplash.png:drawable-mdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-hdpi/presplash.png:drawable-hdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xhdpi/presplash.png:drawable-xhdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xxhdpi/presplash.png:drawable-xxhdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xxxhdpi/presplash.png:drawable-xxxhdpi/presplash.png
+```
+
+Keep ``presplash.filename = ...png`` as the rare-fallback for
+devices that match no bucket. Android prefers a qualifier
+match over the unqualified drawable.
+
+### Diagnostic logging — verify which bucket landed
+
+Android doesn't surface the chosen drawable bucket in
+logcat. Use the shared helper at peer startup:
+
+```python
+from azt_collab_client.lowpower import log_presplash_variant
+
+# Distinct tag per APK so a combined logcat is grep-able.
+log_presplash_variant(tag='presplash')           # peer
+log_presplash_variant(tag='presplash:server')    # server APK
+```
+
+Sample line:
+
+```
+[presplash:server] device densityDpi=420 (xxhdpi); native
+960x1599 source=480dpi (xxhdpi variant)
+```
+
+For a non-presplash multi-density asset (icons, large
+illustrations), pass a custom ``bucket_table``:
+
+```python
+log_presplash_variant(
+    tag='icon', resource_name='icon',
+    bucket_table={'mdpi': (160, 48), 'hdpi': (240, 72),
+                  'xhdpi': (320, 96), 'xxhdpi': (480, 144),
+                  'xxxhdpi': (640, 192)},
+)
+```
+
+#### Why this recipe and not the obvious one
+
+Two simpler recipes that **don't work** — don't copy them:
+
+- ``Drawable.getIntrinsicWidth/Height()`` returns device-scaled
+  pixels, so every bucket collapses to the same number on any
+  given device.
+- ``BitmapDrawable.getBitmap().getDensity()`` /
+  ``.getWidth()`` reports post-scaling state — Android has
+  already pre-scaled the bitmap to the device target density
+  by the time ``getDrawable`` returns, and the bitmap's
+  ``density`` field is reset to match.
+
+The helper uses ``BitmapFactory.decodeResource`` with
+``inJustDecodeBounds=true`` (skips bitmap allocation) and
+``inScaled=false`` (the load-bearing flag — without it
+``outWidth`` would be pre-scaled like the broken recipes).
+``opts.outWidth`` then carries the native pixel width of the
+resource file Android actually picked, and ``opts.inDensity``
+the source folder's density. Cross-referencing both against
+the known bucket table identifies the variant unambiguously.
+
+### Verification
+
+After shipping the multi-density splash:
+
+- ``unzip -l <peer>.apk | grep drawable-`` lists exactly one
+  ``presplash.png`` per declared bucket.
+- The ``[presplash]`` log line at startup names the bucket
+  matching the device's ``densityDpi``.
+- The splash is sharp at native resolution on a device of
+  each tier you care about (no on-device PIL-resize).
+
+After gating ``lowMemory`` adaptations:
+
+- Force ``lowMemory`` true via the Android Debug Bridge
+  (``adb shell am send-trim-memory`` or
+  ``Activity.onTrimMemory``) and confirm gated paths take
+  the degraded branch.
+- Verify ``on_pause`` / ``on_resume`` actually suspend /
+  re-arm background polls (no battery drain in
+  ``adb shell dumpsys batterystats`` while paused).
+
+## 19. Package-replacement handling
+
+APK install ≠ process upgrade on Android. When a package is
+reinstalled — ``adb install -r``, file-manager sideload, browser
+``ACTION_INSTALL_PACKAGE``, Play Store update — Android may keep
+the old process alive serving from the old code until something
+kills it. Lazy ContentProviders are the worst case: once a
+process is up serving the provider, it stays until killed
+(memory pressure, device reboot, explicit
+``killBackgroundProcesses``). Lazy services are the same.
+
+The user-visible symptom is "I installed the new server APK,
+but the peer still says the server is too old." The peer's
+``check_server_compat`` is talking to the old running server
+process, which is still reporting the old version. "Wait for
+an update" is the wrong instruction — the update is right
+there on disk, what's missing is a process restart.
+
+### Contract
+
+Every suite APK (server + every peer) MUST handle its own
+replacement. **No peer-side coordination required and no peer
+permission needed.**
+
+1. **Manifest receiver, NOT runtime.** Declare a receiver for
+   ``android.intent.action.MY_PACKAGE_REPLACED`` in
+   ``AndroidManifest.xml``. Runtime-registered receivers require
+   the process to be alive at broadcast time; some Android
+   versions / OEMs kill the old process as part of the replace
+   and there's no live receiver to deliver to. Manifest-declared
+   receivers cold-start the process to deliver — exactly what's
+   needed: spawn the NEW APK's code, run the handler, exit.
+
+2. **Reap surviving old-code processes, then self-kill.** The
+   receiver calls
+   ``ActivityManager.killBackgroundProcesses(getPackageName())``
+   first to reap any old-code process Android kept alive across
+   the install (sticky bindings, lazy provider clients), then
+   ``Process.killProcess(Process.myPid())`` on its own fresh
+   process. The reap step is load-bearing on OEMs that don't
+   auto-kill on replace; it requires
+   ``KILL_BACKGROUND_PROCESSES`` declared on the APK *whose
+   receiver is firing* — i.e. the freshly-installed APK reaps
+   its own old-code daemon. No cross-package killing happens, so
+   peers never need this permission to fix the server.
+
+3. **Receiver + permission are suite-provided.** The class
+   ``org.atoznback.aztcollab.SuiteSelfReplaceReceiver`` lives in
+   ``azt-collab/android/src/main/java/`` (compiled into every APK
+   via ``android.add_src``); the manifest ``<receiver>`` AND the
+   ``<uses-permission>`` for ``KILL_BACKGROUND_PROCESSES`` are
+   both injected by
+   ``p4a_hook.py:_inject_self_replace_receiver`` for every APK
+   in the suite (not gated on ``dist_name``). Peers don't add
+   the receiver, the permission, or any peer-side backstop —
+   symlinking ``android/`` from the canonical repo plus using
+   the shared p4a hook brings it all in automatically.
+
+### What peers MUST NOT do
+
+Peers MUST NOT assume the server APK on disk matches the server
+process currently serving requests. Pre-0.41.28 the assumption
+was implicit — the user would install a new server, peer's next
+compat probe talked to the OLD running process, and the popup
+told them their just-finished install had "no newer release."
+Every suite APK self-handling its own replacement (0.41.28+)
+closes that gap; the receiver's in-APK reap step (0.42+)
+closes the remaining OEM-doesn't-auto-kill-on-replace case.
+
+Peers MUST NOT add ``KILL_BACKGROUND_PROCESSES`` to their own
+``android.permissions``. The pre-0.42 peer-side backstop
+(``bootstrap._kill_server_background``) is gone; declaring the
+permission peer-side does nothing useful now and gives Google
+Play (or any future store reviewer) an extra permission to ask
+about.
+
+### Rollout window
+
+Until every field server APK ships daemon 0.42+, the in-receiver
+reap step isn't available for those legacy installs. The user's
+recourse for a stuck pre-0.42 install is to reboot the device
+(the most reliable way to clear a sticky-bound process). Peers
+on client 0.42+ surface this automatically:
+``_prompt_server_update`` reads the installed-on-disk server APK
+version via ``PackageManager.getPackageInfo`` and compares it
+to whatever /v1/health reports; if installed > running,
+``_prompt_server_reboot_to_apply`` substitutes a "you have X
+installed but the running process is Y — reboot to switch"
+popup for the usual download-and-install popup. Once every
+field daemon is at 0.42+ the comparison should never trigger
+(the receiver auto-reaps during install) and the helper is
+effectively dead code.
 
 ## What the suite does *for* you (keep code shareable)
 

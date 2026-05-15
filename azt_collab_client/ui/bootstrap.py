@@ -170,6 +170,44 @@ _prewarm_started = False
 _proc_start_monotonic = _time.monotonic()
 
 
+def _installed_server_version():
+    """Return the ``versionName`` of the server APK installed on disk,
+    or '' if it can't be read (not Android, no jnius, server APK not
+    installed, JNI failure).
+
+    Used by ``_prompt_server_update`` to detect the
+    "user just sideloaded a newer server APK but the old process is
+    still serving the provider" transition. When the on-disk version
+    is greater than what /v1/health reports, the install on disk is
+    new but Android's package replace didn't kill the running
+    daemon; ``_prompt_server_reboot_to_apply`` then substitutes the
+    reboot-to-apply body for the usual download-and-install one.
+
+    This is a transition helper for the pre-0.41.30 daemon → 0.41.30+
+    upgrade where the receiver didn't yet auto-reap; once every
+    field daemon is at 0.41.30 or newer the comparison should never
+    fire (every install reaps the old daemon from the receiver,
+    next bind = new code).
+    """
+    try:
+        from jnius import autoclass
+    except Exception:
+        return ''
+    try:
+        PA = autoclass('org.kivy.android.PythonActivity')
+        activity = PA.mActivity
+        if activity is None:
+            return ''
+        pm = activity.getPackageManager()
+        info = pm.getPackageInfo(_SERVER_PACKAGE_NAME, 0)
+        return str(info.versionName or '')
+    except Exception as ex:
+        print(f'[bootstrap] _installed_server_version failed '
+              f'({type(ex).__name__}: {ex})',
+              file=sys.stderr, flush=True)
+        return ''
+
+
 def _boot_trace(phase, **fields):
     """Emit a boot-timing trace line. Format:
 
@@ -702,7 +740,11 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
                       font_size=sp(15))
 
     def _do_check_again(*_):
-        # Dismiss the popup, drop the per-process release cache
+        # Dismiss the popup, kill any stale server background
+        # process (curative if the user just sideloaded a newer
+        # server APK; harmless if the server is already healthy —
+        # the next call lazy-spawns from whichever APK is on disk
+        # either way), drop the per-process release cache
         # (``_fetch_latest`` keeps results for 5 minutes; without
         # this drop, Check-again would just re-render against the
         # same stale release entry — real user-reported bug), and
@@ -711,8 +753,9 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
         # work" report shows up in logcat with a clear before/
         # after pair (or the absence of "after" if something
         # raised silently in the worker).
-        print('[bootstrap] Check again pressed — invalidating '
-              'release cache + re-entering _check_server',
+        print('[bootstrap] Check again pressed — '
+              'invalidating release cache + '
+              're-entering _check_server',
               file=sys.stderr, flush=True)
         view.dismiss()
         from .update import invalidate_release_cache
@@ -744,6 +787,49 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
     box.add_widget(btn_row)
     view.add_widget(box)
     view.open()
+
+
+def _prompt_server_reboot_to_apply(ctx, installed_version,
+                                    running_version):
+    """The user has installed a newer server APK but Android kept
+    the old daemon process alive across the replace, so /v1/health
+    still reports the old version. Tell them to reboot.
+
+    Specifically a transition-period helper: daemon 0.41.30+
+    ships ``SuiteSelfReplaceReceiver`` with the in-APK reap step,
+    which kills the surviving old process during the install and
+    makes this whole branch unreachable. Until every field daemon
+    is at 0.41.30 or later, this is the cleanest way to nudge a
+    user who installed the new APK out of the "I installed it but
+    it's still saying I need to update" loop.
+
+    Re-uses the ``_show_update_blocked_popup`` shape (Check again
+    + Quit + maintainer email link) — same UI vocabulary as the
+    other terminal popups in this module. Does NOT fire on_done."""
+    body_text = _tr(
+        'You have {name} {installed} installed, but the version '
+        'currently running is {running}. Restart your device to '
+        'switch to the newer version, then reopen this app.\n\n'
+        'If reboot doesn\'t help, '
+        '[ref=email][color=4ea1ff][u]send the developer an Email'
+        '[/u][/color][/ref].'
+    ).format(name=ctx.server_display_name,
+             installed=installed_version,
+             running=running_version)
+    subject = (
+        f'{ctx.server_display_name}: installed {installed_version} '
+        f'but running process is {running_version}')
+    msg_body = (
+        f'{ctx.server_display_name} installed-on-disk: '
+        f'{installed_version}\n'
+        f'{ctx.server_display_name} running process:    '
+        f'{running_version}\n\n'
+        f'The new APK is on disk but the old daemon process is '
+        f'still serving. Reboot should normally clear it.\n\n'
+        f'(Sent from the in-app "send the developer an Email" '
+        f'link.)'
+    )
+    _show_update_blocked_popup(ctx, body_text, subject, msg_body)
 
 
 def _show_release_too_old(ctx, latest_seen, required_min,
@@ -1350,8 +1436,20 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
             latest and _version_tuple(latest)
             > _version_tuple(ctx.peer_version)
         )
+        # Local-newer-than-release: the installed peer is at a higher
+        # version than what GitHub's "latest" release advertises. The
+        # typical cause is an adb-sideloaded dev build that hasn't
+        # been published yet; we must not propose installing the
+        # older online build over it. Gates the digest_changed
+        # branch — same-tag re-upload semantics only make sense when
+        # the user is on a version ≤ the published tag.
+        local_newer = bool(
+            latest and _version_tuple(latest)
+            < _version_tuple(ctx.peer_version)
+        )
         digest_changed = bool(
             gh_digest and last_seen and gh_digest != last_seen
+            and not local_newer
         )
         # First-run case: no last_seen recorded yet. We can't
         # introspect the installed APK's bundled digest to baseline
@@ -1359,20 +1457,40 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
         unknown_baseline = bool((not last_seen) and gh_digest)
         # Mandatory-mode override. The daemon has already told us
         # the running client is too old; the probe's job here is
-        # just to find a target to install, not to second-guess
-        # whether one is needed. Always prompt as long as the
-        # release feed gave us *something* to download — covers
-        # the unknown-baseline case (first run) AND the post-tap
-        # case where last_seen was just recorded by Update-tap
-        # but the install failed (otherwise the next probe would
-        # see digest_changed=False and silently fall through to
-        # _show_no_newer_release, hiding a real update).
-        mandatory_force = bool(mandatory and latest)
+        # to find a target to install IF one exists.
+        #
+        # Previously "always prompt as long as the release feed
+        # gave us *something*" — which looped when peer_version ==
+        # latest, because installing the same version doesn't make
+        # the daemon any happier. User installs 1.42.16, daemon
+        # still says client_too_old, popup says "1.42.16 available,
+        # install"; install, repeat. The peer's parity-with-latest
+        # case has its own destination — _show_no_newer_release —
+        # but the unconditional force_prompt hid it.
+        #
+        # Now force the prompt only when there's an actual reason
+        # to install: a real version bump (version_newer), a
+        # same-tag re-upload with new bytes (digest_changed), or a
+        # first-run unknown baseline (so we record a digest to
+        # baseline against on the next probe — the install at this
+        # point is a no-op against same-version-latest, but the
+        # recorded baseline means the NEXT probe falls cleanly
+        # into _show_no_newer_release). The parity case otherwise
+        # falls through to on_no_update → _show_no_newer_release,
+        # which surfaces all four version anchors (peer name +
+        # peer version + bundled client lib + required client lib)
+        # plus a Check-again + mailto so the user understands
+        # they're not at fault and the maintainer knows to cut a
+        # fresh build.
+        mandatory_force = bool(
+            mandatory and latest
+            and (version_newer or digest_changed or unknown_baseline))
         print(f'[bootstrap] _probe peer={ctx.peer_repo!r} '
               f'latest={latest!r} peer_v={ctx.peer_version!r} '
               f'gh_digest={gh_digest[:12]!r}… '
               f'last_seen={last_seen[:12]!r}… '
               f'version_newer={version_newer} '
+              f'local_newer={local_newer} '
               f'digest_changed={digest_changed} '
               f'mandatory={mandatory} '
               f'mandatory_force={mandatory_force}',
@@ -1635,6 +1753,17 @@ def _prompt_server_update(ctx, current_version, min_required=''):
     current_version (so check_for_update doesn't redownload an
     identical release).
 
+    **Pre-flight: installed-on-disk vs running-process.** Before
+    deciding the user needs to download anything, check whether
+    the server APK *on disk* is already newer than what /v1/health
+    reports. That mismatch means the user has already installed
+    the new APK but Android kept the old daemon process alive
+    across the replace (the symptom this whole package-
+    replacement work series exists to handle). In that case,
+    redirect to ``_prompt_server_reboot_to_apply`` instead of
+    asking the user to re-download — the bytes are already where
+    they need to be; what's missing is a process restart.
+
     **Pre-flight version check.** If ``min_required`` is set (the
     daemon's compat response carries it on the ``server_too_old``
     branch), we fetch GitHub's latest server release and confirm
@@ -1658,6 +1787,21 @@ def _prompt_server_update(ctx, current_version, min_required=''):
     On install completion the popup's continuation chain re-runs
     the compat check, same as the missing-server case."""
     from .popups import install_server_apk_popup
+    from .. import _version_tuple
+    installed = _installed_server_version()
+    if installed and current_version and (
+            _version_tuple(installed) > _version_tuple(current_version)):
+        # The bytes on disk are already newer than the running
+        # daemon. Asking the user to download again is wrong; what
+        # they need is a process restart. Reboot popup, no download.
+        print(f'[bootstrap] server installed={installed!r} > '
+              f'running={current_version!r}; offering reboot '
+              f'instead of update',
+              file=sys.stderr, flush=True)
+        _prompt_server_reboot_to_apply(
+            ctx, installed_version=installed,
+            running_version=current_version)
+        return
     if current_version and _consume_decline(
             ctx.server_repo, current_version):
         # One-shot decline consumed: let the host continue at the

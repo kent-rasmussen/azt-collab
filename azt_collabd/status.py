@@ -21,6 +21,15 @@ COMMITTED_OFFLINE = 'COMMITTED_OFFLINE'
 COMMITTED_NO_REMOTE = 'COMMITTED_NO_REMOTE'
 COMMITTED_AND_PUSHED = 'COMMITTED_AND_PUSHED'
 NOTHING_TO_COMMIT = 'NOTHING_TO_COMMIT'
+# Files in the project's working dir that don't match the audio/
+# / images/ / .lift staging filter and therefore won't reach git.
+# A peer wrote to an unexpected location — data is on the
+# device's daemon-private filesDir but will never be backed up.
+# Surface loudly: this is a data-loss-class condition, not silent
+# config drift. ``count`` and ``sample`` (up to 5 paths) carried
+# in params so a peer's toast / banner can render usefully
+# without parsing the daemon log.
+DATA_LOSS_RISK = 'DATA_LOSS_RISK'
 REMOTE_SET = 'REMOTE_SET'
 REMOTE_UPDATED = 'REMOTE_UPDATED'
 REMOTE_UNCHANGED = 'REMOTE_UNCHANGED'
@@ -48,6 +57,20 @@ ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
+# Persistent COMMIT_FAILED: the daemon has hit COMMIT_FAILED on
+# two-or-more successive commit attempts for this project.
+# dulwich's ``porcelain.commit`` essentially only raises on
+# persistent conditions (index corruption, refs problem, disk
+# full, broken repo state) — a single failure can be a fluke;
+# two in a row means the underlying problem is not self-healing
+# and the user's data is accumulating on the daemon's filesDir
+# without entering git history. Routed peer-side as a never-
+# silenced, data-loss-class condition (same bucket as
+# DATA_LOSS_RISK). Params carry ``count`` (the running streak)
+# and ``error`` (the last dulwich message). Counter persisted
+# in projects.json :: <langcode>.commit_failure_count; cleared
+# on the next successful commit.
+COMMIT_REPEATEDLY_FAILED = 'COMMIT_REPEATEDLY_FAILED'
 PUSH_FAILED = 'PUSH_FAILED'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
@@ -97,6 +120,17 @@ COLLABORATOR_ALREADY = 'COLLABORATOR_ALREADY'
 COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
 INVALID_USERNAME = 'INVALID_USERNAME'
 NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
+
+# ── Work-offline mode ──────────────────────────────────────────────────────
+# Returned from the user-initiated sync path (POST /v1/projects/<lang>/sync,
+# i.e. the Sync button) when the daemon-wide ``sync.work_offline`` toggle
+# is on. Peers route this as: toast "Work-offline mode is on" + navigate
+# to the daemon settings screen anchored on the toggle (same pattern as
+# AUTH_REQUIRED → credentials, NOT_A_REPO → publish flow). Auto-sync
+# paths silently no-op on this code per the auto/user contract.
+# Commit endpoints (commit_project) ignore the toggle — only push is
+# suppressed.
+WORK_OFFLINE_ENABLED = 'WORK_OFFLINE_ENABLED'
 
 # ── Contributor identity unset ─────────────────────────────────────────────
 # Returned by commit-issuing endpoints (init / sync / sync_async) when

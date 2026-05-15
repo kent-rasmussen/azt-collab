@@ -80,6 +80,39 @@ class ProjectStatus:
     # for forward-compat with pre-0.39 daemons.
     repo_slug: str = ''
     cawl_image_repo: str = ''
+    # Stuck-commit telemetry (since daemon 0.41.27). Running
+    # streak of successive COMMIT_FAILED, last failure timestamp
+    # (unix), last dulwich error message. Peers polling
+    # ``project_status`` SHOULD surface ``COMMIT_REPEATEDLY_FAILED``
+    # when ``commit_failure_count >= 2`` — matches the daemon's
+    # threshold and catches the case where the daemon's scheduler
+    # retried in the background (no fresh sync result delivered to
+    # the peer). Counter clears on the next successful commit.
+    commit_failure_count: int = 0
+    last_commit_failure_at: float = 0.0
+    last_commit_error: str = ''
+    # Atomic-recovery diagnostic counter (daemon 0.41.27+). The
+    # daemon auto-merges orphaned ``.azt_atomic_pending/<token>``
+    # LIFT scratches into the current LIFT in the background;
+    # this is the count of recoveries that landed today. Zero
+    # on a healthy project. Purely informational — peers needing
+    # a "we rescued some unsaved work today" diagnostic banner
+    # can render this number; recovered entries are already on
+    # disk (and the conflicts, if any, are flagged with
+    # ``<annotation name="azt-lift-conflict">`` the same way as
+    # cross-peer merge conflicts).
+    n_recovered_today: int = 0
+    # Daemon-wide work-offline toggle (since daemon 0.43.0). True
+    # means automatic push is suppressed: the connectivity
+    # watcher's drain is a no-op and the user-gestured Sync
+    # button returns ``S.WORK_OFFLINE_ENABLED``. Commits via
+    # ``commit_project`` are unaffected. Peers render a badge
+    # alongside ``commits_ahead`` so the user sees "5 commits
+    # waiting · offline mode" rather than misreading the count as
+    # a sync failure. Carried on every ``project_status`` even
+    # though it's daemon-wide (not per-project) so peers can
+    # render the badge without a second RPC.
+    work_offline: bool = False
 
     @classmethod
     def from_dict(cls, d):
@@ -96,4 +129,12 @@ class ProjectStatus:
             commits_ahead=int(d.get('commits_ahead', 0)),
             repo_slug=d.get('repo_slug', '') or '',
             cawl_image_repo=d.get('cawl_image_repo', '') or '',
+            commit_failure_count=int(
+                d.get('commit_failure_count', 0) or 0),
+            last_commit_failure_at=float(
+                d.get('last_commit_failure_at', 0.0) or 0.0),
+            last_commit_error=d.get('last_commit_error', '') or '',
+            n_recovered_today=int(
+                d.get('n_recovered_today', 0) or 0),
+            work_offline=bool(d.get('work_offline', False)),
         )

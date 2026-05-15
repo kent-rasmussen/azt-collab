@@ -47,6 +47,25 @@ icon.adaptive_background.filename = %(source.dir)s/icons/icon_adaptive_bg.png
 presplash.filename = %(source.dir)s/presplash.png
 android.presplash_color = #8cd9bf
 
+# Multi-density presplash. Each variant is rendered at native bucket
+# size by generate_presplash.py (re-run before build if appinfo / icon /
+# theme / version changed). Android's resource resolver picks the
+# matching bucket at install/run time; the unqualified
+# ``presplash.filename`` above stays as the rare-fallback for devices
+# that match no bucket.
+#
+# Rationale lives in NOTES_TO_DAEMON.md "be eager when you have room
+# to" §9: doing the resize in the build keeps the cost off the device,
+# instead of asking budget phones to PIL-rescale a single oversized
+# asset on first boot.
+android.add_resources =
+    %(source.dir)s/presplash_variants/drawable-ldpi/presplash.png:drawable-ldpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-mdpi/presplash.png:drawable-mdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-hdpi/presplash.png:drawable-hdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xhdpi/presplash.png:drawable-xhdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xxhdpi/presplash.png:drawable-xxhdpi/presplash.png,
+    %(source.dir)s/presplash_variants/drawable-xxxhdpi/presplash.png:drawable-xxxhdpi/presplash.png
+
 source.dir = .
 # We pull the daemon and client from sibling directories. Buildozer
 # resolves these paths at packaging time, then the resulting APK
@@ -63,6 +82,13 @@ source.include_patterns = main.py,service.py
 # daemon access for that repo if no cache file exists yet.
 # Closes install-day-no-network for index lookup.
 source.include_exts = py,xml,gz,png,po,mo,json
+
+# Maintainer / desktop-only scripts that get swept up by the
+# include_exts glob but have no business living in the on-device
+# APK. Each line documents what it is and why it's excluded.
+source.exclude_patterns =
+    test_install.py,
+    azt_collabd/data/cawl/generate_seed.py
 
 version.regex = __version__ = ['"](.*)['"]
 # This buildozer is running in a subdirectory of the azt-collab package,
@@ -114,7 +140,29 @@ android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, org.atoznback.
 # button. ~500 KB AAR; lives in the server APK because the
 # picker subprocess (which owns the clone flow) runs as an
 # Activity here.
-android.gradle_dependencies = com.journeyapps:zxing-android-embedded:4.3.0
+#
+# Its AndroidX deps (fragment, appcompat) are declared in the
+# library's POM as ``implementation``, NOT ``api``, so they don't
+# bleed into the consuming APK transitively — Gradle resolves them
+# at compile time inside the AAR but does NOT add them to our dex.
+# The journeyapps classes then reference Fragment / FragmentActivity
+# / AppCompatActivity, the Android verifier can't load them at
+# runtime, and ``autoclass('com.google.zxing.integration.android.IntentIntegrator')``
+# fails with NoClassDefFoundError on Landroidx/fragment/app/Fragment.
+# Listing the AndroidX deps explicitly here forces Gradle to pull
+# them into the project classpath and thus into classes.dex.
+#
+# Kotlin stdlib pins resolve a duplicate-class clash: androidx
+# fragment 1.6.2 → lifecycle-runtime 2.6.2 pulls kotlin-stdlib 1.8.20
+# (post-merge, contains jdk7+jdk8 classes), but the same lifecycle-
+# runtime → kotlinx-coroutines-android 1.6.4 transitively pulls
+# kotlin-stdlib-jdk{7,8}:1.6.21 (pre-merge, also ships those classes).
+# Result: ``Duplicate class kotlin.collections.jdk8.CollectionsJDK8Kt``
+# at ``:checkReleaseDuplicateClasses``. Pinning the -jdk7/-jdk8
+# artifacts to 1.8.20 routes the transitive request to the empty
+# metadata-only redirect artifacts that Kotlin started shipping at
+# 1.8 when those packages were merged into kotlin-stdlib proper.
+android.gradle_dependencies = com.journeyapps:zxing-android-embedded:4.3.0,androidx.appcompat:appcompat:1.6.1,androidx.fragment:fragment:1.6.2,org.jetbrains.kotlin:kotlin-stdlib:1.8.20,org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.20,org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.20
 
 # ContentProvider + sticky-bound service declarations.
 # Note: buildozer's key is `extra_manifest_xml` (NOT `manifest_extra_xml`,

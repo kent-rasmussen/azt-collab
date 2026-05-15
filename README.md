@@ -394,10 +394,12 @@ if status['state'] == 'DONE':
     print(translate_result(status['result']))
 ```
 
-See `examples/sister_app.py` for an end-to-end demo runnable with:
+See `examples/sister_app.py` for a read-only survey of everything
+the client gets from the daemon (`p` opens the picker, `s` opens
+the daemon settings UI):
 
 ```bash
-python examples/sister_app.py /path/to/some_project_dir
+python examples/sister_app.py
 ```
 
 ## Status codes worth checking

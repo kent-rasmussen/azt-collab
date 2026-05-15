@@ -38,6 +38,7 @@ from kivy.uix.screenmanager import (
 from kivy.utils import platform
 
 import azt_collab_client
+import azt_collabd
 from azt_collab_client import (
     S, clone_project, create_project_from_template, list_projects,
     register_project, translate_status,
@@ -174,6 +175,37 @@ class PickerApp(App):
     # otherwise 'Roboto'. Read by the modal overlays.
     _font_name = 'Roboto'
 
+    # Public alias matching ``CollabUIApp.font_name`` so shared
+    # screen code (settings, popups) reading
+    # ``App.get_running_app().font_name`` resolves the same value
+    # under either host App class. The picker's own internals
+    # still use ``_font_name``; the alias is read-only for
+    # cross-host compatibility.
+    @property
+    def font_name(self):
+        return self._font_name
+
+    # Set by ``main(launch_source=...)`` — 'user' (launcher-icon /
+    # adb am start) or 'peer' (peer's ``open_server_ui()`` added
+    # the ``azt_launch_source=peer`` extra to its launching
+    # Intent). Drives on_start update-check UX: popup for 'user',
+    # badge-only for 'peer'.
+    _launch_source = 'user'
+
+    # Set by the boot update check (background thread on
+    # ``on_start``) when GitHub's latest release is newer than the
+    # running version. Read by SettingsScreen.refresh to colour
+    # the Update-this-app button in 'peer' mode.
+    update_available_version = StringProperty('')
+
+    # Set by ``main(launch_mode=...)`` before ``app.run()``.
+    # 'external' = launched via PICK_PROJECT Intent from a peer;
+    # _emit_and_quit fires setResult/finish.
+    # 'internal' = launched in-process by the daemon settings UI
+    # (Switch project button); _emit_and_quit writes last_project
+    # and navigates back to settings instead of finishing.
+    _launch_mode = 'external'
+
     # ── Lifecycle ─────────────────────────────────────────────────────
     def build(self):
         theme.set_theme('Ocean')
@@ -193,6 +225,35 @@ class PickerApp(App):
         register_picker_kv(font_name=self._font_name, hide_settings_gear=False)
         register_langpicker_kv(font_name=self._font_name)
         self.sm = _PickerRoot(transition=SlideTransition())
+        # Honour the launch_mode set by ``main()``. 'internal' opens
+        # directly on the settings screen — used when the daemon's
+        # own Switch-project button re-runs picker_main without an
+        # external PICK_PROJECT intent, AND when the user taps the
+        # server APK's launcher icon, AND when a peer fires
+        # ``open_server_ui()``. Default 'external' keeps the
+        # existing picker-as-initial-screen behaviour for the
+        # peer-driven PICK_PROJECT Intent dispatch.
+        if getattr(self, '_launch_mode', 'external') == 'internal':
+            if self.sm.has_screen('settings'):
+                settings = self.sm.get_screen('settings')
+                # _PickerRoot KV sets ``back_to: 'picker'`` on the
+                # SettingsScreen instance — correct for external
+                # mode (settings reached from picker via gear, back
+                # should pop to picker). Wrong for internal mode:
+                # settings IS the root and the user reached it
+                # from outside the Activity (launcher tap or peer's
+                # open_server_ui), so the KV "« Back" button
+                # navigating to picker would dump them on a screen
+                # they never asked for. Clear back_to here so the
+                # KV button's ``if root.back_to else 0`` gating
+                # collapses it to height=0/opacity=0/disabled, and
+                # the OS back path (_navigate_back internal branch)
+                # is the only way to leave settings — which lets
+                # Android finish() the Activity and return the user
+                # to wherever they came from (launcher / peer).
+                settings.back_to = ''
+                self.sm.current = 'settings'
+                self.subtitle = _tr('Settings')
         return self.sm
 
     def go(self, name):
@@ -202,6 +263,141 @@ class PickerApp(App):
         bindings work in either host."""
         if self.sm.has_screen(name):
             self.sm.current = name
+
+    def _kick_boot_update_check(self):
+        """Background-thread poll of the server APK's GitHub release.
+        On newer-than-running result, branch UX on _launch_source:
+
+        - ``'user'``: fire the standard ``check_for_update`` flow
+          (popup + download + install intent) so a launcher-icon
+          tap that finds an outdated server gets prompted to
+          update. Routes status through the daemon settings
+          UI's existing update-msg label.
+        - ``'peer'``: set ``update_available_version`` only. The
+          SettingsScreen's ``refresh`` reads the property and
+          repaints the Update-this-app button as
+          ``Update available · X.Y.Z`` in GREEN. No popup — the
+          peer that opened us already handled its own update
+          surfaces; we don't want a second modal in the user's
+          face on top of whatever the peer just dispatched."""
+        from azt_collab_client.ui.update import check_for_update
+        from azt_collabd.config import update_repo
+        if self._launch_source == 'user':
+            check_for_update(
+                repo=update_repo(),
+                current_version=azt_collabd.__version__,
+                on_status=self._on_boot_update_status,
+                on_no_update=lambda: None,
+                on_error=lambda msg: print(
+                    f'[picker_app] boot update check failed: {msg}',
+                    file=sys.stderr, flush=True),
+            )
+            return
+        # 'peer' branch — silent probe via the SAME helper but with
+        # a no-op popup path. ``check_for_update``'s on_status fires
+        # 'Downloading…' once it commits to installing, so we
+        # short-circuit before that by setting the property in
+        # on_status's first call and never calling install.
+        # Practical implementation: just hit the GitHub Releases
+        # endpoint ourselves and stash the latest tag.
+        import threading
+        threading.Thread(
+            target=self._probe_latest_release,
+            args=(update_repo(),),
+            daemon=True,
+            name='boot-update-probe').start()
+
+    def _probe_latest_release(self, repo):
+        """Read the latest tag from GitHub Releases (used by the
+        'peer' launch-source branch). On newer-than-running, store
+        the tag in ``update_available_version`` so SettingsScreen
+        can render its badge. Best-effort: silent on any failure
+        (network, missing repo, parse error)."""
+        from azt_collab_client.ui.update import _fetch_latest
+        from azt_collab_client import _version_tuple
+        try:
+            release = _fetch_latest(repo)
+        except Exception as ex:
+            print(f'[picker_app] _probe_latest_release fetch failed: '
+                  f'{ex}', file=sys.stderr, flush=True)
+            return
+        tag = (release.get('tag_name') or '').lstrip('vV')
+        if not tag:
+            return
+        if _version_tuple(tag) > _version_tuple(azt_collabd.__version__):
+            def _set(_dt):
+                self.update_available_version = tag
+                print(f'[picker_app] update available: {tag} '
+                      f'(running {azt_collabd.__version__})',
+                      file=sys.stderr, flush=True)
+            Clock.schedule_once(_set, 0)
+
+    def _on_boot_update_status(self, text):
+        """Status sink for the 'user' launch-source update flow.
+        Mirrors ``SettingsScreen._set_update_msg`` so the popup's
+        status text lands on the settings page's update_msg label
+        when the user dismisses the popup."""
+        try:
+            settings = (self.sm.get_screen('settings')
+                        if self.sm.has_screen('settings') else None)
+            msg = settings.ids.get('update_msg') if settings else None
+            if msg is not None:
+                msg.text = text or ''
+        except Exception:
+            pass
+
+    def _apply_decor_fits_system_windows(self):
+        """Restore pre-API-35 insets behaviour so the status bar and
+        gesture navigation bar reserve their insets instead of
+        overlaying our content. Without this on Android 15+, the
+        picker's gear icon (top of screen) sits underneath the
+        status bar and looks "missing"; same risk for any
+        bottom-anchored widget vs. the gesture bar.
+
+        ``WindowCompat.setDecorFitsSystemWindows`` is the
+        compat-shim alternative to handling
+        ``WindowInsetsListener`` per-view, available because we
+        pull ``androidx.appcompat`` (which transitively brings
+        ``androidx.core.view``).
+
+        Window decoration changes must run on the Activity's UI
+        thread; Kivy's ``on_start`` runs on the SDL thread, which
+        is not the UI thread on Android. We use
+        ``android.runnable.run_on_ui_thread`` (provided by p4a)
+        to marshal the call. Best-effort: silent fallback to a
+        direct call (which may produce a one-time
+        ``CalledFromWrongThreadException``) if the helper isn't
+        available."""
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass(
+                'org.kivy.android.PythonActivity')
+            WindowCompat = autoclass(
+                'androidx.core.view.WindowCompat')
+            activity = PythonActivity.mActivity
+            if activity is None:
+                return
+            window = activity.getWindow()
+        except Exception as ex:
+            print(f'[picker_app] decor-fits autoclass failed: {ex}',
+                  file=sys.stderr, flush=True)
+            return
+
+        def _apply():
+            try:
+                WindowCompat.setDecorFitsSystemWindows(window, True)
+                print('[picker_app] setDecorFitsSystemWindows(true) — '
+                      'system bars will reserve insets',
+                      file=sys.stderr, flush=True)
+            except Exception as ex:
+                print(f'[picker_app] setDecorFitsSystemWindows raised: '
+                      f'{ex}', file=sys.stderr, flush=True)
+
+        try:
+            from android.runnable import run_on_ui_thread
+            run_on_ui_thread(_apply)()
+        except ImportError:
+            _apply()
 
     def on_pause(self):
         """Permit Kivy to pause when the Activity backgrounds. Returning
@@ -215,6 +411,23 @@ class PickerApp(App):
         the provider down with it."""
         return True
 
+    def on_resume(self):
+        """Refresh the active screen when the Activity returns to the
+        foreground. Cheap call into ``refresh()`` so any state that
+        changed elsewhere (project switched via another Activity,
+        credentials updated, etc.) shows up immediately."""
+        try:
+            current = self.sm.current_screen
+        except Exception:
+            return
+        refresh = getattr(current, 'refresh', None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception as ex:
+                print(f'[picker_app] on_resume refresh failed: {ex}',
+                      file=sys.stderr, flush=True)
+
     def on_start(self):
         """Once the app is running, watch ``$AZT_HOME/config.json`` so
         a language change made in a settings subprocess (opened via
@@ -225,6 +438,29 @@ class PickerApp(App):
             azt_collabd.paths.azt_home(), 'config.json')
         self._config_mtime = self._get_config_mtime()
         Clock.schedule_interval(self._check_language_change, 1.0)
+        # Android 15+ enforces edge-to-edge by default — the status
+        # bar and gesture navigation bar overlay the app window
+        # unless we opt back into the pre-API-35 "decor fits system
+        # windows" behaviour. Without this, top-of-screen widgets
+        # (the picker's gear icon, every screen's TopBar) sit
+        # underneath the status bar and look "missing" to the user.
+        # Bottom-anchored widgets disappear behind the gesture bar
+        # the same way. ``WindowCompat.setDecorFitsSystemWindows``
+        # restores reserved insets on every API level the suite
+        # supports; available because we pull androidx.appcompat
+        # (which transitively brings androidx.core.view) into the
+        # APK.
+        if platform == 'android':
+            self._apply_decor_fits_system_windows()
+        # Boot-time update check. UX gated by _launch_source:
+        # 'user' (launcher tap) → popup-on-newer; 'peer' (settings
+        # opened from a peer that already ran its own boot update
+        # flow) → badge only. external launch_mode (PICK_PROJECT
+        # Intent) skips the check entirely — the launching peer
+        # is already responsible for keeping the server APK
+        # current.
+        if getattr(self, '_launch_mode', 'external') == 'internal':
+            self._kick_boot_update_check()
         # Android hardware back button does not flow through
         # App.on_request_close; it surfaces as a key 27 event on
         # Window.on_keyboard. Bind the same back-nav logic there so
@@ -372,6 +608,26 @@ class PickerApp(App):
                 'Internal error: tried to return an empty path. '
                 'Please pick again or report this.'))
             return
+        # Internal launch path: the daemon settings UI invoked us via
+        # the Switch-project button; there's no peer waiting for an
+        # Activity result. Stamp the new langcode server-side and
+        # navigate back to settings instead of finishing the Activity.
+        if getattr(self, '_launch_mode', 'external') == 'internal':
+            try:
+                from azt_collab_client import set_last_project
+                if langcode:
+                    set_last_project(langcode)
+            except Exception as ex:
+                print(f'[picker_app] _emit_and_quit internal: '
+                      f'set_last_project failed: {ex}',
+                      file=sys.stderr, flush=True)
+            print(f'[picker_app] _emit_and_quit internal: '
+                  f'navigating to settings (langcode={langcode!r})',
+                  file=sys.stderr, flush=True)
+            if self.sm.has_screen('settings'):
+                self.sm.current = 'settings'
+                self.subtitle = _tr('Settings')
+            return
         if platform == 'android':
             try:
                 from jnius import autoclass
@@ -450,29 +706,50 @@ class PickerApp(App):
     def _navigate_back(self):
         """Handle a back-press inside the picker subprocess.
 
-        Three classes of screen, three behaviours:
+        Behaviour depends on ``_launch_mode`` because the picker
+        runs in two roles now:
 
-        * Sub-screens with somewhere to go (settings / github / gitlab
-          when reached from the picker) — pop back to the screen named
-          by ``back_to`` (default ``'picker'``).
-        * The project-picker screen itself and the langpicker — exit
-          the picker subprocess and return the user to the recorder.
-          When ``last_project()`` resolves to a live registered
-          project we emit it so the recorder auto-resumes; otherwise
-          we emit a clean cancel (the recorder's ``_handle_pick``
-          silently returns to whatever it was showing). Either way
-          the user lands on the recorder, never on a stale picker
-          screen with one more back-press needed to actually exit.
-        * Anything else with no ``back_to`` and no matching screen
-          — return False so Kivy / Android default-close fires."""
+        * ``external`` (peer-driven PICK_PROJECT Intent): picker
+          is the initial screen. Back from sub-screens pops to
+          their ``back_to`` (defaults to ``'picker'``). Back from
+          picker / langpicker calls
+          ``_exit_to_last_project_or_cancel`` so the launching peer
+          gets a setResult(OK, last_project) or setResult(CANCELED)
+          and we ``finish()``.
+        * ``internal`` (Switch-project from daemon settings UI):
+          settings is the initial screen. Back from settings
+          returns False so Android default-closes the Activity
+          (matches the pre-0.41.22 ``CollabUIApp`` back-from-
+          settings = exit behaviour). Back from picker / langpicker
+          navigates to settings instead of finishing the Activity —
+          there's no peer waiting for an Activity result. Other
+          sub-screens still honour ``back_to``."""
         if not hasattr(self, 'sm'):
             return False
-        if self.sm.current in ('picker', 'langpicker'):
-            self._exit_to_last_project_or_cancel(
-                from_screen=self.sm.current)
+        launch_mode = getattr(self, '_launch_mode', 'external')
+        current = self.sm.current
+        if launch_mode == 'internal':
+            if current == 'settings':
+                return False  # let Android close the Activity
+            if current in ('picker', 'langpicker'):
+                if self.sm.has_screen('settings'):
+                    self.sm.current = 'settings'
+                    self.subtitle = _tr('Settings')
+                    return True
+                return False
+            cur = (self.sm.get_screen(current)
+                   if self.sm.has_screen(current) else None)
+            target = getattr(cur, 'back_to', '') or 'settings'
+            if self.sm.has_screen(target):
+                self.sm.current = target
+                return True
+            return False
+        # External mode — existing behaviour.
+        if current in ('picker', 'langpicker'):
+            self._exit_to_last_project_or_cancel(from_screen=current)
             return True
-        cur = (self.sm.get_screen(self.sm.current)
-               if self.sm.has_screen(self.sm.current) else None)
+        cur = (self.sm.get_screen(current)
+               if self.sm.has_screen(current) else None)
         target = getattr(cur, 'back_to', '') or 'picker'
         if self.sm.has_screen(target):
             self.sm.current = target
@@ -524,7 +801,22 @@ class PickerApp(App):
         teardown shape is reachable from anywhere (e.g. a back-press
         from langpicker that doesn't have a ``last_project`` to
         resume). On desktop, just sets the exit code; ``main()`` reads
-        ``_exit_code`` after ``App.run`` returns."""
+        ``_exit_code`` after ``App.run`` returns.
+
+        Internal launch_mode: no peer waiting for an Activity result —
+        navigate back to settings instead of finishing the Activity.
+        Defensive coverage of any callsite that still falls through
+        here from internal-mode paths (today only _exit_to_last_
+        project_or_cancel and on_request_close, both of which we
+        route away from cancel in internal mode at the call site)."""
+        if getattr(self, '_launch_mode', 'external') == 'internal':
+            print('[picker_app] _emit_cancel_and_quit internal: '
+                  'navigating to settings instead of finishing',
+                  file=sys.stderr, flush=True)
+            if hasattr(self, 'sm') and self.sm.has_screen('settings'):
+                self.sm.current = 'settings'
+                self.subtitle = _tr('Settings')
+            return
         if platform == 'android':
             try:
                 from jnius import autoclass
@@ -951,14 +1243,51 @@ class PickerApp(App):
             _tr('Could not create project: {error}').format(error=err))
 
 
-def main():
+def main(launch_mode='external', launch_source='user'):
+    """Run the unified Kivy app that hosts both the project picker
+    and the daemon settings UI.
+
+    ``launch_mode`` controls the initial screen and the picker's
+    submit-handler behaviour:
+
+    - ``'external'`` (default; PICK_PROJECT-via-Intent): initial
+      screen is the picker; on selection, the picker calls
+      ``activity.setResult(RESULT_OK, intent)`` + ``finish()`` to
+      hand the result back to the launching peer. Existing
+      pre-0.41.22 behaviour.
+    - ``'internal'`` (Switch-project from daemon settings UI OR
+      user tapped the server APK's launcher icon): initial screen
+      is settings; on picker selection, the picker writes the new
+      langcode to ``set_last_project`` server-side and navigates
+      back to settings instead of finishing the Activity. Pairs
+      with ``CLIENT_INTEGRATION.md`` § 14a so peers reload to the
+      new project on the next ``on_resume``.
+
+    ``launch_source`` (only meaningful for ``launch_mode=
+    'internal'``) controls the boot-time update-check UX:
+
+    - ``'user'`` (launcher-icon tap / adb am start): the user
+      reached the server APK directly and otherwise has no
+      occasion to learn about updates. Popup-on-boot when a
+      newer release is available.
+    - ``'peer'`` (peer-driven ``open_server_ui()``): the peer
+      already ran its own boot update flow against the server
+      via ``check_server_compat``. Don't pop a redundant
+      modal — surface an unobtrusive "Update available" badge
+      on the existing Update-this-app button instead.
+    """
     import time as _time
     from azt_collab_client._debug import first_try_log
     _t0 = _time.monotonic()
     first_try_log('picker_app.main_entry',
                   argv=sys.argv,
-                  platform=platform)
-    PickerApp().run()
+                  platform=platform,
+                  launch_mode=launch_mode,
+                  launch_source=launch_source)
+    app = PickerApp()
+    app._launch_mode = launch_mode
+    app._launch_source = launch_source
+    app.run()
     first_try_log('picker_app.main_returned',
                   dt=f'{_time.monotonic() - _t0:.3f}s')
     if platform != 'android':

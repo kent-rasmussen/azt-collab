@@ -21,8 +21,12 @@ Dependency: the consuming APK's ``buildozer.spec`` must list
 - ``com.journeyapps.barcodescanner.CaptureActivity`` — the
   full-screen camera-preview Activity that ZXing dispatches
   via Intent.
-- ``com.journeyapps.barcodescanner.IntentIntegrator`` — the
-  helper that builds the Intent and parses the result.
+- ``com.google.zxing.integration.android.IntentIntegrator`` — the
+  helper that builds the Intent and parses the result. Note the
+  package: the journeyapps AAR re-ships ZXing's original
+  IntentIntegrator at its historical path, so the class lives
+  under ``com.google.zxing.integration.android`` even though the
+  rest of the library is under ``com.journeyapps.barcodescanner``.
 
 The Activity inherits from AppCompatActivity and renders its own
 UI (camera preview + targeting rect + "point at a code" prompt).
@@ -121,8 +125,13 @@ def scan_qr(on_result, on_cancel=None, prompt=''):
     from kivy.clock import Clock
 
     try:
+        # IntentIntegrator lives in com.google.zxing.integration.android,
+        # not com.journeyapps.barcodescanner — the journeyapps AAR
+        # re-ships the original ZXing helper under its historical
+        # package. CaptureActivity *is* under
+        # com.journeyapps.barcodescanner; IntentIntegrator is not.
         IntentIntegrator = autoclass(
-            'com.journeyapps.barcodescanner.IntentIntegrator')
+            'com.google.zxing.integration.android.IntentIntegrator')
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
     except Exception as ex:
         # zxing-android-embedded isn't in the APK. Tell the caller

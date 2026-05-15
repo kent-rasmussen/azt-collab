@@ -67,6 +67,32 @@ def _launch_intent_action():
         return ''
 
 
+def _launch_source():
+    """Return ``'peer'`` if the launching Intent carries the
+    ``azt_launch_source=peer`` extra (set by
+    ``azt_collab_client._open_server_ui_android``), else ``'user'``
+    (launcher-icon tap, ``adb am start``, etc.). Distinguishes peer-
+    driven settings-open from a user-direct launcher tap so the
+    server-APK's on_start can pick an update-check UX appropriate
+    to each: badge for peer-driven, popup for user-direct.
+
+    Falls through to ``'user'`` on any failure — the conservative
+    default matches the user-direct path's "popup on boot if
+    newer" behaviour."""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        intent = PythonActivity.mActivity.getIntent()
+        if intent is None:
+            return 'user'
+        src = intent.getStringExtra('azt_launch_source')
+        if src == 'peer':
+            return 'peer'
+    except Exception:
+        pass
+    return 'user'
+
+
 def _ensure_provider_service():
     """Start AZTServiceProviderhost if we're on Android. Idempotent —
     Android collapses repeat startService into a single running
@@ -95,6 +121,15 @@ def _ensure_provider_service():
 
 
 def main():
+    # 0. Diagnostic: which presplash bucket landed at install time.
+    #    No-op on desktop / on jnius failure. Distinct tag from peer
+    #    logs so a combined logcat is grep-able.
+    try:
+        from azt_collab_client.lowpower import log_presplash_variant
+        log_presplash_variant(tag='presplash:server')
+    except Exception as ex:
+        print(f'[server_apk] presplash diag skipped: {ex}', flush=True)
+
     # 1. Server APK is the canonical Github App identity holder.
     #    Override the defaults if your suite ships under a different
     #    GitHub App slug.
@@ -115,6 +150,44 @@ def main():
     except Exception as ex:
         print(f'[server_apk] provider install skipped: {ex}')
 
+    # 2a. Pre-warm jnius-touching state on the main thread. Both
+    #    helpers below have lazy-init paths that call into pyjnius
+    #    autoclass + JNI method invocation on first read. Calling
+    #    them HERE forces that work to happen on the daemon main
+    #    thread (which inherits the app classloader) instead of
+    #    deferring to whichever background Python thread happens to
+    #    need the value first (Timer-spawned sync workers, HTTP
+    #    server threads, etc.) — Python-spawned threads attach to
+    #    the JVM with the bootclassloader, which has triggered
+    #    NULL-deref SIGSEGV in art::JNI::CallObjectMethodA on field
+    #    reads against app context. After this warmup both helpers
+    #    serve from cached state (config.json / process memory) for
+    #    every subsequent caller on any thread.
+    try:
+        from azt_collabd import store as _store
+        from azt_collabd.paths import azt_home as _azt_home
+        _azt_home()
+        _store.get_device_name()
+    except Exception as ex:
+        print(f'[server_apk] jnius prewarm skipped: {ex}', flush=True)
+
+    # 2b. Crash-marker bookkeeping. Detect "previous process didn't
+    #    run atexit" (SIGSEGV / SIGKILL / OOM-kill / kernel kill —
+    #    anything that bypasses normal teardown), write the
+    #    one-liner to $AZT_HOME/last_native_crash.json so /v1/health
+    #    can surface it to peers, then arm the sentinel for THIS
+    #    process so the next startup can do the same. Best-effort:
+    #    failures here don't block daemon startup.
+    try:
+        from azt_collabd import crash_marker as _crash
+        from azt_collabd.paths import azt_home as _azt_home
+        _home = _azt_home()
+        _crash.record_ungraceful_shutdown_if_any(_home)
+        _crash.arm_graceful_shutdown_marker(_home)
+    except Exception as ex:
+        print(f'[server_apk] crash_marker setup skipped: {ex}',
+              flush=True)
+
     # 3. Start the sticky-bound service so the host process is pinned
     #    across the upcoming activity.finish(). Must happen BEFORE the
     #    picker mounts so that even an immediate cancel-and-finish
@@ -122,19 +195,21 @@ def main():
     #    URI grant from a previous pick.
     _ensure_provider_service()
 
-    # 4. Dispatch on Intent action.
+    # 4. Run the unified picker+settings Kivy app. Initial screen +
+    #    submit-handler branch depend on launch_mode:
+    #    - PICK_PROJECT intent (peer-driven): launch_mode='external',
+    #      picker is initial; submit fires setResult/finish.
+    #    - no intent / launcher tap (user opened the server APK to
+    #      tweak settings): launch_mode='internal', settings is
+    #      initial; the Switch-project button there can navigate to
+    #      the picker in-process and the picker's submit returns to
+    #      settings instead of finishing the Activity.
+    from azt_collabd.ui.picker_app import main as picker_main
     if _launch_intent_action() == _PICK_ACTION:
-        from azt_collabd.ui.picker_app import main as picker_main
-        picker_main()
-        return
-
-    # 5. Default: settings UI. The daemon's loopback HTTP server is
-    #    spun up lazily by the first client call (auto-spawn). On
-    #    Android the in-process pyjnius shim handles RPCs directly,
-    #    so the loopback server stays dormant unless the UI itself
-    #    triggers a client call that misses the cache.
-    from azt_collabd.ui.app import main as ui_main
-    ui_main()
+        picker_main(launch_mode='external')
+    else:
+        picker_main(launch_mode='internal',
+                    launch_source=_launch_source())
 
 
 if __name__ == '__main__':

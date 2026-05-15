@@ -838,6 +838,20 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     body_label.bind(width=lambda w, val: setattr(
         w, 'text_size', (val, None)))
     content.add_widget(body_label)
+    # Dedicated status line for transient updates ("Downloading…",
+    # "Tap install again to confirm", "Install failed: …"). Visually
+    # distinct from ``body_label`` (larger, ACCENT colour, bold) so
+    # a fresh message reads as the most-current call-to-action
+    # rather than vanishing into the wall of explanatory text above.
+    status_label = Label(
+        text='', halign='left', valign='top',
+        font_size=sp(15), color=theme.ACCENT, font_name=font_name,
+        bold=True, size_hint_y=None,
+    )
+    status_label.bind(
+        width=lambda w, val: setattr(w, 'text_size', (val, None)),
+        texture_size=lambda w, ts: setattr(w, 'height', ts[1]))
+    content.add_widget(status_label)
     # Tall enough to hold two lines of wrapped button text on
     # narrow screens — "Open install page" and "Quit AZT Recorder"
     # both want to wrap. Without text_size binding (below) Kivy
@@ -851,7 +865,7 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         background_color=theme.ACCENT,
     )
     open_page_btn = Button(
-        text=_tr('Open install page'),
+        text=_tr('More info'),
         font_size=sp(13), font_name=font_name,
         halign='center', valign='middle',
     )
@@ -905,8 +919,8 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         btn_row.add_widget(retry_btn)
     if open_app_btn is not None:
         btn_row.add_widget(open_app_btn)
-    btn_row.add_widget(open_page_btn)
     btn_row.add_widget(install_btn)
+    btn_row.add_widget(open_page_btn)
     content.add_widget(btn_row)
 
     # Version footer — discrete, dim, helps diagnose which client
@@ -929,12 +943,14 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
     )
 
     def _route_status(text):
-        # Surface progress in the popup body so the user always sees
-        # what's happening even if the host's status sink isn't
-        # currently visible. Keeps the lead context line so the
-        # user keeps the "what's this about" anchor.
-        body_label.text = (msg + '\n\n' + (text or '')) if msg else (
-            text or '')
+        # Surface progress on the dedicated status_label below the
+        # main message. body_label keeps the original explanatory
+        # ``msg`` unchanged so the user retains the "what's this
+        # about" anchor; status_label carries the current call-to-
+        # action ("Downloading…", "Tap install again to confirm",
+        # …) in the ACCENT bold style so it doesn't get lost in
+        # the wall of text above.
+        status_label.text = text or ''
         if on_status:
             try:
                 on_status(text)

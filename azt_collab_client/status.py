@@ -16,6 +16,14 @@ COMMITTED_OFFLINE = 'COMMITTED_OFFLINE'
 COMMITTED_NO_REMOTE = 'COMMITTED_NO_REMOTE'
 COMMITTED_AND_PUSHED = 'COMMITTED_AND_PUSHED'
 NOTHING_TO_COMMIT = 'NOTHING_TO_COMMIT'
+# Files written to the daemon's project dir that don't fall under
+# any staging filter (audio/, images/, .lift) — peer wrote to an
+# unexpected location and the file will never reach git. Surfaced
+# loudly by the daemon as a data-loss-class signal. params carry
+# ``count`` and ``sample`` (up to 5 paths) so peers can render a
+# user-actionable toast / banner urging "Please send your daemon
+# log" without parsing the log file.
+DATA_LOSS_RISK = 'DATA_LOSS_RISK'
 REMOTE_SET = 'REMOTE_SET'
 REMOTE_UPDATED = 'REMOTE_UPDATED'
 REMOTE_UNCHANGED = 'REMOTE_UNCHANGED'
@@ -38,6 +46,14 @@ ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
+# Two-or-more successive COMMIT_FAILED for this project. Routed
+# never-silenced peer-side — same bucket as DATA_LOSS_RISK because
+# the user's data is accumulating on the daemon's filesDir without
+# entering git history. Params: ``count`` (running streak),
+# ``error`` (last dulwich message). Counter cleared on the next
+# successful commit. See azt_collabd/status.py for the full
+# rationale.
+COMMIT_REPEATEDLY_FAILED = 'COMMIT_REPEATEDLY_FAILED'
 PUSH_FAILED = 'PUSH_FAILED'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
@@ -69,6 +85,15 @@ COLLABORATOR_ALREADY = 'COLLABORATOR_ALREADY'
 COLLABORATOR_INVITE_FAILED = 'COLLABORATOR_INVITE_FAILED'
 INVALID_USERNAME = 'INVALID_USERNAME'
 NOT_GITHUB_REMOTE = 'NOT_GITHUB_REMOTE'
+
+# Returned from the user-initiated sync path (Sync button) when the
+# daemon-wide ``sync.work_offline`` toggle is on. Peers route this as:
+# toast "Work-offline mode is on" + navigate to the daemon settings
+# screen (open_server_ui()) so the user can toggle it off. Auto-sync
+# paths silently no-op on this code per the auto/user contract. The
+# commit endpoint (``commit_project``) ignores the toggle entirely —
+# only push is suppressed.
+WORK_OFFLINE_ENABLED = 'WORK_OFFLINE_ENABLED'
 
 # Returned by commit-issuing endpoints (init / sync / sync_async)
 # when the daemon's stored contributor name is empty. Peers must

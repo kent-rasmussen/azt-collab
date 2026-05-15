@@ -60,6 +60,8 @@ from azt_collab_client import (
     test_gitlab_credentials,
     set_contributor,
     set_daemon_log_to_file,
+    get_cawl_prefetch_all_variants,
+    set_cawl_prefetch_all_variants,
     translate_result,
     translate_status,
 )
@@ -176,19 +178,6 @@ def _show_share_repo_qr_popup(url, langcode, font_name='Roboto'):
         btn.bind(on_release=on_release)
         return btn
 
-    def _copy(_btn):
-        # ``Clipboard.copy`` works on every Kivy platform; on
-        # Android it routes through the system clipboard service.
-        try:
-            from kivy.core.clipboard import Clipboard
-            Clipboard.copy(url)
-            instr.text = _tr('Copied to clipboard.')
-        except Exception as ex:
-            instr.text = _tr('Could not copy: {error}').format(
-                error=ex)
-
-    btn_row.add_widget(_make_btn(
-        _tr('Copy URL'), theme.SURFACE, _copy))
     btn_row.add_widget(_make_btn(
         _tr('Close'), theme.ACCENT, lambda *_: view.dismiss()))
     box.add_widget(btn_row)
@@ -478,6 +467,7 @@ KV_TEMPLATE = '''
                             x: self.parent.x + dp(12)
                             center_y: self.parent.center_y
                     RecBtn:
+                        id: update_btn
                         text: _('Update')
                         normal_color: T.SURFACE
                         on_press: app.update_app()
@@ -498,14 +488,17 @@ KV_TEMPLATE = '''
                     text: _('Your name (appears in commits)')
                 ThemedInput:
                     id: contributor_input
-                    hint_text: _('e.g. Kent Rasmussen')
+                    hint_text: _('first_name last_name')
                     on_focus: root.save_contributor() if not self.focus else None
                 BodyLabel:
                     id: contributor_msg
                     text: ''
                     color: T.TEXT_DIM
                     size_hint_y: None
-                    height: dp(20)
+                    # Auto-grow so the multi-line "Required: …"
+                    # warning isn't truncated when it appears.
+                    height: self.texture_size[1] + dp(4)
+                    text_size: self.width, None
                 # GitHub: a single state-aware button. ``refresh()``
                 # flips the label between "Connect to GitHub" (until
                 # verified) and "GitHub Settings" (once verified).
@@ -596,6 +589,18 @@ KV_TEMPLATE = '''
                         color: T.TEXT_DIM
                         size_hint_y: None
                         height: dp(20)
+                # Switch project — always visible, outside the gated
+                # project_actions_row. A user may want to abandon an
+                # unpublished project for another without publishing
+                # first; the row above is gated on a remote being
+                # set, this button isn't.
+                RecBtn:
+                    id: switch_project_btn
+                    text: _('Switch project')
+                    size_hint_y: None
+                    height: dp(52)
+                    normal_color: T.SURFACE
+                    on_press: root.switch_project()
                 # Status — read-only credential / online state, parked
                 # at the bottom now that the actionable rows live up
                 # top. Refresh Status sits directly under it so the
@@ -611,6 +616,87 @@ KV_TEMPLATE = '''
                 NavBtn:
                     text: _('Refresh Status')
                     on_press: root.refresh()
+                # Wordlist-image-cache policy. Default is one image
+                # per CAWL line (the preferred ``__`` variant); peers
+                # can still on-demand-fetch other variants as the
+                # user navigates to them. Flipping to "all" warms
+                # every variant in the index — heavier on network /
+                # disk but useful when bandwidth is cheap and the
+                # user wants the broader set available offline.
+                #
+                # Section label is filled at refresh time with the
+                # active wordlist name (derived from the active
+                # project's image_repo slug) so a user juggling
+                # multiple projects can see which wordlist this
+                # toggle affects.
+                SectionLabel:
+                    id: cawl_section_label
+                    text: _('Wordlist images')
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Cache images:')
+                        size_hint_x: None
+                        width: dp(120)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: cawl_variants_one_btn
+                        text: _('1 per line')
+                        on_press: root.set_cawl_prefetch_mode(False)
+                    RecBtn:
+                        id: cawl_variants_all_btn
+                        text: _('all')
+                        on_press: root.set_cawl_prefetch_mode(True)
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
+                # Work-offline toggle (0.43.0). When on, the
+                # connectivity watcher's push-drain is a no-op
+                # and the user-gestured Sync button returns
+                # ``S.WORK_OFFLINE_ENABLED`` (peers route to
+                # this screen). Commits via commit_project are
+                # unaffected — local work still groups into
+                # commits; only the push half is suppressed.
+                # Toggling OFF fires an immediate drain
+                # server-side so the user doesn't wait a full
+                # connectivity_poll_s tick for pending commits
+                # to push.
+                SectionLabel:
+                    id: work_offline_label
+                    text: _('Work offline')
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Suppress push:')
+                        size_hint_x: None
+                        width: dp(160)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: work_offline_yes_btn
+                        text: _('yes')
+                        on_press: root.set_work_offline_mode(True)
+                    RecBtn:
+                        id: work_offline_no_btn
+                        text: _('no')
+                        on_press: root.set_work_offline_mode(False)
+                BodyLabel:
+                    id: work_offline_status
+                    text: ''
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: self.texture_size[1] + dp(4)
+                    text_size: self.width, None
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
                 # Diagnostic log capture — off by default. When on,
                 # the daemon mirrors its stderr to
                 # ``$AZT_HOME/daemon.log`` and the Share button
@@ -619,13 +705,25 @@ KV_TEMPLATE = '''
                 # bug on a device that doesn't have adb access.
                 SectionLabel:
                     text: _('Diagnostic log')
-                RecBtn:
-                    id: daemon_log_toggle_btn
-                    text: _('Save daemon log to file')
+                BoxLayout:
                     size_hint_y: None
                     height: dp(52)
-                    normal_color: T.SURFACE
-                    on_press: root.toggle_daemon_log_to_file()
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Log server activity:')
+                        size_hint_x: None
+                        width: dp(160)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: daemon_log_yes_btn
+                        text: _('yes')
+                        on_press: root.set_daemon_log_mode(True)
+                    RecBtn:
+                        id: daemon_log_no_btn
+                        text: _('no')
+                        on_press: root.set_daemon_log_mode(False)
                 BoxLayout:
                     size_hint_y: None
                     height: dp(52)
@@ -980,6 +1078,7 @@ class SettingsScreen(Screen):
             self._build_lang_selector()
             self.refresh()
             self._start_cawl_cache_poll()
+            self._focus_contributor_if_unset()
         Clock.schedule_once(_ready, 0)
 
     def on_leave(self):
@@ -1044,6 +1143,8 @@ class SettingsScreen(Screen):
         status = cawl_cache_status(langcode)
         total = status['total']
         cached = status['cached']
+        offline = status.get('offline', False)
+        circuit_open = status.get('circuit_open', False)
         if total == 0:
             self._hide_cawl_cache_banner(banner, label)
             return
@@ -1052,12 +1153,32 @@ class SettingsScreen(Screen):
             self._hide_cawl_cache_banner(banner, label)
             self._stop_cawl_cache_poll()
             return
-        # Show progress + the explicit "network in use" cue so
-        # the user knows not to disconnect.
-        label.text = _tr(
-            'Caching images: {cached} / {total} '
-            '(network in use — please stay online)').format(
-                cached=cached, total=total)
+        if offline:
+            # Worker bailed before iterating because device was
+            # offline. Banner stays polling at 1 Hz so we
+            # auto-update when the scheduler's connectivity
+            # watcher fires on_online_edge and the next prefetch
+            # actually runs. RPC cost is in-memory dict lookups;
+            # the [first-try] probe is already suppressed for
+            # this path.
+            label.text = _tr(
+                'Image cache: {cached} / {total} '
+                '(offline — will resume when online)').format(
+                    cached=cached, total=total)
+        elif circuit_open:
+            # Mid-prefetch connectivity loss tripped the breaker.
+            # Same auto-resume path via the scheduler edge.
+            label.text = _tr(
+                'Image cache: {cached} / {total} '
+                '(paused — connectivity lost)').format(
+                    cached=cached, total=total)
+        else:
+            # Live progress + the explicit "network in use" cue so
+            # the user knows not to disconnect.
+            label.text = _tr(
+                'Caching images: {cached} / {total} '
+                '(network in use — please stay online)').format(
+                    cached=cached, total=total)
         label.height = label.texture_size[1]
         banner.height = label.height + dp(12)
         banner.opacity = 1
@@ -1134,6 +1255,14 @@ class SettingsScreen(Screen):
             pass
         try:
             self._refresh_daemon_log_state()
+        except Exception:
+            pass
+        try:
+            self._refresh_work_offline_state()
+        except Exception:
+            pass
+        try:
+            self._refresh_cawl_variants_state()
         except Exception:
             pass
         try:
@@ -1228,13 +1357,21 @@ class SettingsScreen(Screen):
         btn = self.ids.get('grant_collab_btn')
         if row is None or btn is None:
             return
-        # Default hidden; flip on only if all gates pass.
+        # Default hidden; flip on only if all gates pass. Detach
+        # children so their RecBtn ``on_press`` handlers can't
+        # intercept touches that should reach the
+        # gh_action_btn / gl_action_btn / publish_btn ABOVE this
+        # row — same hide-by-detach pattern used in
+        # _refresh_publish_row. Without this, taps on Connect to
+        # GitHub fired the grant_collab_btn handler (this row's
+        # first button), Publish fired switch_project_btn, etc.
         row.height = 0
         row.opacity = 0
         if info is not None:
             info.text = ''
         if msg is not None:
             msg.text = ''
+        self._detach_project_actions_children()
         project = self._pick_publish_candidate()
         if project is None:
             return
@@ -1258,10 +1395,16 @@ class SettingsScreen(Screen):
                     remote_url=live_remote_url)
         # Heights: section label (dp 32) + info (~dp 40) + grant
         # button (dp 52) + share button (dp 52) + msg (dp 20) +
-        # 4× spacing (dp 8 each).
-        row.height = (dp(32) + dp(40) + dp(52) + dp(52) + dp(20)
-                      + dp(8) * 4)
+        # 4× spacing (dp 8 each). Switch-project lives OUTSIDE
+        # this row now (always visible), so it doesn't contribute
+        # to the gated row's height.
+        row.height = (dp(32) + dp(40) + dp(52) + dp(52)
+                      + dp(20) + dp(8) * 4)
         row.opacity = 1
+        # Restore the children that ``_detach_project_actions_children``
+        # may have removed during a previous refresh while the row
+        # was hidden. Idempotent if they're already attached.
+        self._reattach_project_actions_children()
 
     def grant_collaborator(self):
         """Open the shared ``grant_collaborator_popup`` for the
@@ -1282,6 +1425,26 @@ class SettingsScreen(Screen):
             on_done=lambda _r: Clock.schedule_once(
                 lambda _dt: self.refresh(), 0),
         )
+
+    def switch_project(self):
+        """Navigate to the project picker so the user can pick a
+        different project. Only available when the host app's
+        ScreenManager includes a ``'picker'`` screen — true for
+        the unified server-APK app (since 0.41.22 picker+settings
+        live in one Kivy App), false for the desktop-only
+        settings-without-picker entry point (``python -m
+        azt_collabd ui``).
+
+        Falls back to a translated message on the inline status
+        line when picker isn't reachable — keeps the button safe
+        to bind regardless of host."""
+        app = App.get_running_app()
+        sm = getattr(app, 'sm', None)
+        if sm is not None and sm.has_screen('picker'):
+            app.go('picker')
+            return
+        self._set_project_actions_msg(_tr(
+            'Switch project is unavailable from this entry point.'))
 
     def share_repo_qr(self):
         """Open a popup that renders the current project's remote
@@ -1319,12 +1482,80 @@ class SettingsScreen(Screen):
             font_name=App.get_running_app().font_name,
         )
 
-    def toggle_daemon_log_to_file(self):
-        """Flip the "Save daemon log to file" toggle. Takes effect
-        immediately in the running daemon (the RPC installs /
-        removes the stderr tee in-process); no restart required."""
+    def set_cawl_prefetch_mode(self, all_variants):
+        """Set the CAWL prefetch policy explicitly. Bound from the
+        two buttons in the "Cache images:" row (False = "1 per
+        line", True = "all"). Idempotent — tapping the active
+        button is a no-op on the daemon side.
+
+        Takes effect on the next ``auto_prefetch`` trigger (next
+        project-load / scheduler edge); does NOT retroactively
+        re-warm an in-flight worker. Existing on-disk cache
+        entries are preserved either way."""
+        new_state = bool(all_variants)
+        set_cawl_prefetch_all_variants(new_state)
+        self._cawl_variants_all = new_state
+        self._refresh_cawl_variants_buttons()
+
+    def _refresh_cawl_variants_state(self):
+        """Read the daemon's current prefetch policy + active
+        wordlist name. Called from ``refresh()`` so the button
+        highlight and section label are correct on screen entry.
+        Tolerant of transport failure on either side (policy
+        defaults to False, label falls back to the generic
+        translation)."""
+        self._cawl_variants_all = bool(get_cawl_prefetch_all_variants())
+        self._refresh_cawl_variants_buttons()
+        self._refresh_cawl_section_label()
+
+    def _refresh_cawl_variants_buttons(self):
+        all_variants = bool(getattr(self, '_cawl_variants_all', False))
+        one_btn = self.ids.get('cawl_variants_one_btn')
+        all_btn = self.ids.get('cawl_variants_all_btn')
+        # Active button gets GREEN, inactive gets SURFACE. Matches
+        # the language-selector row's highlight convention.
+        if one_btn is not None:
+            one_btn.normal_color = (
+                theme.SURFACE if all_variants else theme.GREEN)
+        if all_btn is not None:
+            all_btn.normal_color = (
+                theme.GREEN if all_variants else theme.SURFACE)
+
+    def _refresh_cawl_section_label(self):
+        """Update the wordlist section label with the active
+        wordlist name. Source: ``cawl_cache_status(langcode)``
+        carries ``image_repo`` already, so we don't need a new RPC.
+        Empty langcode or empty image_repo falls back to the
+        generic ``Wordlist images`` label."""
+        label = self.ids.get('cawl_section_label')
+        if label is None:
+            return
+        langcode = (last_project() or '').strip()
+        repo = ''
+        if langcode:
+            try:
+                status = cawl_cache_status(langcode)
+                repo = (status.get('image_repo') or '').strip()
+            except Exception:
+                repo = ''
+        from azt_collabd import cawl as _cawl_mod
+        name = _cawl_mod.wordlist_name(repo)
+        if name:
+            label.text = _tr('Wordlist ({name}) images').format(name=name)
+        else:
+            label.text = _tr('Wordlist images')
+
+    def set_daemon_log_mode(self, enabled):
+        """Set the "Log server activity" toggle explicitly. Bound
+        from the yes / no buttons. Idempotent — tapping the active
+        button is a no-op as far as the daemon is concerned (the
+        RPC re-applies the same state).
+
+        Takes effect immediately in the running daemon (the RPC
+        installs / removes the stderr tee in-process); no restart
+        required."""
         status = self.ids.get('daemon_log_status')
-        new_state = not self._daemon_log_enabled_state()
+        new_state = bool(enabled)
         result = set_daemon_log_to_file(new_state)
         if result is None:
             if status is not None:
@@ -1365,17 +1596,82 @@ class SettingsScreen(Screen):
 
     def _refresh_daemon_log_buttons(self):
         enabled = self._daemon_log_enabled_state()
-        toggle = self.ids.get('daemon_log_toggle_btn')
-        if toggle is not None:
-            toggle.text = (_tr('Stop saving daemon log')
-                           if enabled
-                           else _tr('Save daemon log to file'))
+        yes_btn = self.ids.get('daemon_log_yes_btn')
+        no_btn = self.ids.get('daemon_log_no_btn')
+        # Active gets GREEN, inactive sits at SURFACE — same
+        # convention as the wordlist-image-cache row and the
+        # language-selector row.
+        if yes_btn is not None:
+            yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
+        if no_btn is not None:
+            no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
         for btn_id in ('daemon_log_share_btn',
                        'daemon_log_email_btn'):
             btn = self.ids.get(btn_id)
             if btn is not None:
                 btn.disabled = not enabled
                 btn.opacity = 1.0 if enabled else 0.4
+
+    def set_work_offline_mode(self, enabled):
+        """Set the work-offline toggle explicitly. Bound from the
+        yes / no buttons. Idempotent.
+
+        Toggling OFF triggers an immediate push-drain server-side
+        so pending commits go out without waiting a full
+        connectivity_poll_s tick (the daemon handles this in
+        ``_h_set_work_offline``)."""
+        from azt_collab_client import set_work_offline as _swo
+        new_state = bool(enabled)
+        try:
+            applied = _swo(new_state)
+        except Exception as ex:
+            status = self.ids.get('work_offline_status')
+            if status is not None:
+                status.text = _tr(
+                    'Failed to update work-offline setting: {error}').format(
+                        error=str(ex))
+            return
+        self._work_offline_enabled = bool(applied)
+        self._refresh_work_offline_buttons()
+        status = self.ids.get('work_offline_status')
+        if status is not None:
+            if self._work_offline_enabled:
+                status.text = _tr(
+                    'Push suppressed. Commits will accumulate locally '
+                    'until you turn this off.')
+            else:
+                status.text = _tr(
+                    'Pushing enabled. Pending commits will go out '
+                    'when the network is reachable.')
+
+    def _refresh_work_offline_state(self):
+        """Read the daemon's current toggle state. Called from
+        ``refresh()`` so the button highlight is correct on
+        screen entry."""
+        from azt_collab_client import get_work_offline as _gwo
+        try:
+            self._work_offline_enabled = bool(_gwo())
+        except Exception:
+            self._work_offline_enabled = False
+        self._refresh_work_offline_buttons()
+        status = self.ids.get('work_offline_status')
+        if status is None:
+            return
+        if self._work_offline_enabled:
+            status.text = _tr(
+                'Push suppressed. Commits will accumulate locally '
+                'until you turn this off.')
+        else:
+            status.text = ''
+
+    def _refresh_work_offline_buttons(self):
+        enabled = bool(getattr(self, '_work_offline_enabled', False))
+        yes_btn = self.ids.get('work_offline_yes_btn')
+        no_btn = self.ids.get('work_offline_no_btn')
+        if yes_btn is not None:
+            yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
+        if no_btn is not None:
+            no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
 
     def share_daemon_log(self):
         """Dispatch the daemon log through Android's share sheet —
@@ -1553,6 +1849,46 @@ class SettingsScreen(Screen):
         for c in kids:
             row.add_widget(c)
 
+    # ── project_actions_row child detach (anti-touch-intercept) ──────
+    #
+    # Same shape as publish_row's detach/reattach. ``project_actions_row``
+    # defaults to ``height=0, opacity=0`` and sits below the GitHub +
+    # GitLab Connect buttons + the publish_row. Even with the parent
+    # collapsed, BoxLayout's ``_do_layout`` still positions the inner
+    # RecBtns (grant_collab_btn, share_repo_btn, switch_project_btn)
+    # at their explicit dp(52) heights — Kivy's touch dispatch loop
+    # then visits them and an ``on_press: root.grant_collaborator()``
+    # fires when the user thinks they tapped Connect to GitHub. Same
+    # symptom across the three children: their on_press handlers
+    # silently hijack taps meant for buttons higher in the screen.
+    # Detaching the children removes them from the touch tree entirely.
+
+    _project_actions_detached = None
+
+    def _detach_project_actions_children(self):
+        row = self.ids.get('project_actions_row')
+        if row is None:
+            return
+        if self._project_actions_detached is not None:
+            return  # already detached; idempotent
+        kids = list(row.children)
+        # ``children`` is in reverse-add order; flip so reattach
+        # produces the same top-to-bottom layout as the KV rule.
+        self._project_actions_detached = list(reversed(kids))
+        for c in kids:
+            row.remove_widget(c)
+
+    def _reattach_project_actions_children(self):
+        row = self.ids.get('project_actions_row')
+        if row is None:
+            return
+        kids = self._project_actions_detached
+        if not kids:
+            return  # nothing to restore (already attached, or never detached)
+        self._project_actions_detached = None
+        for c in kids:
+            row.add_widget(c)
+
     def _pick_publish_candidate(self):
         """Return the Project the daemon last touched, or ``None`` if
         there isn't one (no project ever opened on this device, server
@@ -1588,6 +1924,32 @@ class SettingsScreen(Screen):
               file=sys.stderr, flush=True)
         return project
 
+    def _focus_contributor_if_unset(self):
+        """On screen entry, if the contributor name is empty, focus
+        the input and surface an inline reason. Avoids the peer-side
+        ``S.CONTRIBUTOR_UNSET`` toast getting blown away by the
+        screen transition before the user can read it — the field
+        coming up with the keyboard active makes the missing-value
+        story obvious without an overlay.
+
+        Defensive: silent on missing widget (UI not yet built), and
+        only takes focus if the field is empty AND not already
+        focused (don't yank focus from a user typing)."""
+        inp = self.ids.get('contributor_input')
+        msg = self.ids.get('contributor_msg')
+        if inp is None:
+            return
+        if (inp.text or '').strip():
+            return
+        if inp.focus:
+            return
+        inp.focus = True
+        if msg is not None:
+            msg.text = _tr(
+                'Required: your name is used for commit authorship; '
+                'sync and publish refuse until this is set.')
+            msg.color = theme.RED
+
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the
         trimmed value to the server (config.json :: collab.contributor)
@@ -1621,8 +1983,11 @@ class SettingsScreen(Screen):
             return
         if err is not None:
             msg.text = _tr('Error: {error}').format(error=err)
+            msg.color = theme.RED
             return
         msg.text = _tr('Saved.')
+        # Drop the on-entry "Required" red if it was up.
+        msg.color = theme.TEXT_DIM
         Clock.schedule_once(lambda dt: setattr(msg, 'text', ''), 2.0)
 
     # ``gh_action`` / ``connect_github`` removed in 0.30.8: the KV

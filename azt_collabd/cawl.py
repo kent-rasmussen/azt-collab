@@ -53,6 +53,7 @@ trample each other.
 import http.client
 import json
 import os
+import sys
 import threading
 import time
 import urllib.error
@@ -169,11 +170,22 @@ _prefetch_state = {}           # repo -> dict (see _make_prefetch_state)
 _prefetch_threads = {}         # repo -> Thread
 
 
+# After this many consecutive offline-class failures inside the
+# prefetch worker, bail out rather than burn through the rest of
+# the list logging the same DNS error N times. Trip count is low
+# because real GitHub fetches succeed in <500 ms; three back-to-
+# back URLError failures means the device dropped connectivity,
+# not that a few individual files happen to be missing.
+_PREFETCH_CONSECUTIVE_FAIL_LIMIT = 3
+
+
 def _make_prefetch_state(requested):
     return {
         'requested': requested,
         'completed': 0,
         'failed': 0,
+        'skipped_offline': False,    # device was offline at start
+        'circuit_open': False,       # bailed after consecutive failures
         'started_at': time.time(),
         'finished': False,
         'finished_at': None,
@@ -192,7 +204,37 @@ def _prefetch_worker(repo, paths):
     given ``start_prefetch``'s idempotency) won't double-fetch.
     Cache hits return immediately; cache misses fetch from
     GitHub. Failures are logged inside ``get_image_path`` via
-    its existing ``[cawl] image fetch failed`` path."""
+    its existing ``[cawl] image fetch failed`` path.
+
+    Two offline guards keep an offline boot from hammering DNS
+    for every entry in ``paths``:
+
+    1. Connectivity gate at start. If ``_has_internet()`` is
+       false, mark the state ``skipped_offline=True`` /
+       ``finished=True`` and return without touching any path.
+       0.41.11 moved iteration into this worker; the peer-side
+       circuit breaker that lived in the old per-image
+       iteration model no longer applies.
+    2. Consecutive-failure circuit breaker. Three back-to-back
+       fetch failures (typically DNS or connection refused)
+       trip ``circuit_open=True`` and bail. A few genuinely
+       missing files won't trip this — real fetches succeed in
+       <500 ms while offline-class failures bunch up
+       immediately and consecutively."""
+    from .net import _has_internet
+    if paths and not _has_internet():
+        with _cache_status_lock:
+            state = _prefetch_state.get(repo)
+            if state is not None:
+                state['skipped_offline'] = True
+                state['finished'] = True
+                state['finished_at'] = time.time()
+        print(f'[cawl] prefetch skipped: device offline '
+              f'(repo={repo!r}, requested={len(paths)})',
+              file=sys.stderr, flush=True)
+        return
+
+    consecutive_fail = 0
     for path in paths:
         target = get_image_path(repo, path)
         with _cache_status_lock:
@@ -203,8 +245,23 @@ def _prefetch_worker(repo, paths):
                 return
             if target is not None:
                 state['completed'] += 1
+                consecutive_fail = 0
             else:
                 state['failed'] += 1
+                consecutive_fail += 1
+        if consecutive_fail >= _PREFETCH_CONSECUTIVE_FAIL_LIMIT:
+            with _cache_status_lock:
+                state = _prefetch_state.get(repo)
+                if state is not None:
+                    state['circuit_open'] = True
+                    state['finished'] = True
+                    state['finished_at'] = time.time()
+            print(f'[cawl] prefetch circuit-break after '
+                  f'{consecutive_fail} consecutive failures '
+                  f'(repo={repo!r}, completed={state["completed"]} '
+                  f'of {state["requested"]})',
+                  file=sys.stderr, flush=True)
+            return
     with _cache_status_lock:
         state = _prefetch_state.get(repo)
         if state is not None:
@@ -241,14 +298,33 @@ def start_prefetch(repo, paths):
     requested = len(paths)
     with _cache_status_lock:
         existing = _prefetch_state.get(repo)
-        if (existing is not None
-                and existing.get('requested') == requested
-                and not existing.get('finished')):
+        if existing is not None and not existing.get('finished'):
+            # A worker is already running for this repo. Don't
+            # start a second one — return the existing state.
+            #
+            # Pre-0.41.21 we replaced the state when ``requested``
+            # differed, on the theory that "old worker exits on
+            # next loop iteration via state-identity check, worst
+            # case it bumps the new state once before exiting,
+            # harmless." That was wrong once two prefetch
+            # producers (Stage A auto_prefetch with the full
+            # index + pre-Stage-B peers still POSTing
+            # cawl_prefetch with their working subset) started
+            # arriving on overlapping timelines: two worker
+            # threads simultaneously iterated paths through
+            # urllib/SSL, doubled the JNI dance, and were the
+            # leading suspect for a NULL-deref SIGSEGV in the
+            # daemon's :provider process ~2 s after the second
+            # POST.
+            #
+            # The peer's working subset is always a subset of the
+            # auto_prefetch full index for the same repo, so the
+            # in-flight worker will eventually warm everything
+            # the peer cares about. Different repos key
+            # ``_prefetch_state`` independently and never collide.
             return dict(existing)
-        # Replace state. The previous worker (if any) will notice
-        # the change on its next loop iteration via the state-
-        # identity check and exit. Worst case: it bumps a counter
-        # on the new state once before exiting; harmless.
+        # Either no prior state or the previous worker finished.
+        # Fresh start.
         state = _make_prefetch_state(requested)
         _prefetch_state[repo] = state
         snapshot = dict(state)
@@ -268,6 +344,179 @@ def start_prefetch(repo, paths):
     _prefetch_threads[repo] = t
     t.start()
     return snapshot
+
+
+# Throttle for ``auto_prefetch`` — at most one trigger attempt
+# per repo per this many seconds. _touch_project (and thus
+# auto_prefetch) fires on every langcode-bound endpoint
+# including 1 Hz cache-status polls, so the throttle is what
+# keeps us from re-probing _has_internet every second.
+_AUTO_PREFETCH_THROTTLE_S = 30.0
+_auto_prefetch_last_at = {}    # repo -> monotonic timestamp
+
+
+def wordlist_name(image_repo):
+    """Best-effort wordlist label derived from an image-repo slug.
+
+    Strips the ``images_`` / ``images-`` / ``Images_`` / ``Images-``
+    prefix conventionally used to name CAWL-style image
+    repositories, returning the trailing wordlist identifier.
+
+    Examples::
+
+        kent-rasmussen/images_CAWL → CAWL
+        foo/images-paws            → paws
+        foo/MyWordlist             → MyWordlist
+        ''                         → ''
+
+    Used by the daemon settings UI to label the prefetch section
+    with the currently-active wordlist (so a user with multiple
+    projects on different image repos can tell which one the
+    toggle affects)."""
+    if not image_repo:
+        return ''
+    last = image_repo.rsplit('/', 1)[-1]
+    for prefix in ('images_', 'images-', 'Images_', 'Images-'):
+        if last.startswith(prefix) and len(last) > len(prefix):
+            return last[len(prefix):]
+    return last
+
+
+def auto_prefetch(repo):
+    """Daemon-side trigger: warm the cache for *repo*'s entire
+    image index. Idempotent + throttled — safe to call from
+    every langcode-bound endpoint via ``_touch_project``.
+
+    The peer no longer needs to compute a working-set list and
+    POST ``cawl/prefetch``; the daemon already owns LIFT path +
+    image_repo and decides for itself what to warm. The peer
+    just polls ``cache_status`` for progress.
+
+    Throttle: at most one trigger per repo per
+    ``_AUTO_PREFETCH_THROTTLE_S`` seconds. Within the window,
+    returns without touching state.
+
+    Past the throttle, defers to ``start_prefetch``'s existing
+    idempotency: a running worker with matching paths → no-op;
+    a finished worker (success OR offline-skipped) → restart,
+    which is the path that retries when network may have come
+    back. ``start_prefetch`` itself returns immediately —
+    iteration runs in a background thread.
+
+    Peer's explicit ``cawl/prefetch`` POST still works for
+    backward compatibility; lock-coalescing on the per-target
+    fetch lock means a peer-driven + daemon-driven trigger on
+    overlapping path sets won't double-fetch anything."""
+    repo = (repo or '').strip()
+    if not repo:
+        return
+    now = time.monotonic()
+    last = _auto_prefetch_last_at.get(repo)
+    if last is not None and (now - last) < _AUTO_PREFETCH_THROTTLE_S:
+        return
+    _auto_prefetch_last_at[repo] = now
+    paths = _index_image_paths(repo)
+    if not paths:
+        return
+    start_prefetch(repo, paths)
+
+
+def on_online_edge():
+    """Called by the connectivity watcher when offline → online.
+
+    For every repo whose last prefetch was offline-skipped or
+    circuit-broken, clears the auto_prefetch throttle and
+    re-fires auto_prefetch so the cache resumes warming.
+
+    The 30 s throttle is normally what keeps ``_touch_project``
+    from re-probing ``_has_internet`` every second; on an
+    authoritative edge from the watcher we want to bypass it
+    because the probe state has just changed.
+
+    Idempotent — safe to call on every detected edge, even if
+    no repo has a stale state."""
+    with _cache_status_lock:
+        stale_repos = [
+            repo for repo, state in _prefetch_state.items()
+            if state.get('skipped_offline')
+            or state.get('circuit_open')
+        ]
+    for repo in stale_repos:
+        _auto_prefetch_last_at.pop(repo, None)
+        auto_prefetch(repo)
+        print(f'[cawl] online-edge retry: repo={repo!r}',
+              file=sys.stderr, flush=True)
+
+
+def _index_image_paths(repo):
+    """Return the list of image-shaped entry paths in the cached
+    index for *repo*.
+
+    Policy gate: ``$AZT_HOME/config.json :: cawl.prefetch_all_variants``
+    (read via ``store.get_cawl_prefetch_all_variants``). Default
+    False — for each CAWL id directory, returns one path: the
+    first whose basename contains the ``__`` preferred-variant
+    marker, falling back to the first file if no variant marker
+    is present. True — returns every image-shaped entry.
+
+    Empty list if the index isn't cached yet (the seed JSON or a
+    successful index fetch populates it)."""
+    cached = _read_cached_index(repo)
+    if cached is None:
+        return []
+    images = []
+    for entry in cached.get('files') or []:
+        if not isinstance(entry, dict):
+            continue
+        full = entry.get('path')
+        if (isinstance(full, str)
+                and full.lower().endswith(('.png', '.jpg', '.jpeg'))):
+            images.append(full)
+    try:
+        from . import store as _store
+        prefetch_all = _store.get_cawl_prefetch_all_variants()
+    except Exception:
+        prefetch_all = False
+    if prefetch_all:
+        return images
+    return _filter_preferred_variant_per_id(images)
+
+
+def _filter_preferred_variant_per_id(paths):
+    """Pick one image per CAWL id directory.
+
+    CAWL repos use ``<cawl_id>/<image_name>.<ext>`` with multiple
+    variants per id; the canonical preferred variant carries
+    ``__`` in its basename (line-art with the ``__bw`` /
+    ``__color`` / etc. suffix). For each id we return:
+
+    - The first path whose basename contains ``__`` (the
+      preferred variant), OR
+    - The first path in the id directory if no variant has the
+      marker (defensive fallback for ids that don't follow the
+      convention).
+
+    Stable order: ids in the order they first appear in
+    ``paths``; one entry per id."""
+    seen = {}
+    order = []
+    for path in paths:
+        bits = path.split('/', 1)
+        if len(bits) != 2:
+            cawl_id, basename = '', path
+        else:
+            cawl_id, basename = bits[0], bits[1]
+        entry = seen.get(cawl_id)
+        if entry is None:
+            entry = {'preferred': None, 'fallback': path}
+            seen[cawl_id] = entry
+            order.append(cawl_id)
+        if entry['preferred'] is None and '__' in basename:
+            entry['preferred'] = path
+    return [
+        (seen[cid]['preferred'] or seen[cid]['fallback'])
+        for cid in order
+    ]
 
 
 def get_prefetch_state(repo):
@@ -337,15 +586,30 @@ def _walk_image_count(repo):
 
 
 def cache_status(repo):
-    """Return ``(cached_count, total_count)`` for the image cache
-    of *repo*.
+    """Return a dict describing the image-cache state for *repo*.
+
+    Shape::
+
+        {'cached':         int   # images successfully on disk / completed
+         'total':          int   # working-set size or index-image count
+         'offline':        bool  # prefetch was skipped because device offline
+         'circuit_open':   bool  # prefetch bailed after consecutive failures
+         'finished':       bool  # no active worker thread for this repo
+         }
 
     If a daemon-driven prefetch is active or completed for this
     repo, the counts come from that job's state — the peer asked
     the daemon to warm a specific working set, so progress
     against *that* set is what's meaningful. Banner becomes
-    "M completed of N requested" and ends at 100% by
-    construction.
+    "M completed of N requested" and ends at 100% by construction.
+
+    When the worker was offline-skipped (``skipped_offline``),
+    ``cached`` falls back to the actually-on-disk count via
+    ``_walk_image_count`` so the banner shows the most useful
+    truth available (e.g. "1247 / 3000" from a prior successful
+    run, not "0 / 3000" just because *this* boot couldn't fetch).
+    The ``offline`` flag stays set so the peer can badge the bar
+    "offline" instead of rendering it as stuck progress.
 
     Otherwise (no prefetch ever started for this repo this
     daemon-session), the fallback semantics are "files on disk
@@ -354,27 +618,40 @@ def cache_status(repo):
     (the canonical CAWL repo has 2-4 variants per identifier,
     peers typically use one); the banner plateaus at the peer's
     working-set size, not the full index. Daemon-driven prefetch
-    (via ``start_prefetch``) is the way to get an accurate
-    progress bar.
-
-    Returns ``(0, 0)`` when the repo is empty or the index isn't
-    loaded. After the first call per repo, polling cost is
-    effectively zero — dict lookups, no I/O."""
+    (via ``start_prefetch``) is the way to get an accurate bar."""
     repo = (repo or '').strip()
     if not repo:
-        return 0, 0
+        return {'cached': 0, 'total': 0, 'offline': False,
+                'circuit_open': False, 'finished': True}
     pf = get_prefetch_state(repo)
     if pf is not None:
-        # Active or completed prefetch — its numbers are
-        # authoritative for the indicator. "completed + failed"
-        # accounts for paths where the daemon resolved the
-        # request (either cached or returned a hit), even if
-        # individual fetches failed. We surface only "completed"
-        # for the banner so failures stay visible as "stuck
-        # short of total" rather than "100% with silent
-        # failures".
-        return pf['completed'], pf['requested']
-    return _walk_image_count(repo), _count_index_images(repo)
+        offline = bool(pf.get('skipped_offline'))
+        circuit_open = bool(pf.get('circuit_open'))
+        finished = bool(pf.get('finished'))
+        if offline:
+            # Worker never iterated. Show what's actually on disk
+            # from any prior run so the user sees a meaningful
+            # baseline instead of "0 / N" each offline boot.
+            # Cap at ``requested`` — ``_walk_image_count`` returns
+            # the total file count in the on-disk cache directory,
+            # which may exceed the current working-set size
+            # (cache accumulates across sessions / past working
+            # sets). Without the cap, the banner can report
+            # ``cached > total``, which trips peer "cache warm,
+            # hide" logic and looks like a daemon accounting bug.
+            cached = min(_walk_image_count(repo), pf['requested'])
+        else:
+            # We surface only "completed" for the banner so
+            # failures stay visible as "stuck short of total"
+            # rather than "100% with silent failures".
+            cached = pf['completed']
+        return {'cached': cached, 'total': pf['requested'],
+                'offline': offline, 'circuit_open': circuit_open,
+                'finished': finished}
+    return {'cached': _walk_image_count(repo),
+            'total': _count_index_images(repo),
+            'offline': False, 'circuit_open': False,
+            'finished': True}
 
 
 def index_path(repo):

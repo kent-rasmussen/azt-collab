@@ -120,13 +120,22 @@ class AndroidContentProviderTransport(Transport):
         extras = self._Bundle()
         if body is not None:
             extras.putString('body', json.dumps(body))
-        from .._debug import first_try_log
-        first_try_log('transport.call.pre',
-                      method=method, path=path)
+        # Always-on first-try probes added in 0.41.16 instrument
+        # every RPC so a field tester without adb can deliver a
+        # first-try-fails trail. Suppress for high-frequency
+        # polling paths (cache_status at 1 Hz) where the probe
+        # is pure noise — "first-try" semantically doesn't apply
+        # to the Nth call of a polling loop.
+        suppress_probe = path.endswith('/cawl/cache_status')
+        if not suppress_probe:
+            from .._debug import first_try_log
+            first_try_log('transport.call.pre',
+                          method=method, path=path)
         bundle = self._resolver.call(uri, method, path, extras)
-        first_try_log('transport.call.post',
-                      method=method, path=path,
-                      bundle_null=bundle is None)
+        if not suppress_probe:
+            first_try_log('transport.call.post',
+                          method=method, path=path,
+                          bundle_null=bundle is None)
         if bundle is None:
             # Most common cause: signature-grant denial (peer's APK
             # signed with a different key than the suite keystore)

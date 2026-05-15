@@ -16,7 +16,7 @@ Pins:
 - ``_h_init_project`` / ``_h_project_sync`` refuse with
   ``S.CONTRIBUTOR_UNSET`` when no contributor is stored.
 - ``_h_project_sync_async`` enqueues unconditionally; scheduler's
-  ``_run_sync`` refuses with ``S.CONTRIBUTOR_UNSET`` at exec time
+  ``_run_commit`` refuses with ``S.CONTRIBUTOR_UNSET`` at exec time
   (defence-in-depth so a long debounce + name-clear race can't
   produce a meaningless commit).
 - ``body['contributor']`` is **ignored** by the daemon endpoints —
@@ -273,14 +273,15 @@ def test_body_contributor_does_not_bypass_unset_refusal(tmp_path):
 # ── Scheduler exec-time defence-in-depth ────────────────────────────────
 
 
-def test_scheduler_run_sync_refuses_when_contributor_unset():
+def test_scheduler_run_commit_refuses_when_contributor_unset():
     """If a job manages to slip past the upfront check (it
     doesn't, today, since the endpoint enqueues unconditionally —
     but a long debounce + a clear-name race could land us here),
-    the scheduler refuses at exec time."""
+    the scheduler refuses at exec time. Since 0.43.0 the debounced
+    worker is ``_run_commit`` (commit-only); ``_run_sync`` is gone."""
     # No contributor stored.
     assert store.get_contributor() == ''
-    result = _scheduler._run_sync('sw-x-mystery')
+    result = _scheduler._run_commit('sw-x-mystery')
     assert result.has(S_d.CONTRIBUTOR_UNSET)
 
 
