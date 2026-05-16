@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: azt_collab_client 0.30.43\n"
+"Project-Id-Version: azt_collab_client 0.43.1\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Language: fr\n"
@@ -49,9 +49,6 @@ msgstr "Confirmer le code de langue du projet"
 msgid "Clone a git repository containing a LIFT file:"
 msgstr "Cloner un dépôt git contenant un fichier LIFT :"
 
-msgid "Paste the repository URL here"
-msgstr "Collez l'URL du dépôt ici"
-
 msgid "code: "
 msgstr "code : "
 
@@ -75,21 +72,12 @@ msgstr "Cloner le dépôt"
 msgid "The AZT collaboration service (server APK) is not installed."
 msgstr "Le service de collaboration AZT (APK serveur) n'est pas installé."
 
-msgid "Install it to enable sync, then reopen this app."
-msgstr "Installez-le pour activer la synchronisation, puis rouvrez cette application."
-
 msgid ""
 "Tap Install to download and install it. Android will ask you to "
 "confirm before the install starts."
 msgstr ""
 "Touchez Installer pour le télécharger et l'installer. Android vous "
 "demandera de confirmer avant le début de l'installation."
-
-msgid "Open install page"
-msgstr "Ouvrir la page d'installation"
-
-msgid "Share this app"
-msgstr "Partager cette application"
 
 # ── bootstrap.py — startup install/update workflow ───────────────────────
 
@@ -104,11 +92,6 @@ msgstr "Impossible de vérifier le service : {error}"
 
 msgid "Service check returned: {error}"
 msgstr "Le contrôle du service a renvoyé : {error}"
-
-msgid "AZT Collaboration installed but unreachable. Continuing offline."
-msgstr ""
-"AZT Collaboration installé mais inaccessible. Poursuite en mode "
-"hors ligne."
 
 msgid "Connecting to AZT Collaboration service…"
 msgstr "Connexion au service AZT Collaboration…"
@@ -137,37 +120,11 @@ msgstr "/v1/health répond normalement."
 msgid "AZT Collaboration not responding"
 msgstr "AZT Collaboration ne répond pas"
 
-msgid ""
-"The AZT Collaboration service ({name}) is installed but did not "
-"respond. It may still be starting up; wait a moment, then tap "
-"Install to reinstall it, or Quit to close this app and try again "
-"later."
-msgstr ""
-"Le service AZT Collaboration ({name}) est installé mais n'a pas "
-"répondu. Il est peut-être encore en cours de démarrage ; "
-"patientez un instant, puis touchez Installer pour le réinstaller, "
-"ou Quitter pour fermer cette application et réessayer plus tard."
-
 msgid "Install AZT Collaboration?"
 msgstr "Installer AZT Collaboration ?"
 
-msgid ""
-"This app needs the AZT Collaboration service ({name}) to sync your "
-"data. Tap Install to download and install it."
-msgstr ""
-"Cette application a besoin du service AZT Collaboration ({name}) "
-"pour synchroniser vos données. Touchez Installer pour le "
-"télécharger et l'installer."
-
 msgid "Update AZT Collaboration?"
 msgstr "Mettre à jour AZT Collaboration ?"
-
-msgid ""
-"A newer version of the AZT Collaboration service ({name}) is "
-"required. Tap Update to download and install it."
-msgstr ""
-"Une nouvelle version du service AZT Collaboration ({name}) est "
-"requise. Touchez Mettre à jour pour la télécharger et l'installer."
 
 msgid "Update {name}?"
 msgstr "Mettre à jour {name} ?"
@@ -189,30 +146,7 @@ msgstr "Mettre à jour"
 msgid "Not now"
 msgstr "Plus tard"
 
-msgid "Update needed"
-msgstr "Mise à jour requise"
-
-msgid ""
-"This app is too old for the AZT Collaboration service, but no "
-"newer version is published yet. Please check back later."
-msgstr ""
-"Cette application est trop ancienne pour le service AZT "
-"Collaboration, mais aucune version plus récente n'est publiée. "
-"Veuillez réessayer plus tard."
-
-msgid "Installing AZT Collaboration…"
-msgstr "Installation d'AZT Collaboration…"
-
-msgid "AZT Collaboration is up to date."
-msgstr "AZT Collaboration est à jour."
-
-msgid "Updating {name}…"
-msgstr "Mise à jour de {name}…"
-
 # ── update.py — self-update flow ──────────────────────────────────────────
-
-msgid "Update this app"
-msgstr "Mettre à jour cette application"
 
 msgid "Up to date."
 msgstr "À jour."
@@ -475,9 +409,6 @@ msgstr "Non connecté à GitHub. Allez dans Configuration > Se connecter à GitH
 msgid "App not installed. Visit {url} and select \"All repositories\"."
 msgstr "Application non installée. Visitez {url} et sélectionnez « Tous les dépôts »."
 
-msgid "GitHub App installation is suspended. Resume it at {url}."
-msgstr "L'installation de l'application GitHub est suspendue. Reprenez-la à {url}."
-
 msgid ""
 "GitHub App installation is suspended at {url}. Open it, scroll to the "
 "bottom, and tap 'Unsuspend'."
@@ -521,14 +452,6 @@ msgid "Check again"
 msgstr "Vérifier à nouveau"
 
 msgid ""
-"{name} {version} is required to use the AZT Collaboration service. Tap "
-"Update to download and install it, or Quit to close this app."
-msgstr ""
-"{name} {version} est requis pour utiliser le service AZT Collaboration. "
-"Touchez Mettre à jour pour le télécharger et l'installer, ou Quitter "
-"pour fermer cette application."
-
-msgid ""
 "A new build of {name} {version} is available. The current build is too old "
 "for the AZT Collaboration service. Tap Update to install the new build, or "
 "Quit to close this app."
@@ -544,16 +467,6 @@ msgstr ""
 "{name} {peer_v} est trop ancienne pour le service AZT Collaboration. "
 "Touchez Mettre à jour pour installer {name} {latest}, ou Quitter pour "
 "fermer cette application."
-
-msgid ""
-"{name} is too old for the AZT Collaboration service, but no newer version "
-"is published yet. Check back later or [ref=email][color=4ea1ff][u]send the "
-"developer an Email[/u][/color][/ref]."
-msgstr ""
-"{name} est trop ancienne pour le service AZT Collaboration, mais aucune "
-"version plus récente n'est encore publiée. Revenez plus tard ou "
-"[ref=email][color=4ea1ff][u]envoyez un courriel au développeur[/u]"
-"[/color][/ref]."
 
 msgid ""
 "{name} {peer_v} is too old for the AZT Collaboration service.\n"
@@ -641,12 +554,6 @@ msgstr "Mise en cache des images : {cached} / {total} (réseau utilisé — rest
 msgid "Diagnostic log"
 msgstr "Journal de diagnostic"
 
-msgid "Save daemon log to file"
-msgstr "Enregistrer le journal du service dans un fichier"
-
-msgid "Stop saving daemon log"
-msgstr "Arrêter l'enregistrement du journal"
-
 msgid "Share daemon log"
 msgstr "Partager le journal du service"
 
@@ -716,20 +623,8 @@ msgstr "Le fichier journal est vide."
 msgid "Log file: {path}"
 msgstr "Fichier journal : {path}"
 
-msgid "Active host"
-msgstr "Hôte actif"
-
-msgid "GitHub"
-msgstr "GitHub"
-
-msgid "GitLab"
-msgstr "GitLab"
-
 msgid "Connect to GitHub"
 msgstr "Se connecter à GitHub"
-
-msgid "Disconnect GitHub"
-msgstr "Se déconnecter de GitHub"
 
 msgid "GitHub Settings"
 msgstr "Paramètres GitHub"
@@ -791,9 +686,6 @@ msgstr ""
 "Application GitHub installée. Touchez Vérifier la configuration pour "
 "terminer."
 
-msgid "Setup complete. Connected as {username}."
-msgstr "Configuration terminée. Connecté en tant que {username}."
-
 msgid ""
 "Setup complete. Connected as {username}. Tap Verify setup any time to "
 "re-test."
@@ -825,29 +717,14 @@ msgstr ""
 msgid "Connect to GitLab"
 msgstr "Se connecter à GitLab"
 
-msgid "Set GitLab credentials"
-msgstr "Configurer les identifiants GitLab"
-
-msgid "Disconnect GitLab"
-msgstr "Se déconnecter de GitLab"
-
 msgid "Publish data"
 msgstr "Publier les données"
-
-msgid "Test connection"
-msgstr "Tester la connexion"
-
-msgid "Refresh"
-msgstr "Actualiser"
 
 msgid "Refresh Status"
 msgstr "Actualiser l'état"
 
 msgid "Interface language"
 msgstr "Langue de l'interface"
-
-msgid "GitLab credentials"
-msgstr "Identifiants GitLab"
 
 msgid "Enter your GitLab username and a personal access token (read/write to repos)."
 msgstr "Saisissez votre nom d'utilisateur GitLab et un jeton d'accès personnel (lecture/écriture des dépôts)."
@@ -858,14 +735,8 @@ msgstr "Nom d'utilisateur"
 msgid "Personal access token"
 msgstr "Jeton d'accès personnel"
 
-msgid "Save"
-msgstr "Enregistrer"
-
 msgid "Back"
 msgstr "Retour"
-
-msgid "Tap \"Begin\" to start the device-flow login."
-msgstr "Touchez « Commencer » pour démarrer la connexion par flux d'appareil."
 
 msgid "Your one-time code"
 msgstr "Votre code à usage unique"
@@ -902,20 +773,11 @@ msgstr "Confirmé :"
 msgid "Error: {error}"
 msgstr "Erreur : {error}"
 
-msgid "Error setting host: {error}"
-msgstr "Erreur lors du changement d'hôte : {error}"
-
 msgid "Starting device flow..."
 msgstr "Démarrage du flux d'appareil..."
 
 msgid "(code copied)"
 msgstr "(code copié)"
-
-msgid "Opening {uri}\nEnter the code on the GitHub page."
-msgstr "Ouverture de {uri}\nSaisissez le code sur la page GitHub."
-
-msgid "Connected as {username}."
-msgstr "Connecté en tant que {username}."
 
 msgid "Failed: {error}"
 msgstr "Échec : {error}"
@@ -945,9 +807,6 @@ msgstr "Erreur réseau — vérifiez votre connexion."
 
 msgid "Test failed: {error}"
 msgstr "Échec du test : {error}"
-
-msgid "Saved for {username}."
-msgstr "Enregistré pour {username}."
 
 # ── settings: publish row ─────────────────────────────────────────────────
 
@@ -980,9 +839,6 @@ msgstr "Échec de la publication : {error}"
 msgid "Your name (appears in commits)"
 msgstr "Votre nom (apparaît dans les commits)"
 
-msgid "e.g. Kent Rasmussen"
-msgstr "par ex. Kent Rasmussen"
-
 msgid "Saved."
 msgstr "Enregistré."
 
@@ -1010,16 +866,10 @@ msgstr "Impossible d'ouvrir le sélecteur de fichiers : {error}"
 msgid "Could not create project: {error}"
 msgstr "Impossible de créer le projet : {error}"
 
-msgid "Could not open settings: {error}"
-msgstr "Impossible d'ouvrir les paramètres : {error}"
-
 msgid "Open settings"
 msgstr "Ouvrir les paramètres"
 
 # ── share.py — share running APK via Android share sheet ──────────────────
-
-msgid "Share this app"
-msgstr "Partager cette appli"
 
 msgid "Share app"
 msgstr "Partager l'appli"
@@ -1038,126 +888,126 @@ msgstr "Le partage de l'APK n'est disponible que sur Android."
 
 #: azt_collab_client/translate.py:172
 msgid "Invited {username} as a collaborator on {owner_repo}. They must accept the invitation on GitHub before they can clone or sync."
-msgstr ""
+msgstr "{username} a été invité·e comme collaborateur·rice sur {owner_repo}. Iel doit accepter l'invitation sur GitHub avant de pouvoir cloner ou synchroniser."
 
 #: azt_collab_client/translate.py:176
 msgid "{username} already has access to {owner_repo} (or a pending invitation)."
-msgstr ""
+msgstr "{username} a déjà accès à {owner_repo} (ou une invitation en attente)."
 
 #: azt_collab_client/translate.py:179
 msgid "Could not invite {username} to {owner_repo}: {error}"
-msgstr ""
+msgstr "Impossible d'inviter {username} à {owner_repo} : {error}"
 
 #: azt_collab_client/translate.py:181
 msgid "Enter a GitHub username."
-msgstr ""
+msgstr "Saisissez un nom d'utilisateur·rice GitHub."
 
 #: azt_collab_client/translate.py:183
 msgid "This project is not hosted on GitHub ({remote_url}). Collaborator invites are only supported for GitHub repositories."
-msgstr ""
+msgstr "Ce projet n'est pas hébergé sur GitHub ({remote_url}). Les invitations de collaborateur·rice ne sont prises en charge que pour les dépôts GitHub."
 
 #: azt_collab_client/translate.py:192
 msgid "Sync was interrupted; please retry."
-msgstr ""
+msgstr "La synchronisation a été interrompue ; veuillez réessayer."
 
 #: azt_collab_client/ui/bootstrap.py:273
 msgid "Bootstrap failed: could not derive asset filename (running Activity unreachable). Pass peer_asset_filename= explicitly."
-msgstr ""
+msgstr "Échec de l'amorçage : impossible de déduire le nom du fichier (Activity en cours inaccessible). Passez peer_asset_filename= explicitement."
 
 #: azt_collab_client/ui/bootstrap.py:935
 msgid "Attempt {n} of {total}"
-msgstr ""
+msgstr "Tentative {n} sur {total}"
 
 #: azt_collab_client/ui/bootstrap.py:938
 msgid "{s}s elapsed"
-msgstr ""
+msgstr "{s} s écoulées"
 
 #: azt_collab_client/ui/bootstrap.py:1517
 msgid "Last error: {kind}"
-msgstr ""
+msgstr "Dernière erreur : {kind}"
 
 #: azt_collab_client/ui/bootstrap.py:1522
 msgid "Waited {s}s before giving up."
-msgstr ""
+msgstr "Attente de {s} s avant abandon."
 
 #: azt_collab_client/ui/bootstrap.py:1532
 msgid "Installed {name} version: {v}"
-msgstr ""
+msgstr "{name} installé en version : {v}"
 
 #: azt_collab_client/ui/bootstrap.py:1537
 msgid "The AZT Collaboration service ({name}) is installed but did not respond. Tap Open {name} to wake the service, then come back here. Or tap Install to reinstall it, or Quit to close this app and try again later."
-msgstr ""
+msgstr "Le service AZT Collaboration ({name}) est installé mais n'a pas répondu. Touchez Ouvrir {name} pour activer le service, puis revenez ici. Ou touchez Installer pour le réinstaller, ou Quitter pour fermer cette application et réessayer plus tard."
 
 #: azt_collab_client/ui/bootstrap.py:1556
 msgid "Could not open {name}."
-msgstr ""
+msgstr "Impossible d'ouvrir {name}."
 
 #: azt_collab_client/ui/bootstrap.py:1583
 msgid "Open {name}"
-msgstr ""
+msgstr "Ouvrir {name}"
 
 #: azt_collab_client/ui/bootstrap.py:1688
 msgid "A newer version of {name} is required. Tap Update to download and install it."
-msgstr ""
+msgstr "Une nouvelle version de {name} est requise. Touchez Mettre à jour pour la télécharger et l'installer."
 
 #: azt_collab_client/ui/popups.py:144
 msgid "Invite a collaborator to:"
-msgstr ""
+msgstr "Inviter un·e collaborateur·rice à :"
 
 #: azt_collab_client/ui/popups.py:159
 msgid "(no remote configured)"
-msgstr ""
+msgstr "(aucun dépôt distant configuré)"
 
 #: azt_collab_client/ui/popups.py:168
 msgid "Enter the collaborator's GitHub username:"
-msgstr ""
+msgstr "Saisissez le nom d'utilisateur·rice GitHub du·de la collaborateur·rice :"
 
 #: azt_collab_client/ui/popups.py:175
 msgid "e.g. octocat"
-msgstr ""
+msgstr "par ex. octocat"
 
 #: azt_collab_client/ui/popups.py:198
 msgid "Invite"
-msgstr ""
+msgstr "Inviter"
 
 #: azt_collab_client/ui/popups.py:205
 msgid "Invite collaborator"
-msgstr ""
+msgstr "Inviter un·e collaborateur·rice"
 
 #: azt_collab_client/ui/popups.py:222
 msgid "Sending invitation…"
-msgstr ""
+msgstr "Envoi de l'invitation…"
 
 #: azt_collab_client/ui/popups.py:231
 msgid "Invite failed: {error}"
-msgstr ""
+msgstr "Échec de l'invitation : {error}"
 
 #: azt_collab_client/ui/popups.py:356
 msgid "owner/repository"
-msgstr ""
+msgstr "propriétaire/dépôt"
 
 #: azt_collab_client/ui/popups.py:802
 msgid "Open AZT Collaboration"
-msgstr ""
+msgstr "Ouvrir AZT Collaboration"
 
 #: azt_collab_client/ui/update.py:704
 msgid "Update check failed: could not derive asset filename (running Activity unreachable). Pass asset_filename= explicitly."
-msgstr ""
+msgstr "Échec de la vérification de mise à jour : impossible de déduire le nom du fichier (Activity en cours inaccessible). Passez asset_filename= explicitement."
 
 #: azt_collab_client/ui/update.py:1008
 msgid "Install failed: could not derive asset filename (running Activity unreachable). Pass asset_filename= explicitly."
-msgstr ""
+msgstr "Échec de l'installation : impossible de déduire le nom du fichier (Activity en cours inaccessible). Passez asset_filename= explicitement."
 
 #: azt_collab_client/ui/update.py:1096
 msgid "Downloading…"
-msgstr ""
+msgstr "Téléchargement…"
 
 # ── Drift placeholders appended by tests/add_missing_msgids.py ──
 # Translate the msgstr values when ready; empty msgstr falls back to the msgid (English) at runtime, same as the pre-add behaviour.
 
 #: azt_collab_client/translate.py:162
 msgid "Please set your name in the sync settings before publishing or syncing."
-msgstr ""
+msgstr "Veuillez définir votre nom dans les paramètres de synchronisation avant de publier ou de synchroniser."
 
 msgid "Work-offline mode is on. Turn it off in sync settings to push."
 msgstr "Mode hors-ligne activé. Désactivez-le dans les paramètres de synchronisation pour pousser."
@@ -1178,7 +1028,7 @@ msgid "Failed to update work-offline setting: {error}"
 msgstr "Échec de la mise à jour du paramètre hors-ligne : {error}"
 
 msgid "More info"
-msgstr ""
+msgstr "Plus d'infos"
 
 msgid ""
 "You have {name} {installed} installed, but the version currently running is "
@@ -1188,6 +1038,13 @@ msgid ""
 "If reboot doesn't help, [ref=email][color=4ea1ff][u]send the developer an "
 "Email[/u][/color][/ref]."
 msgstr ""
+"Vous avez {name} {installed} installé, mais la version actuellement en "
+"cours d'exécution est {running}. Redémarrez votre appareil pour passer à "
+"la version la plus récente, puis rouvrez cette application.\n"
+"\n"
+"Si le redémarrage ne résout pas le problème, "
+"[ref=email][color=4ea1ff][u]envoyez un courriel au développeur"
+"[/u][/color][/ref]."
 
 # ── 0.41.22: QR scan, share-repo popup, switch-project, wordlist row ──
 
@@ -1205,15 +1062,6 @@ msgstr "Partager le projet {langcode}"
 
 msgid "Scan with another device to clone the repo."
 msgstr "Scannez avec un autre appareil pour cloner le dépôt."
-
-msgid "Copied to clipboard."
-msgstr "Copié dans le presse-papiers."
-
-msgid "Could not copy: {error}"
-msgstr "Impossible de copier : {error}"
-
-msgid "Copy URL"
-msgstr "Copier l'URL"
 
 msgid "Close"
 msgstr "Fermer"

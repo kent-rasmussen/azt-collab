@@ -11,6 +11,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
+### azt_collabd 0.43.1 / azt_collab_client 0.43.1 — Polish: French translations, orphan cleanup, sister-app demo rewrite
+
+Patch follow-up to 0.43.0. No wire-format or behaviour changes
+— pure cleanup.
+
+- **French catalog filled.** 32 previously-empty ``msgstr``
+  entries translated, covering the GitHub-collaborator-invite
+  flow, the bootstrap install / update / reboot prompts,
+  popups (``Invite collaborator``, ``owner/repository``,
+  ``Sending invitation…``, ``Invite failed: {error}``,
+  ``Open AZT Collaboration``, ``More info``), update.py
+  status strings (``Downloading…``, asset-filename failures),
+  ``Sync was interrupted; please retry.``, and ``Please set
+  your name in the sync settings before publishing or
+  syncing.`` ``Project-Id-Version`` header bumped to match.
+- **41 catalog orphans removed.** Stale ``msgid`` entries
+  from features that were removed or rephrased: ``Active
+  host``, ``Copy URL``, ``Disconnect GitHub`` / ``GitLab``,
+  ``GitHub`` / ``GitLab`` standalone, ``GitLab credentials``,
+  ``Refresh``, ``Save``, ``Save daemon log to file`` / ``Stop
+  saving daemon log``, ``Set GitLab credentials``, ``Test
+  connection``, ``Update needed`` / ``Update this app`` /
+  ``Updating {name}…``, four bootstrap strings now phrased
+  differently, two ``Opening {uri}…`` variants, ``Tap
+  "Begin"…``, ``Connected as {username}.`` (kept the
+  ``…Credentials saved.`` variant), ``Error setting host:
+  {error}``, ``Saved for {username}.``, ``Copied to
+  clipboard.`` / ``Could not copy: {error}``, ``Could not
+  open settings: {error}``, ``e.g. Kent Rasmussen``, ``Install
+  it to enable sync, then reopen this app.``, ``Paste the
+  repository URL here``, and ``Share this app`` (orphan
+  beside the live ``Share app``). Also deduplicated ``Share
+  this app`` which appeared twice — both removed since
+  neither was referenced.
+- **``examples/sister_app.py`` rewritten** as a read-only
+  daemon survey. Previously took a working-tree path and
+  did ``register_project`` + ``commit_project`` — a
+  bootstrap demo masquerading as a peer. Now takes no
+  args and prints every field the client gets from the
+  daemon: reachability + version compat, contributor +
+  device_name + credentials, ``sync.work_offline``,
+  registered project list, full ``project_status`` for
+  ``last_project()`` including the new 0.43.0 fields.
+  Interactive prompt with ``p`` to open the picker
+  subprocess, ``s`` to open the daemon settings UI
+  subprocess, ``r`` to refresh, ``q`` to quit. After
+  ``p`` returns the survey re-prints so changes are
+  immediately visible. References in ``README.md`` /
+  ``CLAUDE.md`` updated to match the no-arg form.
+- **Test fix.** ``test_scheduler_run_sync_refuses_when_
+  contributor_unset`` renamed to ``test_scheduler_run_
+  commit_refuses…`` and now calls ``_run_commit`` (the
+  0.43.0 rename of ``_run_sync``).
+
 ### azt_collabd 0.43.0 / azt_collab_client 0.43.0 — Split commit and push; daemon-driven push policy; ``sync.work_offline`` toggle
 
 Closes the NOTES_TO_DAEMON.md item filed by azt-recorder
