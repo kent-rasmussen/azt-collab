@@ -11,10 +11,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
 ## [Unreleased]
 
-### azt_collabd 0.43.1 / azt_collab_client 0.43.1 — Polish: French translations, orphan cleanup, sister-app demo rewrite
+### azt_collabd 0.43.1 / azt_collab_client 0.43.1 — Polish + bootstrap parity guard
 
-Patch follow-up to 0.43.0. No wire-format or behaviour changes
-— pure cleanup.
+Patch follow-up to 0.43.0. One small behaviour change in the
+bootstrap probe (the parity guard); everything else is pure
+cleanup.
+
+- **Bootstrap: no "newer available" popup at version parity.**
+  Closes NOTES_TO_DAEMON.md filed by azt-recorder 1.45.0
+  (2026-05-15). `_peer_update_with_confirm._probe` was firing
+  the self-update popup with the *currently-installed* version
+  in the message when (a) the user had just `adb install -r`'d
+  the freshly-published release, (b) `peer_version == latest`,
+  and (c) the last-seen-digest peer_pref was a leftover from
+  an earlier version's session. Phantom "digest_changed=True
+  at parity" signal. New `at_version_parity` flag suppresses
+  `digest_changed` whenever `peer_version == latest`; the
+  parity-with-stale-baseline case folds into the existing
+  silent re-baseline branch (was `unknown_baseline`-only, now
+  also covers `stale_baseline_at_parity`). Cost: a legitimate
+  same-tag re-upload won't pop until either the maintainer
+  bumps the tag or the next dev-loop install picks up the new
+  bytes naturally. Benefit: dev-loop installs of just-
+  published builds no longer surface a same-version-to-self
+  prompt.
+- **i18n: peer-side language re-sync hook +
+  ``translate.tr`` fallback dropped.** Closes
+  NOTES_TO_DAEMON.md filed by azt-recorder 1.45.0
+  (2026-05-16) — "only `'More info'` renders translated" on
+  the voluntary-update popup. Root cause was the peer's
+  `add_fallback` target capturing the client `_current` at
+  peer startup and never refreshing when bootstrap's
+  `_sync_ui_language_with_daemon` swapped the client catalog
+  out from under it. The `translate.tr` second-chance retry
+  to `_client_tr` (the "if host returned msgid, try client"
+  safety net) hid the issue for some strings but not
+  others, depending on whether the host catalog returned the
+  msgid unchanged. New `i18n.subscribe_language_change(cb)`
+  API: peers register a callback that re-creates their own
+  `gettext.translation` in the new language and re-calls
+  `add_fallback(client_i18n.gettext_translation())` so the
+  chain keeps pointing at the *current* client catalog.
+  `set_language` invokes every subscriber after the swap +
+  persist; failures are logged, not raised. `translate.tr`
+  simplified to a straight delegation — no retry. Peer
+  obligation documented in `CLIENT_INTEGRATION.md` § 6.
 
 - **French catalog filled.** 32 previously-empty ``msgstr``
   entries translated, covering the GitHub-collaborator-invite

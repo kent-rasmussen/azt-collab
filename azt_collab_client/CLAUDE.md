@@ -335,13 +335,31 @@ is the client catalog. Peer with its own catalog chains via
 gettext's `add_fallback`; the code shape is in
 `CLIENT_INTEGRATION.md` § 6.
 
-`translate.tr` has a software fallback in case the host forgets
-`add_fallback`: if the host translator returns the msgid unchanged,
-`tr` retries via the client catalog. So a misconfigured host still
-gets client strings translated for KV-rendered text. The failure
-mode becomes "missing translation for client string" instead of
-"untranslated forever" — but rely on `add_fallback` for the
-non-degraded path.
+**0.43.1: `translate.tr` is a straight delegation; the
+second-chance retry to `_client_tr` is gone.** Pre-0.43.1
+`tr` retried via the client catalog when the host translator
+returned the msgid unchanged — a software fallback for peers
+that forgot to `add_fallback`. That fallback masked a real
+bug: when the host catalog had stale entries with English
+msgstrs (msgid 'Update' → msgstr 'Update' as a leftover from
+a pre-dedup recorder.po), `translated != msg` so the retry
+didn't fire, and the string came out English even though the
+client catalog had French. Strings the host catalog had no
+entry for (like 'More info', new in 0.43.0) DID return msgid
+unchanged, so the retry fired and they came out French. Net
+user-visible: only some client-owned strings translated, and
+the pattern looked random.
+
+Fix is two-fold: drop the retry (so peers MUST configure
+`add_fallback` correctly per § 6 of CLIENT_INTEGRATION.md),
+and add `i18n.subscribe_language_change(cb)` so peers can
+re-create their `gettext.translation` and re-call
+`add_fallback` whenever the client catalog re-languages.
+Bootstrap's `_sync_ui_language_with_daemon` swaps the client
+catalog and now notifies subscribers; the peer rebuilds its
+chain against the fresh client `_current`. Without the
+subscriber hook, the peer's `add_fallback` target stays
+frozen at the client `_current` captured at peer startup.
 
 ### Live retranslation
 

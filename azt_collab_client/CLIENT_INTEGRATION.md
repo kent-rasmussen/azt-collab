@@ -318,7 +318,8 @@ true cancel. The peer just has to honor the contract.
 
 If your peer ships its own ``.po`` catalog, chain the client
 catalog as a fallback so client-owned strings translate without
-duplication:
+duplication, AND subscribe to language-change events so the
+chain stays fresh when the daemon's language toggle fires.
 
 ```python
 import gettext, azt_collab_client
@@ -335,11 +336,32 @@ def set_app_language(lang):
     collab_i18n.set_language(lang)
     peer_t.add_fallback(collab_i18n.gettext_translation())
     azt_collab_client.set_translator(peer_t.gettext)
+
+# Required since client 0.43.1: re-run the chain whenever the
+# client catalog re-languages. Bootstrap's
+# ``_sync_ui_language_with_daemon`` calls ``collab_i18n.set_language``
+# with the daemon's language pref, which fires this subscriber so
+# the peer's gettext.translation is re-created in the new language
+# and its add_fallback target gets re-captured against the freshly-
+# swapped client._current. Without this hook the peer's catalog stays
+# frozen at startup language while the client catalog re-languages —
+# producing the "only client-owned strings translate, and only when
+# fallback-retried" split closed in client 0.43.1.
+collab_i18n.subscribe_language_change(set_app_language)
 ```
+
+The subscriber call is idempotent — peers that import this module
+multiple times don't end up with duplicate callbacks.
 
 If you don't have your own catalog (small peer): nothing to do.
 The client catalog applies automatically when a language is
-selected from the daemon's settings UI.
+selected from the daemon's settings UI. ``client.translate.tr``
+delegates straight to whatever ``set_translator`` was last given
+(or the client's own catalog if none); as of 0.43.1 there is NO
+second-chance retry to the client catalog when the host
+translator returns the msgid unchanged. Peers that ship a catalog
+but skip the ``add_fallback`` step will see client-owned strings
+render as English msgids. Wire the fallback per the snippet above.
 
 ## 7. App.title
 

@@ -1447,14 +1447,40 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
             latest and _version_tuple(latest)
             < _version_tuple(ctx.peer_version)
         )
+        # Version-parity guard: if peer_version == latest, the user
+        # is on the published release per the tag-vs-tag comparison,
+        # and any digest discrepancy is necessarily an out-of-band
+        # install artifact (adb install -r of a freshly published
+        # build, in-place rebuild, etc.) rather than a real "newer
+        # bytes available" signal. Bootstrap has no way to inspect
+        # the bundled digest of the running APK to distinguish that
+        # from a legitimate same-tag re-upload, so we treat parity
+        # as authoritative and fold the digest mismatch into the
+        # silent re-baseline branch below. The cost is missing a
+        # real same-tag re-upload until either (a) the maintainer
+        # bumps the tag or (b) the next dev-loop install picks up
+        # the new bytes naturally. The benefit is no more "1.45.0
+        # available" popups after the user already installed
+        # 1.45.0. See NOTES_TO_DAEMON.md (2026-05-15, closed).
+        at_version_parity = bool(
+            latest and latest == ctx.peer_version)
         digest_changed = bool(
             gh_digest and last_seen and gh_digest != last_seen
             and not local_newer
+            and not at_version_parity
         )
         # First-run case: no last_seen recorded yet. We can't
         # introspect the installed APK's bundled digest to baseline
         # against, so digest_changed alone can't tell us anything.
         unknown_baseline = bool((not last_seen) and gh_digest)
+        # Parity-with-stale-baseline: peer_version == latest but
+        # the recorded digest predates this version. Same shape as
+        # unknown_baseline — silent re-baseline so the next probe
+        # has a clean reference. Catches the adb install -r drift
+        # documented in NOTES_TO_DAEMON.md (2026-05-15).
+        stale_baseline_at_parity = bool(
+            at_version_parity and gh_digest and last_seen
+            and gh_digest != last_seen)
         # Mandatory-mode override. The daemon has already told us
         # the running client is too old; the probe's job here is
         # to find a target to install IF one exists.
@@ -1491,7 +1517,9 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
               f'last_seen={last_seen[:12]!r}… '
               f'version_newer={version_newer} '
               f'local_newer={local_newer} '
+              f'at_version_parity={at_version_parity} '
               f'digest_changed={digest_changed} '
+              f'stale_baseline_at_parity={stale_baseline_at_parity} '
               f'mandatory={mandatory} '
               f'mandatory_force={mandatory_force}',
               file=sys.stderr, flush=True)
@@ -1500,12 +1528,22 @@ def _peer_update_with_confirm(ctx, *, on_status, on_no_update, on_error,
             version_newer or digest_changed or mandatory_force)
 
         if not needs_update:
-            # Quiet path. Take the first-run baseline now so the
-            # NEXT probe can detect a real change. Only do this on
-            # the no-prompt branch — recording before a prompt
-            # would let a "Quit" decline silently re-baseline and
-            # mask the pending update on next launch.
-            if unknown_baseline:
+            # Quiet path. Take the baseline now so the NEXT probe
+            # can detect a real change. Two cases:
+            # - ``unknown_baseline``: first run for this repo,
+            #   record the digest as the starting point.
+            # - ``stale_baseline_at_parity``: an out-of-band
+            #   install (adb install -r, dev rebuild) moved us
+            #   to peer_version == latest without going through
+            #   the in-app probe, so last_seen is from an earlier
+            #   version's session. Re-baseline silently — the
+            #   user is on the latest published bytes per the
+            #   version field, no popup justified.
+            # Only do this on the no-prompt branch — recording
+            # before a prompt would let a "Quit" decline silently
+            # re-baseline and mask the pending update on next
+            # launch.
+            if unknown_baseline or stale_baseline_at_parity:
                 _record_last_seen_digest(ctx.peer_repo, gh_digest)
             _on_ui(on_no_update)
             return

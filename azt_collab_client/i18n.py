@@ -41,6 +41,19 @@ _LOCALE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _current: gettext.NullTranslations = gettext.NullTranslations()
 _current_lang: str = 'en'
 
+# Subscribers for "client catalog just switched languages." Peers
+# with their own catalog (recorder, future viewer) register a
+# callback that re-creates their own ``gettext.translation`` in the
+# new lang and re-calls ``add_fallback(client_i18n.gettext_translation())``
+# so their chained lookup keeps pointing at the *current* client
+# translation, not the one captured at peer startup. Without this,
+# a daemon-side language toggle that triggers
+# ``_sync_ui_language_with_daemon`` would re-language the client
+# catalog but leave the peer's catalog frozen at startup language —
+# resulting in the "some buttons translate, some don't" split
+# closed in client 0.43.1.
+_lang_change_subs: list = []
+
 _DISPLAY_NAMES = {
     'en': 'English',
     'fr': 'Français',
@@ -272,14 +285,51 @@ def set_language(lang):
     ``$AZT_HOME/config.json``. There is no transient mode — one
     preference, one store, sticks everywhere until next changed.
     Returns the language actually set (falls back to ``'en'`` if the
-    catalog can't be loaded)."""
+    catalog can't be loaded).
+
+    Notifies every registered ``subscribe_language_change``
+    callback with the applied language code after persistence
+    succeeds. Peer host apps (recorder, viewer, …) use this to
+    re-create their own ``gettext.translation`` in the new
+    language and re-call ``add_fallback`` so their chained lookup
+    keeps pointing at the *current* client catalog rather than
+    the one captured at peer startup."""
     applied = _apply(lang)
     try:
         _save_language_pref(applied)
     except OSError as ex:
         print(f'[client.i18n] could not persist language: {ex}',
               file=sys.stderr)
+    for cb in list(_lang_change_subs):
+        try:
+            cb(applied)
+        except Exception as ex:
+            print(f'[client.i18n] lang-change subscriber raised: {ex}',
+                  file=sys.stderr)
     return applied
+
+
+def subscribe_language_change(callback):
+    """Register *callback* to be invoked with the new language code
+    whenever ``set_language`` applies a new language. The callback
+    runs after the client catalog has been swapped and the
+    preference has been persisted, so any subsequent
+    ``client.i18n._(msg)`` lookup will use the new catalog.
+
+    Idempotent: registering the same callable twice is a no-op.
+    Returns the callback so it can be used as a decorator."""
+    if callback not in _lang_change_subs:
+        _lang_change_subs.append(callback)
+    return callback
+
+
+def unsubscribe_language_change(callback):
+    """Remove a previously-registered language-change callback.
+    No-op if the callback wasn't subscribed."""
+    try:
+        _lang_change_subs.remove(callback)
+    except ValueError:
+        pass
 
 
 def current_language():

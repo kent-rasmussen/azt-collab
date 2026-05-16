@@ -34,22 +34,29 @@ def set_translator(fn):
 
 
 def tr(msg):
-    """Translate ``msg`` through the host translator first, then fall
-    back to the client catalog. Useful for KV ``#:import`` so
-    subsequent ``set_translator`` calls take effect (KV imports bind
-    once; importing this wrapper instead of ``_tr`` makes the
-    indirection explicit).
+    """Translate ``msg`` through whatever was last passed to
+    ``set_translator`` (or the client catalog by default).
 
-    The fallback layer means an embedded peer does not need to
-    duplicate client strings into its own catalog: any string the host
-    catalog leaves unchanged falls through to the client's catalog,
-    which owns the picker/popup/status translations."""
-    if _tr is _client_tr:
-        return _tr(msg)
-    translated = _tr(msg)
-    if translated == msg:
-        return _client_tr(msg)
-    return translated
+    Indirection-friendly: KV ``#:import`` binds once at template
+    load, but ``tr`` is a plain wrapper that resolves the current
+    ``_tr`` at every call, so subsequent ``set_translator`` swaps
+    take effect.
+
+    The peer host is responsible for chaining its own gettext
+    catalog to the client's via ``add_fallback`` (per
+    ``CLIENT_INTEGRATION.md`` § 6). With the chain configured
+    correctly, host strings resolve through the host catalog and
+    client-owned strings fall through to the client catalog *within
+    a single gettext lookup* — no second-chance retry needed here.
+    Peers MUST also re-do the ``add_fallback`` whenever the client
+    catalog re-languages, which they do by subscribing to
+    ``client.i18n.subscribe_language_change`` (since client 0.43.1
+    — without that hook the peer's chained fallback target
+    captures the client ``_current`` at peer startup and never
+    refreshes, which produced the "only client-owned strings
+    translate; only when the second-chance retry fired" split
+    closed in 0.43.1)."""
+    return _tr(msg)
 
 
 def _fmt(template, params):

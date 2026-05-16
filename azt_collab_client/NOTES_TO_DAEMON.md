@@ -39,4 +39,33 @@ to:
   (online + `sync.post_online_grace_s` +
   `sync.work_offline`). See `CLIENT_INTEGRATION.md` § 17 for
   the new routing.
+- "`digest_changed` prompts after `adb install -r` of a fresh
+  release" → at-version-parity guard (acted on 2026-05-15 —
+  client 0.43.1). `digest_changed` now requires
+  `peer_version < latest`; the parity-with-stale-baseline case
+  folds into the existing silent re-baseline branch alongside
+  `unknown_baseline`. Same-tag re-uploads at strict parity no
+  longer pop; out-of-band sideloads (adb install -r) silently
+  refresh the baseline on next probe.
+- "Bootstrap update popup: only `'More info'` renders
+  translated" → peer-side i18n re-sync hook (acted on
+  2026-05-16 — client 0.43.1). Root cause was the peer's
+  `add_fallback` target capturing the client `_current` at
+  peer startup, never refreshed when
+  `_sync_ui_language_with_daemon` swapped the client catalog
+  underneath it. Strings absent from the peer's .po walked
+  the chain to the frozen English `NullTranslations` and
+  came back as msgids; the `translate.tr` second-chance
+  retry to `_client_tr` was the only path that found
+  French, and it depended on the host catalog returning the
+  msgid unchanged (which it did for 'More info' but not
+  for the four bootstrap-side strings — the host catalog
+  likely had English msgstrs for them as leftovers from a
+  pre-dedup pass, so `translated != msg` and the retry
+  didn't fire). Fix shape: `client.i18n.subscribe_language_change`
+  callback API (peer re-creates its own gettext.translation
+  in the new lang and re-`add_fallback`s on every client
+  re-language); `translate.tr` second-chance retry dropped
+  (peers must `add_fallback` correctly per the contract).
+  See `CLIENT_INTEGRATION.md` § 6 for the peer-side wiring.
 
