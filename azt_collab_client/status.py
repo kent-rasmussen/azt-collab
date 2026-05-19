@@ -55,6 +55,14 @@ COMMIT_FAILED = 'COMMIT_FAILED'
 # rationale.
 COMMIT_REPEATEDLY_FAILED = 'COMMIT_REPEATEDLY_FAILED'
 PUSH_FAILED = 'PUSH_FAILED'
+# Both system DNS and the daemon's DoH fallback failed to resolve
+# the sync host. See azt_collabd/status.py for the full rationale.
+# Peers should route this **silent on auto-sync** (same bucket as
+# PUSH_FAILED on network-class failures) — the daemon will retry
+# automatically when the underlying issue clears. On user-initiated
+# Sync, route to an informational toast telling the user to check
+# device DNS / VPN / restricted-data settings; do not navigate.
+DNS_RESOLUTION_FAILED = 'DNS_RESOLUTION_FAILED'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'

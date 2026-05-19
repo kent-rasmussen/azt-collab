@@ -52,10 +52,24 @@ def discover():
             return None
         resolver = activity.getContentResolver()
         uri = Uri.parse(f'content://{CANONICAL_AUTHORITY}/v1/health')
-        try:
-            bundle = resolver.call(uri, 'ping', None, None)
-        except Exception:
-            return None
+        # Tolerate the daemon cold-spawn race here too: discovery's
+        # ping is often the very call that triggers Android's lazy
+        # spawn of ``:provider``, so the first attempt commonly
+        # returns null while Python imports. Same justification as
+        # ``_raw_call``'s retry (see there); kept short so a real
+        # "server APK not installed" still falls through to the
+        # install prompt quickly.
+        bundle = None
+        for delay in (0.0, 0.2, 0.4, 0.8, 1.6):
+            if delay:
+                import time as _time
+                _time.sleep(delay)
+            try:
+                bundle = resolver.call(uri, 'ping', None, None)
+            except Exception:
+                return None
+            if bundle is not None:
+                break
         if bundle is None:
             return None
         # Phase B2: hold a service binding so :provider stays warm
@@ -107,6 +121,17 @@ class AndroidContentProviderTransport(Transport):
                 f'provider call failed: {ex}',
                 kind='transport_error')
 
+    # Backoff for the transparent ``null_bundle`` retry below.
+    # Cumulative budget: 0.1+0.2+0.4+0.8+1.6 = 3.1 s, which covers
+    # the observed daemon cold-spawn import (~1.9 s on a mid-range
+    # Android device — see ``[boot-trace-daemon]`` ``module_loaded``
+    # → ``after_install_callbacks``) plus margin. If the daemon
+    # truly isn't there (signature mismatch / authority gone) we
+    # surface ``null_bundle`` after burning this 3 s budget; the
+    # outer bootstrap path then renders its "unresponsive" popup
+    # as before.
+    _NULL_BUNDLE_RETRY_BACKOFF_S = (0.1, 0.2, 0.4, 0.8, 1.6)
+
     def _raw_call(self, method, path, body, timeout):
         # ContentResolver.call(uri, method, arg, extras) consumes the
         # URI's authority for provider routing but does NOT deliver the
@@ -131,19 +156,50 @@ class AndroidContentProviderTransport(Transport):
             from .._debug import first_try_log
             first_try_log('transport.call.pre',
                           method=method, path=path)
-        bundle = self._resolver.call(uri, method, path, extras)
+        # Transparent retry on null Bundle. Two known producers:
+        #
+        #   1. Cold-daemon spawn race. The peer's call lazy-spawns
+        #      ``:provider``; Android registers the provider authority
+        #      before the Python body has imported
+        #      ``AZTServiceProviderhost`` and installed the dispatch
+        #      callback. The Java provider's ``call()`` sees ``cb ==
+        #      null`` and returns a null Bundle. Resolves on its own
+        #      once the Python import lands (~2 s).
+        #
+        #   2. Persistent structural failure. Signature-grant
+        #      denial, provider authority absent. No amount of
+        #      waiting fixes it.
+        #
+        # We can't distinguish (1) from (2) at call time, so we
+        # retry case (1) blind and let case (2) bleed through after
+        # the budget. Retrying is safe for both GETs and POSTs:
+        # null Bundle means Python dispatch never ran, so no work
+        # was done on the daemon side. Pre-0.43.9 this was treated
+        # as fail-fast "structural", which crashed the peer on its
+        # first call when the daemon happened to be idle-stopped
+        # or had just been reaped (0.43.7's
+        # SuiteSelfReplaceReceiver fix made reaping reliable, which
+        # also made cold-spawn races strictly more common).
+        bundle = None
+        attempt = 0
+        max_attempts = len(self._NULL_BUNDLE_RETRY_BACKOFF_S)
+        while True:
+            bundle = self._resolver.call(uri, method, path, extras)
+            if bundle is not None:
+                break
+            if attempt >= max_attempts:
+                break
+            import time as _time
+            _time.sleep(self._NULL_BUNDLE_RETRY_BACKOFF_S[attempt])
+            attempt += 1
         if not suppress_probe:
             first_try_log('transport.call.post',
                           method=method, path=path,
-                          bundle_null=bundle is None)
+                          bundle_null=bundle is None,
+                          null_retries=attempt)
         if bundle is None:
-            # Most common cause: signature-grant denial (peer's APK
-            # signed with a different key than the suite keystore)
-            # or the provider authority not actually present.
-            # Structural; bootstrap's warmup loop fails fast on this
-            # kind rather than waiting the full 60s budget.
             raise ServerUnavailable(
-                'provider returned null',
+                f'provider returned null after {attempt} retries',
                 kind='null_bundle')
         status = bundle.getInt('status', 500)
         json_str = bundle.getString('json') or ''

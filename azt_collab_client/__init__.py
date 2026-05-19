@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.43.1"
+__version__ = "0.43.18"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -156,7 +156,7 @@ __version__ = "0.43.1"
 # ``sync.work_offline`` toggle and ``S.WORK_OFFLINE_ENABLED``
 # status code; a 0.43 client paired with an older daemon would
 # render the work-offline UI but the toggle would have no effect.
-MIN_SERVER_VERSION = "0.43.0"
+MIN_SERVER_VERSION = "0.43.18"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``

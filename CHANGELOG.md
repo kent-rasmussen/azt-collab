@@ -9,7 +9,1106 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## [Unreleased]
+## 0.43.18 — daemon log rotates on toggle-on; previous session preserved in `.prev`
+
+### Why
+
+The "Save daemon log to file" toggle's `truncate=True` path
+opened the log file in `'w'` mode, wiping any prior content. A
+remote tester flipping the toggle to start a fresh investigation
+would lose the previous investigation's evidence — confirmed in
+the field after the user said "the toggle just erased the sync
+trace we'd been waiting to see." Remote debugging across time
+zones and a language barrier doesn't have the bandwidth to
+re-ask "do exactly the same thing again so I can capture the
+same log."
+
+### Change
+
+`azt_collabd/server.py::install_stdio_tee(truncate=True)` now
+rotates first:
+
+1. If `$AZT_HOME/daemon.log` exists, rename it to
+   `daemon.log.prev` (overwriting any prior `.prev`).
+2. Open `daemon.log` fresh in `'w'` mode (effectively empty
+   since the rename took the prior content).
+3. Write the `(fresh session, daemon X.Y.Z)` banner.
+
+Respawns (the `truncate=False` path, fired by
+`maybe_install_stdio_tee` at every `:provider` boot) continue to
+append to `daemon.log` unchanged — rotation only happens at the
+explicit toggle-on gesture. This avoids the otherwise-pathological
+case where idle-stop respawns rotate the `.prev` away every few
+minutes.
+
+`azt_collabd/ui/app.py::share_daemon_log` now passes
+`prev_path=data['log_path'] + '.prev'` to `share_log_file`. The
+existing `_bundle_log_blob` silently skips the previous-session
+section when the path doesn't exist (first toggle-on, no prior
+file to rotate), so the share bundle gracefully degrades to
+just the current-session block when there's no `.prev`.
+
+Net behaviour:
+
+- **First toggle-on ever:** no rotation, fresh log, share shows
+  one `=== current session ===` block.
+- **Subsequent toggle-on:** prior log rotated to `.prev`, new
+  `.log` starts fresh, share shows
+  `=== previous session === / === current session ===`.
+- **Daemon respawn (toggle stays on):** appends to current `.log`
+  with an `(appending — daemon X.Y.Z respawn)` banner as section
+  break. `.prev` is untouched.
+
+### Notes
+
+- Matches the peer (`azt_recorder.log` / `azt_recorder.log.prev`)
+  rotate-on-launch pattern that the share helper was already
+  written to support — just plumbed through to the daemon side.
+- No wire-format change; no `MIN_CLIENT_VERSION` change.
+- Rotation is best-effort: if the rename fails (disk full,
+  permissions, whatever), we log the failure to `sys.__stderr__`
+  and continue opening `.log` in `'w'` mode — so the toggle-on
+  gesture still gives the user a clean log even if rotation
+  couldn't preserve the prior session.
+
+## 0.43.17 — drop the "Email daemon log" button from the settings UI
+
+### Why
+
+The settings UI had two side-by-side buttons for shipping the
+daemon log: "Share daemon log" and "Email daemon log".
+
+- **Share** reads the file directly from disk, includes the
+  `=== current session (<path>) [daemon X.Y.Z] ===` header
+  (with the daemon-version tag added in 0.43.8), and sends as
+  a real file attachment via `Intent.ACTION_SEND` + MediaStore +
+  `EXTRA_STREAM`. Arbitrary size, picker offers email apps
+  alongside messaging / file-saver / cloud-paste.
+- **Email** used `Intent.ACTION_SENDTO` with the log inlined into
+  the body parameter of a `mailto:` URI. That made the log
+  payload subject to (a) the daemon's 256 KB RPC truncation cap,
+  (b) URI size limits in the email app and Android's URI parser,
+  and (c) loss of the session-header decoration.
+
+For "send the daemon log to the developer", **Share is strictly
+better** — the user picks their email app from the chooser and
+the attachment is a full-fidelity file. The Email button was
+the strictly-worse path of the two; offering both was confusing
+and invited testers to pick the worse one.
+
+### Changes
+
+`azt_collabd/ui/app.py`:
+
+- KV layout: the `RecBtn` for `_('Email daemon log')` is gone;
+  the remaining "Share daemon log" button stretches to fill the
+  row.
+- `email_daemon_log` method removed.
+- `_dispatch_daemon_log` collapsed into `share_daemon_log`
+  (single channel, no branch). Docstring rewritten to record
+  the rationale so the next maintainer doesn't re-add an Email
+  button without re-reading why it was removed.
+
+`azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`:
+
+- `msgid "Email daemon log"` entry dropped.
+
+### Notes
+
+- `azt_collab_client.ui.share.email_text` itself is **not**
+  removed — peers may still want a "send the developer a short
+  note" mailto-only path for other contexts. The helper just
+  stops being called from `azt_collabd.ui.app`.
+- No wire-format change. Pure UI cleanup.
+
+## 0.43.16 — fix push regression introduced in 0.43.13's non-FF guard
+
+### Regression
+
+0.43.13 added a "safety" branch to the push retry loop in
+`_push_step_locked`: when a non-FF rejection lands AND the
+post-rejection fetch reports `new_remote == local_sha`, bail with
+`PUSH_FAILED` rather than claiming `S.PUSHED`. The reasoning was
+"non-FF but the server already shows our tip means we're in an
+inconsistent state we can't recover from in-loop; claiming PUSHED
+would silently lose data."
+
+That reasoning was wrong. The actual common path that hits this
+branch is adaptive batching: an earlier network failure halved
+`target_sha` to an intermediate ancestor of `local_sha`. While
+the loop is shrinking, the server (concurrent peer push, prior
+in-flight commit, anything) advances to `local_sha`. The peer's
+next attempt pushes `target_sha:refs/heads/<branch>`. Server
+rejects: target_sha is an ancestor of the server's current tip,
+so the push would move the ref backwards → non-FF rejection
+shape. We re-fetch, `new_remote = local_sha` (matches local).
+
+In that case **the server already holds `local_sha`** — we are
+in sync. The pre-0.43.13 code correctly claimed `S.PUSHED` here.
+0.43.13's bail turned this into a spurious failure, and a phone
+that had been adaptive-batching its way through a slow link
+would stop progressing.
+
+### Fix
+
+Removed the `if non_ff: bail` arm. The equal-local-new_remote
+branch now claims `PUSHED` for *both* race and non-FF triggers —
+which is correct, because in both cases the server's view of the
+branch matches our local tip. Comment block at the call site
+updated to record the 0.43.13 → 0.43.16 history so the next
+maintainer doesn't reintroduce the same "safety" guard.
+
+### Also: `new_remote is None` guard
+
+0.43.13's gate change (`(new_remote and new_remote != remote_sha)
+or non_ff`) could enter the reconciliation block with
+`new_remote = None` when the only trigger was `non_ff` and the
+local repo hadn't yet written `refs/remotes/origin/<branch>` (a
+freshly-cloned-but-empty-tracking-ref state). The ancestor
+checks below would then walk against `None` and raise. New gate:
+`new_remote and ((new_remote != remote_sha) or non_ff)`. The
+``new_remote`` truthy check now governs both arms, so `non_ff`
+without a real tracking SHA falls through to the unfamiliar-
+exception backoff path instead of crashing the loop.
+
+### Notes
+
+- No wire-format change. Pure daemon-side fix.
+- The 0.43.13 `_format_push_error` rewrite (tuple-of-bytes
+  → "remote rejected ref update (likely non-fast-forward …)") is
+  unchanged and still in effect — that part of 0.43.13 was right
+  on its own.
+- A peer that had stopped syncing due to this regression should
+  resume on the first user-initiated Sync gesture against a
+  0.43.16+ daemon. No state to clear.
+
+## 0.43.15 — daemon-log file captures everything (`stdout` + `stderr`), and the tee auto-installs on every `:provider` respawn
+
+### Field report (and a finished thought)
+
+A user with "Save daemon log to file" toggled on shared a log
+whose only content was the banner line:
+
+```
+=== current session (.../daemon.log) ===
+[01:51:44] [daemon-log] mirroring stderr to '…' (fresh session,
+                                                 daemon 0.43.9)
+```
+
+Two distinct gaps explained that empty log; both are closed here:
+
+1. **The tee only captured `sys.stderr`.** Boot-trace prints
+   (`print(f'[boot-trace-daemon] phase=…')` in
+   `server_apk/service.py` and `server.py`) go via `sys.stdout` by
+   default. Most other daemon diagnostics use explicit
+   `file=sys.stderr` — those *were* captured — but
+   `[boot-trace-daemon]`, `[service] entering idle-stop loop`,
+   and a scattering of other status prints went to logcat only.
+2. **On Android, the tee only installed via the UI toggle and
+   never on `:provider` boot.** `server.run()`'s
+   `_maybe_install_stderr_tee` call is the loopback HTTP server
+   path — never executed in the server APK's `:provider` process.
+   So even with the persisted toggle on, every daemon respawn
+   after an idle auto-stop started with no tee until the user
+   re-touched the UI toggle.
+
+### Changes
+
+`azt_collabd/server.py`:
+
+- `_StderrTee` → `_StdioTee`. Generalised to wrap any stream;
+  two instances are installed in tandem (one over `sys.stdout`,
+  one over `sys.stderr`) sharing a single underlying file *and* a
+  shared `[bool]` start-of-line flag so per-line `[HH:MM:SS] `
+  stamping stays correct when the two streams interleave.
+- `install_stderr_tee` → `install_stdio_tee`: opens the log file
+  once, installs both `_StdioTee` instances atomically.
+- `uninstall_stderr_tee` → `uninstall_stdio_tee`: restores both
+  originals and closes the file.
+- `_maybe_install_stderr_tee` → `maybe_install_stdio_tee`. Public
+  now (no leading underscore) because the Android service body
+  calls it from outside this package.
+- All four internal call sites updated; banner wording changed
+  from "mirroring stderr to …" to "mirroring stdio to …".
+
+`server_apk/service.py`:
+
+- `main()` now calls `azt_collabd.server.maybe_install_stdio_tee()`
+  immediately after `import azt_collabd`. This is the Android
+  equivalent of `server.run()`'s desktop-path install. Subsequent
+  `_boot_trace` lines (`configured`, `before_install_callbacks`,
+  `after_install_callbacks`, `before_reconcile`, `after_reconcile`,
+  `entering_idle_loop`) and every later `[recent]` / `[cawl]` /
+  `[commit-*]` print land in the on-disk log alongside the existing
+  stderr stream.
+- Lines emitted *before* `import azt_collabd` (`module_loaded`,
+  `main_entered`, `before_import_azt_collabd`) still only reach
+  logcat. Capturing those would require a Python-side read of the
+  toggle without `azt_collabd` imported — possible but adds
+  duplication of path-resolution logic. Out of scope for this
+  bump; the captured tail is the diagnostically valuable part.
+
+### Notes
+
+- No wire-format change; `MIN_CLIENT_VERSION` and
+  `MIN_SERVER_VERSION` untouched.
+- Existing `daemon.log` files keep working — the file format
+  (per-line `[HH:MM:SS] ` prefix, plain text) is unchanged. Just
+  more lines land in it now.
+- Hot-toggle still works: flip "Save daemon log to file" off in
+  the settings UI and *both* tees uninstall atomically; flip back
+  on and they install together against a fresh-session log.
+
+## 0.43.14 — revert 0.43.12 `_python_bundle/` wipe; shorten DoH negative cache
+
+### Urgent: revert the 0.43.12 wipe
+
+0.43.12 added a step to `SuiteSelfReplaceReceiver.onReceive` that
+recursively wiped `files/app/_python_bundle/` after a package
+replace, so the next spawn would force p4a to re-extract from the
+new APK's assets. That theory was: any spawn that finds the dir
+missing will trigger p4a's "extract from APK" branch.
+
+**That's true for the Activity bootstrap but NOT for the
+`:provider` service bootstrap.** P4a's service bootstrap expects
+`_python_bundle/` to already be present and imports from it —
+there is no extract-on-missing branch. After the wipe, every
+lazy-respawn of `:provider` hit
+`_python_bundle does not exist...should we expect a crash soon?`
+in p4a's bootstrap, exited, and was respawned by `START_STICKY`
+into the same broken state. Field log from a 0.43.12 install:
+
+```
+[python] _python_bundle does not exist…should we expect a crash soon?
+[python] Initializing Python for Android   (next respawn, PID 1919)
+[python] _python_bundle does not exist…should we expect a crash soon?
+[python] Initializing Python for Android   (next respawn, PID 1944)
+[python] _python_bundle does not exist…should we expect a crash soon?
+```
+
+Receiver reverted to its pre-0.43.12 three-step shape (per-PID
+reap → `killBackgroundProcesses` fallback → self-kill). The
+import and helper method added in 0.43.12 are gone. The class
+Javadoc carries a NOTE explaining why the wipe is *not* there, so
+the next person to try this re-derives the conclusion instead of
+rediscovering the crash-loop.
+
+The stale-unpack problem the wipe was meant to solve is still
+real — `/v1/health` will keep reporting the old `__version__` on
+a server-APK replace if only the Service has been respawned since.
+A correct fix needs to also cause the Activity to run (so its
+bootstrap re-extracts) or add an extract-on-missing branch on the
+service side. Out of scope for this hotfix.
+
+### Also: DoH negative-cache window shrunk 30 s → 5 s
+
+`net.py:_DOH_NEGATIVE_TTL_S` controls how long
+`_patched_getaddrinfo` remembers a failed Cloudflare-1.1.1.1
+lookup before retrying. The pre-0.43.14 value was 30 s — wide
+enough that a single transient DoH miss during a Starlink
+satellite handover (~15 s) or a connectivity blip would silently
+disable the fallback for a user-initiated push retry that arrived
+within 30 s of the miss. Field reports of "DNS resolution failed"
+in a loop, on networks where the user's browser kept working,
+trace to this poisoning window.
+
+5 s is the new value:
+
+- Still long enough to absorb urllib3's in-loop retry storm
+  (~3 attempts within ~2 s) so we don't pay the 2.5 s DoH timeout
+  on every one.
+- Short enough that any human-perceived retry (tap Sync, see
+  error, wait, tap Sync again) gets a fresh DoH probe.
+- Background `_has_internet()` ticks still debounce via the
+  positive-cache TTL (300 s) once a probe actually lands.
+
+Comment block updated to spell out the Starlink-handover
+rationale so the next maintainer doesn't widen the window again.
+
+### Notes
+
+- Hotfix release; ship over 0.43.12 / 0.43.13 directly. Users
+  caught in the 0.43.12 crash-loop install **this** APK and the
+  next replace's receiver runs from the new code (Step 1 reaps
+  the surviving `:provider`, Step 3 self-kills), then peer's next
+  call lazy-spawns a clean `:provider` against the existing
+  `_python_bundle/` — which is still the old version's code, but
+  at least it's not crash-looping. Versions reconcile naturally
+  as Activity boots happen.
+- Carries the 0.43.13 work below (push error formatting +
+  non-fast-forward recovery) since 0.43.13 was never released.
+
+## 0.43.13 — diagnosable `PUSH_FAILED` messages + non-fast-forward push recovery
+
+### Field report
+
+Peer log on a phone running a couple versions behind:
+
+```
+Échec de l'envoi : (b'810ef46cd8378ca8e0a199a54fd2d765035d706d',
+                    b'd7d4c0b95b76977b15ec39da109f77aa9917e7a0')
+```
+
+The raw `(b'old_sha', b'new_sha')` repr is dulwich
+`UpdateRefsError`'s default `__str__` when its `args` is a tuple
+of byte SHAs (the (old, new) pair the server reported as
+rejected) and the exception has no override. `repo.py`'s
+`_add_push_failure` was calling `str(exc)` directly, so the
+useless tuple landed in `Result.params['error']`, was passed
+through `_('Push failed: {error}')` → `Échec de l'envoi : {error}`,
+and reached the user as a meaningless line. Worse, the underlying
+cause (almost always non-fast-forward) was invisible to anyone
+reading the log.
+
+### Two fixes
+
+**1. `_format_push_error(exc)`** in `azt_collabd/repo.py`. When
+`str(exc)` is the bytes-tuple shape, rewrite it as `'remote
+rejected ref update (likely non-fast-forward — remote has commits
+not present locally): <raw>'`. Falls through to `str(exc)` for
+informative shapes (network errors, HTTP 4xx). Wired into
+`_add_push_failure`, the `PULL_FAILED` site after the initial
+fetch, and the `_merge_diverged` failure path. Net result: every
+`Result.params['error']` from a push/pull failure is now a
+sentence a user (or maintainer reading a shared log) can act on.
+
+**2. `_is_non_ff_rejection(exc)` + retry-loop gate change.** The
+push retry loop already re-fetches after a failure and reconciles
+when `new_remote != remote_sha` (race-with-concurrent-pusher).
+The gate was too conservative for the case observed here: a
+genuine non-fast-forward where our `refs/remotes/origin/<branch>`
+cache happens to already match the server's tip (we fetched on a
+prior iteration but the merge never happened, or we're being
+adversarially-served stale fetch responses, etc.). The rejection
+itself proves the server has something we don't, regardless of
+what the mirror ref says.
+
+New gate: `(new_remote and new_remote != remote_sha) or
+_is_non_ff_rejection(exc)`. When non-FF is detected, the loop
+enters the same four-case reconciliation
+(equal / remote-ancestor / local-ancestor / diverged) used for
+the race case, with one extra safety branch: in the
+`local_sha == new_remote` arm, if the trigger was a non-FF
+rejection (not a race), the loop bails with the formatted error
+instead of claiming `S.PUSHED` — claiming success on a
+genuinely-rejected push would silently lose the data on the next
+round.
+
+### Notes
+
+- Pure daemon-side fix; no wire-format change, no peer rebuild
+  required. The corrected error string travels through the
+  existing `Result.params['error']` slot and the existing
+  `_('Push failed: {error}')` translation site, so any peer at
+  any version sees the improved message as soon as the daemon
+  serving them is 0.43.13+.
+- The retry loop's `MAX_CONSECUTIVE_FAILURES = 12` cap is
+  unchanged; non-FF detection just shortens the cap-burning loop
+  in the case where reconciliation would have succeeded if we'd
+  let it run.
+
+## 0.43.12 — `SuiteSelfReplaceReceiver` wipes the stale p4a unpack on package replace
+
+### The replace-but-stale-Python loop, finally
+
+Symptom: every server-APK update left `/v1/health` reporting the
+*old* `__version__` from on-device Python code, even though the
+new APK was demonstrably on disk and PackageManager reported its
+new `versionName`. The peer's bootstrap correctly detected the
+mismatch (`installed > running`) and popped the "Restart your
+device" loop on every install — even after force-stopping
+`:provider`, even after the receiver fired and reaped the daemon
+process.
+
+### Root cause
+
+p4a's bootstrap unpacks the APK's bundled Python code to
+`files/app/_python_bundle/` on the Activity's first launch, then
+short-circuits subsequent launches whenever the dir already
+exists — including launches from a different (newer) APK after a
+package replace. The ContentProvider's `:provider` service
+bootstrap doesn't unpack at all; it just imports from
+`_python_bundle/site-packages/`. So a replace install left the
+on-disk APK at version N+1 while every lazy-respawned `:provider`
+kept reading version N's Python code from the stale unpack
+directory, and `/v1/health` forever reported N. Force-stopping
+`:provider` didn't help because the lazy-respawn loaded the same
+stale dir; the receiver firing didn't help because all it did was
+kill processes that were going to be respawned against the same
+stale dir.
+
+Smoking gun: aapt-dumping the installed APK's manifest at 0.43.11
+returned `versionName=0.43.11`, while the running daemon's
+`/v1/health` reported `0.43.9` — same UID, two different versions
+of the same code.
+
+### Fix
+
+`SuiteSelfReplaceReceiver` now wipes `files/app/_python_bundle/`
+as Step 1 of `onReceive` (before the process kills below). The
+wipe runs synchronously before `onReceive` returns; existing
+interpreters in memory are unaffected (their code is already
+loaded), but the next lazy-spawn — Activity OR Service — finds
+no bundle and falls into p4a's C bootstrap "no bundle present,
+extract from APK assets" branch. Existing receiver work (per-PID
+kill, `killBackgroundProcesses`, self-kill) follows unchanged,
+renumbered to Steps 2–4. Receiver's Javadoc rewritten to
+document the unpack semantics so the next person reading the
+file understands why Step 1 exists.
+
+`deleteRecursive` helper added; same-UID file deletion needs no
+permission. Logs success/failure under the existing
+`SuiteSelfReplace` tag so a tester's logcat answers "did the
+wipe land" definitively.
+
+### Notes
+
+- No wire-format change; `MIN_CLIENT_VERSION` and
+  `MIN_SERVER_VERSION` untouched (both still 0.43.11 from the
+  test-scaffolding bump in 0.43.10).
+- The receiver lives in every suite APK via the existing
+  `add_src` path. Server APK gets the load-bearing path
+  (wipe + `KILL_BACKGROUND_PROCESSES` permission); peer APKs
+  get the wipe + a no-op kill fallback, which is harmless: a
+  peer that updates while its own `:provider`-equivalent is
+  alive doesn't exist (peers have no long-lived service
+  process).
+- Takes effect on the install of *this* APK: Android registers
+  the new APK's components before dispatching
+  `MY_PACKAGE_REPLACED`, so it's the new (wipe-enabled) receiver
+  that runs during this very replace. No manual workaround
+  needed for this update or any future one.
+
+## 0.43.9 — ContentProvider transport absorbs the daemon cold-spawn race transparently
+
+### Peer first-launch crash after server-APK reap
+
+Field report: peer launched, "load and crash"; tapping the icon a
+second time worked. Logcat for the working launch shows
+`[boot-trace-daemon] phase=before_install_callbacks t=0.878` →
+`phase=after_install_callbacks t=1.925` — a ~1 s window during
+which Android has registered the `org.atoznback.aztcollab`
+ContentProvider authority but the Python body inside `:provider`
+hasn't yet installed the dispatch callback. The Java side returns
+a null `Bundle` for any peer call during that window.
+
+Bootstrap's existing fast-fail policy treats three consecutive
+`null_bundle` errors as a structural signature/install failure
+and renders the "AZT Collaboration is unresponsive" popup
+(`_NULL_BUNDLE_FAIL_FAST = 3`, adaptive backoff
+`(0.2, 0.4, 0.8) s` — total 1.4 s). That's *less* than the
+~1.9 s cold spawn the new (0.43.7) `SuiteSelfReplaceReceiver`
+makes more common: reliable reaping of `:provider` during the
+suite-replace receiver means the next peer call lazy-spawns
+from scratch instead of finding a survivor. Pre-0.43.7, the
+old daemon process limped along across the APK replace and the
+peer never hit the cold-spawn window — the same code path
+that now fails was effectively gated behind a now-fixed bug.
+
+Even after bootstrap, post-launch RPCs had no retry on
+`null_bundle` at all — they went through `rpc.call`'s single
+re-discover and raised. If the daemon idle-stopped while the
+peer was open (5 min default), the next main-thread call would
+crash the peer the same way.
+
+### Fix: transparent retry inside the ContentProvider transport
+
+`azt_collab_client/transports/android_cp.py`:
+
+- `AndroidContentProviderTransport._raw_call` now retries on
+  `bundle is None` with backoff
+  `(0.1, 0.2, 0.4, 0.8, 1.6) s` — 3.1 s total budget. Covers
+  the observed cold-spawn import (~1.9 s) plus margin. Safe
+  for POSTs as well as GETs: a null Bundle means the Python
+  dispatch never ran, so no work was done on the daemon side.
+  Records `null_retries=N` on the `transport.call.post` first-
+  try log line for diagnostic visibility.
+- `discover()` applies the same backoff to its initial `ping`
+  with delays `(0.0, 0.2, 0.4, 0.8, 1.6) s`, since the discovery
+  ping is frequently the call that *causes* the lazy spawn.
+
+`null_bundle` only escapes the transport now after the 3 s
+budget is exhausted — i.e. when the failure really is
+persistent (signature-grant denial, authority gone). Bootstrap's
+existing fast-fail on the kind still works for that case;
+docstring in `transports/__init__.py` updated to spell out
+that the kind is now reserved for genuinely unrecoverable
+failures.
+
+### Notes
+
+- Pure client-side fix; no daemon changes, no wire-format
+  change, `MIN_CLIENT_VERSION` untouched.
+- Peer rebuild required to pick up the fix (the symlinked
+  `azt_collab_client` is consumed at peer-build time). Running
+  daemon doesn't need to be updated.
+- The 3 s budget is paid on the slow path only; healthy
+  steady-state calls return on the first attempt with zero
+  overhead.
+
+## 0.43.8 — `_touch_project` no longer rewrites `config.json` on every hot endpoint; daemon log gets per-line timestamps and a version-tagged share header
+
+### Phone-slowness fix
+
+Field report: phone visibly slow while working through a CAWL pass.
+Daemon log shows the cause — `_touch_project('baf')` firing 10–15× per
+displayed entry (one per `cawl_image_bytes`, one per `project_status`
+poll, one per `get_audio`, …), and **every** call rewrites
+`$AZT_HOME/config.json` to disk (load → atomic temp + rename) and
+emits a `[recent]` log line that the daemon-log mirror also writes to
+disk. On Android internal storage that is the dominant per-action
+cost.
+
+The diagnostic comment at `_h_cawl_cache_status` already noted that
+the 1 Hz prefetch-progress poll was intentionally excluded from
+`_touch_project` for this exact reason, but every other langcode-bound
+endpoint kept paying the toll.
+
+Fix in two layers:
+
+1. **`server._touch_project`** now reads
+   `store.get_last_langcode()` first and short-circuits the disk
+   write + log line when the value is already current. The cheap
+   `auto_prefetch` re-trigger still fires (it has its own 30 s
+   per-repo throttle and is what drives circuit-recovery when
+   connectivity returns), so behaviour is unchanged for any caller
+   that wasn't already in the "stamp the same value again" steady
+   state.
+2. **`store.set_last_langcode`** gained a module-level
+   `_last_langcode_cache` that holds the last successfully-stamped
+   value in memory. Writes that match the cache are a no-op (no disk
+   read, no disk write); writes that don't match update the cache
+   in lock-step with `_save_config_file`. `get_last_langcode` reads
+   from the cache so the server-side check above is also free.
+
+Defense in depth: either layer alone would eliminate the flooding;
+both together mean any future caller (settings UI, picker, sister
+app) gets the same short-circuit without remembering to apply it.
+
+### Daemon-log diagnostic enhancements
+
+Two readability gains for testers / maintainers reading
+`daemon.log` after the heartbeat traffic went quiet:
+
+1. **Per-line timestamps in the file mirror.** `_StderrTee` now
+   prefixes each new line written to the daemon-log file with
+   `[HH:MM:SS] `. Original stderr (logcat / terminal) is left
+   unchanged — logcat already supplies its own time column, and
+   double-stamping would just clutter `adb logcat` output.
+   Implementation tracks an at-start-of-line flag across calls
+   so a `print(x)` that lands as separate `write('text')` +
+   `write('\n')` calls still gets exactly one stamp at the head
+   of the line.
+
+   Motivation: with `_touch_project` no longer firing on every
+   RPC, the remaining log traffic doesn't supply a passage-of-
+   time signal on its own. The stamp closes that gap — a tester
+   can now see "5-second gap here, then a burst" without
+   correlating against external state.
+
+2. **Server version in the daemon-log banner _and_ the share
+   header.** `install_stderr_tee`'s on-start banner now reads
+   `(fresh session, daemon 0.43.8)` / `(appending — daemon
+   0.43.8 respawn)`, so the on-disk file is self-describing.
+   The `share_log_file` bundle header also reads
+   `$AZT_HOME/server.json :: version` and renders the
+   current-session line as
+   `=== current session (<path>) [daemon X.Y.Z] ===`. Falls
+   back silently to the path-only form if `server.json` isn't
+   readable.
+
+### Notes
+
+- No wire-format change; `MIN_CLIENT_VERSION` is untouched.
+- Sole on-disk effect: `config.json :: recent.last_langcode` now
+  gets one write per actual project switch instead of one per
+  langcode-bound RPC. The persisted value is identical.
+- `[recent] _touch_project` lines in the daemon log are now a useful
+  signal again — one per real change — rather than a per-call
+  heartbeat.
+
+## 0.43.7 — `SuiteSelfReplaceReceiver` actually reaps the `:provider` process; `azt_collab_client/CLAUDE.md` split into rules + `docs/rationale/`
+
+### Doc reorganisation: rules vs. rationale
+
+`azt_collab_client/CLAUDE.md` had grown to ~900 lines, mostly
+"architectural rationale" sections that triggered "large file
+will impact performance" notices on every boot. Split along the
+existing rationale-section headers:
+
+- `azt_collab_client/CLAUDE.md` (now ~315 lines) holds the
+  **rules / invariants / hard contracts** — hard rules,
+  daemon-owned state, transport facade, public API surface
+  rules, status-code contract, the new index of rationale
+  files. Reading just this file is sufficient to avoid
+  breaking the client.
+- `azt_collab_client/docs/rationale/<topic>.md` holds the
+  *why* behind each subsystem. Eight files: `sync.md`,
+  `lift_access.md`, `cawl.md`, `i18n.md`, `identity.md`,
+  `ui.md`, `lowpower.md`, `project_switch.md`, plus a
+  `README.md` index in the same directory.
+
+New hard rule (#9 in CLAUDE.md): **rules live in CLAUDE.md;
+rationale lives in `docs/rationale/`**. Rules never go into
+rationale files. If a "do X / don't do Y" emerges from a
+why-discussion, it goes up into CLAUDE.md (or
+CLIENT_INTEGRATION.md if it's a peer contract) with the
+rationale file providing the justification via a forward link.
+
+Net effect: every daily session boot loads ~315 lines instead
+of ~900; subsystem rationale is one Read away when needed.
+Convention previously recorded in memory as "CLAUDE =
+philosophy / rationale / architecture" supersedes to "CLAUDE
+= rules / invariants; rationale lives in docs/rationale/".
+
+### `SuiteSelfReplaceReceiver` actually reaps the `:provider` process
+
+**Motivation.** Sideloading the server APK via `adb install -r` (and
+every other install pathway) left the old daemon process running.
+Symptom: the "Restart your device to switch to the newer version"
+popup (`_prompt_server_reboot_to_apply` in
+`azt_collab_client/ui/bootstrap.py`) fired on every install, despite
+the receiver having been in place since 0.41.28.
+
+**Diagnosis.** `SuiteSelfReplaceReceiver.onReceive` called
+`ActivityManager.killBackgroundProcesses(getPackageName())`. That API
+only kills processes whose importance is at or below the BACKGROUND
+threshold. The server APK's `:provider` process hosts
+`AZTServiceProviderhost` as a `START_STICKY` started service
+(`AZTServiceProviderhost.java:121`), which pins the process at
+`IMPORTANCE_SERVICE` — *above* the background threshold. So
+`killBackgroundProcesses` was a documented no-op against the very
+process the receiver was meant to reap. The new APK's bytes were on
+disk, but every peer ContentResolver call routed into the still-alive
+old `:provider` interpreter, which kept reporting the old
+`__version__` from `/v1/health`, which tripped the installed-vs-
+running mismatch in `_prompt_server_update`.
+
+It worked occasionally — but only on OEMs that aggressively kill
+all processes of a replaced package during install. That was
+incidental, not contracted.
+
+**Fix.** `SuiteSelfReplaceReceiver` now enumerates running processes
+via `ActivityManager.getRunningAppProcesses()` (which always returns
+the caller's own same-UID processes) and calls
+`android.os.Process.killProcess(pid)` on each non-receiver PID
+before falling back to `killBackgroundProcesses`. Same-UID
+`killProcess` needs no permission and ignores process importance,
+so a `START_STICKY`-pinned `:provider` gets reaped directly. The
+existing `killBackgroundProcesses` call is kept as a belt-and-braces
+fallback for anything enumeration might miss but is in a reapable
+state.
+
+**Files.**
+
+- `android/src/main/java/org/atoznback/aztcollab/SuiteSelfReplaceReceiver.java`
+  — three-step body (per-PID kill, then `killBackgroundProcesses`,
+  then self-kill); top-of-file Javadoc rewritten to spell out the
+  importance-state gotcha so the next person reading the file
+  understands why step 1 exists.
+
+**No wire change; `MIN_CLIENT_VERSION` unchanged.** Build-tooling
+unchanged: the receiver lives at `android/src/main/java/...`,
+compiled into every APK via `android.add_src`; the manifest
+`<receiver>` and the server-APK-only `KILL_BACKGROUND_PROCESSES`
+`<uses-permission>` injection in `p4a_hook.py:_inject_self_replace_receiver`
+both stay (the permission still backs the step-2 fallback on the
+server APK).
+
+**User-visible effect.** Once every suite APK in the field is at
+0.43.7+, the reboot-to-apply popup becomes unreachable on
+package-replace as originally designed. Pre-0.43.7 installs still
+need the transitional popup; that branch stays in
+`_prompt_server_update`.
+
+## 0.43.6 — `recent.last_langcode` empty-state invariant; first-boot picker-cancel carve-out for `App.stop()`
+
+**Motivation.** Field report 2026-05-18 — user toggled daemon logging
+on, asked to switch projects, peer GET ``/v1/recent/last_project`` →
+~2 ms later Kivy logged ``[INFO] [Base] Leaving application in
+progress... Python for android ended.`` The peer's ``on_resume`` had
+interpreted an unexpected ``last_project() == ''`` as "no project
+loaded" and called ``App.stop()`` while a sync was mid-flight. Daemon
+process kept running and finished the in-flight ``[commit]`` 250 ms
+later, but the user perceived the whole thing as a crash.
+
+Diagnosis showed the empty return could in principle leak from a
+transient I/O hiccup, a malformed RPC, or a peer accidentally
+sending empty — and nothing in the daemon refused to land ``''`` on
+disk. This release closes that escape path.
+
+**Daemon-side invariants.**
+
+- ``store.set_last_langcode()`` **refuses empty input** (warns to
+  stderr and no-ops). No legitimate caller passes empty;
+  defense-in-depth against transient bugs that could otherwise mimic
+  a user gesture.
+- ``POST /v1/recent/last_project`` with empty body returns
+  ``400 empty_langcode``. No legitimate peer issues that POST —
+  picker-cancel is a no-op end-to-end, not an RPC. If a peer is
+  sending empty, surface the bug rather than silently absorbing.
+- ``_h_get_last_project`` emits a one-line transition log on every
+  observed change to the returned value (``'<prev>' → '<new>'``,
+  sentinel ``'<unset>'`` differentiating the first call per
+  process). High-frequency 1 Hz poll path stays log-free; transitions
+  give us the diagnostic shape we'd want if this regression ever
+  recurs in the field.
+
+**Peer-side contract revision (`CLIENT_INTEGRATION.md` § 14a).**
+``last_project()`` returns ``''`` legitimately exactly once in a
+device's lifetime — first boot, before any project has ever been
+touched. Picker-cancel is a no-op: the picker issues no RPC and no
+write, the daemon's ``last_langcode`` is unchanged across the
+gesture, and the ``on_resume`` comparison naturally no-ops because
+the peer's ``_current_langcode`` is unchanged too. Don't add a
+"clear" RPC for picker-cancel; don't write ``''`` from any path.
+
+**One ``App.stop()`` case is carved out: first-boot picker-cancel.**
+Fresh install, peer has no ``_current_langcode``, bootstrap opens
+the picker, user backs out without picking. The peer has literally
+nothing to display and the user has signaled "not now." ``stop()``
+is correct *only* in that state — the discriminator is the peer's
+own ``_current_langcode is None`` plus a non-selection return from
+the picker, not the empty return from ``last_project()``. The
+May-18 failure mode (peer calling ``stop()`` with a loaded project
+on its way to a project-switch reload) remains banned; the
+"What NOT to do" section in § 14a is updated to reflect the
+exception explicitly.
+
+No wire-format change. No new status codes. The transition log line
+is the only new diagnostic surface; it costs one stderr write per
+actual change, which on Android adds maybe ten lines per session.
+
+### azt_collabd 0.43.5 / azt_collab_client 0.43.5 — DoH fallback resolver; DNS_RESOLUTION_FAILED status; watcher logs resolver path on online edge
+
+**DNS-over-HTTPS fallback resolver (`azt_collabd/net.py:_patch_resolver`).**
+Field reports keep showing the same pattern: the user can browse the
+internet but `dulwich` raises ``NameResolutionError: Failed to resolve
+'github.com' ([Errno 7] No address associated with hostname)``. The
+distinguishing characteristic is that the failure mode is **app-
+specific** — system browser is fine, Python's resolver path is not.
+Causes range from per-app data restrictions, captive-portal Wi-Fi in
+limbo, broken Private DNS, IPv6-only networks without DNS64, stale
+negative caches after a brief outage. Bad-internet resilience is a
+primary requirement of the suite (West / Central African field
+deployments routinely hit this), and the previous behaviour was just
+to surface PUSH_FAILED and hope the user knew to wait.
+
+This release installs a fallback resolver as a side effect of
+``_ensure_ssl()`` (which already ran before any dulwich op):
+``socket.getaddrinfo`` is monkey-patched. The system resolver runs
+**first**, unchanged — on a healthy network the patch is a passthrough
+and the DoH dependency is dormant. On ``socket.gaierror``, the patch
+issues one DoH JSON query to Cloudflare at the **literal IP**
+``https://1.1.1.1/dns-query`` (cert SAN covers ``1.1.1.1`` so TLS
+validates against the certifi roots without itself needing DNS; the
+literal-IP form makes the DoH path itself loop-free because
+``getaddrinfo('1.1.1.1', 443)`` is satisfied by libc without
+triggering DNS). Both ``A`` and ``AAAA`` records are queried — the
+synthetic ``addrinfo`` list returns AAAA records first to mirror the
+order a v6-preferring stack would produce, so urllib3 / socket's
+sequential iteration gets a happy-eyeballs-shaped retry path.
+
+Results are cached for 5 minutes keyed by ``(host, port)`` so the
+push-retry loop's reconnection attempts don't refire DoH on every
+iteration. The lookup is gated on the host *looking like* a hostname
+(numeric IPs and AF_UNIX paths bypass), and the patch never
+substitutes for the system answer — if system DNS returns a valid
+empty answer for a name that just doesn't exist, the DoH path doesn't
+run. A new ``_RESOLVER_STATE`` module-global records which path served
+the last lookup; ``azt_collabd.net.resolver_state()`` exposes it as
+``'system' | 'doh' | 'fail' | 'unknown'``.
+
+**Connectivity watcher logs the resolver path on online edges.**
+``scheduler._watcher_loop``'s offline → online edge handler emits
+``[watcher] online edge — resolver path: <path>`` so a developer
+skimming a field log can tell whether the DoH path was load-bearing
+during the session. Healthy networks always show ``system``;
+``doh`` flags resolver-class fragility that's silently being routed
+around. No new log volume on per-tick basis — edges only.
+
+**New status: ``DNS_RESOLUTION_FAILED``.** Mirrored in both
+``azt_collabd/status.py`` and ``azt_collab_client/status.py`` (per the
+mirror discipline of hard rule #3), with a translation in
+``azt_collab_client/translate.py``. Emitted from
+``_add_push_failure(result, exc)`` in ``repo.py`` alongside the
+existing ``PUSH_FAILED`` when the exception string matches DNS markers
+(``nameresolutionerror``, ``no address associated``, ``failed to
+resolve``, etc.) — meaning *both* system DNS and the DoH fallback
+failed for the same hostname. Distinct from ``PUSH_FAILED`` so peers
+can route silently in the auto-sync path (per the auto/user contract
+in ``azt_collab_client/CLAUDE.md`` § "Peer contract: why auto-sync
+must be silent"). On user-initiated Sync the peer should toast the
+translated message ("Network reachable, but the sync host could not
+be resolved…") without navigating — there's no settings change that
+will fix this; the daemon will retry automatically when the
+underlying network state clears.
+
+**What this does not do** (documented in the README's *DNS
+resilience* section): it doesn't fix networks that are genuinely
+offline, doesn't bypass per-app firewalls that block 443 outbound,
+and doesn't catch the case where DNS succeeds but the resulting IP
+is unreachable. Those remain visible as ``PUSH_FAILED`` on the next
+sync attempt.
+
+No wire-format change. ``MIN_CLIENT_VERSION`` stays at ``0.43.4``
+on the daemon; an older client receiving ``DNS_RESOLUTION_FAILED``
+falls through ``translate_status``'s default branch and renders
+``[DNS_RESOLUTION_FAILED] {}`` — ugly but non-fatal, and exceptional
+in practice (the DoH path makes the underlying NameResolutionError
+class of failure rare).
+
+### azt_collabd 0.43.4 / azt_collab_client 0.43.4 — Push-retry no-op merge guard + FF case; settings UI shows the daemon's actual version; collab settings reorder; adaptive push batching for bad internet; one canonical version
+
+**Single source of truth for the suite version.** The two
+``__version__`` literals diverged in the field (2026-05-18:
+daemon at 0.43.3, client at 0.43.1 → settings strip read
+``client 0.43.1  ·  server 0.43.3`` and testers thought the
+build was incomplete). Rather than keep two literals + a
+"remember to bump both" discipline + a UI explanation for
+why they're shown separately, the version now lives in one
+place:
+
+- Canonical literal: ``azt_collab_client/__init__.py``
+  (``__version__ = "0.43.4"``).
+- Re-export: ``azt_collabd/__init__.py`` does
+  ``from azt_collab_client import __version__`` so anything
+  reading ``azt_collabd.__version__`` keeps working
+  unchanged.
+- External tooling pointed at the canonical: buildozer
+  (``server_apk/buildozer.spec.tmpl :: version.filename``)
+  and the presplash generator (``appinfo.py ::
+  FILE_W_VERSION``) both read from
+  ``azt_collab_client/__init__.py`` directly via regex / file
+  read.
+- Import direction stays correct: daemon imports client
+  (allowed); client never imports daemon (hard rule per
+  ``azt_collab_client/CLAUDE.md`` — would break the
+  "client works in a separate APK from the daemon" guarantee).
+
+The previously-stated "patch-level bumps in one without the
+other are fine" rule is retired — there's literally only one
+``__version__`` to bump now. CHANGELOG headers continue to
+list both package names (``azt_collabd X.Y.Z / azt_collab_client
+X.Y.Z``) as a readability courtesy; the numbers always match.
+
+Surfaced by a field daemon log on 2026-05-18: a transient
+``RemoteDisconnected`` on push, followed by GitHub returning
+HTTP 400 on the immediate retry, cascaded into **two
+unnecessary "merge" commits** before the third push attempt
+succeeded. The pre-push branch correctly identified
+``local ahead of remote`` (so no initial merge), but the
+retry-after-push-failure branch unconditionally re-merged on
+every attempt regardless of ancestor relationship, producing
+no-op merge commits (two parents, zero files changed) and an
+extra push round-trip for each.
+
+- **Retry path uses the same 4-case structure as pre-push.**
+  ``_push_step_locked``'s push-retry block now distinguishes:
+  (a) remote unchanged → push retry only; (b) local ahead of
+  remote (the field log case) → push retry only; (c) remote
+  advanced past local → fast-forward local before retry,
+  otherwise the next push is non-FF rejected; (d) truly
+  diverged → merge. Previously case (b) was guarded but case
+  (c) silently fell through to "skip merge, push stale local
+  SHA" which would have non-FF rejected on every subsequent
+  retry. Diagnostic from the field:
+  ``[sync-trace] retry merge done merged_sha=…`` appearing
+  with ``base=N ours=N theirs=N`` (all equal) was the
+  signature; new traces are
+  ``[sync-trace] retry: remote unchanged, push retry only``,
+  ``[sync-trace] retry: local still ahead of remote, push
+  retry only``, ``[sync-trace] retry: remote advanced;
+  fast-forward local``.
+- **``CollabUIApp`` version strip now reflects the running
+  daemon, not the UI subprocess's compile-time version.**
+  Previously the bottom-of-settings ``client X · server Y``
+  string used ``azt_collabd.__version__`` from the UI process,
+  which equalled the daemon's version only on a coherent
+  install — the moment a user updated one half (e.g. ran an
+  in-place ``adb install -r`` on the server APK while a
+  desktop settings UI was still pointed at an older daemon),
+  the strip silently lied. ``on_start`` now spawns the same
+  ``_probe_server_version`` worker the picker app uses (off
+  the UI thread), calling ``check_server_compat()`` and
+  rendering the daemon's reported version into the strip;
+  ``server ?`` until the probe lands, ``server ? (reason)``
+  if the daemon is unreachable / too old / too new. Field
+  utility: lets a maintainer answer "what server is actually
+  running?" without adb-shelling into the device.
+- **Collab settings page reorganised.** Three field-driven
+  changes to the in-daemon Settings page:
+    1. **Interface language at the top, no section header.**
+       The language-switcher row is the page's first widget
+       (after the optional back button) — the row of language-
+       name buttons is self-evident, the ``Interface
+       language`` SectionLabel was visual noise.
+       Share/Update follow, then the contributor field.
+    2. **New ``Servers`` section groups everything that talks
+       to the network.** GitHub button, GitLab button, the
+       conditional Publish row, the ``Work offline:`` toggle,
+       and the ``Cache images:`` toggle now sit together under
+       one header. Previously Work offline + Cache images had
+       their own SectionLabels, a "Suppress push:" prefix row,
+       a "Wordlist images" header that dynamically appended
+       the wordlist name, and a multiline status BodyLabel
+       underneath — all collapsed to a single line each. The
+       row's GREEN-vs-SURFACE highlight on yes/no continues
+       to show the active state; the status BodyLabels were
+       redundant.
+    3. **``GitHub Settings`` button reflects daemon answer on
+       first open, even on a cold daemon.** Previously the
+       button label was driven by a single try-block holding
+       both ``get_credentials_status()`` and ``is_online()``;
+       any exception in either RPC bailed the whole refresh
+       and left the KV-default ``Connect to GitHub`` label in
+       place even when the daemon eventually answered
+       ``confirmed=true``. Field symptom: button state on
+       first open of the settings page was inconsistent
+       across launches. Split into two independent try blocks
+       so the buttons always update on whatever credentials
+       info we have; ``is_online`` failure now degrades the
+       Status block but not the action buttons. Plus: detect
+       the ``ServerUnavailable`` fallback dict (no
+       ``confirmed`` key under ``github``) and schedule one
+       follow-up ``refresh()`` 1.5 s later so the daemon-cold-
+       start race resolves itself silently.
+    4. **Daemon log no longer wiped by daemon respawn.**
+       ``install_stderr_tee`` opened the file in ``'w'`` mode
+       on every install, including the
+       ``_maybe_install_stderr_tee`` call at daemon startup
+       — so an idle auto-stop (5 min) or OOM-kill of the
+       server APK's ``:provider`` process followed by a
+       lazy-respawn for the next peer RPC truncated the file
+       and left only the freshly-printed ``[daemon-log]
+       mirroring stderr to …`` line. Field symptom: testers
+       reported "I turned the log on, used the app, hit
+       Share — got one line." Fix: ``install_stderr_tee``
+       gained a ``truncate`` kwarg (default ``False`` →
+       append mode); only the explicit user toggle-on path
+       (``_h_set_daemon_log_to_file(enabled=True)``) passes
+       ``truncate=True`` to start a clean session. The
+       mirroring-stderr line is annotated ``(fresh
+       session)`` vs ``(appending — daemon respawn)`` so a
+       reader can tell which install they're looking at.
+       ``_h_get_daemon_log`` already caps reads to the last
+       256 KB, so unbounded growth across many respawns is a
+       non-issue.
+    5. **Debug "Toggle service not responding" surface
+       removed from the Settings page.** The
+       ``$AZT_HOME/_debug_force_503`` sentinel daemon-side
+       (``server.py:_h_health``) is unchanged — testers can
+       still plant it via ``adb shell run-as
+       org.atoznback.aztcollab touch
+       files/azt/_debug_force_503`` — and the
+       ``toggle_debug_503`` / ``_refresh_debug_503_state`` /
+       ``_debug_503_path`` methods on ``SettingsScreen`` stay
+       for REPL-callable convenience and future UI re-add.
+       Just the KV widgets (SectionLabel + NavBtn + state
+       BodyLabel) are gone — debug clutter the typical user
+       never wanted to see.
+- **Client conformity contract:
+  ``CLIENT_INTEGRATION.md`` § 17b adds the "Badge refresh
+  obligation".** Daemon has no peer-push channel; in the
+  split-commit world peers MUST re-call
+  ``project_status(langcode)`` after every sync gesture, on a
+  5-15 s background tick, and on ``on_resume``. The gesture's
+  own ``Result`` no longer encodes push state (push happens
+  on the daemon's drain loop, not in the gesture's
+  transaction), so peers that read ``commits_ahead`` only
+  from the gesture result leave the badge stuck at
+  last-gesture-time forever. Closes a 2026-05-18 field
+  report where a peer's ``(+160)`` indicator persisted
+  despite the daemon log showing successful
+  ``[sync-rpc] done: codes=['NOTHING_TO_COMMIT', 'PUSHED']``.
+  Migration-checklist item 5 added.
+- **Adaptive push batching for bad-internet large queues.**
+  ``_push_step_locked`` now starts with the historical
+  single-transaction push of the local tip — no extra
+  round-trips on the happy path. On a network-class push
+  failure (``RemoteDisconnected`` / ``IncompleteRead`` /
+  ``NameResolutionError`` / GitHub's ``unexpected http resp
+  4xx`` from a server-side timeout on a slow upload), the
+  loop halves the commit count it tries to push next: parks
+  an intermediate SHA under ``refs/azt-collab/partial_push``
+  and pushes that. Halves again on further failure. Once a
+  partial push lands, locks in the working batch size and
+  drains the remaining chunks at that size until the queue
+  clears. Exponential backoff (1 s → 16 s cap) between
+  retries. Bounded by 12 consecutive failures (resets on any
+  successful push) — comfortably above ``log2(160)`` for
+  queues of 160+ commits with retry headroom. The
+  race-with-another-peer's-push path (re-fetch shows the
+  remote moved) is preserved as a parallel branch: when
+  detected, the four-case ancestor logic resolves it
+  (FF / merge / no-op / already-in-sync) and the adaptive
+  loop resets to push the new tip from scratch. Helpers
+  added: ``_is_network_push_failure(exc)``,
+  ``_count_commits_between(repo, ancestor, descendant)``,
+  ``_pick_intermediate_sha(repo, base, tip, n)``. New
+  trace lines: ``[sync-trace] push loop begin
+  commits_to_push=N``, ``[sync-trace] push attempt
+  target=<8hex> chunk_n=N``, ``[sync-trace] retry: halving
+  chunk_n N → N/2``, ``[sync-trace] batch size locked at
+  N``. Closes the low-power-phone-on-bad-internet failure
+  mode where a 160-commit backlog produced a single ~10 MB
+  pack that GitHub's git-receive-pack timed out on, with no
+  recovery short of finding better Wi-Fi.
+- **Client conformity contract: ``CLIENT_INTEGRATION.md``
+  § 14a now explicitly prohibits ``App.stop()`` as the
+  project-switch reload mechanism.** Closes a 2026-05-18
+  field report: user enabled daemon logging, asked to switch
+  projects, peer ``GET /v1/recent/last_project`` → 2 ms
+  later Kivy logged
+  ``[INFO] [Base] Leaving application in progress... Python
+  for android ended.`` Daemon process kept running and
+  finished the in-flight commit 250 ms after the peer
+  exited; user perceived it as "the app crashed when I
+  switched projects." Android does NOT auto-restart a peer
+  that exits via ``App.stop()``, so the user has to
+  relaunch from the home screen every time they switch. The
+  contract already documented "reload via the same code
+  path the picker-result handler uses"; the new explicit ❌
+  bullet names the anti-pattern and the field-log signature
+  so the next peer audit catches it.
+- **CAWL: root-level images no longer log spurious "flat
+  basename not in index".** ``_resolve_basename_via_index``
+  returned the same string in two distinct cases — "matched
+  but the canonical path *is* the basename" (e.g.
+  ``Image-Not-Found.png`` at the top of
+  ``kent-rasmussen/images_CAWL``) and "no entry matched" —
+  and the caller in ``get_image_path`` couldn't distinguish
+  them. Every fetch of a root-level image logged ``[cawl]
+  get_image_path: flat basename not in index: …`` even
+  though the asset was in the index and the subsequent fetch
+  succeeded. Field log 2026-05-18 showed the spurious line
+  with no follow-up ``image fetch failed``, exactly because
+  the asset was present. Fix: ``_resolve_basename_via_index``
+  now returns ``(resolved_path, found)``; the caller logs the
+  "not in index" line only when ``found is False`` and a
+  cached index exists. Root-level matches stay silent. Six rules for
+  how peers must shed load instead of leaning on daemon-side
+  protections: single-in-flight guard per (RPC, project);
+  auto-paths use ``commit_project`` not ``sync_project``;
+  peer-side debounce of the Sync button; budgeted background
+  polls (5-15 s for the active project, 30 s+ for per-
+  project iterations, stop when backgrounded); ``S.BUSY``
+  is "back off" not "retry"; per-event triggers not
+  per-status-change triggers. Closes a 2026-05-18 field
+  report where a peer fired six parallel
+  ``POST /v1/projects/<lang>/sync`` per gesture; the
+  daemon's project_lock did its job by refusing them with
+  ``S.BUSY``, but the peer surfaced each refusal as
+  "Une autre synchronisation est en cours" toast — a wall
+  of noise the user couldn't act on. ``S.BUSY`` added to
+  the § 17 routing table (silent on both auto and user
+  paths) and to the § 17 constants list. § 17 auto-sync
+  code example updated to use ``commit_project`` +
+  ``poll_job`` (it was still showing the pre-0.43
+  ``sync_project`` shape, which is exactly the
+  anti-pattern § 17c Rule 2 closes). Daemon-side
+  protections summarised at the end of § 17c so future
+  peer maintainers know what NOT to reinvent.
 
 ### azt_collabd 0.43.1 / azt_collab_client 0.43.1 — Polish + bootstrap parity guard
 

@@ -989,14 +989,28 @@ def _resolve_image_target(repo, rel_path):
 
 
 def _resolve_basename_via_index(repo, rel_path):
-    """If ``rel_path`` is a flat basename, look it up in the
-    repo's cached index and return the canonical (possibly
-    nested) path. If already nested, or not in the index,
-    return ``rel_path`` unchanged.
+    """Try to resolve a flat basename to its canonical (possibly
+    nested) index path. Returns ``(resolved_path, found)``:
 
-    Why this exists: peers may extract a flat basename from a
-    CAWL identifier and pass it here, but the canonical image
-    may live under a category subdir
+    - ``resolved_path``: canonical path from the index when the
+      basename matched, otherwise ``rel_path`` unchanged.
+    - ``found``: True iff an index entry's basename equals
+      ``rel_path``.
+
+    The ``found`` flag exists to distinguish "matched but path
+    equals basename" (a legitimate root-level file in the repo,
+    e.g. ``Image-Not-Found.png`` at the top of
+    ``kent-rasmussen/images_CAWL``) from "no entry matched".
+    Pre-fix the function returned the same string in both cases
+    and the caller couldn't tell them apart — every fetch of a
+    root-level image logged ``flat basename not in index`` even
+    though the index had it and the fetch then succeeded. Field
+    log 2026-05-18 showed the spurious line with no follow-up
+    ``image fetch failed`` confirming the asset was present.
+
+    Why this resolver exists at all: peers may extract a flat
+    basename from a CAWL identifier and pass it here, but the
+    canonical image may live under a category subdir
     (``0001_body/<basename>.png``). The index already records
     full paths from the GitHub tree; using it as a basename →
     full-path resolver bridges the gap without forcing every
@@ -1004,21 +1018,24 @@ def _resolve_basename_via_index(repo, rel_path):
 
     No fresh fetch — we only consult the on-disk cache /
     bundled seed (whichever ``_read_cached_index`` returns).
-    If the index isn't cached yet, we return ``rel_path`` as-is
-    and let the network fetch attempt 404 honestly."""
+    Non-flat input and missing-cache cases return
+    ``(rel_path, False)``; the caller's existing
+    ``_read_cached_index(repo) is not None`` gate handles the
+    distinguishing logic for the "no cache" vs "cache but no
+    match" log decision."""
     if '/' in rel_path:
-        return rel_path
+        return rel_path, False
     cached = _read_cached_index(repo)
     if cached is None:
-        return rel_path
+        return rel_path, False
     files = cached.get('files') or []
     for entry in files:
         if not isinstance(entry, dict):
             continue
         full = entry.get('path')
         if isinstance(full, str) and os.path.basename(full) == rel_path:
-            return full
-    return rel_path
+            return full, True
+    return rel_path, False
 
 
 def get_image_path(repo, rel_path):
@@ -1064,15 +1081,19 @@ def get_image_path(repo, rel_path):
     # straight through (which is what the prefetch worker does
     # and what stage-2 peers do).
     if '/' not in rel_path:
-        rel_path = _resolve_basename_via_index(repo, rel_path)
+        rel_path, found_in_index = _resolve_basename_via_index(
+            repo, rel_path)
         if rel_path != original_rel_path:
             print(f'[cawl] get_image_path: resolved basename '
                   f'{original_rel_path!r} → {rel_path!r}',
                   file=sys.stderr, flush=True)
-        elif _read_cached_index(repo) is not None:
+        elif not found_in_index and _read_cached_index(repo) is not None:
             # Peer sent a flat basename, we tried the index, no
             # match. Log because this is a real "not found in
             # index" case the peer may want to know about.
+            # (A root-level file in the repo — index path equals
+            # the basename — hits ``found_in_index=True`` with
+            # ``rel_path`` unchanged, and is NOT logged here.)
             print(f'[cawl] get_image_path: flat basename not in '
                   f'index: {original_rel_path!r}',
                   file=sys.stderr, flush=True)

@@ -39,6 +39,7 @@ import signal
 import socketserver
 import sys
 import threading
+import time as _time
 
 from . import auth
 from . import cawl as _cawl
@@ -933,17 +934,30 @@ def _touch_project(langcode):
     POST ``cawl/prefetch`` (though the endpoint still works for
     peers that explicitly want a different working set than the
     full index). ``auto_prefetch`` is throttled per repo so the
-    1 Hz cache-status poll doesn't re-trigger every second."""
+    1 Hz cache-status poll doesn't re-trigger every second.
+
+    Short-circuit when the value is already current: hot endpoints
+    (cawl_image, get_audio, project_status) fire this 10–15× per
+    UI interaction. Rewriting the same value to ``config.json`` on
+    every call burns flash wear and floods the daemon log mirror
+    (visibly slow phone, see 0.43.8). ``store.set_last_langcode``
+    also short-circuits internally; both layers cache so that
+    neither path lands a redundant write."""
     if not langcode:
         return
     try:
-        store.set_last_langcode(langcode)
-        print(f'[recent] _touch_project({langcode!r}) → '
-              f'{store._config_path()!r}',
-              file=sys.stderr, flush=True)
-    except Exception as ex:
-        print(f'[recent] _touch_project({langcode!r}) failed: {ex}',
-              file=sys.stderr, flush=True)
+        already_current = (store.get_last_langcode() == langcode)
+    except Exception:
+        already_current = False
+    if not already_current:
+        try:
+            store.set_last_langcode(langcode)
+            print(f'[recent] _touch_project({langcode!r}) → '
+                  f'{store._config_path()!r}',
+                  file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[recent] _touch_project({langcode!r}) failed: {ex}',
+                  file=sys.stderr, flush=True)
     try:
         repo = _cawl.resolve_image_repo(langcode)
         if repo:
@@ -953,24 +967,54 @@ def _touch_project(langcode):
               file=sys.stderr, flush=True)
 
 
+_last_project_logged = ['<unset>']
+
+
 def _h_get_last_project(_body):
-    # No success log here — peers poll this at high frequency
+    # No per-call success log — peers poll this at high frequency
     # (the daemon UI's cache-status indicator reads
     # ``last_project()`` every second to know which project to
     # query), and a per-call log floods logcat. The setter
     # (``_h_set_last_project``) still logs because it's a real
     # state change, not a poll.
+    #
+    # *Transition* logging IS on, because the previously-silent
+    # case "GET returned empty when we expected a langcode" is
+    # exactly the diagnostic shape that explained a peer
+    # ``App.stop()`` during project-switch (2026-05-18 field
+    # report): the peer's reload path interpreted empty as "no
+    # project loaded" and shut down. ``_last_project_logged``
+    # holds the previous response so we emit one line per actual
+    # change, not per poll. Sentinel ``'<unset>'`` differentiates
+    # the first call this process ever served.
     val = store.get_last_langcode()
+    if val != _last_project_logged[0]:
+        print(f'[recent] GET /v1/recent/last_project transition '
+              f'{_last_project_logged[0]!r} → {val!r}',
+              file=sys.stderr, flush=True)
+        _last_project_logged[0] = val
     return 200, {"ok": True, "langcode": val}
 
 
 def _h_set_last_project(body):
     """Explicit override. Most peers shouldn't need to call this —
     every langcode-bound endpoint already stamps via ``_touch_project``
-    — but the wrapper exists so peers that genuinely want to *clear*
-    the recent slot (or pin a different project than the one they
-    just touched) have an affordance."""
-    val = body.get('langcode', '') or ''
+    — but the wrapper exists so peers that want to pin a different
+    project than the one they just touched have an affordance.
+
+    Empty ``langcode`` is **refused** (no-op + stderr warning). The
+    daemon-side invariant is that ``recent.last_langcode`` never
+    lands as a stored ``''`` on disk; the only legitimate empty state
+    is "key absent" (first boot). Picker-cancel is a peer-side
+    gesture that issues no RPC at all — the ``on_resume`` comparison
+    naturally no-ops because the daemon's ``last_langcode`` is
+    unchanged. See ``azt_collab_client/CLIENT_INTEGRATION.md`` § 14a."""
+    val = (body.get('langcode', '') or '').strip()
+    if not val:
+        print('[recent] POST /v1/recent/last_project refused empty '
+              '(picker-cancel must not POST; this is a peer bug)',
+              file=sys.stderr, flush=True)
+        return 400, {"ok": False, "error": "empty_langcode"}
     store.set_last_langcode(val)
     print(f'[recent] POST /v1/recent/last_project ← {val!r} '
           f'(to {store._config_path()!r})',
@@ -1794,12 +1838,16 @@ def _h_set_daemon_log_to_file(body):
     enabled = bool(body.get('enabled'))
     store.set_daemon_log_to_file(enabled)
     if enabled:
-        ok = install_stderr_tee()
+        # Explicit user gesture — start a fresh log session.
+        # Truncate any prior content so the captured window
+        # starts at "the user just turned this on" rather than
+        # carrying state from a previous debugging session.
+        ok = install_stdio_tee(truncate=True)
         if not ok:
             return 500, {"ok": False,
-                         "error": "stderr_tee_install_failed"}
+                         "error": "stdio_tee_install_failed"}
     else:
-        uninstall_stderr_tee()
+        uninstall_stdio_tee()
     return 200, {"ok": True, "enabled": enabled,
                  "log_path": daemon_log_path()}
 
@@ -2222,19 +2270,49 @@ def daemon_log_path():
     return os.path.join(azt_home(), 'daemon.log')
 
 
-class _StderrTee:
-    """File-like that mirrors writes to the original stderr (logcat /
-    terminal) AND to an on-disk log file. Used by
-    ``_maybe_install_stderr_tee`` to capture daemon diagnostics for
-    a remote tester who can't run logcat.
+class _StdioTee:
+    """File-like that mirrors writes to the original stream (logcat /
+    terminal) AND to a shared on-disk log file. One instance wraps
+    ``sys.stdout``, another wraps ``sys.stderr``, both pointing at
+    the same file so daemon code can use whichever stream is
+    idiomatic for the call site without the tester losing output.
 
-    Writes go through best-effort — a failure to write to the file
-    (rotated, disk full) doesn't break the original stderr path.
+    Boot-trace prints (``print(f'[boot-trace-daemon] phase=…',
+    flush=True)`` in ``service.py`` and ``server.py``) go to
+    ``sys.stdout``; the bulk of structured diagnostics
+    (``[recent] _touch_project``, ``[cawl]``, ``[commit-*]``) use
+    ``print(..., file=sys.stderr)``. Pre-0.43.15 the tee only
+    captured ``sys.stderr``, so the on-disk daemon log lost every
+    boot trace and the user-facing symptom was "the log only has
+    the banner line": prints that went via ``sys.stdout`` reached
+    logcat but not the file the tester could share.
+
+    File-side writes are timestamped per line (``[HH:MM:SS] ``) so
+    the on-disk log doubles as a passage-of-time signal — the bulk
+    of ``[recent] _touch_project`` heartbeat lines collapsed away
+    in 0.43.8, and without timestamps the remaining traffic
+    couldn't tell a tester whether the gap between two lines was
+    50 ms or 5 minutes. logcat / terminal output is left untouched
+    (logcat already supplies its own time column).
+
+    The stdout and stderr instances share a single SOL (start-of-
+    line) flag via ``_sol_state[0]`` so concurrent writes from the
+    two streams don't break the per-line stamp prefix when they
+    interleave at the file. Both writes still go through best-
+    effort — a failure to write to the file (rotated, disk full)
+    doesn't break the original stream path.
     """
 
-    def __init__(self, original, file_obj):
+    def __init__(self, original, file_obj, sol_state):
         self._orig = original
         self._file = file_obj
+        # Shared mutable list ``[bool]`` rather than per-instance
+        # attribute: both the stdout and stderr tees write to the
+        # same file, so the "next byte begins a new line" property
+        # belongs to the file, not the stream. A list of one bool
+        # is the simplest way to share mutable state between two
+        # Python objects without introducing a third.
+        self._sol_state = sol_state
 
     def write(self, data):
         try:
@@ -2242,11 +2320,35 @@ class _StderrTee:
         except Exception:
             pass
         try:
-            self._file.write(data)
-            self._file.flush()
+            self._write_to_file(data)
         except Exception:
             pass
         return len(data) if isinstance(data, str) else 0
+
+    def _write_to_file(self, data):
+        if not data:
+            return
+        if not isinstance(data, str):
+            self._file.write(data)
+            self._file.flush()
+            return
+        stamp = _time.strftime('[%H:%M:%S] ')
+        pieces = data.split('\n')
+        at_sol = self._sol_state[0]
+        out = []
+        for k, piece in enumerate(pieces):
+            has_newline_after = k < len(pieces) - 1
+            if at_sol and piece:
+                out.append(stamp)
+            out.append(piece)
+            if has_newline_after:
+                out.append('\n')
+                at_sol = True
+            elif piece:
+                at_sol = False
+        self._sol_state[0] = at_sol
+        self._file.write(''.join(out))
+        self._file.flush()
 
     def flush(self):
         try:
@@ -2266,70 +2368,137 @@ class _StderrTee:
 # Module-level state for hot-toggle. Lets the daemon install /
 # remove the tee without a process restart in response to the
 # settings-UI toggle.
-_stderr_tee_installed = False
-_stderr_tee_original = None
-_stderr_tee_file = None
+_stdio_tee_installed = False
+_stdio_tee_stdout_original = None
+_stdio_tee_stderr_original = None
+_stdio_tee_file = None
 
 
-def install_stderr_tee():
-    """Begin mirroring ``sys.stderr`` to ``daemon_log_path()``.
-    Idempotent: a second call while a tee is already installed
-    is a no-op. Truncates the log file so it reflects one
-    session's worth of output (typically what a tester sharing
-    "the log around the crash I just had" wants).
+def install_stdio_tee(truncate=False):
+    """Begin mirroring BOTH ``sys.stdout`` and ``sys.stderr`` to
+    ``daemon_log_path()``. Idempotent: a second call while a tee
+    is already installed is a no-op.
+
+    *truncate*: when True, the log file is opened in write mode
+    (prior content discarded). When False (the default), the file
+    is opened in append mode so a daemon respawn after an idle
+    auto-stop / OOM-kill preserves the prior session's captured
+    output. Without this distinction the field symptom was "I
+    turned the log on, did some work, hit Share — got only the
+    ``[daemon-log] mirroring stdio to …`` line": the server
+    APK's ``:provider`` process auto-stops after 5 min idle (or
+    earlier under memory pressure), and the next peer RPC
+    lazy-respawns it, which re-runs the startup
+    ``maybe_install_stdio_tee`` path; if it opened the file
+    ``'w'`` there it'd silently wipe the prior session.
+
+    The explicit toggle-on path (user just enabled "Log server
+    activity" in Settings) passes ``truncate=True`` to start a
+    clean session — testers sharing "the log around the crash I
+    just had" want exactly that. The respawn path
+    (``maybe_install_stdio_tee`` at process boot) leaves
+    ``truncate=False`` so the prior session survives.
+    ``_h_get_daemon_log`` already caps reads to the last 256 KB,
+    so unbounded growth across many respawns is a non-issue.
 
     Safe to call from outside the daemon's main thread — replaces
-    the global ``sys.stderr`` atomically, and concurrent writes
-    end up on the original-stderr branch of the tee (best-effort
-    write-through) until the swap completes."""
-    global _stderr_tee_installed, _stderr_tee_original, _stderr_tee_file
-    if _stderr_tee_installed:
+    the global ``sys.stdout`` and ``sys.stderr`` references, and
+    concurrent writes end up on the original-stream branch of the
+    tee (best-effort write-through) until the swap completes."""
+    global _stdio_tee_installed, _stdio_tee_stdout_original
+    global _stdio_tee_stderr_original, _stdio_tee_file
+    if _stdio_tee_installed:
         return True
     path = daemon_log_path()
+    mode = 'w' if truncate else 'a'
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        log_file = open(path, 'w', buffering=1, encoding='utf-8',
+    except OSError as ex:
+        print(f'[daemon-log] cannot mkdir for {path!r}: {ex}',
+              file=sys.__stderr__, flush=True)
+        return False
+    # On the truncate (fresh-session) path, rotate the existing log
+    # to ``<path>.prev`` before opening so the previous investigation
+    # isn't lost when the user flips the toggle to start a new one.
+    # Matches the peer's rotate-on-launch pattern and lets
+    # ``share_log_file`` ship both files under
+    # ``=== previous session === / === current session ===``
+    # headers. Rotation only happens here (not on the respawn
+    # ``truncate=False`` path) because daemon respawns can fire
+    # every few minutes during normal idle-stop churn and rotating
+    # on each would wipe ``.prev`` faster than a remote tester can
+    # grab it.
+    if truncate:
+        prev_path = path + '.prev'
+        try:
+            if os.path.exists(path):
+                os.replace(path, prev_path)
+        except OSError as ex:
+            print(f'[daemon-log] rotation {path!r} -> {prev_path!r} '
+                  f'failed: {ex} (continuing without rotation)',
+                  file=sys.__stderr__, flush=True)
+    try:
+        log_file = open(path, mode, buffering=1, encoding='utf-8',
                         errors='replace')
     except OSError as ex:
         print(f'[daemon-log] cannot open {path!r}: {ex}',
               file=sys.__stderr__, flush=True)
         return False
-    _stderr_tee_original = sys.stderr
-    _stderr_tee_file = log_file
-    sys.stderr = _StderrTee(_stderr_tee_original, log_file)
-    _stderr_tee_installed = True
-    print(f'[daemon-log] mirroring stderr to {path!r}',
-          file=sys.stderr, flush=True)
+    sol_state = [True]
+    _stdio_tee_stdout_original = sys.stdout
+    _stdio_tee_stderr_original = sys.stderr
+    _stdio_tee_file = log_file
+    sys.stdout = _StdioTee(_stdio_tee_stdout_original,
+                           log_file, sol_state)
+    sys.stderr = _StdioTee(_stdio_tee_stderr_original,
+                           log_file, sol_state)
+    _stdio_tee_installed = True
+    if truncate:
+        print(f'[daemon-log] mirroring stdio to {path!r} '
+              f'(fresh session, daemon {_VERSION})',
+              file=sys.stderr, flush=True)
+    else:
+        print(f'[daemon-log] mirroring stdio to {path!r} '
+              f'(appending — daemon {_VERSION} respawn)',
+              file=sys.stderr, flush=True)
     return True
 
 
-def uninstall_stderr_tee():
-    """Stop mirroring stderr to the daemon log file. Restores the
-    original ``sys.stderr``. Idempotent."""
-    global _stderr_tee_installed, _stderr_tee_original, _stderr_tee_file
-    if not _stderr_tee_installed:
+def uninstall_stdio_tee():
+    """Stop mirroring stdio to the daemon log file. Restores the
+    original ``sys.stdout`` and ``sys.stderr``. Idempotent."""
+    global _stdio_tee_installed, _stdio_tee_stdout_original
+    global _stdio_tee_stderr_original, _stdio_tee_file
+    if not _stdio_tee_installed:
         return
-    print('[daemon-log] stopping stderr mirror',
+    print('[daemon-log] stopping stdio mirror',
           file=sys.stderr, flush=True)
-    sys.stderr = _stderr_tee_original
+    sys.stdout = _stdio_tee_stdout_original
+    sys.stderr = _stdio_tee_stderr_original
     try:
-        if _stderr_tee_file is not None:
-            _stderr_tee_file.close()
+        if _stdio_tee_file is not None:
+            _stdio_tee_file.close()
     except Exception:
         pass
-    _stderr_tee_original = None
-    _stderr_tee_file = None
-    _stderr_tee_installed = False
+    _stdio_tee_stdout_original = None
+    _stdio_tee_stderr_original = None
+    _stdio_tee_file = None
+    _stdio_tee_installed = False
 
 
-def _maybe_install_stderr_tee():
-    """Called at daemon startup. Installs the tee iff the user's
-    persisted toggle is on. No-op when off. The toggle can be
-    flipped live without a daemon restart via the
-    ``/v1/logging/daemon_log_to_file`` endpoint."""
+def maybe_install_stdio_tee():
+    """Called at daemon process startup (loopback ``run()`` on
+    desktop, and ``server_apk/service.py`` on Android). Installs
+    the tee iff the user's persisted toggle is on. No-op when off.
+    The toggle can be flipped live without a daemon restart via
+    the ``/v1/logging/daemon_log_to_file`` endpoint.
+
+    Public (no leading underscore) so the Android service body in
+    ``server_apk/service.py`` can call it from outside this
+    package without reaching into a private name."""
     try:
         if store.get_daemon_log_to_file():
-            install_stderr_tee()
+            install_stdio_tee()
     except Exception:
         # store might not be initialised yet — bail quietly.
         return
@@ -2346,7 +2515,7 @@ def run(host='127.0.0.1', port=0):
     # Install the daemon-log-to-file tee before anything else so
     # we capture the boot trace. Idempotent and silent when the
     # toggle is off.
-    _maybe_install_stderr_tee()
+    maybe_install_stdio_tee()
 
     # Single-instance guard — flock on $AZT_HOME/server.lock
     lock_path = os.path.join(home, 'server.lock')

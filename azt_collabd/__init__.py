@@ -17,7 +17,24 @@ The backend has no Kivy dependency. UI-thread marshaling is the caller's
 responsibility.
 """
 
-__version__ = "0.43.1"
+# Single source of truth for the suite version lives in
+# ``azt_collab_client/__init__.py`` — the two packages always ship as
+# one APK build, so two separately-edited literal strings were a
+# foot-gun (real field confusion 2026-05-18: daemon at 0.43.3, client
+# at 0.43.1 → settings strip read "client 0.43.1 · server 0.43.3" and
+# testers thought the build was incomplete). Re-export from here so
+# everything that did ``azt_collabd.__version__`` keeps working.
+#
+# Direction matters: daemon imports client (allowed). Client must
+# NEVER import daemon (hard rule — see ``azt_collab_client/CLAUDE.md``
+# "No ``azt_collabd`` import"). The canonical lives client-side so
+# the import direction stays correct.
+#
+# ``server_apk/buildozer.spec.tmpl :: version.filename`` and
+# ``appinfo.py :: FILE_W_VERSION`` both point at the canonical file
+# so external tooling (buildozer's APK version, the presplash
+# generator) reads the same value without importing Python.
+from azt_collab_client import __version__  # noqa: F401
 
 # Floor on the azt_collab_client version this daemon is willing to talk
 # to. Published on /v1/health so the client compares locally and a peer
@@ -83,7 +100,7 @@ __version__ = "0.43.1"
 # split. Also lifts the always-skip-commit-when-offline bug filed
 # in NOTES_TO_DAEMON.md (2026-05-15) — pre-0.43 daemons skip the
 # commit step entirely on offline ``request_sync``.
-MIN_CLIENT_VERSION = "0.43.0"
+MIN_CLIENT_VERSION = "0.43.11"
 
 from . import config
 from . import net

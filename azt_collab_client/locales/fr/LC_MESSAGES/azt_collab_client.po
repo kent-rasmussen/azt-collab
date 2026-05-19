@@ -557,9 +557,6 @@ msgstr "Journal de diagnostic"
 msgid "Share daemon log"
 msgstr "Partager le journal du service"
 
-msgid "Email daemon log"
-msgstr "Envoyer le journal par e-mail"
-
 msgid "Daemon log is being saved to {path}"
 msgstr "Le journal du service est enregistré dans {path}"
 

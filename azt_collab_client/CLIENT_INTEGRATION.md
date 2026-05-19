@@ -1152,8 +1152,68 @@ fresh server-side switch always lands ``last_project()`` on
 a value before the peer resumes, so the comparison is
 authoritative.
 
+**What an empty return means.** ``last_project()`` legitimately
+returns ``''`` exactly once in a device's lifetime: on first
+boot, before any project has ever been touched. The key in
+``$AZT_HOME/config.json :: recent.last_langcode`` doesn't
+exist yet, so the getter returns ``''``.
+
+**Picker-cancel writes nothing.** When the user opens the
+picker and backs out without choosing, the picker issues no
+``POST /v1/recent/last_project`` and no other write. The
+daemon's ``last_langcode`` is whatever it was before the
+picker opened; the peer's ``_current_langcode`` is whatever
+it was before the picker opened; comparison is equal; no
+reload. The "I changed my mind" gesture is naturally a no-op
+end-to-end. Don't add a "clear" RPC for it.
+
+**Exception — first-boot picker-cancel: `App.stop()` is
+correct.** When a fresh install opens the bootstrap picker
+(no project has ever been touched, peer's
+``_current_langcode`` is unset, daemon's ``last_langcode``
+key is absent so ``last_project()`` returns ``''``) and the
+user hits OS back without picking anything, the peer has
+literally nothing to display and the user has signaled "I
+don't want this app open right now." ``App.stop()`` is the
+right gesture here. The discriminator is the peer's own
+state — ``_current_langcode is None`` *and* picker came back
+without a selection — not the empty return from
+``last_project()``. This is the **only** circumstance where
+``App.stop()`` should fire during a picker / on_resume flow;
+see "What NOT to do" below for the contrast.
+
+**Daemon-side invariants (since 0.43.5).** ``store.set_last_langcode()``
+refuses empty input (warns and no-ops). ``POST /v1/recent/last_project``
+with empty body returns ``400 empty_langcode``. So a
+transient bug — mid-rename, mid-merge, malformed RPC, a peer
+that accidentally sends empty — cannot land ``''`` as a
+stored value. The only path to empty from ``last_project()``
+is the first-boot-key-absent case; if you see empty in any
+other circumstance, it's a daemon-side regression.
+
 **What NOT to do:**
 
+- ❌ **Call ``App.get_running_app().stop()`` / ``sys.exit()``
+  / any other process-exit path as the "reload" mechanism
+  when the peer has a loaded project.** The
+  first-boot-no-project case carved out above is the lone
+  exception; in any other state — including the more
+  dangerous "we had a project loaded and now ``last_project()``
+  returned something we didn't expect" — ``stop()`` loses the
+  user's place and looks like a crash. Tempting because it
+  gets the user back to a fresh state cheaply, but Android
+  does NOT auto-restart a peer that exits via ``App.stop()``
+  — the user just sees the app close and has to relaunch
+  from the home screen. Field symptom (2026-05-18): user
+  toggled daemon logging on, asked to switch projects, peer
+  GET ``/v1/recent/last_project`` → 2 ms later Kivy logged
+  ``[INFO] [Base] Leaving application in progress... Python
+  for android ended.`` — daemon process kept running and
+  finished the in-flight ``[commit]`` 250 ms later, but the
+  user perceived the
+  whole thing as "app crashed when I switched projects."
+  Reload state in-place via the same code path your initial
+  project-load uses; don't exit the process.
 - ❌ Re-read on every cache_status poll or other 1 Hz tick.
   The check is an Activity-resume event, not a constant
   poll. The user's "switch happened" gesture is bounded by
@@ -1389,6 +1449,7 @@ the sync settings screen anchored on the work-offline toggle
 | ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` / ``S.REPO_NOT_AUTHORIZED`` | **Silent.** Log; project still usable. | Open the ``url`` param the Status carries. |
 | ``S.CONTRIBUTOR_UNSET`` | **Silent.** Log; sync refused until name set. | Route to daemon settings UI's contributor field. |
 | ``S.WORK_OFFLINE_ENABLED`` | n/a — auto-commit doesn't see this (only ``sync_project`` emits it). | Toast "Work-offline mode is on" + ``open_server_ui()`` to the sync settings screen. The user explicitly turned the toggle on; the Sync button is the only path that surfaces the refusal. (0.43.0+.) |
+| ``S.BUSY`` | **Silent.** Daemon's project_lock is held by another caller (almost always *this peer's* prior in-flight sync). Lock clears in milliseconds; the next regular tick covers it. Auto-sync surfaces nothing. | **Silent.** Even on user-gesture: showing "Another sync is in progress" toasts back-to-back is just punishing the user for the peer's missing in-flight guard. Optionally: debounce the Sync button so a fast double-tap fires once. See § 17c for the load-shedding rules that prevent ``S.BUSY`` in the first place. |
 | ``S.JOB_INTERRUPTED`` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails. |
 | ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` | **Silent.** Log; daemon will be reachable next time. | Transient-error toast. DO NOT route to settings — no user-fixable config here. |
 | ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
@@ -1399,11 +1460,16 @@ the sync settings screen anchored on the work-offline toggle
 ### Code shape — both contexts
 
 ```python
-# Auto-sync (post-load, post-edit, background) — silent on
+# Auto-commit (post-load, post-edit, background) — silent on
 # configuration-class AND transport-class failures; never derail
-# whatever the user was doing.
-def _auto_sync(self, langcode):
-    result = sync_project(langcode)
+# whatever the user was doing. Uses commit_project (debounced,
+# async, no push), NOT sync_project — auto-paths MUST NOT push
+# (see § 17c Rule 2). Push is the daemon scheduler's job.
+def _auto_commit(self, langcode):
+    job_id = commit_project(langcode)
+    if not job_id:
+        return  # transport failure already wrapped; silent
+    result = poll_job(job_id)
     # DATA_LOSS_RISK / COMMIT_REPEATEDLY_FAILED are NEVER
     # silenced — surface either before any other branch consumes
     # the result. They're the two canaries for "data is
@@ -1416,15 +1482,16 @@ def _auto_sync(self, langcode):
                       S.AUTH_REQUIRED, S.CONTRIBUTOR_UNSET,
                       S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
                       S.REPO_NOT_AUTHORIZED,
+                      S.BUSY,
                       S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
                       S.AUTH_REFRESH_STALE):
-        print(f'[auto-sync] {langcode}: '
+        print(f'[auto-commit] {langcode}: '
               f'{result.codes()!r} (silenced)',
               file=sys.stderr)
         return
     if result.has(S.JOB_INTERRUPTED):
-        return self._auto_sync_retry_once(langcode)
-    self.show_status(translate_result(result))  # PUSHED, etc.
+        return self._auto_commit_retry_once(langcode)
+    self.show_status(translate_result(result))  # COMMITTED_LOCAL, etc.
 
 
 # User-initiated sync — the user just tapped Sync; route to
@@ -1489,6 +1556,7 @@ S.REPO_NOT_AUTHORIZED     # 'REPO_NOT_AUTHORIZED'
 S.CONTRIBUTOR_UNSET       # 'CONTRIBUTOR_UNSET'
 S.JOB_INTERRUPTED         # 'JOB_INTERRUPTED'
 S.WORK_OFFLINE_ENABLED    # 'WORK_OFFLINE_ENABLED' ← 0.43.0+, sync_project only
+S.BUSY                    # 'BUSY'                ← project_lock held; silent (§ 17c)
 S.SERVER_UNAVAILABLE      # 'SERVER_UNAVAILABLE'  ← 0.41.13+
 S.SERVER_ERROR            # 'SERVER_ERROR'        ← 0.41.13+
 S.PUSHED / S.PULLED / S.NOTHING_TO_COMMIT / S.CONFLICTS / ...
@@ -1572,6 +1640,40 @@ else:
     sync_indicator.text = ""  # all up to date
 ```
 
+### Badge refresh obligation — peer MUST re-poll after every sync gesture
+
+The daemon has no channel to push state changes into a running
+peer; ``project_status`` is the only surface, and it's pull-only.
+That means every gesture that mutates ``commits_ahead`` /
+``work_offline`` on the daemon side leaves the peer's last-
+seen ``ProjectStatus`` snapshot stale until the peer re-fetches.
+Peers MUST re-call ``project_status(langcode)`` and re-bind the
+badge:
+
+1. **In the result handler of every sync gesture.** Whether
+   the gesture was the user-pressed Sync button
+   (``sync_project``), a debounced background commit
+   (``commit_project`` + ``poll_job``), or a peer-side
+   work-offline toggle (``set_work_offline``). Don't read the
+   gesture's own ``Result`` for the new ``commits_ahead`` —
+   ``Result`` carries status codes, not state. Always re-poll
+   ``project_status``.
+2. **On a low-rate background tick.** Daemon-driven push
+   happens on the scheduler's drain loop without a peer
+   gesture; without a background poll the badge would stay at
+   the last-gesture-time value indefinitely. 5-15 s is the
+   right range — fast enough that the user sees the
+   ``commits_ahead`` drop after a background push, slow enough
+   that the RPC cost stays trivial.
+3. **On ``on_resume`` / activity-foreground.** Same hook used
+   for project-switch reconciliation (§ 14a). The daemon may
+   have drained while the peer was backgrounded.
+
+Field symptom this section closes (2026-05-18): UI badge
+sticky at ``(+160)`` while daemon log showed successive
+``[sync-rpc] 'baf' done: codes=['NOTHING_TO_COMMIT', 'PUSHED']``
+— daemon was at zero commits_ahead, peer never re-polled.
+
 ### Migration checklist (from pre-0.43 peer)
 
 1. Swap ``request_sync(langcode)`` for ``commit_project(langcode)``
@@ -1585,7 +1687,15 @@ else:
    routing table — toast + route to ``open_server_ui()``.
 4. Render the work-offline badge from
    ``ProjectStatus.work_offline``.
-5. (Optional) Surface ``get_work_offline()`` /
+5. **Wire the badge to re-poll after every sync gesture, on
+   a 5-15 s background tick, and on ``on_resume``.** See
+   "Badge refresh obligation" above. Pre-0.43 peers got away
+   without an explicit re-poll because the gesture's own
+   ``Result`` carried ``PUSHED`` and the peer could update
+   from there; in the split-commit world the ``Result`` no
+   longer encodes push state, so a missing re-poll leaves
+   the badge stuck at the last-gesture-time value.
+6. (Optional) Surface ``get_work_offline()`` /
    ``set_work_offline()`` in a peer-side quick-toggle if your
    UX wants the switch outside the daemon settings screen.
    Most peers won't need this — the daemon settings UI hosts
@@ -1637,6 +1747,149 @@ UX gain. Same shape for ``n_recovered_today`` — it's a counter,
 not an event; rendering it as a count is fine, popping a modal
 "we rescued 3 files" toast is not (the user didn't ask to be
 told, and the data is already on disk where they expect it).
+
+## 17c. Don't overload the server — peer concurrency obligations
+
+The daemon's protections (per-project ``flock``-backed
+``project_lock``, server-side commit debounce, scheduler
+serialization) exist to keep its own state coherent — not to
+absorb a peer that fires N parallel RPCs per gesture. When a
+peer skips the obligations below, the **daemon stays fine** but
+the **peer pays in user-visible noise**: stacks of toasts for
+``S.BUSY``, redundant ``project_status`` polls that move the
+badge nowhere, and (worst) flapping ``commits_ahead`` numbers
+because two in-flight syncs see different snapshots of the
+project tree.
+
+Field log signature this section closes (2026-05-18): six
+``POST /v1/projects/<lang>/sync`` "pre" lines without their
+matching "post", followed by four back-to-back ``[do_sync]
+Une autre synchronisation est en cours`` (= ``S.BUSY``) toasts.
+Peer was firing parallel ``sync_project`` calls per gesture;
+the daemon's project_lock did the right thing by refusing the
+later ones, but the user saw a wall of toasts.
+
+### Rule 1 — Single in-flight guard per (RPC, project)
+
+NEVER fire ``sync_project`` (or ``commit_project``, or any
+other mutating RPC) when a prior call for the same project is
+still in flight. Maintain a peer-side ``_sync_in_flight``
+flag (or, more idiomatically, a per-project ``asyncio.Lock`` /
+threading.Lock) set on the "pre" branch and cleared on the
+"post" branch (success or failure, in a ``finally``). Drop new
+triggers while the flag is held; **do not queue** them
+(queuing converts user mashing into a chain that runs after
+the user has moved on).
+
+```python
+def request_sync(self, langcode):
+    if self._sync_in_flight.get(langcode):
+        # Drop — user mash, double-tap, racing background
+        # trigger. The currently-running sync will cover
+        # whatever this one would have done.
+        return
+    self._sync_in_flight[langcode] = True
+    try:
+        result = sync_project(langcode)   # synchronous
+        self._handle_sync_result(result)  # § 17 routing
+    finally:
+        self._sync_in_flight[langcode] = False
+```
+
+The daemon's ``project_lock`` is a correctness backstop, not
+the peer's primary concurrency control. Without the peer-side
+guard, ``S.BUSY`` toasts pile up and the daemon does the same
+work multiple times in serial.
+
+### Rule 2 — Auto-paths use ``commit_project``, not ``sync_project``
+
+``sync_project`` is the user-Sync-button RPC: it does commit
++ push synchronously under one lock. Auto-paths
+(project-select, project-load, post-edit debounce, background
+periodic) MUST use ``commit_project``, which is debounced
+server-side and returns immediately with a ``job_id``. Push
+happens on the daemon's drain loop, no peer involvement.
+
+Mixing the two for the same gesture is what produced the
+field-log pattern — the peer fired ``commit_project`` *and*
+``sync_project`` for the same edit event, and the ``sync_project``
+calls collided with each other on the lock.
+
+### Rule 3 — Debounce user gestures peer-side too
+
+The Sync button SHOULD debounce on the peer side (200-500 ms)
+even though the daemon also debounces ``commit_project``.
+Reason: ``sync_project`` is NOT debounced server-side (it's
+the explicit "do it now" gesture). A fast double-tap fires
+two parallel ``sync_project`` calls; Rule 1 drops the second
+silently, but a 250 ms peer-side debounce avoids even queuing
+the call.
+
+### Rule 4 — Background polls have a budget
+
+``project_status`` is the only legitimate background poll
+surface. Rate it conservatively:
+
+- **5-15 s** for the active project's sync badge. Faster
+  wastes RPC cost; slower makes the badge feel sticky after a
+  daemon-driven push.
+- **30 s+** for any per-project iteration (e.g. dashboard
+  showing all registered projects). Multiply by ``N`` projects
+  before deciding the interval — 10 projects × 5 s = 2 RPCs/s,
+  which is wasteful for state that changes minutes apart.
+- **Stop polling when the activity is backgrounded.** Resume
+  on ``on_resume`` with one fresh fetch (see § 14a).
+
+NEVER fire ``project_status`` from multiple peer-side handlers
+for the same UI event (e.g. one from the sync result handler
+*and* one from a poll tick that just happened to land). Pick
+one owner per polling axis.
+
+### Rule 5 — ``S.BUSY`` is "back off", not "retry"
+
+When ``S.BUSY`` lands on a result, the right response is to do
+nothing. The next regular tick / next user gesture covers it.
+DO NOT:
+
+- retry in a tight loop (you'll just hit ``S.BUSY`` again
+  until the lock holder finishes — which would have happened
+  on its own);
+- show a toast (it's a daemon implementation detail leaking
+  through; the user can't act on it);
+- queue the call for "later" (Rule 1 — drop, don't queue).
+
+### Rule 6 — Per-event triggers, not per-status-change triggers
+
+Wire sync / commit gestures to **user-events** (edit saved,
+button pressed, screen left) — never to **state observations**
+(``commits_ahead > 0`` watcher firing a sync). State-based
+triggers create feedback loops where the daemon's own state
+update kicks off the next round of RPCs.
+
+### What the daemon does on its own (so peers don't need to)
+
+So peer maintainers know what *not* to reinvent:
+
+- **Server-side debounce on ``commit_project``** (default 500
+  ms). Bursts of edit-events that fire ``commit_project``
+  repeatedly collapse into one commit. Peers don't need their
+  own commit debounce beyond what their event source produces.
+- **Push drain on the scheduler tick** (default 30 s online
+  check + 60 s post-online grace). Peers don't need to push;
+  they just commit and the daemon pushes when network is
+  ready.
+- **Stuck-commit retry with exponential backoff** (30 s, 60 s,
+  120 s, … capped 1 h). Peers don't need to retry failed
+  commits.
+- **Project lock with reentrant flock**. Peers don't need
+  their own cross-RPC serialization.
+- **Auto-spawn / lazy respawn** of the daemon process. Peers
+  don't need to ping for liveness before each RPC.
+
+If a "smart" peer-side feature you're considering overlaps
+with any of the above, default to NOT adding it. The daemon
+is the single source of truth; peer cleverness that duplicates
+its work loses every disagreement.
 
 ## 18. Low-power adaptive policy
 

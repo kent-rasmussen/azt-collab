@@ -72,6 +72,20 @@ COMMIT_FAILED = 'COMMIT_FAILED'
 # on the next successful commit.
 COMMIT_REPEATEDLY_FAILED = 'COMMIT_REPEATEDLY_FAILED'
 PUSH_FAILED = 'PUSH_FAILED'
+# Both system DNS and the DoH fallback failed to translate a sync
+# host (github.com / gitlab.com / etc.) to an IP. Distinct from
+# PUSH_FAILED so peers can route silently in the auto-sync path:
+# the daemon's scheduler will keep retrying and resolve itself when
+# the underlying problem clears, and a toast that says "DNS is
+# broken on this device" mid-recording is useless. Real-world
+# causes are typically *not* "no internet" (browsers keep working):
+# per-app data-restriction, captive-portal limbo, broken
+# system-level Private DNS, IPv6-only network where AAAA records
+# are missing — see ``net.py`` for the DoH fallback that absorbs
+# most of these before this code ever fires. If you see this code,
+# *both* the system resolver and Cloudflare DoH-via-1.1.1.1 failed
+# for the same hostname.
+DNS_RESOLUTION_FAILED = 'DNS_RESOLUTION_FAILED'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'

@@ -436,6 +436,19 @@ def _watcher_loop():
         # offline. Push drain has its own gate (grace + work_offline)
         # and runs every tick, not just on edges.
         if prev is False and online is True:
+            # Log which resolver path served the probe — useful when
+            # debugging field reports of "browser works but sync
+            # doesn't". 'system' on the healthy path; 'doh' when the
+            # ``net.py`` DoH fallback is what got us through; 'fail'
+            # means we somehow recorded online despite both failing
+            # (shouldn't happen via the probe — a sanity tag).
+            try:
+                from . import net as _net
+                print(f'[watcher] online edge — resolver path: '
+                      f'{_net.resolver_state()}',
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pass
             try:
                 from . import cawl as _cawl
                 _cawl.on_online_edge()

@@ -167,6 +167,11 @@ _HANDLERS = {
         'Diagnostic log → Log server activity = yes, then Share '
         'daemon log so we can investigate.'), p),
     S.PUSH_FAILED:            lambda p: _fmt(_tr('Push failed: {error}'), p),
+    S.DNS_RESOLUTION_FAILED:  lambda p: _tr(
+        'Network reachable, but the sync host could not be resolved. '
+        'Sync will retry automatically when this clears. If it persists, '
+        'check this device’s Private DNS, VPN, or per-app data '
+        'restrictions.'),
     S.PULL_FAILED:            lambda p: _fmt(_tr('Pull failed: {error}'), p),
     S.CLONE_FAILED:           lambda p: _fmt(_tr('Clone failed: {error}'), p),
     S.CLONE_AUTH_REQUIRED:    lambda p: _fmt(_tr(

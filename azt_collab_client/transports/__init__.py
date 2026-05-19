@@ -25,11 +25,16 @@ class ServerUnavailable(RuntimeError):
       ``daemon_not_ready`` body. Service is up but Python's
       ``install_callbacks()`` hasn't fired yet. Boot-in-progress;
       worth retrying.
-    - ``'null_bundle'`` — ``ContentResolver.call`` returned ``null``.
-      Most common cause is signature-grant denial (peer's APK signed
-      with a different key than the suite keystore) or the provider
-      authority not actually being installed. Structural; retrying
-      doesn't help.
+    - ``'null_bundle'`` — ``ContentResolver.call`` returned ``null``
+      *and* the ContentProvider transport's transparent retry
+      (~3 s budget; see ``android_cp._NULL_BUNDLE_RETRY_BACKOFF_S``)
+      didn't recover. Likely structural: signature-grant denial
+      (peer's APK signed with a different key than the suite
+      keystore) or the provider authority not actually being
+      installed. Pre-0.43.9 every null Bundle surfaced here
+      including the transient cold-daemon-spawn race; the
+      transport now absorbs those so bootstrap's fast-fail on
+      this kind only fires for genuinely unrecoverable failures.
     - ``'server_apk_not_installed'`` — discovery returned ``None``;
       same shape, surfaced from ``pick_transport``.
     - ``'http'`` — loopback / HTTP error from the desktop transport.

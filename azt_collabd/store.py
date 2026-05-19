@@ -545,14 +545,55 @@ def set_device_name(name):
 # don't have to remember to call ``set_last_project`` from the right
 # load path; just touching the project via any RPC marks it recent.
 
+# In-memory cache of ``recent.last_langcode``. Hot endpoints
+# (``_touch_project`` from cawl_image / get_audio / project_status)
+# read+write this value tens of times per second; on Android internal
+# storage every hit would otherwise pay an atomic-rename of
+# ``config.json``. ``None`` = not yet loaded; ``''`` = loaded, no
+# project ever touched (a valid persistent state).
+_last_langcode_cache = None
+
+
 def get_last_langcode():
-    return (_load_config_file().get('recent') or {}).get('last_langcode', '')
+    global _last_langcode_cache
+    if _last_langcode_cache is None:
+        _last_langcode_cache = (
+            (_load_config_file().get('recent') or {}).get('last_langcode', ''))
+    return _last_langcode_cache
 
 
 def set_last_langcode(langcode):
+    """Stamp *langcode* as the most-recently-touched project. Empty /
+    whitespace-only values are **refused** here as a defensive
+    invariant: nothing in the daemon should ever land ``''`` on disk
+    for ``recent.last_langcode``. The only legitimate empty state is
+    "key absent" (first boot, no project ever touched), and
+    ``get_last_langcode()`` returns ``''`` for that case naturally.
+    Picker-cancel does **not** write anything — it's a no-op
+    server-side, and the peer's ``on_resume`` comparison handles it
+    for free (peer's ``_current_langcode`` equals the daemon's
+    unchanged ``last_langcode``, so no reload fires).
+
+    No-op when *langcode* already matches the in-memory cache — no
+    disk write, no log. Server-side ``_touch_project`` also checks
+    before calling, so the redundant-write path is doubly guarded."""
+    global _last_langcode_cache
+    val = (langcode or '').strip()
+    if not val:
+        import sys as _sys
+        print('[recent] set_last_langcode refused empty value '
+              '(no legitimate caller passes empty; treating as no-op)',
+              file=_sys.stderr, flush=True)
+        return
+    if _last_langcode_cache is None:
+        _last_langcode_cache = (
+            (_load_config_file().get('recent') or {}).get('last_langcode', ''))
+    if val == _last_langcode_cache:
+        return
     cfg = _load_config_file()
-    cfg.setdefault('recent', {})['last_langcode'] = (langcode or '').strip()
+    cfg.setdefault('recent', {})['last_langcode'] = val
     _save_config_file(cfg)
+    _last_langcode_cache = val
 
 
 # ── CAWL prefetch policy ────────────────────────────────────────────────────

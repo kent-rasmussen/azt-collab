@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 
 from . import config as _config
 from . import status as S
@@ -822,7 +823,7 @@ def _init_repo_locked(project_dir, remote_url, username, token,
         )
         result.add(S.PUSHED, url=remote_url, branch=branch)
     except Exception as exc:
-        result.add(S.PUSH_FAILED, error=str(exc))
+        _add_push_failure(result, exc)
 
     return result
 
@@ -1016,7 +1017,7 @@ def _commit_and_push_branch_locked(project_dir, username, token,
         result.add(S.PUSHED, branch=branch_name)
         result.add(S.OPEN_PR)
     except Exception as exc:
-        result.add(S.PUSH_FAILED, error=str(exc))
+        _add_push_failure(result, exc)
 
     return result
 
@@ -1173,6 +1174,164 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     return result
 
 
+# Markers for the network-class push failures that adaptive
+# batching can recover from. Anything matching here triggers
+# halve-and-retry; anything else (auth, repo gone, etc.) does not.
+# Field-observed strings — extend as new patterns surface.
+_PUSH_NETWORK_MARKERS = (
+    'connection aborted',
+    'remotedisconnected',
+    'incompleteread',
+    'nameresolutionerror',
+    'no address associated',
+    'timeout',
+    'connection reset',
+    'broken pipe',
+    'eof occurred',
+    # GitHub's git-receive-pack returns an unexpected HTTP status
+    # (typically 4xx) when a slow / large upload exceeds its
+    # server-side timeout. Looks like a protocol error but the
+    # underlying cause is "this pack didn't fit through this pipe
+    # in the allotted time" — exactly the case adaptive batching
+    # exists to fix. Field log 2026-05-18 showed
+    # ``unexpected http resp 400`` from this path.
+    'unexpected http resp',
+)
+
+
+def _is_network_push_failure(exc):
+    """Return True if *exc* looks like a transient network failure
+    eligible for adaptive batch shrinking. False on auth / definitive
+    server errors — those should not loop."""
+    if _is_http_403(exc):
+        return False
+    s = str(exc).lower()
+    return any(m in s for m in _PUSH_NETWORK_MARKERS)
+
+
+# DNS-specific subset of the network markers. Hitting any of these
+# means the push didn't fail for any of the usual transport reasons
+# (timeout / connection-reset / pack-too-big) — it failed because the
+# resolver couldn't translate the host. After 0.43.5's DoH fallback
+# (``net.py:_patch_resolver``), reaching here means *both* the system
+# resolver and Cloudflare DoH-via-1.1.1.1 failed for the same name.
+# Emitted on failure paths alongside ``PUSH_FAILED`` so peers can
+# route to a distinct, auto-sync-silent ``DNS_RESOLUTION_FAILED``
+# toast on the user-initiated path.
+_DNS_FAILURE_MARKERS = (
+    'nameresolutionerror',
+    'no address associated',
+    'failed to resolve',
+    'name or service not known',
+    'temporary failure in name resolution',
+)
+
+
+def _is_dns_resolution_failure(exc):
+    """Return True if *exc* looks like a DNS resolution failure."""
+    s = str(exc).lower()
+    return any(m in s for m in _DNS_FAILURE_MARKERS)
+
+
+def _format_push_error(exc):
+    """Best-effort human-readable string from a push exception.
+
+    Handles the dulwich case where ``str(exc)`` yields a
+    tuple-of-bytes repr like ``(b'810ef46…', b'd7d4c0b…')``: that's
+    ``UpdateRefsError``'s default ``__str__`` when ``args`` is a
+    tuple of two byte SHAs (the (old_sha, new_sha) pair the server
+    rejected) and the exception has no override. The repr is
+    useless to a user and hides the real cause — in the field
+    observed (0.43.x baf testing) this shape is almost always a
+    non-fast-forward rejection. Rewrite to something a user /
+    maintainer can actually act on.
+
+    Falls through to ``str(exc)`` for shapes we recognise as
+    informative (network errors, HTTP 4xx, etc.)."""
+    raw = str(exc)
+    if raw.startswith("(b'") or raw.startswith('(b"'):
+        return ('remote rejected ref update (likely non-fast-forward — '
+                'remote has commits not present locally): ' + raw)
+    return raw
+
+
+def _is_non_ff_rejection(exc):
+    """Detect a non-fast-forward push rejection. Surfaces in two
+    shapes in the field:
+
+    1. ``str(exc)`` is a bytes-tuple repr (dulwich
+       ``UpdateRefsError`` with bytes-tuple ``args`` and no
+       ``__str__`` override — the (old_sha, new_sha) pair the
+       server reported as rejected).
+    2. ``str(exc)`` contains an explicit non-FF marker — git
+       servers (and dulwich layers above the raw status report)
+       use a handful of phrases.
+
+    Used by the push retry loop to force re-fetch + reconcile
+    even when our local cache of ``refs/remotes/origin/<branch>``
+    matches the post-rejection fetch result. The rejection itself
+    proves the server has something we don't; the existing race
+    gate (``new_remote != remote_sha``) is too conservative for
+    that case."""
+    raw = str(exc)
+    if raw.startswith("(b'") or raw.startswith('(b"'):
+        return True
+    s = raw.lower()
+    return ('non-fast-forward' in s
+            or 'fetch first' in s
+            or 'ref update rejected' in s)
+
+
+def _add_push_failure(result, exc):
+    """Append PUSH_FAILED to *result*, and DNS_RESOLUTION_FAILED first
+    if the cause is resolver-class. Both go on the result so peers
+    can route on either with ``result.has(S.DNS_RESOLUTION_FAILED)``
+    (preferred for the auto/user routing distinction) or fall back
+    to ``result.has(S.PUSH_FAILED)`` for the unspecified-failure
+    bucket."""
+    if _is_dns_resolution_failure(exc):
+        result.add(S.DNS_RESOLUTION_FAILED)
+    result.add(S.PUSH_FAILED, error=_format_push_error(exc))
+
+
+def _count_commits_between(repo, ancestor_sha, descendant_sha):
+    """Number of commits on ``descendant_sha`` not reachable from
+    ``ancestor_sha``. 0 on equality or any walker failure."""
+    if not ancestor_sha or not descendant_sha:
+        return 0
+    if ancestor_sha == descendant_sha:
+        return 0
+    try:
+        walker = repo.get_walker(
+            include=[descendant_sha], exclude=[ancestor_sha])
+        return sum(1 for _ in walker)
+    except Exception:
+        return 0
+
+
+def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
+    """Return the SHA *n* commits forward from ``base_sha`` along the
+    chain to ``tip_sha`` (1-indexed). Used by adaptive push batching
+    to pick a partial-advance target when the full push didn't fit
+    through the network. ``n >= total_commits`` returns ``tip_sha``.
+    Any walker error returns ``tip_sha`` (safest fallback — pushing
+    the tip just retries the original full transaction)."""
+    if not base_sha or not tip_sha or base_sha == tip_sha or n <= 0:
+        return tip_sha
+    try:
+        walker = repo.get_walker(
+            include=[tip_sha], exclude=[base_sha])
+        # Walker yields newest-first; reverse so commits[0] is the
+        # immediate child of base_sha.
+        commits = [entry.commit.id for entry in walker]
+    except Exception:
+        return tip_sha
+    if not commits:
+        return tip_sha
+    commits.reverse()
+    return commits[min(n, len(commits)) - 1]
+
+
 def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     """Fetch + merge + push on an already-opened repo. Mutates
     *result* in place. Caller holds the project lock and has
@@ -1227,7 +1386,7 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             result.statuses.append(diagnose_403(token, remote_url))
             return result
         # Non-fatal: maybe remote is empty or temporarily unreachable.
-        result.add(S.PULL_FAILED, error=str(exc))
+        result.add(S.PULL_FAILED, error=_format_push_error(exc))
     lift_merge.trace('[sync-trace] fetch done')
 
     # ``repo.refs`` is ``DiskRefsContainer`` which does NOT define a
@@ -1283,52 +1442,141 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 f'conflicts={len(conflicts)}')
         except Exception as exc:
             lift_merge.trace(f'[sync-trace] merge_diverged FAILED: {exc}')
-            result.add(S.PULL_FAILED, error=f'merge failed: {exc}')
+            result.add(S.PULL_FAILED,
+                       error=f'merge failed: {_format_push_error(exc)}')
             return result
 
-    # Push, with retry loop for races (someone pushed between our
-    # fetch and our push).
-    refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
+    # Adaptive-batching push loop.
+    #
+    # Default behaviour: push the whole local in one transaction
+    # (one HTTP POST carrying the full pack). That's the historical
+    # shape and the right call when the network and remote can
+    # both handle it.
+    #
+    # Adaptation: on a network-class failure (large pack timed out
+    # mid-upload, connection dropped, DNS blipped, GitHub's
+    # git-receive-pack returned 4xx because we didn't finish in
+    # time), halve the number of commits in the next attempt.
+    # Push an intermediate SHA as ``<sha>:refs/heads/<branch>``
+    # instead of the local tip — smaller pack, finishes in less
+    # wall-clock time, more likely to fit through. Once a batch
+    # size succeeds, lock it in (``working_batch_n``) and use it
+    # for the remaining chunks until the queue drains. Inter-
+    # attempt exponential backoff (1 s → capped at 16 s) gives
+    # the network a chance to recover.
+    #
+    # We do NOT batch on the first attempt — only after a network-
+    # class failure on a multi-commit push. The fast path (small
+    # queue, healthy network) keeps its single-transaction shape
+    # and pays no extra round-trips.
+    #
+    # The merge-on-race retry (someone pushed between our fetch
+    # and our push) is preserved as a parallel branch: if the
+    # re-fetch shows the remote moved, we run the four-case
+    # ancestor logic — fast-forward / no-merge-needed / merge —
+    # then resume the adaptive loop against the (possibly new)
+    # local tip.
+    #
+    # Bounded by ``consecutive_failures``: each successful push
+    # resets the counter, so we keep going as long as we're
+    # making progress. Capped at 12 (≥ log2 of any plausible
+    # queue size, with headroom for transient retries within
+    # each chunk).
+    target_sha = local_sha
+    working_batch_n = None
+    backoff_s = 1.0
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 12
+
+    initial_to_push = _count_commits_between(repo, remote_sha, local_sha)
     lift_merge.trace(
-        f'[sync-trace] push loop begin retries={retries_remaining}')
-    while retries_remaining > 0:
-        retries_remaining -= 1
+        f'[sync-trace] push loop begin commits_to_push={initial_to_push}')
+
+    # Temp ref used to push an intermediate SHA. dulwich's
+    # ``porcelain.push`` resolves the refspec's left-hand side via
+    # ``repo.refs[lh]`` — a raw hex SHA on the lhs ``KeyError``s.
+    # Workaround: drop the SHA into a temp ref, push that ref to
+    # the remote branch, clean up. We hold ``project_lock`` for
+    # the whole loop so no concurrent caller can observe the
+    # temp ref.
+    TEMP_REF = b'refs/azt-collab/partial_push'
+
+    def _cleanup_temp_ref():
+        try:
+            del repo.refs[TEMP_REF]
+        except KeyError:
+            pass
+
+    while consecutive_failures < MAX_CONSECUTIVE_FAILURES:
+        chunk_n = _count_commits_between(repo, remote_sha, target_sha)
+        try:
+            _target_label = target_sha[:8].decode('ascii')
+        except Exception:
+            _target_label = repr(target_sha)[:10]
         lift_merge.trace(
-            f'[sync-trace] push attempt '
-            f'(retries_remaining_after={retries_remaining})')
+            f'[sync-trace] push attempt target={_target_label} '
+            f'chunk_n={chunk_n} '
+            f'consecutive_failures={consecutive_failures}')
+        # Clean any leftover temp ref from a prior iteration before
+        # we possibly write a new one (idempotent on missing ref).
+        # Then compose the refspec: full local tip uses the local
+        # branch ref directly (the historical shape); an
+        # intermediate SHA gets parked under the temp ref so
+        # dulwich can resolve the lhs.
+        _cleanup_temp_ref()
+        if target_sha == local_sha:
+            refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
+        else:
+            repo.refs[TEMP_REF] = target_sha
+            refspec = _enc(f'{TEMP_REF.decode()}:refs/heads/{branch}')
         try:
             porcelain.push(
                 repo, remote_url, refspec,
                 username=username, password=token,
                 errstream=io.BytesIO(),
             )
-            lift_merge.trace('[sync-trace] push done')
-            # Push advances the remote on GitHub but doesn't update the
-            # *local mirror* of refs/remotes/origin/<branch>. Without
-            # this set, ``_count_commits_ahead`` keeps comparing the
-            # just-pushed local SHA against the pre-push remote mirror
-            # and reports ``(+N)`` to the recorder's sync indicator
-            # even though we're fully in sync. Bumping the mirror
-            # explicitly is what ``git push`` does in CLI git too.
+            lift_merge.trace(
+                f'[sync-trace] push done (advanced {chunk_n} commits)')
+            # Advance the local mirror to the SHA we just pushed.
             try:
-                repo.refs[remote_ref] = local_sha
+                repo.refs[remote_ref] = target_sha
             except Exception as ex:
                 lift_merge.trace(
                     f'[sync-trace] post-push remote-mirror '
                     f'update failed: {ex!r}')
-            result.add(S.PUSHED, branch=branch)
-            return result
+            remote_sha = target_sha
+            consecutive_failures = 0
+            backoff_s = 1.0
+            if target_sha == local_sha:
+                # Queue cleared.
+                _cleanup_temp_ref()
+                result.add(S.PUSHED, branch=branch)
+                return result
+            # More commits to push. Lock in the batch size that
+            # worked (first successful chunk sets ``working_batch_n``;
+            # subsequent chunks reuse it). Pick the next target.
+            if working_batch_n is None:
+                working_batch_n = chunk_n
+                lift_merge.trace(
+                    f'[sync-trace] batch size locked at '
+                    f'{working_batch_n}')
+            target_sha = _pick_intermediate_sha(
+                repo, remote_sha, local_sha, working_batch_n)
+            continue
         except Exception as exc:
             lift_merge.trace(f'[sync-trace] push raised: {exc!r}')
             if _is_http_403(exc):
+                _cleanup_temp_ref()
                 result.statuses.append(diagnose_403(token, remote_url))
                 return result
-            if retries_remaining <= 0:
-                result.add(S.PUSH_FAILED, error=str(exc))
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                _cleanup_temp_ref()
+                _add_push_failure(result, exc)
                 return result
-            # Try to fetch + remerge once more. Use the remote NAME
-            # so dulwich updates ``refs/remotes/origin/<branch>`` —
-            # see the rationale above the initial fetch call.
+            # Re-fetch first — if the remote actually moved,
+            # this isn't a network-class failure but a race with
+            # another peer's push. Different recovery path.
             try:
                 porcelain.fetch(
                     repo, 'origin',
@@ -1336,37 +1584,132 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                     errstream=io.BytesIO(),
                 )
                 new_remote = _read_ref(remote_ref)
-                lift_merge.trace(
-                    f'[sync-trace] retry fetch new_remote={new_remote!r} '
-                    f'local_sha={local_sha!r}')
-                if (new_remote
-                        and new_remote != local_sha
-                        and not _is_ancestor(repo, local_sha, new_remote)
-                        and not _is_ancestor(repo, new_remote, local_sha)):
-                    # Truly diverged — fetch brought commits we don't
-                    # have AND our local has commits the remote doesn't.
-                    # Pre-fix the second ``not _is_ancestor`` check was
-                    # missing, so the "remote is already an ancestor of
-                    # local" case (e.g. a transient push rejection that
-                    # the retry fetched into a stale ref state)
-                    # produced a no-op merge commit — two parents, zero
-                    # files changed — cluttering history with
-                    # `Merge origin/main into main` commits that
-                    # didn't actually merge anything.
-                    merged_sha, _ = _merge_diverged(
-                        repo, project_dir, branch, local_sha, new_remote)
-                    lift_merge.trace(
-                        f'[sync-trace] retry merge done '
-                        f'merged_sha={merged_sha!r}')
-                    local_sha = merged_sha
-                else:
-                    lift_merge.trace(
-                        '[sync-trace] retry fetch: no merge needed '
-                        f'(new_remote ancestor relationship makes '
-                        f'merge a no-op)')
             except Exception as ex:
                 lift_merge.trace(
-                    f'[sync-trace] retry fetch/merge failed: {ex!r}')
+                    f'[sync-trace] retry fetch failed: {ex!r}')
+                new_remote = remote_sha
+            lift_merge.trace(
+                f'[sync-trace] retry fetch new_remote={new_remote!r} '
+                f'remote_sha={remote_sha!r} local_sha={local_sha!r}')
+            non_ff = _is_non_ff_rejection(exc)
+            # Reconcile when EITHER the fetch revealed a moved remote
+            # (race with a concurrent pusher) OR the rejection itself
+            # is a non-fast-forward (the server has something we
+            # don't, regardless of whether our refs/remotes mirror
+            # caught up yet — fetch may have already brought the
+            # new tip down on a prior iteration). Require
+            # ``new_remote`` truthy in both branches so the
+            # ancestor checks below have a real SHA to walk — the
+            # ``or non_ff`` extension would otherwise let us
+            # enter with ``new_remote=None`` on a freshly-cloned
+            # repo with no tracking ref written yet, and the
+            # ancestor walker would raise.
+            if new_remote and ((new_remote != remote_sha) or non_ff):
+                # Four cases — disjoint structure:
+                # remote==local nothing to do, remote-is-ancestor
+                # local still ahead, local-is-ancestor remote
+                # advanced (fast-forward), otherwise diverged
+                # (merge). Field log 2026-05-18 showed that
+                # missing the second ancestor check produced no-op
+                # merge commits cluttering history.
+                #
+                # The equal-local-new_remote branch claims PUSHED
+                # for BOTH race and non-FF triggers: in both cases
+                # the server's view of ``branch`` matches our local
+                # tip, so we're in sync regardless of how we got
+                # here. (0.43.13 had a "bail with PUSH_FAILED if
+                # non_ff" guard here that turned a real adaptive-
+                # batching recovery — target_sha was an ancestor
+                # of a server that had concurrently advanced to
+                # local_sha — into a spurious failure. Removed in
+                # 0.43.16.)
+                if local_sha == new_remote:
+                    # Already in sync — the failed push was
+                    # spurious (e.g. server saw it succeed
+                    # then dropped our connection before ack)
+                    # OR adaptive-batching pushed an ancestor of
+                    # what the server already holds.
+                    _cleanup_temp_ref()
+                    repo.refs[remote_ref] = new_remote
+                    remote_sha = new_remote
+                    result.add(S.PUSHED, branch=branch)
+                    return result
+                if _is_ancestor(repo, new_remote, local_sha):
+                    lift_merge.trace(
+                        '[sync-trace] retry: local still ahead — '
+                        'push retry only')
+                    remote_sha = new_remote
+                elif _is_ancestor(repo, local_sha, new_remote):
+                    lift_merge.trace(
+                        '[sync-trace] retry: remote advanced; '
+                        'fast-forward local')
+                    _cleanup_temp_ref()
+                    prev_local_sha = local_sha
+                    repo.refs[branch_ref] = new_remote
+                    _apply_tree_to_workdir(
+                        repo, project_dir, prev_local_sha, new_remote)
+                    local_sha = new_remote
+                    remote_sha = new_remote
+                    result.add(S.PUSHED, branch=branch)
+                    return result
+                else:
+                    lift_merge.trace(
+                        '[sync-trace] retry: diverged; merging')
+                    try:
+                        merged_sha, _ = _merge_diverged(
+                            repo, project_dir, branch,
+                            local_sha, new_remote)
+                        local_sha = merged_sha
+                        remote_sha = new_remote
+                        lift_merge.trace(
+                            f'[sync-trace] retry merge done '
+                            f'merged_sha={merged_sha!r}')
+                    except Exception as ex:
+                        lift_merge.trace(
+                            f'[sync-trace] retry merge failed: {ex!r}')
+                        _cleanup_temp_ref()
+                        _add_push_failure(result, ex)
+                        return result
+                # Resume the adaptive loop fresh: new commit
+                # chain → don't carry the prior batch size.
+                target_sha = local_sha
+                working_batch_n = None
+                backoff_s = 1.0
+                continue
+            # Remote unchanged. Genuine network-class failure (or
+            # unfamiliar exception). Back off, then decide whether
+            # to halve.
+            time.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, 16.0)
+            if not _is_network_push_failure(exc):
+                # Unfamiliar exception — don't halve (might mask
+                # a real bug); retry at the same target after the
+                # backoff. If it keeps failing,
+                # ``consecutive_failures`` bottoms out and we bail.
+                lift_merge.trace(
+                    '[sync-trace] retry at same target_sha '
+                    '(non-network exception)')
+                continue
+            if chunk_n <= 1:
+                # Already pushing one commit at a time and it
+                # still doesn't fit through. No more shrinking
+                # possible — fail out.
+                lift_merge.trace(
+                    '[sync-trace] retry: at minimum chunk_n=1, '
+                    'network failure persists — giving up')
+                _cleanup_temp_ref()
+                _add_push_failure(result, exc)
+                return result
+            new_n = max(1, chunk_n // 2)
+            lift_merge.trace(
+                f'[sync-trace] retry: halving chunk_n '
+                f'{chunk_n} → {new_n}')
+            target_sha = _pick_intermediate_sha(
+                repo, remote_sha, local_sha, new_n)
+            # Until we find a working size, don't lock it in.
+            working_batch_n = None
+            continue
+    _cleanup_temp_ref()
     return result
 
 
@@ -1744,6 +2087,6 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
         if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
         else:
-            result.add(S.PUSH_FAILED, error=str(exc))
+            _add_push_failure(result, exc)
 
     return result

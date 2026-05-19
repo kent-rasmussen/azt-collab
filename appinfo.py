@@ -10,4 +10,4 @@ APP_SLUG = 'azt-collaboration'             # URL/package slug
 APP_TAGLINE = 'Collaborate With Others'    # shown on welcome screen & window title
 APP_USER_AGENT = 'AZTCollaboration'        # HTTP User-Agent prefix (no spaces)
 APP_ICON = 'server_apk/icons/icon.png'        # some day will be subject to theme
-FILE_W_VERSION = 'azt_collabd/__init__.py'  # So others can find the canonical version without importing
+FILE_W_VERSION = 'azt_collab_client/__init__.py'  # Single source of truth: see comment in azt_collabd/__init__.py

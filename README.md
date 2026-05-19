@@ -115,6 +115,54 @@ entries 0.6.0 → 0.8.0.
   `check_server_compat()` is the one-shot probe that tells a peer
   whether to surface "Please update the AZT Collaboration service".
 
+## DNS resilience — DoH fallback
+
+Bad-internet resilience is a primary requirement of the suite. Field
+deployments routinely sit on networks where the browser keeps working
+but `dulwich` can't resolve `github.com`: per-app data restrictions,
+captive-portal Wi-Fi in a half-authenticated state, mis-configured
+system Private DNS, IPv6-only carriers without DNS64, stale negative
+caches after a brief outage. The user sees no internet problem and
+assumes the app is broken.
+
+The daemon installs a **DoH fallback resolver** at first network use
+(`azt_collabd/net.py:_patch_resolver`). The shape is:
+
+- `socket.getaddrinfo` is monkey-patched. The system resolver runs
+  **first**, unchanged. On a healthy network the patch is a passthrough.
+- On `socket.gaierror`, the patch issues one DNS-over-HTTPS query to
+  Cloudflare at the literal IP `https://1.1.1.1/dns-query` (the cert
+  there carries `1.1.1.1` as a Subject Alt Name, so TLS validates
+  against the bundled certifi roots without itself needing DNS). Both
+  `A` and `AAAA` records are queried. Results are cached for 5 minutes
+  keyed by `(host, port)`.
+- The fallback is gated on the lookup looking like a hostname — numeric
+  IPs and AF_UNIX-style paths bypass — and it never substitutes a
+  result for the system answer; if the system resolver returns an
+  empty-but-valid answer, the DoH path doesn't run.
+- The path used for the most recent lookup is exposed at
+  `azt_collabd.net.resolver_state()` (`'system' | 'doh' | 'fail' |
+  'unknown'`). The scheduler's connectivity watcher logs this on each
+  offline → online edge so a developer reading a field log can tell
+  whether the DoH path was load-bearing for the session.
+
+Why this is a fallback rather than a replacement: a system resolver
+that's working correctly is the right answer (it honors the user's
+Private DNS choice, corporate split-tunnel, etc.). The DoH path is
+only the right answer when the system path is broken for reasons
+specific to this app's resolver context. The patched wrapper preserves
+both invariants.
+
+What this does **not** do: it doesn't fix networks that are genuinely
+offline, doesn't bypass per-app firewalls that block port 443 outbound
+(we still need to actually reach Cloudflare), and doesn't catch the
+case where DNS succeeds but the resulting IP is unreachable. Those
+remain visible as `PUSH_FAILED` on the next sync attempt. When *both*
+system DNS and the DoH fallback fail for the same hostname, the daemon
+additionally emits `S.DNS_RESOLUTION_FAILED` on the result so peers
+can route it to a distinct (auto-sync-silent) user message instead of
+the generic push-failed bucket.
+
 ## Setting up a new sister app
 
 Assumes you have a sibling directory `../my-sister-app/` already
@@ -416,6 +464,7 @@ translated strings.
 | `INITIALIZED`, `ALREADY_INITIALIZED`, `REMOTE_SET`, `REMOTE_UPDATED` | init outcomes |
 | `NOT_A_REPO`, `NO_REMOTE` | project setup incomplete |
 | `AUTH_REQUIRED`, `APP_NOT_INSTALLED`, `REPO_NOT_AUTHORIZED`, `ACCESS_DENIED` | credentials problem (translate for the user) |
+| `DNS_RESOLUTION_FAILED` | both system DNS and the DoH fallback failed for the sync host. Auto-sync should route silently; user-initiated Sync surfaces an informational toast (no navigation). See *DNS resilience* above. |
 | `AUTH_EXPIRED`, `AUTH_DENIED`, `AUTH_TIMEOUT` | device-flow outcomes |
 | `CONFLICTS` | merge had conflicts; entries flagged with `<annotation name="azt-lift-conflict">`. `result.has(S.CONFLICTS)` carries `paths` param. |
 | `BUSY` | another op holds the per-project lock |

@@ -283,8 +283,25 @@ def share_log_file(log_path, prev_path=None, on_error=None,
 
 def _bundle_log_blob(log_path, prev_path):
     """Read current + previous log files and join into one
-    text/plain blob. Empty string when neither file has content."""
+    text/plain blob. Empty string when neither file has content.
+
+    Decorates the current-session header with the running daemon
+    version (read from ``$AZT_HOME/server.json``) so a tester's
+    emailed log carries an unambiguous "what produced this" tag
+    without grepping the body. Silent on miss — the header drops
+    back to the path-only form."""
     import os as _os
+    import json as _json
+    ver_tag = ''
+    try:
+        from .. import paths as _paths
+        sjp = _os.path.join(_paths.azt_home(), 'server.json')
+        with open(sjp, 'r', encoding='utf-8') as f:
+            v = str(_json.load(f).get('version', '')).strip()
+        if v:
+            ver_tag = f' [daemon {v}]'
+    except (OSError, ValueError, Exception):
+        pass
     parts = []
     if prev_path and _os.path.isfile(prev_path):
         try:
@@ -306,7 +323,7 @@ def _bundle_log_blob(log_path, prev_path):
             cur = ''
         if cur:
             parts.append(
-                f'=== current session ({log_path}) ===\n'
+                f'=== current session ({log_path}){ver_tag} ===\n'
                 f'{cur}\n')
     return '\n'.join(parts)
 

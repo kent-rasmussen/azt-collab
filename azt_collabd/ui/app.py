@@ -436,6 +436,16 @@ KV_TEMPLATE = '''
                     opacity: 1 if root.back_to else 0
                     disabled: not root.back_to
                     on_press: app.go(root.back_to) if root.back_to else None
+                # ── Interface language ─────────────────────────────────
+                # Language switcher at the very top, no section header
+                # — the row of language-name buttons is self-evident.
+                # Populated by _build_lang_selector() from the
+                # azt_collab_client catalog discovery.
+                BoxLayout:
+                    id: lang_selector_row
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
                 # ── Share + Update ─────────────────────────────────────
                 # Two utility actions on one row, half-width each.
                 # Share is a no-op on desktop (surfaces a translated
@@ -453,13 +463,6 @@ KV_TEMPLATE = '''
                         text: _('Share')
                         normal_color: T.SURFACE
                         on_press: app.share_apk()
-                        # Icon as a left-overlay; the button keeps
-                        # its centered "Share" text. Half-width
-                        # geometry means we don't need
-                        # ``padding: [dp(52), 0]`` to clear room —
-                        # the icon at ``x: self.parent.x + dp(12)``
-                        # sits inside the bounds without colliding
-                        # with the short single-word label.
                         Image:
                             source: SHARE_ICON
                             size_hint: None, None
@@ -478,13 +481,6 @@ KV_TEMPLATE = '''
                     size_hint_y: None
                     height: dp(20)
                 SectionLabel:
-                    text: _('Interface language')
-                BoxLayout:
-                    id: lang_selector_row
-                    size_hint_y: None
-                    height: dp(40)
-                    spacing: dp(8)
-                SectionLabel:
                     text: _('Your name (appears in commits)')
                 ThemedInput:
                     id: contributor_input
@@ -499,6 +495,19 @@ KV_TEMPLATE = '''
                     # warning isn't truncated when it appears.
                     height: self.texture_size[1] + dp(4)
                     text_size: self.width, None
+                # ── Servers ────────────────────────────────────────────
+                # All sync-target / on-the-wire-toggle controls live
+                # under one header. The two host-credential buttons
+                # are state-aware (refresh() flips Connect ↔ Settings
+                # based on gh/gl.confirmed); Publish is conditional
+                # on the most-recent project lacking a remote; Work
+                # offline is the daemon-wide push-suppression toggle;
+                # Cache images is the CAWL prefetch-eagerness toggle
+                # (a server-side decision but exposed here as part of
+                # the same "what does the daemon do on the network"
+                # group).
+                SectionLabel:
+                    text: _('Servers')
                 # GitHub: a single state-aware button. ``refresh()``
                 # flips the label between "Connect to GitHub" (until
                 # verified) and "GitHub Settings" (once verified).
@@ -548,6 +557,63 @@ KV_TEMPLATE = '''
                         color: T.TEXT_DIM
                         size_hint_y: None
                         height: dp(20)
+                # Work-offline toggle (0.43.0). When on, the
+                # connectivity watcher's push-drain is a no-op
+                # and the user-gestured Sync button returns
+                # ``S.WORK_OFFLINE_ENABLED`` (peers route to
+                # this screen). Commits via commit_project are
+                # unaffected — local work still groups into
+                # commits; only the push half is suppressed.
+                # Toggling OFF fires an immediate drain
+                # server-side so the user doesn't wait a full
+                # connectivity_poll_s tick for pending commits
+                # to push.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Work offline:')
+                        size_hint_x: None
+                        width: dp(160)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: work_offline_yes_btn
+                        text: _('yes')
+                        on_press: root.set_work_offline_mode(True)
+                    RecBtn:
+                        id: work_offline_no_btn
+                        text: _('no')
+                        on_press: root.set_work_offline_mode(False)
+                # Cache images — daemon-side CAWL prefetch policy.
+                # Default is one image per CAWL line (the preferred
+                # ``__`` variant); peers can still on-demand-fetch
+                # other variants as the user navigates to them.
+                # Flipping to "all" warms every variant in the index
+                # — heavier on network / disk but useful when
+                # bandwidth is cheap and the user wants the broader
+                # set available offline.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Cache images:')
+                        size_hint_x: None
+                        width: dp(160)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: cawl_variants_one_btn
+                        text: _('1 per line')
+                        on_press: root.set_cawl_prefetch_mode(False)
+                    RecBtn:
+                        id: cawl_variants_all_btn
+                        text: _('all')
+                        on_press: root.set_cawl_prefetch_mode(True)
                 # Project actions for an already-published project:
                 # invite a GitHub collaborator. Gated on
                 # ``refresh()`` finding a last_project with a remote
@@ -616,84 +682,6 @@ KV_TEMPLATE = '''
                 NavBtn:
                     text: _('Refresh Status')
                     on_press: root.refresh()
-                # Wordlist-image-cache policy. Default is one image
-                # per CAWL line (the preferred ``__`` variant); peers
-                # can still on-demand-fetch other variants as the
-                # user navigates to them. Flipping to "all" warms
-                # every variant in the index — heavier on network /
-                # disk but useful when bandwidth is cheap and the
-                # user wants the broader set available offline.
-                #
-                # Section label is filled at refresh time with the
-                # active wordlist name (derived from the active
-                # project's image_repo slug) so a user juggling
-                # multiple projects can see which wordlist this
-                # toggle affects.
-                SectionLabel:
-                    id: cawl_section_label
-                    text: _('Wordlist images')
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(8)
-                    BodyLabel:
-                        text: _('Cache images:')
-                        size_hint_x: None
-                        width: dp(120)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: self.size
-                    RecBtn:
-                        id: cawl_variants_one_btn
-                        text: _('1 per line')
-                        on_press: root.set_cawl_prefetch_mode(False)
-                    RecBtn:
-                        id: cawl_variants_all_btn
-                        text: _('all')
-                        on_press: root.set_cawl_prefetch_mode(True)
-                Widget:
-                    size_hint_y: None
-                    height: dp(8)
-                # Work-offline toggle (0.43.0). When on, the
-                # connectivity watcher's push-drain is a no-op
-                # and the user-gestured Sync button returns
-                # ``S.WORK_OFFLINE_ENABLED`` (peers route to
-                # this screen). Commits via commit_project are
-                # unaffected — local work still groups into
-                # commits; only the push half is suppressed.
-                # Toggling OFF fires an immediate drain
-                # server-side so the user doesn't wait a full
-                # connectivity_poll_s tick for pending commits
-                # to push.
-                SectionLabel:
-                    id: work_offline_label
-                    text: _('Work offline')
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(8)
-                    BodyLabel:
-                        text: _('Suppress push:')
-                        size_hint_x: None
-                        width: dp(160)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: self.size
-                    RecBtn:
-                        id: work_offline_yes_btn
-                        text: _('yes')
-                        on_press: root.set_work_offline_mode(True)
-                    RecBtn:
-                        id: work_offline_no_btn
-                        text: _('no')
-                        on_press: root.set_work_offline_mode(False)
-                BodyLabel:
-                    id: work_offline_status
-                    text: ''
-                    color: T.TEXT_DIM
-                    size_hint_y: None
-                    height: self.texture_size[1] + dp(4)
-                    text_size: self.width, None
                 Widget:
                     size_hint_y: None
                     height: dp(8)
@@ -733,11 +721,6 @@ KV_TEMPLATE = '''
                         text: _('Share daemon log')
                         normal_color: T.SURFACE
                         on_press: root.share_daemon_log()
-                    RecBtn:
-                        id: daemon_log_email_btn
-                        text: _('Email daemon log')
-                        normal_color: T.SURFACE
-                        on_press: root.email_daemon_log()
                 BodyLabel:
                     id: daemon_log_status
                     text: ''
@@ -747,28 +730,17 @@ KV_TEMPLATE = '''
                 Widget:
                     size_hint_y: None
                     height: dp(8)
-                # Debug section — only purpose is to let testers
-                # exercise the bootstrap "AZT Collaboration not
-                # responding" popup without a debug-signed APK
-                # (which run-as would otherwise require for
-                # planting the sentinel from adb). Toggling creates
-                # / removes ``$AZT_HOME/_debug_force_503``;
-                # ``_h_health`` returns 503 while the sentinel
-                # exists. Always visible — production users
-                # tapping it just see "service unavailable" until
-                # they tap again.
-                SectionLabel:
-                    text: _('Debug (testing)')
-                NavBtn:
-                    id: debug_503_btn
-                    text: _('Toggle "service not responding"')
-                    on_press: root.toggle_debug_503()
-                BodyLabel:
-                    id: debug_503_state
-                    text: ''
-                    color: T.TEXT_DIM
-                    size_hint_y: None
-                    height: dp(20)
+                # Debug "force /v1/health to 503" sentinel — the UI
+                # surface is removed for now (was clutter for normal
+                # users). The daemon-side mechanics stay in
+                # ``server.py:_h_health`` so a tester can still
+                # plant the sentinel via adb:
+                #     adb shell run-as org.atoznback.aztcollab \
+                #         touch files/azt/_debug_force_503
+                # The ``toggle_debug_503`` / ``_debug_503_path`` /
+                # ``_refresh_debug_503_state`` methods on
+                # SettingsScreen are kept around as a REPL-callable
+                # convenience for future UI re-enablement.
                 Widget:
                     size_hint_y: None
                     height: dp(8)
@@ -1246,6 +1218,18 @@ class SettingsScreen(Screen):
         Clock.schedule_once(
             lambda dt: setattr(sm, 'transition', old_transition), 0.1)
 
+    def _retry_refresh_credentials(self):
+        """One-shot follow-up refresh after a cold-start
+        ``get_credentials_status`` returned the daemon-unreachable
+        fallback. Clears the flag before calling so a subsequent
+        screen entry can trigger its own retry chain. We only
+        re-run when the screen is still current, otherwise we'd
+        wake an off-screen settings page."""
+        self._credentials_retry_scheduled = False
+        if self.manager is None or self.manager.current != self.name:
+            return
+        self.refresh()
+
     def refresh(self):
         # Debug-section indicator stays in sync regardless of
         # whether status fetching succeeded.
@@ -1265,16 +1249,40 @@ class SettingsScreen(Screen):
             self._refresh_cawl_variants_state()
         except Exception:
             pass
+        # Split the two RPCs so a transient ``is_online`` failure
+        # doesn't skip the GitHub/GitLab button update — pre-fix,
+        # any exception in the combined try block bailed before
+        # the button text was set, leaving "Connect to GitHub" on
+        # screen even when credentials were confirmed. Field
+        # symptom: button state on first open of the settings page
+        # was inconsistent across launches; the buttons reflected
+        # the daemon answer only when *both* RPCs happened to
+        # succeed in this single try.
         try:
             status = get_credentials_status()
-            online = is_online()
         except Exception as ex:
             label = self.ids.get('status_label')
             if label is not None:
                 label.text = _tr('Error: {error}').format(error=ex)
-            return
+            status = {}
+        try:
+            online = is_online()
+        except Exception:
+            online = False
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
+        # ``get_credentials_status`` returns a ServerUnavailable
+        # fallback dict (no ``confirmed`` field) when the daemon
+        # isn't yet reachable. Detect that and reschedule one
+        # refresh so the button reflects reality once the daemon
+        # finishes booting. Guarded by a flag so we don't loop
+        # forever if the daemon really is gone — a single retry
+        # is enough to cover the cold-start race.
+        if 'confirmed' not in gh and not getattr(
+                self, '_credentials_retry_scheduled', False):
+            self._credentials_retry_scheduled = True
+            Clock.schedule_once(
+                lambda _dt: self._retry_refresh_credentials(), 1.5)
         # GitHub: single state-aware button. We gate on ``confirmed``
         # rather than ``connected`` because a half-finished setup
         # (token saved but App not yet installed / Verify not yet
@@ -1676,30 +1684,15 @@ class SettingsScreen(Screen):
     def share_daemon_log(self):
         """Dispatch the daemon log through Android's share sheet —
         any app that handles ``text/plain`` (email, messaging,
-        file-saver, cloud-paste) accepts it."""
-        self._dispatch_daemon_log('share')
-
-    def email_daemon_log(self):
-        """Open the user's email composer pre-filled with the
-        daemon log. ``ACTION_SENDTO`` restricts the picker to
-        email apps only — better UX than the generic share sheet
-        when the user's intent is specifically "send this to the
-        developer". No recipient pre-filled; user picks."""
-        self._dispatch_daemon_log('email')
-
-    def _dispatch_daemon_log(self, channel):
-        """Shared scaffolding for share/email of the daemon log.
-        Pulls the log path + content + state via RPC, validates
-        the toggle is on + there's content, then delegates to
-        the appropriate share helper in
-        ``azt_collab_client.ui.share``.
-
-        Channel ``'share'`` uses ``share_log_file`` (MediaStore
-        + ``EXTRA_STREAM``, supports arbitrarily large logs and
-        attaches as a real file). Channel ``'email'`` uses
-        ``email_text`` (``mailto:`` URI body — kilobyte limit,
-        but the email-only picker is the right UX for "send to
-        the developer")."""
+        file-saver, cloud-paste) accepts it, so the user can pick
+        their email app from the chooser when the destination is
+        email. (A dedicated Email button used to live next to this
+        one and called ``email_text`` with the log inlined into a
+        ``mailto:`` URI body; that path was strictly worse — log
+        text truncated to the daemon's 256 KB RPC cap, no
+        ``[daemon X.Y.Z]`` session-header tag, and at risk of being
+        further truncated by mailto-URI size limits. Removed in
+        0.43.17.)"""
         status = self.ids.get('daemon_log_status')
         data = get_daemon_log()
         if data is None:
@@ -1717,15 +1710,17 @@ class SettingsScreen(Screen):
             if status is not None:
                 status.text = msg
 
-        if channel == 'email':
-            from azt_collab_client.ui.share import email_text
-            ok = email_text(text=data['log'], to='',
-                            subject=_tr('AZT daemon log'),
+        from azt_collab_client.ui.share import share_log_file
+        # Pass ``<log>.prev`` so the previous toggle-on session
+        # (preserved via the daemon-side rotate-on-truncate added
+        # in 0.43.18) ships alongside the current one under a
+        # ``=== previous session === / === current session ===``
+        # section break. ``share_log_file`` silently skips the
+        # previous section when the path doesn't exist (first run
+        # after toggle-on, no prior file to rotate).
+        ok = share_log_file(log_path=data['log_path'],
+                            prev_path=data['log_path'] + '.prev',
                             on_error=_on_err)
-        else:
-            from azt_collab_client.ui.share import share_log_file
-            ok = share_log_file(log_path=data['log_path'],
-                                on_error=_on_err)
         if ok and status is not None:
             status.text = _tr(
                 'Sending {bytes_n} bytes of daemon log…'
@@ -3040,10 +3035,14 @@ class CollabUIApp(App):
     title = 'A-Z+T Collab'
     subtitle = StringProperty('Settings')
     icon = StringProperty(_AZT_ICON)
+    # Initialized to ``client X · server ?`` and updated by
+    # _probe_server_version() once the daemon answers /v1/health.
+    # Showing ``azt_collabd.__version__`` here would be the
+    # *compile-time* version of the UI subprocess, not the actual
+    # daemon it's talking to — misleading whenever the user has
+    # updated one half without the other.
     version_string = StringProperty(
-        f'client {azt_collab_client.__version__}'
-        f'  ·  '
-        f'server {azt_collabd.__version__ if hasattr(azt_collabd, "__version__") else ""}'
+        f'client {azt_collab_client.__version__}  ·  server ?'
     )
 
     def build(self):
@@ -3062,6 +3061,46 @@ class CollabUIApp(App):
         from inside the connect flow where they're mid-setup."""
         from kivy.core.window import Window
         Window.bind(on_keyboard=self._on_back_button)
+        # Probe the running daemon's version off the UI thread so the
+        # bottom strip reflects what's actually answering, not the
+        # version this UI subprocess was compiled at.
+        import threading
+        threading.Thread(target=self._probe_server_version,
+                         daemon=True).start()
+
+    def _probe_server_version(self):
+        """Ask the daemon what version it is via /v1/health (the
+        only endpoint that doesn't require auth) and render it into
+        ``version_string``. Mirrors the picker-app probe so users
+        see the same ``client X · server Y`` strip in both UIs."""
+        try:
+            compat = azt_collab_client.check_server_compat()
+            err = ''
+        except Exception as ex:
+            compat = {}
+            err = f'{type(ex).__name__}: {ex}'
+        if isinstance(compat, dict):
+            sv = compat.get('server_version') or ''
+            ce = compat.get('error') or ''
+            cd = compat.get('detail') or ''
+        else:
+            sv = ''
+            ce = ''
+            cd = ''
+        if sv:
+            label = f'server {sv}'
+        elif err:
+            label = f'server ? ({err[:60]})'
+        elif ce:
+            label = (f'server ? ({ce}: {cd[:60]})' if cd
+                     else f'server ? ({ce})')
+        else:
+            label = 'server ?'
+        Clock.schedule_once(
+            lambda dt: setattr(
+                self, 'version_string',
+                f'client {azt_collab_client.__version__}  ·  {label}'),
+            0)
 
     def _on_back_button(self, _window, key, *_args):
         """Android key 27 = hardware back. Returns True to consume.
