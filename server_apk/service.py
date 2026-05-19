@@ -173,6 +173,28 @@ def main():
     _boot_trace('before_import_azt_collabd')
     import azt_collabd
     _boot_trace('after_import_azt_collabd')
+
+    # Install the daemon-log-to-file tee here on the Android side.
+    # The desktop loopback path covers itself via ``server.run()``
+    # which calls ``maybe_install_stdio_tee`` directly, but on
+    # Android the daemon lives in ``:provider`` and ``server.run()``
+    # never executes — so without this call, the user's persisted
+    # "Save daemon log to file" toggle would only ever take effect
+    # via the runtime POST endpoint (which patches the running
+    # process), and a daemon respawn after an idle-stop would lose
+    # the mirror until the user re-touched the toggle. Calling here
+    # rather than at module load lets us reach
+    # ``azt_collabd.store.get_daemon_log_to_file`` (the import
+    # above just landed) and means subsequent ``_boot_trace`` lines
+    # (``configured``, ``before_install_callbacks``, …) and every
+    # ``[recent]`` / ``[cawl]`` / ``[commit-*]`` print from the
+    # running daemon both land in the on-disk log.
+    try:
+        from azt_collabd.server import maybe_install_stdio_tee
+        maybe_install_stdio_tee()
+    except Exception as ex:
+        print(f'[service] daemon-log tee install skipped: {ex}',
+              flush=True)
     azt_collabd.configure(
         app_slug=os.environ.get('AZT_GITHUB_APP_SLUG',
                                 'azt-collaboration'),

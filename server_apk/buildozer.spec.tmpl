@@ -91,9 +91,13 @@ source.exclude_patterns =
     azt_collabd/data/cawl/generate_seed.py
 
 version.regex = __version__ = ['"](.*)['"]
-# This buildozer is running in a subdirectory of the azt-collab package,
-# so pulls from a sibling without leaving the repository
-version.filename = %(source.dir)s/../azt_collabd/__init__.py
+# Single source of truth for the suite version: see the comment block
+# at the top of ``azt_collabd/__init__.py``. The literal ``__version__
+# = "X.Y.Z"`` lives in ``azt_collab_client/__init__.py``; the daemon
+# re-exports it. Buildozer reads the literal from the client package
+# so the APK version is unambiguously the one place both Python
+# imports resolve to.
+version.filename = %(source.dir)s/../azt_collab_client/__init__.py
 
 requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3,typing_extensions,segno
 # segno: pure-Python QR-code generator (~50 KB, no native deps).
