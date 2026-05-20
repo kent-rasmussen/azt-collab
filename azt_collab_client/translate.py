@@ -222,6 +222,7 @@ _HANDLERS = {
     # Transport-layer synthetics from the client (not emitted by the backend)
     'SERVER_UNAVAILABLE':     lambda p: _fmt(_tr('Sync service unavailable: {error}'), p),
     'SERVER_ERROR':           lambda p: _fmt(_tr('Sync service error: {error}'), p),
+    'RESTARTING':             lambda p: _tr('Sync service is restarting…'),
 }
 
 

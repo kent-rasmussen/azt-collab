@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.43.20"
+__version__ = "0.43.21"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1721,6 +1721,43 @@ def get_daemon_log():
     }
 
 
+def restart_server():
+    """Ask the daemon to restart itself.
+
+    Daemon returns OK and then, after a short delay so the response
+    can flush, exits — on desktop the process re-execs into
+    ``python -m azt_collabd``; on Android the ``:provider`` process
+    exits and Android's ContentProvider auto-spawn revives it on
+    the next peer call. Caller sees ``Result`` with one of:
+
+    * ``RESTARTING`` (informational): the daemon accepted the request
+      and the restart is in flight. The next RPC from this peer will
+      land on a fresh daemon (loopback transport prints a single
+      ``SERVICE_RESTARTED`` line; ContentProvider transparently
+      lazy-spawns).
+    * ``SERVER_UNAVAILABLE``: no daemon was reachable to accept the
+      request in the first place.
+    * ``SERVER_ERROR``: the daemon returned a non-OK response.
+
+    The wrapper itself never raises — UI code can call it from any
+    button handler without try/except, consistent with the
+    query-shaped-wrapper rule in ``azt_collab_client/CLAUDE.md``.
+    Caller should typically follow with a short delay + a
+    ``health()`` check to confirm the new daemon is up before
+    re-invoking other RPCs."""
+    try:
+        resp = call('POST', '/v1/admin/restart', {})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result(statuses=[Status('RESTARTING', {
+            'transport': resp.get('transport') or 'unknown',
+        })])
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 def atomic_finalize_pending(langcode, rel_path, token):
     """Phase 2 of the two-phase atomic write: rename the daemon's
     scratch file at ``<working_dir>/.azt_atomic_pending/<token>``
@@ -1851,6 +1888,7 @@ __all__ = [
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
     'set_daemon_log_to_file', 'get_daemon_log',
+    'restart_server',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
     'set_cawl_image_repo', 'set_repo_slug',
     'record_project_sync_time', 'grant_collaborator',

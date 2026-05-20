@@ -164,6 +164,11 @@ CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 # codes recognise them as known constants.
 SERVER_UNAVAILABLE = 'SERVER_UNAVAILABLE'
 SERVER_ERROR = 'SERVER_ERROR'
+# Returned by ``restart_server()`` after a successful
+# ``POST /v1/admin/restart``. Informational — the daemon accepted
+# the request and the restart is in flight. params: ``transport``
+# = ``'desktop' | 'android' | 'unknown'``.
+RESTARTING = 'RESTARTING'
 
 
 @dataclass

@@ -1890,6 +1890,85 @@ def _h_get_daemon_log(_body):
                  "enabled": store.get_daemon_log_to_file()}
 
 
+def _h_admin_restart(_body):
+    """``POST /v1/admin/restart`` — restart the daemon process.
+
+    Responds OK immediately and then, after a short delay so the HTTP
+    response can flush, terminates the current daemon process. The
+    next client RPC re-discovers the daemon:
+
+    * **Desktop loopback**: ``os.execv`` replaces the current process
+      image with a fresh ``python -m azt_collabd``. The new process
+      inherits the env (PYTHONPATH, AZT_HOME, etc.) and re-acquires
+      ``server.lock``, writes a new ``server.json`` (new pid + token),
+      so clients see ``SERVICE_RESTARTED`` on their next call.
+    * **Android ``:provider``**: ``os._exit(0)`` exits the process.
+      Android's ``ContentProvider`` contract lazy-spawns a fresh
+      ``:provider`` process on the next peer ``ContentResolver``
+      call, and ``Service.onCreate`` re-runs ``service.py`` which
+      calls ``reconcile_on_startup()`` to flip in-flight jobs to
+      ``JOB_INTERRUPTED``.
+
+    Returns ``{"ok": True, "restarting": True, "transport": "desktop"
+    | "android"}``. The ``transport`` hint lets the caller surface
+    "Restarting…" UI appropriate to the platform; on Android the
+    process is gone within the second, on desktop the re-exec can
+    take a few seconds while the new interpreter boots.
+
+    Auth: callers must already have ``Authorization: Bearer <token>``
+    (this is in the standard authenticated POST set, not in
+    ``UNAUTHENTICATED_PATHS``). On Android the ContentProvider
+    transport enforces the signature-level
+    ``AZT_COLLAB_ACCESS`` permission, so peer apps can call this iff
+    they're suite-signed — there's no admin-token concept on top of
+    that.
+    """
+    is_android = _on_android()
+    transport_label = 'android' if is_android else 'desktop'
+
+    def _restart_after_response():
+        # Give the HTTP / ContentProvider response time to flush back
+        # to the caller before we yank the process out from under it.
+        # 0.5 s is empirically enough on desktop (Python's HTTPServer
+        # acks before the handler returns) and Android (Binder return
+        # is synchronous, so the peer has the response in hand the
+        # moment the dispatch returns).
+        _time.sleep(0.5)
+        try:
+            print(f'[azt_collabd] /v1/admin/restart fired '
+                  f'({transport_label}); exiting', flush=True)
+        except Exception:
+            pass
+        if is_android:
+            # Don't re-exec on Android — there's no Python interpreter
+            # to spawn standalone, and the `:provider` process is
+            # owned by the OS. START_STICKY + ContentProvider's
+            # unconditional auto-spawn handle the rest.
+            os._exit(0)
+        # Desktop: re-exec the current Python with ``-m azt_collabd``.
+        # ``os.execv`` keeps the same PID and inherits env vars
+        # (PYTHONPATH, AZT_HOME, etc.). The flock on server.lock is
+        # released by the kernel on the old image's teardown; the
+        # new image re-acquires it.
+        try:
+            os.execv(sys.executable,
+                     [sys.executable, '-m', 'azt_collabd'])
+        except Exception as ex:
+            print(f'[azt_collabd] restart os.execv failed: {ex!r} — '
+                  f'falling back to plain exit; the next client '
+                  f'call will auto-spawn',
+                  flush=True)
+            os._exit(0)
+
+    threading.Thread(
+        target=_restart_after_response,
+        name='admin-restart',
+        daemon=True,
+    ).start()
+    return 200, {"ok": True, "restarting": True,
+                 "transport": transport_label}
+
+
 def _h_project_atomic_finalize(langcode, body):
     """POST /v1/projects/<lang>/atomic_finalize
 
@@ -2110,6 +2189,8 @@ def dispatch(method, path, body):
             return _h_migrate_from_prefs(body)
         if path == '/v1/logging/daemon_log_to_file':
             return _h_set_daemon_log_to_file(body)
+        if path == '/v1/admin/restart':
+            return _h_admin_restart(body)
         if path == '/v1/recent/last_project':
             return _h_set_last_project(body)
         if path == '/v1/projects/register':

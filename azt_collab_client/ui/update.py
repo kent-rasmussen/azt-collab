@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from kivy.clock import Clock
@@ -45,6 +46,17 @@ from ..translate import tr as _tr
 _GITHUB_API = 'https://api.github.com'
 _USER_AGENT = 'azt-collab-updater/1'
 _DOWNLOAD_CHUNK = 65536
+
+# Per-attempt timeout for the release-metadata probe. Bootstrap blocks
+# the user's first-paint experience on this call, so it has to give up
+# fast when the network is dead — a 15 s socket-timeout (the urlopen
+# default we used pre-0.43.21) compounded by the listing→singleton
+# fall-through below produced 20 s+ startup stalls in the field on
+# DNS-flaky networks (Cameroon, 2026-05). A field user staring at a
+# black presplash for 20 s thinks the app has crashed and force-quits.
+# 5 s is enough for any healthy connection (the listing endpoint
+# returns ~10 KB) while keeping the worst case quick.
+_PROBE_TIMEOUT_S = 5
 
 # Per-process cache of GitHub release lookups. Keyed by repo slug;
 # each entry is ``(fetched_at_epoch, release_dict)``. A peer that
@@ -139,11 +151,28 @@ def _fetch_latest(repo):
         'User-Agent': _USER_AGENT,
     })
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
             releases = json.load(resp)
+    except urllib.error.HTTPError:
+        # Listing endpoint refused (404/410/etc.) but the network
+        # itself is reachable — the singleton endpoint might still
+        # work, so fall back. JSON parse errors land here too via
+        # the broader except below intentionally — a captive-portal
+        # HTML response isn't necessarily a dead network.
+        result = _fetch_latest_singleton(repo)
+        _release_cache[repo] = (time.time(), result)
+        return result
+    except urllib.error.URLError:
+        # Network is dead (DNS failure, connect refused, TLS botch).
+        # The singleton fetch would fail the same way for the same
+        # reason; don't double-pay the timeout on a doomed retry.
+        # Doing so on a Cameroon-class DNS flake produced the 20 s+
+        # startup stall referenced in _PROBE_TIMEOUT_S above.
+        raise
     except Exception:
-        # Listing endpoint refused or returned junk; fall back to
-        # the latest singleton so we still have a chance.
+        # JSON / parsing failure — the connection worked but the body
+        # was junk (captive portal HTML, partial response). Singleton
+        # might still give us valid JSON.
         result = _fetch_latest_singleton(repo)
         _release_cache[repo] = (time.time(), result)
         return result
@@ -167,7 +196,7 @@ def _fetch_latest_singleton(repo):
         'Accept': 'application/vnd.github+json',
         'User-Agent': _USER_AGENT,
     })
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
         return json.load(resp)
 
 

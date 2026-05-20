@@ -534,6 +534,9 @@ msgstr "Service de synchronisation indisponible : {error}"
 msgid "Sync service error: {error}"
 msgstr "Erreur du service de synchronisation : {error}"
 
+msgid "Sync service is restarting…"
+msgstr ""
+
 msgid "Clone failed — repository not found. This may be a private repository.\n\nAre you authenticated to {host}?"
 msgstr "Échec du clonage — dépôt introuvable. Il peut s'agir d'un dépôt privé.\n\nÊtes-vous authentifié auprès de {host} ?"
 
@@ -556,6 +559,15 @@ msgstr "Journal de diagnostic"
 
 msgid "Share daemon log"
 msgstr "Partager le journal du service"
+
+msgid "Restart server"
+msgstr ""
+
+msgid "Could not reach the sync service to restart it."
+msgstr ""
+
+msgid "Restart request returned an unexpected response."
+msgstr ""
 
 msgid "Daemon log is being saved to {path}"
 msgstr "Le journal du service est enregistré dans {path}"

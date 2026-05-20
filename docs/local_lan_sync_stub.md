@@ -35,10 +35,11 @@ implementation has to commit to them:
 4. **Discovery.** Android `NsdManager` via pyjnius, called with
    `DiscoveryRequest.FLAG_SHOW_PICKER` so the system handles the
    device picker — dodges the Android 17 `ACCESS_LOCAL_NETWORK`
-   runtime permission. `python-zeroconf` on desktop.
-   `QR`/manual-IP fallback for hotspot scenarios where mDNS
-   silently fails (Android hotspot + most enterprise/captive
-   Wi-Fi block multicast across clients).
+   runtime permission. `python-zeroconf` on desktop. Static-
+   endpoint fallback (pairing-QR endpoint + manual IP) covers
+   only the fixed-IP hotspot-host case; AP-isolated networks
+   with DHCP churn are out of scope for v1 (see §Discovery →
+   Hotspot / restricted-Wi-Fi: scope).
 5. **Listener.** `dulwich.web.HTTPGitApplication` + `ThreadingMixIn`
    + a custom WSGI middleware for cert-derived peer-id auth, with
    TLS via `ssl.SSLContext.wrap_socket(srv.socket)`. Hosted inside
@@ -132,27 +133,55 @@ must declare `CHANGE_WIFI_MULTICAST_STATE` in the server APK
 Pure-Python, no native binaries, works under the existing
 desktop daemon as-is. Same service type, same TXT records.
 
-### Hotspot / restricted-Wi-Fi fallback
+### Hotspot / restricted-Wi-Fi: scope
 
-mDNS silently fails when one phone is hotspotting to another
-(separate `wlan0`/`ap0` interface, multicast dropped between
-them) and across enterprise Wi-Fi with AP isolation enabled.
-There's no app-level workaround; we have to give the user a
-second path:
+mDNS silently fails in two field-relevant scenarios:
 
-- **QR fallback**: the pairing QR already carries
-  `current_LAN_endpoint=<ip:port>`. When that endpoint is
-  reachable but mDNS doesn't surface the peer, fetch direct
-  using the QR-provided endpoint.
-- **Manual IP**: settings-UI affordance to enter `<ip:port>`
-  by hand. Stored against a paired-peer entry as a
-  `static_endpoints` list (Syncthing's pattern).
+- **Phone-to-phone hotspot** — separate `wlan0`/`ap0`
+  interface, multicast dropped between them.
+- **Enterprise / captive Wi-Fi with AP isolation** —
+  multicast blocked between clients.
 
-The daemon should re-resolve a paired peer's endpoint on every
-sync attempt: mDNS first, then static endpoints, then the QR
-endpoint as a last hint. mDNS `.local` hostname resolution
-through `getaddrinfo` is unreliable on Android — do the lookup
-in-daemon and substitute a raw IP into the dulwich URL.
+There is no general app-level workaround. v1 supports **only**
+the narrow case below; everything else is out of scope, and
+the user falls back to github sync.
+
+#### Supported: hotspot host with a fixed subnet IP
+
+When one phone is the hotspot host, its IP on the hotspot
+subnet is set by Android's hotspot stack (typically
+`192.168.43.1`), not by DHCP. A pairing-QR endpoint captured
+during a hotspot session stays valid indefinitely as long as
+the *same* phone is always the host. This is the one durably
+useful fallback.
+
+Endpoint resolution order on every sync attempt:
+
+1. **mDNS** — current IP this session (best, when not blocked).
+2. **Static endpoints** — manual entries added via the
+   settings UI.
+3. **Pairing-QR endpoint** — recorded into `peers.json` at
+   pair time; treated as the oldest, weakest hint.
+
+mDNS `.local` hostname resolution through `getaddrinfo` is
+unreliable on Android — do the lookup in-daemon and
+substitute a raw IP into the dulwich URL.
+
+#### Not supported in v1: AP-isolated networks with DHCP churn
+
+The common "two phones on enterprise/captive Wi-Fi with AP
+isolation" case is **not** rescued by static endpoints. The
+QR endpoint is current for hours and stale by the next lease
+cycle; the manual-IP UI degenerates into "look up the current
+IP every morning, retype it," which no user will sustain past
+day two.
+
+The honest v1 contract: **mDNS works → LAN sync works; mDNS
+blocked + DHCP churn → not supported, user falls back to
+github sync**. Out-of-band "current endpoint" exchange would
+need either the `ACCESS_LOCAL_NETWORK` permission this design
+is avoiding, or an internet round-trip that defeats the
+offline use case. Park.
 
 ## Pairing
 

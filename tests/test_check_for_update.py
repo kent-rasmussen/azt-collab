@@ -11,6 +11,7 @@ ACTION_VIEW) live in the manual matrix — see test_plan.md §8.
 
 import io
 import json
+import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -106,6 +107,7 @@ def test_fetch_latest_falls_back_when_all_prereleases():
 def test_fetch_latest_falls_back_on_listing_error():
     """If /releases?per_page=20 returns junk or 5xx, fall back to
     /releases/latest."""
+    upd.invalidate_release_cache('owner/repo')
     singleton = _release('0.9.5')
 
     call_count = {'n': 0}
@@ -119,6 +121,69 @@ def test_fetch_latest_falls_back_on_listing_error():
     with patch('urllib.request.urlopen', side_effect=_urlopen):
         rel = upd._fetch_latest('owner/repo')
     assert rel['tag_name'] == '0.9.5'
+
+
+def test_fetch_latest_falls_back_on_http_error():
+    """HTTPError (e.g. 404/410 on the listing) is a server-side
+    refusal; the network is fine, so the singleton might still
+    work. Regression for the 0.43.21 narrowing — bare
+    ``except Exception`` previously caught everything here."""
+    upd.invalidate_release_cache('owner/repo')
+    singleton = _release('0.9.5')
+
+    call_count = {'n': 0}
+
+    def _urlopen(req, timeout=None):
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            raise urllib.error.HTTPError(
+                'http://x', 404, 'Not Found', {}, None)
+        return _FakeResponse(singleton)
+
+    with patch('urllib.request.urlopen', side_effect=_urlopen):
+        rel = upd._fetch_latest('owner/repo')
+    assert rel['tag_name'] == '0.9.5'
+    assert call_count['n'] == 2  # listing tried, then singleton
+
+
+def test_fetch_latest_raises_on_url_error_without_singleton_retry():
+    """URLError (DNS / connect-refused / TLS failure) means the
+    network is dead — the singleton endpoint will fail the same
+    way for the same reason. The fall-through to
+    _fetch_latest_singleton must NOT fire, or we double-pay the
+    socket timeout on bootstrap and produce the 20 s+ startup
+    stall observed in the field (Cameroon, 2026-05). Regression
+    for the 0.43.21 fix."""
+    upd.invalidate_release_cache('owner/repo')
+
+    call_count = {'n': 0}
+
+    def _urlopen(req, timeout=None):
+        call_count['n'] += 1
+        raise urllib.error.URLError(
+            '[Errno 7] No address associated with hostname')
+
+    with patch('urllib.request.urlopen', side_effect=_urlopen):
+        with pytest.raises(urllib.error.URLError):
+            upd._fetch_latest('owner/repo')
+    assert call_count['n'] == 1  # NO retry against the dead resolver
+
+
+def test_fetch_latest_uses_probe_timeout():
+    """Bootstrap blocks first paint on this call; the timeout must
+    be tight (5 s, not the legacy 15 s) so a dead network gives
+    up fast. Regression for the 0.43.21 stall fix."""
+    upd.invalidate_release_cache('owner/repo')
+    captured = {'timeout': None}
+
+    def _urlopen(req, timeout=None):
+        captured['timeout'] = timeout
+        return _FakeResponse([_release('0.9.5')])
+
+    with patch('urllib.request.urlopen', side_effect=_urlopen):
+        upd._fetch_latest('owner/repo')
+    assert captured['timeout'] == upd._PROBE_TIMEOUT_S
+    assert upd._PROBE_TIMEOUT_S <= 5
 
 
 # ── _pick_asset ───────────────────────────────────────────────────────────

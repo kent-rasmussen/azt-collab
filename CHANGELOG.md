@@ -9,6 +9,92 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.43.21 — startup probe gives up fast on DNS failure + local-HTTP-git-remote test coverage
+
+### Why (startup probe)
+
+A field session from baf (2026-05-20) showed bootstrap stalling
+~20 seconds on a presplash with no visible activity when DNS
+resolution of `api.github.com` failed (`[Errno 7] No address
+associated with hostname`). Trace: `compat_ok t=2.389` →
+`bootstrap_done t=22.553`.
+
+Root cause: `_fetch_latest` in `azt_collab_client/ui/update.py`
+used `urlopen(timeout=15)` against `/releases?per_page=20`, then
+caught **any** exception and fell through to
+`_fetch_latest_singleton` which did **a second**
+`urlopen(timeout=15)` against `/releases/latest`. On a dead
+resolver, both calls fail for the same reason — so we paid the
+DNS-timeout budget twice for a doomed retry. The singleton
+fallback was designed for "listing endpoint returned junk /
+HTTP error" cases where the network is fine; on URLError-class
+failures it's pure overhead.
+
+A user staring at a black presplash for 20 s thinks the app has
+crashed and force-quits. dd61da3 ("hopefully final fix for
+Cameroon DNS errors") fixed the sync-path 25-minute push hang
+but didn't touch this bootstrap path.
+
+### Changes (startup probe)
+
+- `_PROBE_TIMEOUT_S = 5` constant introduced in
+  `azt_collab_client/ui/update.py`; replaces the hard-coded
+  `timeout=15` on both `_fetch_latest` and
+  `_fetch_latest_singleton`. Worst-case startup stall now
+  caps at one ~5 s timeout instead of two ~15 s timeouts.
+- `_fetch_latest`'s `except Exception:` split into three
+  branches:
+  - `urllib.error.HTTPError` → fall back to singleton (server
+    refused the listing; network is fine).
+  - `urllib.error.URLError` → `raise` immediately (DNS /
+    connect-refused / TLS botch; singleton fails the same way).
+  - Bare `Exception` → fall back to singleton (JSON parse
+    failure, captive-portal HTML — connection works, body was
+    junk).
+- Tests added in `tests/test_check_for_update.py`:
+  - `test_fetch_latest_falls_back_on_http_error` (404 listing
+    → singleton tried).
+  - `test_fetch_latest_raises_on_url_error_without_singleton_retry`
+    (URLError → call count == 1, no doomed retry).
+  - `test_fetch_latest_uses_probe_timeout` (timeout pinned to
+    `_PROBE_TIMEOUT_S`).
+
+### Why (local-HTTP-git-remote test coverage)
+
+The daemon's remote handling has always been host-agnostic in
+principle — `Project.remote_url` accepts any HTTP/HTTPS git
+URL — but the only host exercised in the field is github.com.
+A team running gitea / forgejo / gogs / git-daemon on a laptop
+on the office LAN is a perfectly valid convergence point, and
+the parked LAN-sync spec in `docs/local_lan_sync_stub.md`
+builds on dulwich.web as its in-process listener (same library,
+same WSGI shape). Without a CI test, a github-ism (substring
+matching on a github-specific error string, host-header
+assumptions in dulwich, a credentials-store lookup keyed on
+`github.com`) could silently break the non-github path and we
+wouldn't notice until a field user with a local gitea filed a
+bug.
+
+### Changes (local-HTTP-git-remote test coverage)
+
+- `tests/test_local_git_remote.py` added. Fixture spins up a
+  dulwich-backed HTTP git server in a background thread serving
+  a bare repo. Five tests cover:
+  - The fixture itself responds to `info/refs?service=git-upload-pack`.
+  - `init_repo` initializes + commits + pushes; bare-side refs
+    reflect the push.
+  - `clone_repo` against the local server produces a working
+    dir matching the seeded content.
+  - `pull_repo` brings updates committed on a second working
+    dir through the local server.
+  - `sync_repo` round-trips two working dirs (commit + push
+    under one lock) converging through the local server.
+- Auth integration on non-github hosts is deliberately out of
+  scope here — the fixture serves unauthenticated HTTP; the
+  github-flavoured credentials paths are exercised by their
+  own tests. The LAN-sync spec implementation phase will add
+  cert-based auth tests on top of this scaffolding.
+
 ## 0.43.20 — sync trace honesty + push timeouts + non-FF retry escalation
 
 ### Why
@@ -74,12 +160,69 @@ four distinct sync-loop bugs:
   the post-reconciliation reset is confined to the diverged-merge
   branch where it belongs.
 
+### Also in this bump: "Restart server" button
+
+Companion fix surfacing the daemon-restart capability that the
+sync-loop hardening above relies on for "give me a fresh process
+right now" recovery.
+
+- `POST /v1/admin/restart` (`azt_collabd/server.py::_h_admin_restart`):
+  responds OK immediately and then, after a 0.5 s flush delay,
+  terminates the daemon. Desktop loopback: `os.execv` replaces the
+  process image with a fresh `python -m azt_collabd`, inheriting
+  env / cwd / PYTHONPATH; the new daemon re-acquires `server.lock`
+  and writes a new `server.json`. Android `:provider`:
+  `os._exit(0)`, Android's ContentProvider auto-spawn revives the
+  process on the next peer call and `Service.onCreate` re-runs
+  `reconcile_on_startup()`.
+- `azt_collab_client.restart_server()`: thin wrapper around the
+  endpoint. Returns a `Result` carrying either `RESTARTING`
+  (informational; daemon accepted and is in flight), or the
+  standard `SERVER_UNAVAILABLE` / `SERVER_ERROR` transport-failure
+  shapes. Never raises — UI handlers call without try/except.
+- `RESTARTING` status code added to both
+  `azt_collabd/status.py` and `azt_collab_client/status.py`
+  (mirrors; client copy is decode-only) plus a translation in
+  `translate.py`. params: `transport=`'desktop' | 'android' |
+  'unknown'`.
+- `azt_collabd/ui/app.py::SettingsScreen.restart_server` +
+  KV `restart_server_btn` next to "Share daemon log" under
+  Diagnostic log. Method runs the blocking RPC off the UI thread
+  and shows status in the existing `daemon_log_status` label.
+  Settings UI lives in a separate process on both desktop
+  (`python -m azt_collabd ui`) and Android (PythonActivity vs.
+  `:provider`), so triggering a daemon restart doesn't kill the
+  UI in either case.
+
 ### Wire compat
 
-Nothing changes on the wire. No new status codes; failures still
+Sync-loop hardening: nothing changes on the wire. Failures still
 surface as `PUSH_FAILED` (with `DNS_RESOLUTION_FAILED` peer-routing
-in the existing `_add_push_failure` path). No `MIN_CLIENT_VERSION`
-bump needed.
+in the existing `_add_push_failure` path).
+
+Restart-server: one new status code (`RESTARTING`) and one new
+endpoint (`POST /v1/admin/restart`). Older clients calling the
+new endpoint would get a 404; older daemons receiving a
+`restart_server()` call would 404 and the client wrapper
+surfaces `SERVER_ERROR`. No `MIN_CLIENT_VERSION` floor bump
+needed — peers don't depend on the endpoint for any existing
+flow.
+
+### Test fixture: `test_local_git_remote.py` mkdir
+
+The `local_git_server` fixture was erroring at setup against the
+installed dulwich (`FileNotFoundError: '<tmp>/remote.git/branches'`
+inside `Repo._init_maybe_bare`) because newer dulwich expects the
+`controldir` path to exist before `init_bare`. Added an explicit
+`remote_path.mkdir()` so the fixture matches the dulwich contract.
+The five tests in that file (LAN-sync prep — see 0.43.19) now get
+past setup; the sanity test passes, but four of them surface
+latent assertion failures (push / clone / pull / sync against a
+dulwich-backed local HTTP server without auth wiring). Those are
+unrelated to this bump's daemon-side changes — they're testing
+LAN-sync prep code that's parked anyway, and the fixture fix
+only made the latent failures visible. Left for a dedicated
+LAN-sync session.
 
 ## 0.43.19 — LAN sync design spec drafted (parked)
 

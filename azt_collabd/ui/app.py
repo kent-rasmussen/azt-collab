@@ -721,6 +721,11 @@ KV_TEMPLATE = '''
                         text: _('Share daemon log')
                         normal_color: T.SURFACE
                         on_press: root.share_daemon_log()
+                    RecBtn:
+                        id: restart_server_btn
+                        text: _('Restart server')
+                        normal_color: T.SURFACE
+                        on_press: root.restart_server()
                 BodyLabel:
                     id: daemon_log_status
                     text: ''
@@ -1725,6 +1730,54 @@ class SettingsScreen(Screen):
             status.text = _tr(
                 'Sending {bytes_n} bytes of daemon log…'
             ).format(bytes_n=data['bytes'])
+
+    def restart_server(self):
+        """Ask the daemon to restart itself. The settings UI lives in
+        a separate process (``python -m azt_collabd ui`` on desktop;
+        PythonActivity on Android) from the daemon process, so the
+        restart is safe from here — the UI keeps running. Status
+        shows up in the existing ``daemon_log_status`` label that
+        also fields share-daemon-log feedback."""
+        from azt_collab_client import restart_server as _restart
+        status = self.ids.get('daemon_log_status')
+
+        def _do():
+            res = _restart()
+            transport = ''
+            for st in res.statuses:
+                if st.code == 'RESTARTING':
+                    transport = st.params.get('transport') or ''
+                    break
+
+            def _show(text):
+                if status is not None:
+                    status.text = text
+            if res.has(S.RESTARTING):
+                # Desktop re-exec can take a few seconds while the
+                # new interpreter boots; Android `:provider` lazy-
+                # respawn is sub-second. Either way, the next RPC
+                # from this UI re-discovers the daemon.
+                Clock.schedule_once(
+                    lambda *_: _show(_tr(
+                        'Sync service is restarting…'
+                    )), 0)
+            elif res.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
+                Clock.schedule_once(
+                    lambda *_: _show(_tr(
+                        'Could not reach the sync service to '
+                        'restart it.'
+                    )), 0)
+            else:
+                Clock.schedule_once(
+                    lambda *_: _show(_tr(
+                        'Restart request returned an unexpected '
+                        'response.'
+                    )), 0)
+
+        # Run off the UI thread — restart_server() is a blocking RPC
+        # that includes the daemon's 0.5 s pre-exit delay.
+        threading.Thread(
+            target=_do, daemon=True, name='ui-restart-server').start()
 
     def _set_project_actions_msg(self, text):
         msg = self.ids.get('project_actions_msg')
