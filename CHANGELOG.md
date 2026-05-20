@@ -9,6 +9,128 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.43.20 — sync trace honesty + push timeouts + non-FF retry escalation
+
+### Why
+
+Field log from baf (2026-05-19, ~5 hours of intermittent DNS) surfaced
+four distinct sync-loop bugs:
+
+1. The `[sync-trace] fetch done` line was logged unconditionally, so
+   a fetch that hit `Max retries exceeded (NameResolutionError)`
+   looked identical to a healthy fetch — downstream `local_sha` /
+   `remote_sha` reads from the (stale) tracking ref then drove
+   adaptive-batching decisions that couldn't possibly converge.
+2. A single push attempt held `project_lock` for 25 minutes
+   (19:11 → 19:36, ending in `SSLEOFError`) because `porcelain.push`
+   was called with no timeout — urllib3's default is no read
+   timeout, so a stalled SSL upload sits there until the kernel
+   keepalive eventually breaks the socket. Every other client RPC
+   during that window got `BUSY`.
+3. A `DivergedBranches` push rejection followed by a re-fetch
+   showing no remote movement entered the "local still ahead"
+   recovery branch and looped: same `target_sha`, same `chunk_n`,
+   same rejection on the next iteration. The server's rejection
+   was authoritative — it had something we couldn't see, or our
+   intermediate-target pack didn't include the full ancestry — but
+   the loop trusted the local ancestor walk over the server.
+4. The "local still ahead" branch (legitimate concurrent-pusher
+   case where remote advanced to something our local descends
+   from) reset `target_sha`, `working_batch_n`, and `backoff_s`
+   to scratch, so every concurrent-push race threw away whatever
+   chunk size adaptive batching had found to work. `chunk_n=89 →
+   chunk_n=719` reset observed repeatedly in the same trace.
+
+### Changes
+
+`azt_collabd/repo.py`:
+
+- `[sync-trace] fetch done` moved inside the success path; the
+  except adds a `[sync-trace] fetch failed: <repr(exc)>` line and
+  still surfaces `PULL_FAILED` on the `Result` so the downstream
+  try-push-anyway behaviour is preserved.
+- `_socket_timeout(seconds)` context manager wraps `porcelain.fetch`
+  (60 s) and `porcelain.push` (180 s) — sets
+  `socket.setdefaulttimeout` for the body, restores on exit. urllib3
+  starts fresh connections on pool exhaustion (the
+  `Starting new HTTPS connection (N)` trace lines confirm this), so
+  the timeout reliably bounds each socket's I/O. DoH calls in
+  `net.py` pass explicit `timeout=` to `urlopen` which override the
+  default, so DoH stays at its 2.5 s budget.
+- `nonff_no_progress_streak` tracker added to the push loop. When a
+  push raises non-FF AND the re-fetch shows no remote movement:
+  - First hit on an intermediate target (`target_sha != local_sha`):
+    revert to the full local tip via the standard
+    `refs/heads/<branch>` refspec. The temp-ref pack-negotiation
+    path may be the culprit; the full-tip path bypasses it.
+  - First hit on the full local tip: force a `_merge_diverged`
+    against the current `remote_sha`. The server's rejection is
+    authoritative; our local ancestor walk is wrong somewhere.
+  - Second hit on the full local tip: bail with `PUSH_FAILED`.
+    We can't reconcile from here without external input.
+- The legitimate "still ahead" branch (re-fetch saw remote actually
+  advance, but to something our local descends from) now `continue`s
+  with `target_sha` + `working_batch_n` + `backoff_s` preserved —
+  the post-reconciliation reset is confined to the diverged-merge
+  branch where it belongs.
+
+### Wire compat
+
+Nothing changes on the wire. No new status codes; failures still
+surface as `PUSH_FAILED` (with `DNS_RESOLUTION_FAILED` peer-routing
+in the existing `_add_push_failure` path). No `MIN_CLIENT_VERSION`
+bump needed.
+
+## 0.43.19 — LAN sync design spec drafted (parked)
+
+### Why
+
+`docs/local_lan_sync_stub.md` was a sketch; expanding it to a real
+spec after researching mDNS-on-Android (Android 17 will gate raw
+mDNS sockets behind a new runtime permission — `NsdManager` with
+`FLAG_SHOW_PICKER` is the escape hatch), Android 14+ foreground-
+service rules (`specialUse` is the right type; `dataSync` has a
+6h/24h cap that's a footgun for an always-on toggle), dulwich's
+HTTP server seam (`HTTPGitApplication` + `make_wsgi_chain`
+covers both upload-pack and receive-pack out of the box), and
+offline-first peer-to-peer git patterns (Syncthing-style identity
++ Radicle's namespace separation of identity from endpoint).
+
+### Changes
+
+- `docs/local_lan_sync_stub.md` rewritten as a design spec with
+  eight load-bearing decisions locked, concrete touchpoints
+  enumerated, and a short list of items deferred to
+  prototyping. Still parked — no implementation in this bump.
+- Onramp section added so a fresh agent (post-/clear) can pick
+  the work up without re-litigating the 23 rejected
+  alternatives. Includes a phased implementation plan (8
+  phases, each independently smokable), a reading list of
+  upstream CLAUDE.md files + relevant memory entries, the
+  status codes to add, desktop-only smoke recipes for phases
+  1-4, and an eight-question self-test.
+
+### Decisions captured (so they're not relitigated)
+
+- Topology: GitHub-authoritative star + opportunistic LAN fan-out.
+  No peer-graph / gossip state — pairing is explicit per-pair,
+  propagation is implicit in git's ref-advertisement dedup.
+- Identity: per-device ed25519 keypair at `$AZT_HOME/peer_id`,
+  separate from the suite signing-keystore fingerprint.
+- Pairing: one-way QR (A shows, B scans), auto-reverse-record on
+  B's first authenticated fetch.
+- Auth: pinned TLS cert on LAN (cert handshake = identity proof);
+  loopback bearer token unchanged.
+- Listener: `dulwich.web` hosted in the existing `:provider`
+  process, promoted to a `specialUse` foreground service while a
+  daemon-wide "Allow LAN sync" toggle is on.
+- Discovery: Android `NsdManager` via pyjnius
+  (`FLAG_SHOW_PICKER`); `python-zeroconf` on desktop; QR /
+  manual-IP fallback for hotspot scenarios where mDNS is
+  silently blocked.
+- Project sharing: per-direction allowlist after pairing, set
+  from the daemon settings UI; no QR for the second step.
+
 ## 0.43.18 — daemon log rotates on toggle-on; previous session preserved in `.prev`
 
 ### Why

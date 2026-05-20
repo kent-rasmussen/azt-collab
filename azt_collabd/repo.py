@@ -7,10 +7,12 @@ inside the backend. Exception paths emit failure codes inside the Result
 rather than raising; that matches the existing log-append style.
 """
 
+import contextlib
 import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 
@@ -27,6 +29,37 @@ from . import settings as _settings
 
 def _busy_result(working_dir):
     return Result().add(S.BUSY, working_dir=os.path.abspath(working_dir))
+
+
+# Default per-call wall-clock budgets for dulwich network ops. Without
+# these a stalled SSL pack-upload can hold ``project_lock`` for the
+# full TCP keepalive window — observed in the field as a 25-minute
+# hang on a single push attempt (19:11→19:36 baf session 2026-05-19,
+# ending in SSLEOFError) that blocked every other client RPC with
+# ``BUSY``. ``socket.setdefaulttimeout`` applies to sockets opened
+# during the call; urllib3 starts fresh connections on pool exhaustion
+# (the "Starting new HTTPS connection (N)" trace lines confirm this)
+# so the timeout reliably bounds the network I/O. DoH calls in
+# ``net.py`` pass explicit ``timeout=`` to ``urlopen`` which override
+# this, so the DoH path stays at its 2.5 s budget. Numbers are
+# generous enough that legitimate slow uploads of an adaptive-batched
+# chunk complete, tight enough that a hung TCP connection can't lock
+# the project indefinitely.
+_FETCH_TIMEOUT_S = 60.0
+_PUSH_TIMEOUT_S = 180.0
+
+
+@contextlib.contextmanager
+def _socket_timeout(seconds):
+    """Set ``socket.setdefaulttimeout`` for the body. Restores prior
+    value on exit. See ``_FETCH_TIMEOUT_S`` / ``_PUSH_TIMEOUT_S`` for
+    the rationale."""
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(prev)
 
 
 def _sha_str(sha):
@@ -1376,18 +1409,25 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     # read above is only used for diagnostics and error reporting.
     lift_merge.trace(f'[sync-trace] fetch begin remote={remote_url!r}')
     try:
-        porcelain.fetch(
-            repo, 'origin',
-            username=username, password=token,
-            errstream=io.BytesIO(),
-        )
+        with _socket_timeout(_FETCH_TIMEOUT_S):
+            porcelain.fetch(
+                repo, 'origin',
+                username=username, password=token,
+                errstream=io.BytesIO(),
+            )
+        lift_merge.trace('[sync-trace] fetch done')
     except Exception as exc:
         if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
             return result
         # Non-fatal: maybe remote is empty or temporarily unreachable.
+        # Trace explicitly so a stale ``refs/remotes/origin/*`` read
+        # downstream isn't misread as authoritative — pre-0.43.19
+        # this path logged ``fetch done`` even on Max-retries-exceeded
+        # and the trace looked indistinguishable from a healthy
+        # fetch.
+        lift_merge.trace(f'[sync-trace] fetch failed: {exc!r}')
         result.add(S.PULL_FAILED, error=_format_push_error(exc))
-    lift_merge.trace('[sync-trace] fetch done')
 
     # ``repo.refs`` is ``DiskRefsContainer`` which does NOT define a
     # dict-style ``.get()`` — only ``__getitem__`` (raises ``KeyError``
@@ -1487,6 +1527,22 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     backoff_s = 1.0
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = 12
+    # Counter for forced-merge attempts triggered by the pathological
+    # case where the server rejects a push as non-fast-forward AND
+    # the immediately-following re-fetch shows the tracking ref
+    # hasn't moved. Server says we don't descend, local ancestor
+    # walk says we do — somebody's wrong. Pre-0.43.20 this looped
+    # forever, "local still ahead" each iteration, re-attempting
+    # the same target_sha + chunk_n with no path to recovery
+    # (~hour-long sessions burning the user's data plan until the
+    # daemon was killed). Escalation: (1) revert intermediate
+    # target to the full local tip — the temp-ref pack-
+    # negotiation path may be the culprit, (2) force a
+    # ``_merge_diverged`` against the current remote_sha — trust
+    # the server's view over our ancestor walk, (3) on the second
+    # such attempt, bail with PUSH_FAILED. Reset to 0 on any push
+    # success.
+    nonff_forced_merges = 0
 
     initial_to_push = _count_commits_between(repo, remote_sha, local_sha)
     lift_merge.trace(
@@ -1530,11 +1586,12 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             repo.refs[TEMP_REF] = target_sha
             refspec = _enc(f'{TEMP_REF.decode()}:refs/heads/{branch}')
         try:
-            porcelain.push(
-                repo, remote_url, refspec,
-                username=username, password=token,
-                errstream=io.BytesIO(),
-            )
+            with _socket_timeout(_PUSH_TIMEOUT_S):
+                porcelain.push(
+                    repo, remote_url, refspec,
+                    username=username, password=token,
+                    errstream=io.BytesIO(),
+                )
             lift_merge.trace(
                 f'[sync-trace] push done (advanced {chunk_n} commits)')
             # Advance the local mirror to the SHA we just pushed.
@@ -1547,6 +1604,7 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             remote_sha = target_sha
             consecutive_failures = 0
             backoff_s = 1.0
+            nonff_forced_merges = 0
             if target_sha == local_sha:
                 # Queue cleared.
                 _cleanup_temp_ref()
@@ -1578,11 +1636,12 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             # this isn't a network-class failure but a race with
             # another peer's push. Different recovery path.
             try:
-                porcelain.fetch(
-                    repo, 'origin',
-                    username=username, password=token,
-                    errstream=io.BytesIO(),
-                )
+                with _socket_timeout(_FETCH_TIMEOUT_S):
+                    porcelain.fetch(
+                        repo, 'origin',
+                        username=username, password=token,
+                        errstream=io.BytesIO(),
+                    )
                 new_remote = _read_ref(remote_ref)
             except Exception as ex:
                 lift_merge.trace(
@@ -1634,11 +1693,105 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                     remote_sha = new_remote
                     result.add(S.PUSHED, branch=branch)
                     return result
+                # Detect the pathological case before the ancestor
+                # fan-out: server rejected the push as non-FF AND the
+                # re-fetch saw no remote movement. The server's
+                # rejection is authoritative — it has something we
+                # can't see (or our intermediate-target pack didn't
+                # include the full ancestry to verify FF). The local
+                # ancestor walk below will say "local still ahead"
+                # because nothing in local state has changed, and
+                # without escalation we'd retry the same target
+                # forever.
+                nonff_no_progress = (
+                    non_ff and new_remote == remote_sha)
                 if _is_ancestor(repo, new_remote, local_sha):
                     lift_merge.trace(
                         '[sync-trace] retry: local still ahead — '
                         'push retry only')
                     remote_sha = new_remote
+                    if nonff_no_progress:
+                        # Server disagrees with our ancestor check.
+                        # Escalate stepwise: try the full local tip
+                        # first, then a forced merge, then bail.
+                        if target_sha != local_sha:
+                            # Pushing an intermediate via temp ref.
+                            # Server may have refused because the
+                            # pack didn't demonstrate the FF chain.
+                            # Try the full local tip via the
+                            # standard refs/heads/<branch> refspec,
+                            # which bypasses the temp-ref pack-
+                            # negotiation path.
+                            lift_merge.trace(
+                                '[sync-trace] retry: non-FF with no '
+                                'remote movement on intermediate '
+                                'target — reverting to full local '
+                                'tip')
+                            target_sha = local_sha
+                            working_batch_n = None
+                            continue
+                        if nonff_forced_merges >= 1:
+                            # We already merged once against this
+                            # same remote_sha and the server still
+                            # rejects with no fetch movement.
+                            # Cannot reconcile from here — surface
+                            # PUSH_FAILED. (One escalation is
+                            # enough: if the merge produced a
+                            # descendant of remote_sha and the
+                            # server still says no, the server's
+                            # view of its ref disagrees with the
+                            # ref-advertisement it gave us. A peer
+                            # branch-protection rule or hosted-
+                            # repo policy is in play; retrying
+                            # won't help.)
+                            lift_merge.trace(
+                                '[sync-trace] retry: non-FF persists '
+                                'after forced merge — giving up')
+                            _cleanup_temp_ref()
+                            _add_push_failure(result, exc)
+                            return result
+                        # First non-FF-no-progress hit on the full
+                        # local tip: trust the server's rejection
+                        # over our ancestor check and force a
+                        # merge against the remote we have on
+                        # hand. ``_merge_diverged`` walks both
+                        # histories from a common base — if our
+                        # local already descends from remote_sha
+                        # it'll produce essentially the same tree,
+                        # and the resulting merge commit at least
+                        # changes target_sha so we're not pushing
+                        # the same SHA the server already said
+                        # no to.
+                        lift_merge.trace(
+                            '[sync-trace] retry: non-FF on full '
+                            'local tip — forcing merge against '
+                            'remote_sha')
+                        try:
+                            merged_sha, _ = _merge_diverged(
+                                repo, project_dir, branch,
+                                local_sha, remote_sha)
+                            local_sha = merged_sha
+                            target_sha = local_sha
+                            working_batch_n = None
+                            backoff_s = 1.0
+                            nonff_forced_merges += 1
+                        except Exception as ex:
+                            lift_merge.trace(
+                                f'[sync-trace] forced merge '
+                                f'failed: {ex!r}')
+                            _cleanup_temp_ref()
+                            _add_push_failure(result, ex)
+                            return result
+                        continue
+                    # Normal "still ahead" case (remote did move,
+                    # but to something our local descends from):
+                    # keep target_sha + working_batch_n. Throwing
+                    # them away resets adaptive-batching progress
+                    # on every concurrent peer push — observed in
+                    # field log baf 2026-05-19 where chunk_n=89
+                    # repeatedly walked back to chunk_n=719 every
+                    # retry cycle.
+                    continue
                 elif _is_ancestor(repo, local_sha, new_remote):
                     lift_merge.trace(
                         '[sync-trace] retry: remote advanced; '
@@ -1670,11 +1823,19 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                         _cleanup_temp_ref()
                         _add_push_failure(result, ex)
                         return result
-                # Resume the adaptive loop fresh: new commit
-                # chain → don't carry the prior batch size.
+                # Diverged-and-merged path: local chain changed,
+                # so reset adaptive-batching state. The FF and
+                # still-ahead branches handle their own state
+                # (FF returns; still-ahead preserves).
+                # ``nonff_forced_merges`` also resets here: this
+                # was real reconciliation progress (remote moved
+                # AND we merged it in), distinct from the still-
+                # ahead nonff-no-progress escalation path that
+                # bumps the counter.
                 target_sha = local_sha
                 working_batch_n = None
                 backoff_s = 1.0
+                nonff_forced_merges = 0
                 continue
             # Remote unchanged. Genuine network-class failure (or
             # unfamiliar exception). Back off, then decide whether
