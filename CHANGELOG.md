@@ -9,6 +9,168 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.44.10 — topic-branch Phase D + startup janitor: clean up merged topic-branches
+
+### Why
+
+After 0.44.9 (Phases A + B + C), the topic-branch
+`azt-pending-<lang>-<device>` is left on the server even after
+the merge commit lands on `main`. Cosmetic clutter, not a
+functional problem — but accumulates over time, and a few
+versions of 0.44.x already left orphans on test repos. Phase D
+deletes the ref on the success path; the janitor cleans up
+stragglers (Phase D delete that didn't fire, daemon kill right
+after Phase C, etc.).
+
+### Phase D — delete topic-branch on Phase C success
+
+After `S.PUSHED` is added in Phase C's success branch, call
+`_delete_remote_topic_branch(repo, remote_url, username,
+token, topic_ref_name)` which pushes a delete refspec
+(`':refs/heads/<topic>'`) and drops the local mirror. Failure
+is non-fatal; logged but doesn't block the sync result. Worst
+case: orphan ref on the server, picked up by the janitor on the
+next startup.
+
+### Janitor — once-per-project-per-daemon-lifetime sweep
+
+`_maybe_run_janitor(repo, project_dir, username, token,
+remote_url, branch)` runs right after the fetch in
+`_push_step_locked`. Memoized in `_JANITOR_SWEPT_PROJECTS` so
+the sweep network cost is one-time per (project, daemon
+lifetime); in steady state (Phase D ran on the last success)
+the sweep finds zero refs and is essentially free.
+
+Conservative scope:
+
+- **Only our own device's refs.** Suffix match on the
+  sanitised device_name. Other devices' orphans stay; their
+  owning device's next sync sweeps them. Refusing to touch
+  anyone else's ref avoids false-positive deletes — if Device
+  B is mid-Phase-A from a checkpoint we don't know about,
+  deleting their topic-branch would force them to restart.
+- **Only merged-into-main refs.** Reachability from
+  `refs/remotes/origin/<branch>` is git's safety contract for
+  "every commit on this ref is also reachable from main, so
+  dropping it loses nothing." The check uses our existing
+  `_is_ancestor(topic_tip, main_tip)`.
+
+### Files touched
+
+- `azt_collabd/repo.py`:
+  - `_delete_remote_topic_branch(...)` helper — Phase D's
+    delete primitive.
+  - `_janitor_sweep_topic_branches(...)` — the actual sweep
+    loop over our own refs.
+  - `_maybe_run_janitor(...)` — idempotent wrapper memoized
+    by project_dir.
+  - `_JANITOR_SWEPT_PROJECTS` module-level set.
+  - Wired `_delete_remote_topic_branch` into Phase C's
+    success branch.
+  - Wired `_maybe_run_janitor` into `_push_step_locked` right
+    after `remote_sha` is read (so the janitor has a valid
+    main tip to validate ancestry against).
+
+### Field-tester migration path (unchanged)
+
+Same flow as 0.44.9 — Phase A chunks, Phase B re-checks, Phase
+C promotes. Now Phase D also deletes the topic-branch on
+success, and any orphan from earlier 0.44.x test builds gets
+swept on the next daemon spawn (visible in the log as
+`[sync-trace] janitor: sweeping N merged topic-branch(es)`).
+
+## 0.44.9 — topic-branch Phases B + C: explicit re-fetch / re-merge / promote loop
+
+### Why
+
+0.44.8 shipped Phase A (chunked push to a per-device topic-branch)
+and relied on the existing direct-push loop to handle Phase B
+(re-fetch + conditional re-merge) and Phase C (promote merge
+commit to main) implicitly. That works for the common no-race
+case and for one bounded race (where the existing post-non-FF
+retry re-merges once inside the direct-push loop), but has a
+hole: if a re-merge inside the direct-push loop produces another
+non-FF state, chunk-halving spins on `DivergedBranches`. Also
+the implicit path doesn't re-enter Phase A after a re-merge —
+it just retries the direct push — so a re-merge during a flaky
+window could leave the merge stuck.
+
+This release adds explicit Phase B and Phase C as a bounded
+loop, replacing the "fall through to direct-push" behaviour
+after a successful Phase A.
+
+### Phase B — re-fetch + conditional re-merge
+
+After Phase A returns success:
+
+1. Re-fetch `origin` (auth errors short-circuit; transient
+   network failures continue with stale local mirror).
+2. Read the local mirror of `refs/remotes/origin/<branch>`.
+3. If unchanged from when we started the run → skip to Phase C.
+4. If changed:
+   - **New remote is reachable from our `local_sha`**: our
+     existing merge already includes the remote's new tip; no
+     re-merge needed. Proceed to Phase C.
+   - **Our `local_sha` is reachable from the new remote**:
+     remote advanced past us during Phase A (e.g., someone else
+     merged our changes upstream). Fast-forward local; surface
+     `S.PULLED`; return — nothing to push.
+   - **Diverged again**: re-run `_merge_diverged` against the
+     new remote tip. Memory pre-flight check
+     (`_check_memory_for_merge`) runs first; refuses with
+     `S.INSUFFICIENT_MEMORY_FOR_MERGE` if low. New merge commit
+     becomes `local_sha`. Conflicts surface as before.
+
+### Phase C — promote merge commit to main
+
+After Phase B leaves us with the right `local_sha`:
+
+1. Set `refs/heads/<branch>` to `local_sha` defensively.
+2. `porcelain.push(remote_url, '<branch>:<branch>')`.
+   Pack negotiation sees the topic-branch ref Phase A
+   populated + `main` + any other server refs; excludes every
+   reachable object. The pack contains only the merge commit
+   + tree + merged LIFT bytes (a few MB) and completes inside
+   the server's per-request timeout.
+3. On success: advance local mirror of `refs/remotes/origin/<branch>`,
+   clear stale chunk_n hints, emit `S.PUSHED`, return.
+4. On `_is_non_ff_rejection`: main moved between Phase B and
+   Phase C (sub-second race window). Loop back to Phase B —
+   re-fetch, re-evaluate, re-push.
+5. On 401 / 403: surface auth-related status, return.
+6. On other (network / server transient): emit `S.PUSH_FAILED`;
+   next drain re-runs Phase A (which short-circuits on
+   already-uploaded objects via the server's topic-branch ref)
+   then Phase B + C.
+
+### Bounded loop
+
+Phase B + Phase C run in a loop with `MAX_PROMOTE_RETRIES = 5`
+iterations. If main keeps moving under us through every retry
+(extremely hot race window), we bail with `S.PUSH_FAILED`;
+next drain tries again. The Phase A short-circuit on resume
+means cost-of-retry across drains is small.
+
+### Files touched
+
+- `azt_collabd/repo.py`: replaced the "fall through to existing
+  direct-push loop" comment-and-trace after Phase A success
+  with the explicit Phase B + C loop. ~150 lines of new code
+  inside `_push_step_locked`. The existing direct-push loop
+  below is unchanged and remains the path for pure-FF cases
+  (the `can_direct_push == True` branch).
+
+### Field-tester migration path (unchanged from 0.44.8)
+
+Same as 0.44.8 — Phase A pushes diverged history to
+`azt-pending-baf-<device>` in chunks, Phase B detects whether
+main moved (won't have, on the tester's repo), Phase C pushes
+the existing `c115b64c` merge commit to main as a tiny pack.
+Difference vs. 0.44.8: if main *did* move during Phase A's
+multi-minute upload, this release handles it cleanly with the
+explicit B + C loop instead of relying on the direct-push
+loop's after-the-fact handling.
+
 ## 0.44.8 — topic-branch Phase A: chunked upload of diverged history
 
 ### Why

@@ -1649,6 +1649,130 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     return commits[min(n, len(commits)) - 1]
 
 
+# Per-daemon-lifetime memo of (project_dir,) we've already swept
+# orphan topic-branches for. Janitor runs once per project per
+# daemon spawn — finding stragglers from earlier daemon lives or
+# from prior versions that didn't have Phase D delete is a one-
+# time cost, not a per-drain one.
+_JANITOR_SWEPT_PROJECTS = set()
+
+
+def _delete_remote_topic_branch(
+    repo, remote_url, username, token, topic_ref_name,
+):
+    """Best-effort delete of ``refs/heads/<topic_ref_name>`` on
+    origin via dulwich's delete-refspec push (``':refs/heads/...'``).
+    Also drops the local mirror at
+    ``refs/remotes/origin/<topic_ref_name>`` on success. Failures
+    are logged and swallowed — the janitor (or a later run) will
+    sweep stragglers."""
+    from dulwich import porcelain
+    refspec = _enc(f':refs/heads/{topic_ref_name}')
+    try:
+        with _socket_timeout(_PUSH_TIMEOUT_S):
+            porcelain.push(
+                repo, remote_url, refspec,
+                username=username, password=token,
+                errstream=io.BytesIO(),
+            )
+        try:
+            del repo.refs[_enc(f'refs/remotes/origin/{topic_ref_name}')]
+        except Exception:
+            pass
+        lift_merge.trace(
+            f'[sync-trace] topic-branch deleted: '
+            f'{topic_ref_name!r}')
+        return True
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] topic-branch delete failed (non-fatal) '
+            f'for {topic_ref_name!r}: {exc!r}')
+        return False
+
+
+def _janitor_sweep_topic_branches(
+    repo, project_dir, username, token, remote_url, branch,
+):
+    """One-shot startup sweep of our own merged topic-branches on
+    the remote. For each ``refs/remotes/origin/azt-pending-*-<our_device>``
+    whose tip is reachable from ``refs/remotes/origin/<branch>``,
+    push a delete refspec.
+
+    Conservative scope:
+    - **Only our own device's refs** (suffix match on the
+      sanitised device_name). Other devices' orphans stay; their
+      owning device's next sync sweeps them. Refusing to touch
+      anyone else's ref avoids any false-positive delete from a
+      reachability check that may not be authoritative (e.g.,
+      another device's topic-branch reachable from main but
+      they're still mid-Phase-A from a stale checkpoint).
+    - **Only merged-into-main refs.** Reachability from main is
+      git's contract for "safe to drop without losing history" —
+      every commit reachable from the topic is also reachable
+      from main, so we can't lose work.
+
+    Called at most once per (project_dir, daemon lifetime) from
+    ``_push_step_locked``. Network cost is one round-trip per
+    deletion; in steady state (Phase D ran on the last success)
+    this finds zero refs to sweep."""
+    from . import store as _store
+
+    device_name = _store.get_device_name() or 'unset'
+    safe_dev = re.sub(r'[^A-Za-z0-9._-]', '_', device_name)
+    suffix = b'-' + safe_dev.encode('utf-8')
+
+    main_remote_ref = _enc(f'refs/remotes/origin/{branch}')
+    try:
+        main_tip = repo.refs[main_remote_ref]
+    except KeyError:
+        return  # nothing to compare against; bail.
+
+    prefix = b'refs/remotes/origin/azt-pending-'
+    candidates = []
+    try:
+        for ref_name in list(repo.refs.allkeys()):
+            if not ref_name.startswith(prefix):
+                continue
+            if not ref_name.endswith(suffix):
+                continue
+            try:
+                topic_tip = repo.refs[ref_name]
+            except KeyError:
+                continue
+            if not _is_ancestor(repo, topic_tip, main_tip):
+                continue
+            candidates.append((ref_name, topic_tip))
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] janitor: ref enumeration failed: {exc!r}')
+        return
+
+    if not candidates:
+        return
+
+    lift_merge.trace(
+        f'[sync-trace] janitor: sweeping {len(candidates)} merged '
+        f'topic-branch(es)')
+    for ref_name, _topic_tip in candidates:
+        server_ref = ref_name[len(b'refs/remotes/origin/'):].decode(
+            'utf-8', errors='replace')
+        _delete_remote_topic_branch(
+            repo, remote_url, username, token, server_ref)
+
+
+def _maybe_run_janitor(
+    repo, project_dir, username, token, remote_url, branch,
+):
+    """Idempotent wrapper around ``_janitor_sweep_topic_branches``
+    keyed by ``project_dir`` so the sweep runs at most once per
+    daemon-lifetime per project."""
+    if project_dir in _JANITOR_SWEPT_PROJECTS:
+        return
+    _JANITOR_SWEPT_PROJECTS.add(project_dir)
+    _janitor_sweep_topic_branches(
+        repo, project_dir, username, token, remote_url, branch)
+
+
 def _topic_branch_name(langcode, device_name):
     """Return the topic-branch ref name (without ``refs/heads/`` prefix)
     for chunked uploads from this device of this project. Format:
@@ -1966,6 +2090,14 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     lift_merge.trace(
         f'[sync-trace] local_sha={local_sha!r} remote_sha={remote_sha!r}')
 
+    # One-shot janitor: sweep merged ``azt-pending-*-<our_device>``
+    # refs on the server. Idempotent per (project, daemon lifetime).
+    # Runs after fetch so it sees fresh server refs and after
+    # remote_sha is read so it can validate ancestry. Best-effort —
+    # any failure logs and returns; sync proceeds.
+    _maybe_run_janitor(
+        repo, project_dir, username, token, remote_url, branch)
+
     retries_remaining = max(1, _settings.merge_retry_max())
     needs_merge = remote_sha is not None and remote_sha != local_sha
     lift_merge.trace(f'[sync-trace] needs_merge={needs_merge}')
@@ -2066,17 +2198,198 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             if success:
                 # Phase A complete. Topic-branch on server now
                 # contains every reachable object from ``local_sha``.
-                # Fall through to the existing direct-push loop —
-                # its first attempt pushes ``local_sha`` to
-                # ``refs/heads/<branch>`` and negotiates a pack
-                # containing only objects the server doesn't have,
-                # which is just the bare minimum (merge commit + a
-                # few small objects). The pack will fit in one
-                # HTTP request, the push succeeds, queue is cleared.
+                # Run explicit Phase B (re-fetch + conditional
+                # re-merge if ``main`` moved during Phase A's long
+                # upload) and Phase C (push merge commit to main).
+                # Each promote attempt loops back to Phase B on
+                # ``DivergedBranches`` from Phase C — bounded by
+                # MAX_PROMOTE_RETRIES so a hot race window can't
+                # spin forever. Return directly when Phase C
+                # succeeds (or fails terminally) instead of
+                # falling through to the existing direct-push
+                # loop; the direct path is for FF cases only and
+                # we've structurally proven we're not FF.
+                MAX_PROMOTE_RETRIES = 5
+                for promote_attempt in range(MAX_PROMOTE_RETRIES):
+                    # ── Phase B: re-fetch main; re-merge on race ──
+                    lift_merge.trace(
+                        f'[sync-trace] phase-b begin '
+                        f'(attempt {promote_attempt + 1}/'
+                        f'{MAX_PROMOTE_RETRIES})')
+                    try:
+                        with _socket_timeout(_FETCH_TIMEOUT_S):
+                            porcelain.fetch(
+                                repo, 'origin',
+                                username=username, password=token,
+                                errstream=io.BytesIO(),
+                            )
+                    except Exception as fexc:
+                        if _is_http_403(fexc):
+                            result.statuses.append(
+                                diagnose_403(token, remote_url))
+                            return result
+                        if _is_http_401(fexc):
+                            result.add(S.AUTH_REQUIRED)
+                            return result
+                        # Non-auth fetch failure: log + proceed
+                        # with stale local mirror. Phase C may
+                        # succeed (no race) or fail (we'll retry
+                        # next drain).
+                        lift_merge.trace(
+                            f'[sync-trace] phase-b: fetch failed '
+                            f'(continuing with stale mirror): '
+                            f'{fexc!r}')
+
+                    new_remote_sha = _read_ref(remote_ref) or remote_sha
+                    if new_remote_sha != remote_sha:
+                        lift_merge.trace(
+                            f'[sync-trace] phase-b: main moved during '
+                            f'Phase A: {_sha_str(remote_sha)[:8]} → '
+                            f'{_sha_str(new_remote_sha)[:8]}')
+                        if _is_ancestor(repo, new_remote_sha, local_sha):
+                            # Our merge already includes the new
+                            # remote tip — no action needed.
+                            lift_merge.trace(
+                                '[sync-trace] phase-b: existing '
+                                'merge already includes new remote; '
+                                'no re-merge')
+                        elif _is_ancestor(repo, local_sha, new_remote_sha):
+                            # Remote moved past us and includes
+                            # everything we had. Fast-forward
+                            # local — nothing to push.
+                            lift_merge.trace(
+                                '[sync-trace] phase-b: remote '
+                                'advanced past us; FF local — '
+                                'nothing to push')
+                            repo.refs[branch_ref] = new_remote_sha
+                            try:
+                                repo.refs[remote_ref] = new_remote_sha
+                            except Exception:
+                                pass
+                            result.add(S.PULLED)
+                            return result
+                        else:
+                            # Diverged again — re-merge.
+                            mem_block = _check_memory_for_merge()
+                            if mem_block is not None:
+                                lift_merge.trace(
+                                    f'[sync-trace] phase-b: re-merge '
+                                    f'skipped — insufficient memory '
+                                    f'(have '
+                                    f'{mem_block.params.get("mem_available_mb")}MB, '
+                                    f'need '
+                                    f'{mem_block.params.get("min_required_mb")}MB)')
+                                result.statuses.append(mem_block)
+                                result.add(S.PULL_FAILED,
+                                           error='insufficient memory '
+                                                 'for re-merge')
+                                return result
+                            lift_merge.trace(
+                                '[sync-trace] phase-b: re-merging '
+                                'against new remote tip')
+                            try:
+                                merged_sha, re_conflicts = _merge_diverged(
+                                    repo, project_dir, branch,
+                                    local_sha, new_remote_sha)
+                                local_sha = merged_sha
+                                if re_conflicts:
+                                    result.add(
+                                        'CONFLICTS',
+                                        paths=[c.path for c in re_conflicts][:50])
+                                lift_merge.trace(
+                                    f'[sync-trace] phase-b: re-merge '
+                                    f'done '
+                                    f'conflicts={len(re_conflicts)}')
+                            except Exception as mexc:
+                                lift_merge.trace(
+                                    f'[sync-trace] phase-b: re-merge '
+                                    f'FAILED: {mexc!r}')
+                                result.add(
+                                    S.PULL_FAILED,
+                                    error=f'phase-b re-merge: '
+                                          f'{_format_push_error(mexc)}')
+                                return result
+                        remote_sha = new_remote_sha
+
+                    # ── Phase C: promote merge commit to main ──
+                    # Make sure the local branch ref points at the
+                    # (possibly re-merged) local_sha before push.
+                    try:
+                        repo.refs[branch_ref] = local_sha
+                    except Exception as rexc:
+                        lift_merge.trace(
+                            f'[sync-trace] phase-c: branch_ref set '
+                            f'failed: {rexc!r}')
+                    refspec = _enc(
+                        f'refs/heads/{branch}:refs/heads/{branch}')
+                    lift_merge.trace(
+                        f'[sync-trace] phase-c: pushing '
+                        f'{_sha_str(local_sha)[:8]} → '
+                        f'refs/heads/{branch}')
+                    try:
+                        with _socket_timeout(_PUSH_TIMEOUT_S):
+                            porcelain.push(
+                                repo, remote_url, refspec,
+                                username=username, password=token,
+                                errstream=io.BytesIO(),
+                            )
+                        # Success. Advance local mirror, clear
+                        # any stale chunk_n hint, signal PUSHED.
+                        try:
+                            repo.refs[remote_ref] = local_sha
+                        except Exception:
+                            pass
+                        _clear_failed_chunk_n(project_dir)
+                        lift_merge.trace(
+                            '[sync-trace] phase-c: push done')
+                        # Phase D: delete the now-unneeded topic-
+                        # branch on the server (best-effort; if it
+                        # fails, the next-startup janitor catches
+                        # the orphan since the topic's tip is now
+                        # reachable from main).
+                        _delete_remote_topic_branch(
+                            repo, remote_url, username, token,
+                            topic_ref_name)
+                        result.add(S.PUSHED, branch=branch)
+                        return result
+                    except Exception as pexc:
+                        if _is_http_403(pexc):
+                            result.statuses.append(
+                                diagnose_403(token, remote_url))
+                            return result
+                        if _is_http_401(pexc):
+                            result.add(S.AUTH_REQUIRED)
+                            return result
+                        if _is_non_ff_rejection(pexc):
+                            # Main moved between Phase B and
+                            # Phase C — loop back through Phase B
+                            # to re-fetch and re-merge.
+                            lift_merge.trace(
+                                f'[sync-trace] phase-c: non-FF '
+                                f'rejection; looping to phase-b')
+                            continue
+                        # Other (network, server transient).
+                        # Bail; next drain re-runs Phase A which
+                        # short-circuits on already-uploaded
+                        # objects, then Phase B + C again.
+                        lift_merge.trace(
+                            f'[sync-trace] phase-c: push raised '
+                            f'{pexc!r}; bailing for next-drain retry')
+                        result.add(
+                            S.PUSH_FAILED,
+                            error=f'phase-c: '
+                                  f'{_format_push_error(pexc)}')
+                        return result
+                # Promote-retry cap exceeded — main keeps moving
+                # under us. Bail; next drain tries again.
                 lift_merge.trace(
-                    '[sync-trace] topic-push complete — falling '
-                    'through to direct push of merge commit (tiny '
-                    'pack)')
+                    f'[sync-trace] phase-c: exceeded '
+                    f'{MAX_PROMOTE_RETRIES} promote-retries — '
+                    f'main keeps racing')
+                result.add(
+                    S.PUSH_FAILED,
+                    error='topic-branch promote: too many races')
+                return result
             elif conflict_status is not None:
                 # Typed status from the topic-push helper. Three
                 # shapes:
