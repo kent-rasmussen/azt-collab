@@ -9,7 +9,86 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.44.11 — Phase A pre-flight pack-size diagnostic + COMMIT_PACK_EXCEEDS_NETWORK_BUDGET bail
+## 0.44.12 — Phase A persistence gate + commit-time large-file flag + clearer bail message
+
+### Why
+
+0.44.11 shipped a single size-based gate (bail when the chunk_n=1
+pack > 10 MB). Field logs from the baf tester on Starlink showed
+the gate was the wrong shape: chunk_n=1 packs as small as 276 KB
+still 408'd at GitHub's receive-pack endpoint in ~20–30 s,
+consistently, indefinitely. The 10 MB gate never fires for a tiny
+pack like that — so the daemon spun all the way to
+MAX_CONSECUTIVE_FAILURES (12) on every drain, burning ~10 min per
+cycle for nothing. And the "single commit too big for your
+connection" wording in the bail message was actively misleading
+on a fast pipe.
+
+### What landed
+
+- **Persistence gate.** ``_push_chunked_to_ref`` now tracks
+  ``chunk_n_1_failures``. After the *second* chunk_n=1 failure
+  (regardless of pack size), bail with
+  ``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET``. This catches the
+  "server keeps rejecting our pushes for reasons we can't see"
+  case the field showed.
+- **Default size-gate budget lowered** from 10 MB to 3 MB
+  (``sync.commit_pack_byte_budget``). The original 10 MB was
+  calibrated on a guess; field data shows even ~7 MB packs 408
+  reliably on observed connections, so 10 MB rarely fired even
+  when it should have. 3 MB still leaves room for a healthy
+  single-commit pack on a working pipe but trips faster on
+  observably-bad ones. (The size gate fires on the *first*
+  chunk_n=1 failure when bytes > budget; the persistence gate
+  fires on the *second* failure regardless.)
+- **Bail message rewritten.** The old wording said "single
+  commit is too large for this connection" — wrong on Starlink
+  where tiny packs also fail. New message: "Could not push to
+  GitHub: the server kept rejecting our push attempts
+  ({commit_sha}, {raw_bytes:,} bytes). May be a connection
+  problem or a GitHub-side issue — try again later or on a
+  different network." The ``Status`` params now carry
+  ``reason='oversize'|'exhausted'`` so future UI / log
+  consumers can differentiate.
+- **Data-quality flag at commit time.** ``_commit_step_locked``
+  now scans every just-made commit for files above
+  ``data_quality.large_audio_byte_threshold`` (default 500 KB)
+  and emits ``S.LARGE_AUDIO_FILE_DETECTED`` plus a
+  ``[data-quality]`` stderr line per offender. The suite
+  recorder is for word-list elicitation; multi-MB files almost
+  always mean a phrase / text was recorded by mistake.
+  Informational — doesn't block the commit; daemon log becomes
+  the audit trail.
+- **Helpers.** ``_check_large_files_in_commit(repo, commit_sha,
+  threshold)`` walks ``dulwich.diff_tree.tree_changes`` for the
+  new commit vs its first parent.
+- **Classifier script.** ``tools/classify_pending.py`` — offline
+  per-commit stats (files / total bytes / max-file) for an
+  existing diverged range. Useful for triaging an already-stuck
+  repo (run against a desktop clone with the full pending
+  history).
+- **Translations** for the new bail wording and
+  ``LARGE_AUDIO_FILE_DETECTED`` (English + French).
+
+### Wire format
+
+Additive only — new status code ``LARGE_AUDIO_FILE_DETECTED``
+and new ``reason`` param on ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET``.
+Old peers fall through to the generic ``[CODE] params``
+formatter or ignore the new param. No ``MIN_CLIENT_VERSION``
+bump.
+
+### What this doesn't fix
+
+The actual cause of baf's stuck push remains unknown — the
+server-side 408s at ~20–30 s on packs of any size, including
+276 KB, on a fast Starlink pipe. The persistence gate just
+gives up faster and tells the user something honest. Real fixes
+require diagnosing whether dulwich-on-Android, GitHub's edge,
+or something in between is the culprit (see "Next test"
+discussion below in CHANGELOG conversation).
+
+## 0.44.11 — Phase A pre-flight pack-size diagnostic + first-cut budget bail
 
 ### Why
 
@@ -25,70 +104,38 @@ to. Before 0.44.11 this just spun on ``MAX_CONSECUTIVE_FAILURES``
 with no indication to the user that the problem isn't going to
 fix itself by waiting.
 
-This release adds a pre-flight pack-size estimate to every Phase A
-attempt (traced) and surfaces a typed
-``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` when chunk-halving has
-already reached ``chunk_n=1`` and either of two OR'd gates trips:
-the single-commit pack estimate exceeds the per-attempt budget
-(default 3 MB), or the second chunk_n=1 attempt has failed
-regardless of size. The user gets a concrete diagnosis ("this
-one commit is too big for this connection") instead of indefinite
-retries.
+This release added a pre-flight pack-size estimate to every Phase A
+attempt (traced) and a typed
+``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` bail at chunk_n=1 when
+the single-commit pack exceeded the per-attempt budget
+(initially 10 MB). See 0.44.12 for the follow-up persistence
+gate + budget retune after field evidence showed the size-only
+gate was insufficient.
 
 ### What landed
 
-- `azt_collabd/repo.py`: `_estimate_delta_size(repo, have_sha,
-  want_sha)` — walks `dulwich.object_store.MissingObjectFinder`
-  and sums `raw_length()` over the missing-objects set. Returns
-  `(object_count, raw_bytes)` (pre-compression upper bound). One
-  call per Phase A attempt; cost dominated by the missing-objects
-  walk (~1–3 s for a 50-commit range, sub-second at chunk_n=1).
-  Wired into `_push_chunked_to_ref` as a pre-flight trace
-  (`[sync-trace] topic-push pack-size: N objects, X bytes`).
-- `_push_chunked_to_ref` adds two OR'd bails at chunk_n=1:
-  the size gate (estimate > `commit_pack_byte_budget()`) fires on
-  the first chunk_n=1 failure when we've already measured the
-  unit as too big; the persistence gate fires on the second
-  chunk_n=1 failure regardless of size (field shows the failure
-  is persistent on too-slow connections, not transient). Either
-  returns `Status(COMMIT_PACK_EXCEEDS_NETWORK_BUDGET, {commit_sha,
-  raw_bytes, budget_bytes, object_count})` instead of looping on.
-  Bail trace: `[sync-trace] topic-push: chunk_n=1 bail (oversize|
-  exhausted) pack=X bytes budget=Y failures=N; surfacing typed
-  status`.
-- `_push_step_locked` handles the new status code alongside
-  `TOPIC_BRANCH_CONFLICT` — surfaces it on the Result and adds
-  `PUSH_FAILED` for peers without specific routing on the new
-  code.
-- `azt_collabd/settings.py`: new
-  `commit_pack_byte_budget()` settings function. Default
-  3 MB (3 × 1024 × 1024). 0 disables the size gate only —
-  the second-failure gate still fires. Tune via
-  `sync.commit_pack_byte_budget` in `$AZT_HOME/config.json`.
-- `azt_collabd/status.py` + `azt_collab_client/status.py`:
-  `COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` mirrored.
-- `azt_collab_client/translate.py`: human-readable message for
-  the new code, plus a previously-missing entry for
-  `TOPIC_BRANCH_CONFLICT` (added 0.44.8, never translated; would
-  have fallen through to `[CODE] params!r`).
-- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`:
-  French translations for both messages.
+- ``azt_collabd/repo.py``: ``_estimate_delta_size(repo, have_sha,
+  want_sha)`` — walks ``dulwich.object_store.MissingObjectFinder``
+  and sums ``raw_length()`` over the missing-objects set. One
+  call per Phase A attempt, traced as
+  ``[sync-trace] topic-push pack-size: N objects, X bytes``.
+- ``_push_chunked_to_ref`` adds a size-only bail at chunk_n=1
+  when ``raw_bytes > commit_pack_byte_budget()``.
+- ``_push_step_locked`` handles the new status code alongside
+  ``TOPIC_BRANCH_CONFLICT``.
+- ``azt_collabd/settings.py``: new ``commit_pack_byte_budget()``
+  (initially 10 MB; retuned to 3 MB in 0.44.12).
+- ``azt_collabd/status.py`` + ``azt_collab_client/status.py``:
+  ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` mirrored.
+- ``azt_collab_client/translate.py``: initial bail message
+  (replaced in 0.44.12 once field evidence showed the
+  "too large for this connection" wording was wrong), plus the
+  previously-missing entry for ``TOPIC_BRANCH_CONFLICT``.
+- French translations.
 
 ### Wire format
 
-Additive status code. Peers that don't know
-`COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` fall through to the generic
-`[CODE] params` formatter — no crash, no wire-incompatibility.
-No `MIN_CLIENT_VERSION` bump.
-
-### What this doesn't fix
-
-The underlying limitation — a single commit's audio bytes
-exceeding what one HTTP receive-pack request can carry on a slow
-connection — is structural. The genuine remedies are a faster
-network or moving audio out of git history (git-lfs / external
-store). Phase A still tries first; the new bail just stops the
-loop with a clear message once it's exhausted its options.
+Additive status code. No ``MIN_CLIENT_VERSION`` bump.
 
 ## 0.44.10 — topic-branch Phase D + startup janitor: clean up merged topic-branches
 

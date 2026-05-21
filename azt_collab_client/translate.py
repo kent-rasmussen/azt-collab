@@ -232,10 +232,15 @@ _HANDLERS = {
         '(server tip {server_tip}). Change this device\'s name in '
         'the daemon settings to something unique and try again.'), p),
     S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET: lambda p: _fmt(_tr(
-        'A single commit ({commit_sha}) is too large '
-        '({raw_bytes:,} bytes) for this connection to upload inside '
-        'the server\'s per-request timeout. No smaller unit to retry '
-        'with. Try again on a faster connection.'), p),
+        'Could not push to GitHub: the server kept rejecting our '
+        'push attempts (single commit {commit_sha}, '
+        '{raw_bytes:,} bytes). This may be a connection problem or '
+        'a GitHub-side issue — try again later or on a different '
+        'network.'), p),
+    S.LARGE_AUDIO_FILE_DETECTED: lambda p: _fmt(_tr(
+        'Unusually large file recorded: {path} ({bytes:,} bytes). '
+        'The recorder is for word-list elicitation — please check '
+        'whether this was a recording mistake.'), p),
 
     # Transport-layer synthetics from the client (not emitted by the backend)
     'SERVER_UNAVAILABLE':     lambda p: _fmt(_tr('Sync service unavailable: {error}'), p),

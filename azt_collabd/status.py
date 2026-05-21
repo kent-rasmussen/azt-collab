@@ -149,6 +149,17 @@ TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
 # history (LFS / external store); the daemon can't work around it.
 # Since 0.44.11.
 COMMIT_PACK_EXCEEDS_NETWORK_BUDGET = 'COMMIT_PACK_EXCEEDS_NETWORK_BUDGET'
+# A just-made commit contains a file whose size exceeds
+# ``data_quality.large_audio_byte_threshold`` (default 500 KB). The
+# suite recorder is for word-list elicitation; legitimate audio files
+# are tens to a few hundred KB. Multi-MB files almost always mean
+# someone recorded a phrase / text by mistake — surface so the user
+# can review and re-record. Doesn't block the commit (the file is
+# already in history); informational. Params: ``path``, ``bytes``,
+# ``threshold``, ``commit_sha`` (hex prefix). Emitted as part of the
+# commit result; auto-commit peers may silently log and user-driven
+# flows may toast per the auto/user routing contract. Since 0.44.11.
+LARGE_AUDIO_FILE_DETECTED = 'LARGE_AUDIO_FILE_DETECTED'
 
 # ── 403 diagnosis ──────────────────────────────────────────────────────────
 AUTH_REQUIRED = 'AUTH_REQUIRED'

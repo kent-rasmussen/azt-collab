@@ -110,6 +110,13 @@ TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
 # a faster connection or moving audio out of git history (LFS /
 # external store); the daemon can't work around it. Since 0.44.11.
 COMMIT_PACK_EXCEEDS_NETWORK_BUDGET = 'COMMIT_PACK_EXCEEDS_NETWORK_BUDGET'
+# Data-quality flag: a just-made commit contains a file whose size
+# exceeds ``data_quality.large_audio_byte_threshold`` (default 500 KB).
+# The recorder is for word-list elicitation; multi-MB files almost
+# always mean a phrase / text was recorded by mistake. Params:
+# ``path``, ``bytes``, ``threshold``, ``commit_sha``. Informational.
+# Since 0.44.11.
+LARGE_AUDIO_FILE_DETECTED = 'LARGE_AUDIO_FILE_DETECTED'
 
 AUTH_REQUIRED = 'AUTH_REQUIRED'
 APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'

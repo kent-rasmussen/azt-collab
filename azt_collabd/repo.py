@@ -1339,13 +1339,33 @@ def _commit_step_locked(repo, project_dir, contributor_name, result):
         author = _default_author(contributor_name)
         committer = _app_committer()
         try:
-            porcelain.commit(
+            sha = porcelain.commit(
                 repo,
                 message=_enc(f'Audio recordings by {contributor_name}'),
                 author=author, committer=committer,
             )
             result.add(S.COMMITTED_LOCAL)
             _clear_commit_failure_count(project_dir)
+            # Data-quality flag: oversize files in the just-made
+            # commit. Recorder is for word-list elicitation; multi-MB
+            # files probably mean someone recorded a phrase/text by
+            # mistake. Trace + typed status. Doesn't block the commit
+            # (file's already in history) — just surfaces for review.
+            threshold = _settings.large_audio_byte_threshold()
+            large = _check_large_files_in_commit(repo, sha, threshold)
+            for path, size in large:
+                sha_str = _sha_str(sha)[:8]
+                print(f'[data-quality] large file in commit '
+                      f'{sha_str}: {path!r} '
+                      f'({size:,} bytes; threshold {threshold:,})',
+                      file=sys.stderr, flush=True)
+                result.add(
+                    S.LARGE_AUDIO_FILE_DETECTED,
+                    path=path,
+                    bytes=size,
+                    threshold=threshold,
+                    commit_sha=sha_str,
+                )
         except Exception as exc:
             _surface_commit_failure(result, project_dir, exc)
     else:
@@ -1647,6 +1667,48 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
         return tip_sha
     commits.reverse()
     return commits[min(n, len(commits)) - 1]
+
+
+def _check_large_files_in_commit(repo, commit_sha, threshold_bytes):
+    """Walk a commit's diff vs its first parent and return a list of
+    ``(path, size_bytes)`` for any file added or modified at size
+    ``>= threshold_bytes``. Best-effort: empty list on any walker
+    failure or if threshold is 0.
+
+    Used as a data-quality flag after a successful commit — the suite
+    recorder is for word-list elicitation, so multi-MB audio files
+    almost always mean a recording mistake worth surfacing."""
+    if threshold_bytes <= 0 or not commit_sha:
+        return []
+    try:
+        from dulwich.diff_tree import tree_changes
+        new_commit = repo[commit_sha]
+        new_tree_id = new_commit.tree
+        parent_tree_id = None
+        if new_commit.parents:
+            parent_commit = repo[new_commit.parents[0]]
+            parent_tree_id = parent_commit.tree
+        large = []
+        for change in tree_changes(
+                repo.object_store, parent_tree_id, new_tree_id):
+            new = getattr(change, 'new', None)
+            if not new or new.sha is None or new.path is None:
+                continue
+            try:
+                size = repo.object_store[new.sha].raw_length()
+            except Exception:
+                continue
+            if size >= threshold_bytes:
+                try:
+                    path_str = new.path.decode('utf-8', errors='replace')
+                except Exception:
+                    path_str = repr(new.path)
+                large.append((path_str, size))
+        return large
+    except Exception as exc:
+        lift_merge.trace(
+            f'[data-quality] large-file scan failed: {exc!r}')
+        return []
 
 
 def _estimate_delta_size(repo, have_sha, want_sha):
@@ -2051,7 +2113,8 @@ def _push_chunked_to_ref(
                     {'commit_sha': label,
                      'raw_bytes': raw_bytes,
                      'budget_bytes': budget,
-                     'object_count': obj_count},
+                     'object_count': obj_count,
+                     'reason': reason},
                 ), chunk_base
             consecutive_failures += 1
             # Halve the chunk size and try again. Floor at 1 — a

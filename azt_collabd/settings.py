@@ -177,6 +177,22 @@ def topic_branch_chunk_size():
     return max(1, int(get('sync.topic_branch_chunk_size', 50)))
 
 
+def large_audio_byte_threshold():
+    """Files added or modified in a commit whose size exceeds this
+    threshold are flagged as ``S.LARGE_AUDIO_FILE_DETECTED`` and
+    written to the daemon log as ``[data-quality]`` lines. The suite
+    recorder is for word-list elicitation; legitimate audio files
+    should be ~tens to a few hundreds of KB. Files in the multi-MB
+    range almost certainly mean someone recorded a phrase or text by
+    mistake — worth surfacing so the user can review.
+
+    Default 500 KB (covers a generous ~10 s of 16-bit 48 kHz mono WAV
+    or ~40 s of 96 kbps MP3). 0 disables the check. Tune via
+    ``data_quality.large_audio_byte_threshold``."""
+    return max(0, int(get('data_quality.large_audio_byte_threshold',
+                          500 * 1024)))
+
+
 def commit_pack_byte_budget():
     """First of two gates that surface ``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET``
     at ``chunk_n=1`` in Phase A. When the pre-flight estimate for the
