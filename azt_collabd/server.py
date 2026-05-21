@@ -44,6 +44,8 @@ import time as _time
 from . import auth
 from . import cawl as _cawl
 from . import config as _config
+from . import peer_id as _peer_id
+from . import peers as _peers
 from . import projects
 from . import scheduler
 from . import store

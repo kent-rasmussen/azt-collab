@@ -9,6 +9,51 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.44.13 — positive cache for system-resolver hits (Starlink DNS round-trip elimination)
+
+### Why
+
+`azt_collabd/net.py` already had a DoH fallback (Cloudflare 1.1.1.1)
+for *failed* system DNS — the "Cameroon" fix. But the fallback only
+fires when ``socket.getaddrinfo`` raises ``gaierror``. On Starlink,
+where system DNS works but each lookup is slow (satellite RTT +
+distant resolver placement = multi-second per query), the fallback
+never engages and we pay full DNS cost on every connection.
+
+Counted against the field log: a typical drain through chunk-halving
+(50 → 25 → 12 → 6 → 3 → 1, then chunk_n=1 retries) opens ~14
+connections to ``github.com:443`` (2 per attempt: ``GET info/refs``
+and ``POST git-receive-pack``), each preceded by a fresh system DNS
+call. The periodic ``_has_internet()`` probe at
+``sync.connectivity_poll_s`` (default 30 s) adds 2 more lookups per
+tick. On a slow resolver every one of those is satellite-RTT.
+
+### What landed
+
+- ``azt_collabd/net.py``: ``_SYSTEM_CACHE`` dict + lock, 5-min TTL
+  (matches DoH cache). Keyed on ``(host, port)``; populated on
+  successful system-resolver returns; checked before calling
+  ``_orig_getaddrinfo``. Hostname-shaped only (gated on
+  ``_looks_like_hostname``) — numeric IPs / AF_UNIX paths fall
+  through to the original ~O(1) path.
+- New ``_RESOLVER_STATE`` value ``'system-cache'`` for cache hits.
+  ``resolver_state()`` docstring updated.
+
+### Impact
+
+During a sync session, ``github.com`` resolves at most once per 5
+min instead of ~14+ times per drain. Eliminates 13+ system-DNS
+round-trips per drain pass on slow resolvers. Effect on the baf
+tester's 408 pattern: TBD — DNS is one of several suspects
+(server-side budget, dulwich-on-Android pump, TLS instability). If
+the 408 was DNS-eating-the-budget, this fixes it; if not, we'll see
+the 408s persist with the same shape and need to keep looking.
+
+### Wire format
+
+None. Pure internal optimisation; no new endpoints, no new
+status codes, no MIN_CLIENT_VERSION bump.
+
 ## 0.44.12 — Phase A persistence gate + commit-time large-file flag + clearer bail message
 
 ### Why

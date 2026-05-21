@@ -200,6 +200,32 @@ _DOH_NEGATIVE_TTL_MAX_S = 60.0
 # resolve), used to compute the exponential negative TTL.
 _DOH_CACHE = {}
 _DOH_CACHE_LOCK = threading.Lock()
+
+# ── Positive cache for system-resolver hits ──────────────────────────
+# The DoH cache above only helps when the system resolver *fails*.
+# On slow-but-working DNS (canonical case: Starlink — satellite RTT +
+# distant resolver placement can push individual lookups into the
+# multi-second range), the system path keeps succeeding so DoH never
+# engages, and every push attempt pays the full DNS round-trip. The
+# typical drain hits ``getaddrinfo('github.com', 443)`` ~14 times per
+# cycle (2 connections × ~7 chunk-halving attempts) plus the periodic
+# connectivity probe. Caching positive system results collapses that
+# back to 1 lookup per cache lifetime per (host, port).
+#
+# TTL matches the DoH cache (5 min). GitHub's anycast IPs are
+# typically stable for hours, so a 5-min stale window is well within
+# the safety margin; on the other end, 5 min is short enough that
+# a real failover (rare) recovers without operator intervention.
+#
+# Keyed on ``(host, port)`` only — same as the DoH cache. Callers
+# that pass family/type filters get a result list with mixed
+# families and filter at the iteration site (urllib3's
+# create_connection happy-eyeballs loop), which is the standard
+# pattern for getaddrinfo callers.
+_SYSTEM_CACHE_TTL_S = 300.0
+_SYSTEM_CACHE = {}
+_SYSTEM_CACHE_LOCK = threading.Lock()
+
 _RESOLVER_STATE = {'last': 'unknown'}
 
 _orig_getaddrinfo = None
@@ -259,10 +285,25 @@ def _looks_like_hostname(host):
 
 def _patched_getaddrinfo(host, port, *args, **kwargs):
     """System resolver first; DoH on gaierror for hostname-shaped
-    lookups. Records the path used in ``_RESOLVER_STATE``."""
+    lookups. Records the path used in ``_RESOLVER_STATE``. Positive
+    system results are cached briefly so a sync session doesn't
+    re-resolve the same host on every connection (see notes on
+    ``_SYSTEM_CACHE`` above)."""
+    cache_key = (host, port)
+    if _looks_like_hostname(host):
+        now = time.time()
+        with _SYSTEM_CACHE_LOCK:
+            entry = _SYSTEM_CACHE.get(cache_key)
+            if entry and entry[0] > now:
+                _RESOLVER_STATE['last'] = 'system-cache'
+                return entry[1]
     try:
         result = _orig_getaddrinfo(host, port, *args, **kwargs)
         _RESOLVER_STATE['last'] = 'system'
+        if _looks_like_hostname(host) and result:
+            with _SYSTEM_CACHE_LOCK:
+                _SYSTEM_CACHE[cache_key] = (
+                    time.time() + _SYSTEM_CACHE_TTL_S, result)
         return result
     except socket.gaierror:
         if not _looks_like_hostname(host):
@@ -327,9 +368,12 @@ def _patch_resolver():
 
 def resolver_state():
     """Return the path used for the most recent ``getaddrinfo`` call:
-    ``'system'``, ``'doh'``, ``'fail'``, or ``'unknown'`` (no lookup
-    performed yet this session). Read by the scheduler so an operator
-    skimming the daemon log can tell whether the DoH path is active."""
+    ``'system'`` (fresh system-resolver hit), ``'system-cache'``
+    (positive cache hit, ~zero RTT), ``'doh'`` (DoH-over-Cloudflare
+    fallback because system resolver failed), ``'fail'``, or
+    ``'unknown'`` (no lookup performed yet this session). Read by the
+    scheduler so an operator skimming the daemon log can tell whether
+    the cache + DoH paths are doing their job."""
     return _RESOLVER_STATE.get('last', 'unknown')
 
 
