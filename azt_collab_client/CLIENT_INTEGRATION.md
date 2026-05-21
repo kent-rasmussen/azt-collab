@@ -1451,6 +1451,7 @@ the sync settings screen anchored on the work-offline toggle
 | ``S.WORK_OFFLINE_ENABLED`` | n/a — auto-commit doesn't see this (only ``sync_project`` emits it). | Toast "Work-offline mode is on" + ``open_server_ui()`` to the sync settings screen. The user explicitly turned the toggle on; the Sync button is the only path that surfaces the refusal. (0.43.0+.) |
 | ``S.BUSY`` | **Silent.** Daemon's project_lock is held by another caller (almost always *this peer's* prior in-flight sync). Lock clears in milliseconds; the next regular tick covers it. Auto-sync surfaces nothing. | **Silent.** Even on user-gesture: showing "Another sync is in progress" toasts back-to-back is just punishing the user for the peer's missing in-flight guard. Optionally: debounce the Sync button so a fast double-tap fires once. See § 17c for the load-shedding rules that prevent ``S.BUSY`` in the first place. |
 | ``S.JOB_INTERRUPTED`` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails. |
+| ``S.INSUFFICIENT_MEMORY_FOR_MERGE`` | **Silent.** Daemon refused the merge because device free memory was below ``sync.min_free_mem_mb_for_merge`` (default 200 MB). Next drain cycle re-checks and proceeds when memory recovers — nothing the user can do mid-recording, and toasting "not enough memory" while they're working is just noise. Params: ``mem_available_mb`` (int), ``min_required_mb`` (int). 0.44.4+. | Translated toast naming the numeric headroom — the user explicitly asked, so they get the "close other apps, I'll retry" message. Translation already covers the wording. DO NOT route to settings — no per-project knob fixes RAM pressure. |
 | ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` | **Silent.** Log; daemon will be reachable next time. | Transient-error toast. DO NOT route to settings — no user-fixable config here. |
 | ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
 | ``S.DATA_LOSS_RISK`` | **SURFACE (not silenced).** This is a data-loss-class signal — files written by a peer aren't reaching git. The auto/user distinction does NOT apply: ALWAYS render the translated toast / banner with the maintainer-contact wording. Params: ``count`` (int), ``sample`` (up to 5 paths). | Same surface as auto-sync. |
@@ -1483,6 +1484,7 @@ def _auto_commit(self, langcode):
                       S.APP_NOT_INSTALLED, S.APP_SUSPENDED,
                       S.REPO_NOT_AUTHORIZED,
                       S.BUSY,
+                      S.INSUFFICIENT_MEMORY_FOR_MERGE,
                       S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
                       S.AUTH_REFRESH_STALE):
         print(f'[auto-commit] {langcode}: '
@@ -1526,8 +1528,11 @@ def do_sync(self, langcode):
                                   S.REPO_NOT_AUTHORIZED)),
                    '')
         self.open_url(url) if url else self.open_github_connect()
-    elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
+    elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR,
+                        S.INSUFFICIENT_MEMORY_FOR_MERGE):
         # Transient — no user-fixable config; just say so.
+        # INSUFFICIENT_MEMORY_FOR_MERGE: translation carries the
+        # numeric headroom + retry promise.
         self.show_toast(translate_result(result))
     elif result.has(S.JOB_INTERRUPTED):
         ...  # retry; transient-error toast if retry fails
@@ -1555,6 +1560,7 @@ S.APP_SUSPENDED           # 'APP_SUSPENDED'
 S.REPO_NOT_AUTHORIZED     # 'REPO_NOT_AUTHORIZED'
 S.CONTRIBUTOR_UNSET       # 'CONTRIBUTOR_UNSET'
 S.JOB_INTERRUPTED         # 'JOB_INTERRUPTED'
+S.INSUFFICIENT_MEMORY_FOR_MERGE  # ← 0.44.4+, daemon refused merge under memory pressure
 S.WORK_OFFLINE_ENABLED    # 'WORK_OFFLINE_ENABLED' ← 0.43.0+, sync_project only
 S.BUSY                    # 'BUSY'                ← project_lock held; silent (§ 17c)
 S.SERVER_UNAVAILABLE      # 'SERVER_UNAVAILABLE'  ← 0.41.13+

@@ -712,20 +712,22 @@ KV_TEMPLATE = '''
                         id: daemon_log_no_btn
                         text: _('no')
                         on_press: root.set_daemon_log_mode(False)
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(10)
-                    RecBtn:
-                        id: daemon_log_share_btn
-                        text: _('Share daemon log')
-                        normal_color: T.SURFACE
-                        on_press: root.share_daemon_log()
-                    RecBtn:
-                        id: restart_server_btn
-                        text: _('Restart server')
-                        normal_color: T.SURFACE
-                        on_press: root.restart_server()
+                RecBtn:
+                    id: daemon_log_share_btn
+                    text: _('Share daemon log')
+                    normal_color: T.SURFACE
+                    on_press: root.share_daemon_log()
+                # Restart on its own row — the French translation
+                # ("Redémarrer le service") + share button's French
+                # translation ("Partager le journal du service") are
+                # both too long to fit side by side on a phone-width
+                # screen. Stacking vertically lets each label render
+                # at full width without truncation.
+                RecBtn:
+                    id: restart_server_btn
+                    text: _('Restart server')
+                    normal_color: T.SURFACE
+                    on_press: root.restart_server()
                 BodyLabel:
                     id: daemon_log_status
                     text: ''
@@ -1737,17 +1739,36 @@ class SettingsScreen(Screen):
         PythonActivity on Android) from the daemon process, so the
         restart is safe from here — the UI keeps running. Status
         shows up in the existing ``daemon_log_status`` label that
-        also fields share-daemon-log feedback."""
+        also fields share-daemon-log feedback.
+
+        Two paths:
+
+        1. **Cooperative.** ``client.restart_server()`` POSTs
+           ``/v1/admin/restart``. The daemon flushes the response,
+           waits 0.5 s, then re-execs (desktop) or ``_exit(0)``s
+           (Android, where the ContentProvider contract auto-spawns
+           the next caller).
+
+        2. **Non-cooperative fallback.** Step 1 fails when the
+           running daemon is too old to know the endpoint (the
+           exact case the user usually wants Restart for — "I just
+           installed a new APK and need to get rid of the old
+           daemon"), or when the daemon is wedged in a long-running
+           op and not draining its dispatch queue. Fall through to
+           the same kill-by-PID mechanism
+           ``SuiteSelfReplaceReceiver`` uses on
+           ``ACTION_MY_PACKAGE_REPLACED``: enumerate same-UID
+           sibling processes (Android) or read
+           ``$AZT_HOME/server.json`` and ``os.kill`` (desktop).
+           Same-UID kill needs no permission, ignores process-
+           importance, and works regardless of the daemon's
+           version.
+        """
         from azt_collab_client import restart_server as _restart
         status = self.ids.get('daemon_log_status')
 
         def _do():
             res = _restart()
-            transport = ''
-            for st in res.statuses:
-                if st.code == 'RESTARTING':
-                    transport = st.params.get('transport') or ''
-                    break
 
             def _show(text):
                 if status is not None:
@@ -1761,23 +1782,182 @@ class SettingsScreen(Screen):
                     lambda *_: _show(_tr(
                         'Sync service is restarting…'
                     )), 0)
-            elif res.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
-                Clock.schedule_once(
-                    lambda *_: _show(_tr(
-                        'Could not reach the sync service to '
-                        'restart it.'
-                    )), 0)
-            else:
-                Clock.schedule_once(
-                    lambda *_: _show(_tr(
-                        'Restart request returned an unexpected '
-                        'response.'
-                    )), 0)
+                # The bottom version strip (``app.version_string``,
+                # rendered ``client X · server Y``) is captured at
+                # startup via ``_probe_server_version`` and never
+                # refreshed. After a successful restart the
+                # ``server Y`` half is stale. Re-probe so the user
+                # sees the new daemon's version land. Delayed 2 s
+                # so the new daemon has time to come up and answer.
+                self._refresh_version_strip_after_restart()
+                return
+            if res.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR):
+                # Cooperative path declined. Try the force-kill
+                # fallback. Path of resort exists because users hit
+                # this exact button when the daemon is too old to
+                # honour /v1/admin/restart (the upgrade case) or is
+                # otherwise unresponsive.
+                killed, detail = self._force_kill_daemon_process()
+                if killed:
+                    Clock.schedule_once(
+                        lambda *_: _show(_tr(
+                            'Sync service is restarting…'
+                        )), 0)
+                    self._refresh_version_strip_after_restart()
+                else:
+                    Clock.schedule_once(
+                        lambda *_: _show(_tr(
+                            'Could not reach the sync service to '
+                            'restart it.'
+                        ) + (f'\n({detail})' if detail else '')), 0)
+                return
+            Clock.schedule_once(
+                lambda *_: _show(_tr(
+                    'Restart request returned an unexpected '
+                    'response.'
+                )), 0)
 
         # Run off the UI thread — restart_server() is a blocking RPC
         # that includes the daemon's 0.5 s pre-exit delay.
         threading.Thread(
             target=_do, daemon=True, name='ui-restart-server').start()
+
+    def _refresh_version_strip_after_restart(self):
+        """Re-probe the daemon's version after a restart so the
+        ``client X · server Y`` strip at the bottom of the settings
+        page reflects the new running daemon. Without this the user
+        sees the toast "Sync service is restarting…" but the version
+        string stays frozen at whatever was captured at app startup,
+        so the restart looks like it did nothing visible.
+
+        Two App classes host this SettingsScreen: ``CollabUIApp``
+        (desktop, has ``_probe_server_version``) and ``PickerApp``
+        (Android, also has ``_probe_server_version``). Both expose
+        the same method on the running App, so call through
+        ``App.get_running_app()``. Best-effort: any failure (App
+        class without the probe method, scheduling exception) is
+        silent — the strip just stays stale.
+
+        Delay matches ``_post_install_continuation``: 2 s gives the
+        new daemon time to come up and answer ``check_server_compat``.
+        """
+        from kivy.app import App as _App
+
+        def _do_probe(_dt):
+            try:
+                app = _App.get_running_app()
+                if app is not None and hasattr(
+                        app, '_probe_server_version'):
+                    import threading as _th
+                    _th.Thread(target=app._probe_server_version,
+                               daemon=True).start()
+            except Exception as ex:
+                print(f'[settings] version strip refresh failed: '
+                      f'{ex}', flush=True)
+        Clock.schedule_once(_do_probe, 2.0)
+
+    def _force_kill_daemon_process(self):
+        """Non-cooperative kill of the daemon process.
+
+        Returns ``(killed: bool, detail: str)``. ``detail`` is a
+        short diagnostic string for the toast on failure (empty on
+        success). Same UID as the daemon → no Android permission
+        and no desktop privilege escalation needed.
+
+        On **Android** the daemon lives in the
+        ``org.atoznback.aztcollab:provider`` process; this method
+        runs in the PythonActivity main process. ``ActivityManager
+        .getRunningAppProcesses()`` returns same-UID processes,
+        ``Process.killProcess(pid)`` reaps non-self PIDs regardless
+        of importance (the sticky-bound service pins ``:provider``
+        at ``IMPORTANCE_SERVICE``, which
+        ``killBackgroundProcesses`` can't touch — but per-PID kill
+        bypasses that).
+
+        On **desktop** the daemon is a sibling child process
+        spawned by ``transports/loopback`` auto-spawn; its PID is
+        in ``$AZT_HOME/server.json``. ``os.kill(pid, SIGTERM)``
+        terminates it; the next client RPC re-discovers via the
+        auto-spawn path.
+        """
+        try:
+            on_android = ('ANDROID_ARGUMENT' in os.environ
+                          or 'ANDROID_BOOTLOGO' in os.environ)
+            if on_android:
+                return self._force_kill_daemon_android()
+            return self._force_kill_daemon_desktop()
+        except Exception as ex:
+            return False, f'force-kill error: {ex}'
+
+    def _force_kill_daemon_android(self):
+        """jnius path: enumerate same-UID processes, kill non-self
+        pids. Mirrors ``SuiteSelfReplaceReceiver`` steps 1–2, minus
+        the self-kill (we keep the UI alive)."""
+        try:
+            from jnius import autoclass
+        except Exception as ex:
+            return False, f'jnius unavailable: {ex}'
+        try:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            Context = autoclass('android.content.Context')
+            Process = autoclass('android.os.Process')
+            activity = PythonActivity.mActivity
+            am = activity.getSystemService(Context.ACTIVITY_SERVICE)
+            my_pid = Process.myPid()
+            procs = am.getRunningAppProcesses()
+            killed_any = False
+            killed_names = []
+            if procs is not None:
+                # Iterate via Java List<RunningAppProcessInfo>;
+                # jnius exposes .size()/.get(i) on java.util.List.
+                for i in range(procs.size()):
+                    info = procs.get(i)
+                    pid = info.pid
+                    if pid == my_pid:
+                        continue
+                    try:
+                        Process.killProcess(pid)
+                        killed_any = True
+                        killed_names.append(
+                            f'{info.processName}:{pid}')
+                    except Exception:
+                        pass
+            # Fallback: killBackgroundProcesses for anything step 1
+            # missed. Server APK has the permission injected; on
+            # peer APKs this throws SecurityException, which is
+            # fine — step 1 already handled the load-bearing case.
+            try:
+                am.killBackgroundProcesses(activity.getPackageName())
+            except Exception:
+                pass
+            if killed_any:
+                print(f'[settings] force-killed: {killed_names!r}',
+                      flush=True)
+                return True, ''
+            return False, 'no sibling processes found to kill'
+        except Exception as ex:
+            return False, f'android kill failed: {ex}'
+
+    def _force_kill_daemon_desktop(self):
+        """Read pid from $AZT_HOME/server.json, send SIGTERM."""
+        import json
+        import signal
+        from azt_collab_client.paths import azt_home
+        try:
+            info_path = os.path.join(azt_home(), 'server.json')
+            with open(info_path) as f:
+                info = json.load(f)
+            pid = int(info.get('pid') or 0)
+            if pid <= 0:
+                return False, 'no pid in server.json'
+            os.kill(pid, signal.SIGTERM)
+            return True, ''
+        except FileNotFoundError:
+            return False, 'no server.json (daemon not running)'
+        except ProcessLookupError:
+            return False, 'pid stale (daemon already gone)'
+        except Exception as ex:
+            return False, f'desktop kill failed: {ex}'
 
     def _set_project_actions_msg(self, text):
         msg = self.ids.get('project_actions_msg')

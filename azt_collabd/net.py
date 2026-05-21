@@ -182,6 +182,22 @@ _DOH_CACHE_TTL_S = 300.0
 # a successful DoH lookup also clears all outstanding negatives via
 # the network-back side-effect in ``_patched_getaddrinfo``.
 _DOH_NEGATIVE_TTL_S = 5.0
+# Ceiling on the negative-cache TTL during sustained DoH outages.
+# Consecutive failures for the same host extend the TTL exponentially
+# (5 s → 10 s → 20 s → 40 s → 60 s, capped) so that a flaky-network
+# session doesn't pay the 2.5 s DoH round-trip every retry attempt for
+# minutes on end. Field log baf 2026-05-20 showed
+# ~150 DoH failures during a 35-minute push storm — at 5 s each the
+# resolver alone accounted for ~12 minutes of wall time the caller
+# could have spent doing useful work. A single recovery resets the
+# counter, so a brief outage followed by reconnection returns to the
+# tight 5 s probe cadence on the next attempt. Cap chosen to stay
+# under the watcher's 30 s connectivity_poll_s × 2 so the daemon
+# still re-probes ambient connectivity at a reasonable cadence.
+_DOH_NEGATIVE_TTL_MAX_S = 60.0
+# Cache value shape: (expiry_ts, records_list, neg_count). neg_count
+# is the consecutive-failure run for this host (cleared on positive
+# resolve), used to compute the exponential negative TTL.
 _DOH_CACHE = {}
 _DOH_CACHE_LOCK = threading.Lock()
 _RESOLVER_STATE = {'last': 'unknown'}
@@ -254,6 +270,7 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
             raise
         now = time.time()
         cache_key = (host, port)
+        prior_neg_count = 0
         with _DOH_CACHE_LOCK:
             entry = _DOH_CACHE.get(cache_key)
             if entry and entry[0] > now:
@@ -265,6 +282,11 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
                     return entry[1]
                 _RESOLVER_STATE['last'] = 'fail'
                 raise
+            # Preserve the consecutive-failure run across cache
+            # expiry so we keep extending the TTL on a sustained
+            # outage rather than dropping back to 5 s every probe.
+            if entry and len(entry) >= 3:
+                prior_neg_count = entry[2]
         # ``socket.getaddrinfo(host, port, family=0, type=0, proto=0,
         # flags=0)`` — derive sock_type / proto from args for the
         # synthetic tuple. Family is ignored (DoH covers both stacks
@@ -275,13 +297,17 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
                  else kwargs.get('proto', 0))
         synth = _doh_addrinfo(host, port, sock_type, proto)
         if not synth:
+            neg_count = prior_neg_count + 1
+            ttl = min(
+                _DOH_NEGATIVE_TTL_S * (2 ** (neg_count - 1)),
+                _DOH_NEGATIVE_TTL_MAX_S)
             with _DOH_CACHE_LOCK:
-                _DOH_CACHE[cache_key] = (
-                    now + _DOH_NEGATIVE_TTL_S, [])
+                _DOH_CACHE[cache_key] = (now + ttl, [], neg_count)
             _RESOLVER_STATE['last'] = 'fail'
             raise
         with _DOH_CACHE_LOCK:
-            _DOH_CACHE[cache_key] = (now + _DOH_CACHE_TTL_S, synth)
+            _DOH_CACHE[cache_key] = (
+                now + _DOH_CACHE_TTL_S, synth, 0)
         _RESOLVER_STATE['last'] = 'doh'
         print(f'[resolver] system DNS failed for {host}; '
               f'DoH returned {len(synth)} record(s)',

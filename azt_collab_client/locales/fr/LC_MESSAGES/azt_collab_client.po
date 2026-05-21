@@ -391,6 +391,24 @@ msgstr "Validation : {error}"
 msgid "Push failed: {error}"
 msgstr "Échec de l'envoi : {error}"
 
+msgid ""
+"Network reachable, but the sync host could not be resolved. Sync will "
+"retry automatically when this clears. If it persists, check this "
+"device’s Private DNS, VPN, or per-app data restrictions."
+msgstr ""
+"Réseau accessible, mais l'hôte de synchronisation n'a pas pu être "
+"résolu. La synchronisation réessaiera automatiquement quand cela se "
+"résoudra. Si cela persiste, vérifiez le DNS privé, le VPN ou les "
+"restrictions de données par application de cet appareil."
+
+msgid ""
+"Sync gave up after {budget_s}s on a flaky network. {commits_pending} "
+"commit(s) still pending — they will go out on the next sync attempt."
+msgstr ""
+"La synchronisation a abandonné après {budget_s} s sur un réseau "
+"instable. {commits_pending} validation(s) en attente — elles seront "
+"envoyées à la prochaine tentative de synchronisation."
+
 msgid "Pull failed: {error}"
 msgstr "Échec de la récupération : {error}"
 
@@ -535,7 +553,7 @@ msgid "Sync service error: {error}"
 msgstr "Erreur du service de synchronisation : {error}"
 
 msgid "Sync service is restarting…"
-msgstr ""
+msgstr "Le service de synchronisation redémarre…"
 
 msgid "Clone failed — repository not found. This may be a private repository.\n\nAre you authenticated to {host}?"
 msgstr "Échec du clonage — dépôt introuvable. Il peut s'agir d'un dépôt privé.\n\nÊtes-vous authentifié auprès de {host} ?"
@@ -561,13 +579,13 @@ msgid "Share daemon log"
 msgstr "Partager le journal du service"
 
 msgid "Restart server"
-msgstr ""
+msgstr "Redémarrer le service"
 
 msgid "Could not reach the sync service to restart it."
-msgstr ""
+msgstr "Impossible de joindre le service de synchronisation pour le redémarrer."
 
 msgid "Restart request returned an unexpected response."
-msgstr ""
+msgstr "La demande de redémarrage a renvoyé une réponse inattendue."
 
 msgid "Daemon log is being saved to {path}"
 msgstr "Le journal du service est enregistré dans {path}"
@@ -634,6 +652,12 @@ msgstr "Fichier journal : {path}"
 
 msgid "Connect to GitHub"
 msgstr "Se connecter à GitHub"
+
+msgid "Servers"
+msgstr "Serveurs"
+
+msgid "Work offline:"
+msgstr "Mode hors ligne :"
 
 msgid "GitHub Settings"
 msgstr "Paramètres GitHub"

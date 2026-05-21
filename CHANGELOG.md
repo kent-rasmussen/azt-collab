@@ -9,6 +9,1510 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.44.8 — topic-branch Phase A: chunked upload of diverged history
+
+### Why
+
+0.44.7 added the routing decision; this release acts on it. When
+`_all_commits_descend_from(remote, local)` returns False — the
+typical post-merge state where the local-side parent chain of the
+merge commit doesn't descend from the current remote — direct push
++ chunk-halving can't help (every intermediate the chunk picker
+selects gets `DivergedBranches` from the server). Phase A
+sidesteps the topology problem by pushing diverged commits to a
+per-device topic-branch first; the audio blobs land in 5–20 MB
+chunks that fit inside GitHub's per-request timeout. Once all
+chunks are on the server (under the topic-branch ref), the
+existing direct-push loop runs immediately after and pushes the
+merge commit to `main` — pack negotiation excludes everything
+already on the server (via any ref, including topic-branch), so
+the main push contains only the merge commit + tree + merged
+LIFT bytes. That pack completes in seconds.
+
+### What landed
+
+New helpers in `azt_collabd/repo.py`:
+
+- `_topic_branch_name(langcode, device_name)` — returns
+  `azt-pending-<sanitized-lang>-<sanitized-device>`. Per-device
+  naming so two devices syncing the same project simultaneously
+  don't clobber each other's topic ref; per-project so one device
+  working on multiple LIFT projects keeps them separate.
+- `_push_chunked_to_ref(repo, project_dir, username, token,
+  remote_url, target_sha, topic_ref_name, branch_for_main)` —
+  adaptive chunked push to the topic-branch. Reads
+  `refs/remotes/origin/<topic_ref_name>` (populated by the
+  earlier fetch) for the server-side tip and resumes from there
+  if a prior attempt got partway. Refuses with
+  `S.TOPIC_BRANCH_CONFLICT` if the server's topic-branch tip
+  isn't an ancestor of our target (another device using the same
+  device_name). Reuses the existing chunk-halving heuristic on
+  per-chunk network failure. No DivergedBranches handling needed
+  — topic-branch is ours alone by naming convention.
+
+New status codes:
+
+- `S.TOPIC_BRANCH_CONFLICT` (`azt_collabd/status.py` +
+  `azt_collab_client/status.py` mirror). Params:
+  `topic_branch`, `server_tip`. User remedy: change device_name
+  to something unique in the daemon settings UI.
+
+New settings knob:
+
+- `sync.topic_branch_chunk_size` (default 50) — initial chunk_n
+  for Phase A. Lower for slower networks. Halves adaptively on
+  per-chunk failure.
+
+Wiring in `_push_step_locked`:
+
+- After the merge handling, when the routing decision says
+  topic-branch, invoke `_push_chunked_to_ref` with
+  `target_sha=local_sha`. On success, fall through to the
+  existing direct-push loop — that push of the merge commit to
+  main now negotiates a tiny pack since the server already has
+  every reachable object.
+- On `S.TOPIC_BRANCH_CONFLICT`: surface the status + add
+  `PUSH_FAILED` for peer routing; return.
+- On consecutive-failures-cap exit: surface
+  `S.SYNC_GIVING_UP_TRANSIENT` + `S.PUSH_FAILED`; next drain
+  cycle re-reads the server's topic-branch tip and resumes.
+
+### How resume works (no on-disk state)
+
+The server's topic-branch ref IS the progress record. Each
+successful chunk push lands on the server; on the next drain the
+existing fetch repopulates `refs/remotes/origin/<topic>` and
+`_push_chunked_to_ref` picks up where the last run left off
+without any local state file. If the daemon was killed
+mid-chunk-push, the chunk that was in flight either landed (and
+the server now has it) or didn't (no partial commit, since git's
+push is atomic per refspec). Either way, the next drain reads the
+authoritative server-side tip and walks forward from there.
+
+### Migration / current stuck tester
+
+The stuck baf tester (424 commits ahead of remote, ~150 MB pack
+timing out at GitHub's ~7-minute per-request ceiling) should
+unstick on next sync after installing 0.44.8:
+
+1. Routing detects non-FF (the 422 pre-merge commits don't
+   descend from current remote `main`) → topic-branch route.
+2. Phase A pushes the merge commit `c115b64c` to
+   `azt-pending-baf-<device>` in chunks of ~50 commits each.
+   Each chunk uploads ~10–25 MB. Wall-clock for the full
+   sequence: tens of minutes on a slow network, but each
+   individual upload survives the per-request timeout.
+3. Existing direct-push runs after Phase A returns. Pushes
+   `c115b64c` to `refs/heads/main`. Pack contains only the merge
+   commit + tree (no audio blobs — those are now reachable via
+   the topic-branch ref). Completes in seconds.
+
+The merge commit they already produced (with 1700
+azt-lift-conflict annotations) lands on main unchanged. Topic
+branch stays on the server temporarily; janitor (step 5,
+deferred to a later release) cleans it up.
+
+### What's not in this release
+
+Per the spec (step 4 of "Implementation order"):
+
+- **Phase B** (re-fetch + conditional re-merge if `main` moved
+  during the long Phase A upload) — for now handled implicitly
+  by the existing post-non-FF retry inside the direct-push loop.
+  Race window: if `main` moved during Phase A and the post-Phase
+  direct push gets `DivergedBranches`, the existing code does a
+  re-merge inside the direct-push loop. Works but doesn't
+  re-enter Phase A if the re-merge produces another non-FF
+  state.
+- **Phase D** (cleanup — delete topic-branch ref via dulwich's
+  delete-refspec push). Leaving the topic ref on the server is
+  cosmetic clutter, not functional. Janitor will sweep these on
+  a future release.
+- **Step 6** UI status emission (`S.UPLOADING_IN_PIECES` with
+  per-chunk progress). Phase A's progress is visible in
+  `[sync-trace] topic-push attempt …` lines in the daemon log
+  for now.
+
+### Files touched
+
+- `azt_collabd/repo.py`: `_topic_branch_name`,
+  `_push_chunked_to_ref`, routing wiring in `_push_step_locked`.
+- `azt_collabd/settings.py`: `topic_branch_chunk_size()`.
+- `azt_collabd/status.py` + `azt_collab_client/status.py`:
+  `TOPIC_BRANCH_CONFLICT`.
+
+## 0.44.7 — push-routing diagnostic (step 1 of topic-branch push)
+
+### Why
+
+Field user 2026-05-21 is stuck pushing a 424-commit post-merge state to GitHub: the merge commit is one atomic git object, the 681 new audio blobs referenced by the merge can only travel as one ~150 MB pack, and GitHub's `git-receive-pack` is timing out at ~7 minutes before the upload completes. Chunk-halving against `main` can't help because every intermediate the chunk picker selects (one of the ~422 pre-merge commits on the local-side parent chain of the merge commit) doesn't descend from the current remote `main` — `DivergedBranches` at every smaller chunk.
+
+The proper architectural fix is to push diverged commits to a topic branch first (the audio blobs land there in small chunks, each upload survives GitHub's per-request timeout), then promote the existing merge commit to `main` as a tiny pack since all blobs are already on the server. The local LIFT-aware merge stays on the device, unchanged.
+
+That implementation lands in stages. This release is **step 1**: the routing decision, observable in the trace but not yet acted on.
+
+### What changed
+
+New helper `_all_commits_descend_from(repo, ancestor_sha, descendant_sha)` in `azt_collabd/repo.py`. O(N) one-pass walk of the delta between ancestor and descendant; returns True iff every commit in the delta has the ancestor as one of its ancestors. False if the delta touches a third branch (typical: post-merge state where the local-side parent chain of the merge commit doesn't descend from the current remote).
+
+New trace line in `_push_step_locked` just before the existing push loop:
+
+```
+[sync-trace] route: direct-push (diagnostic — current build still takes direct path)
+[sync-trace] route: topic-branch (diagnostic — current build still takes direct path)
+```
+
+No behavior change. The existing direct-push + chunk-halving path runs for every push as before. The trace lets us verify on real field data that the routing rule correctly identifies non-FF states (the stuck tester's next sync should log `topic-branch`) before Phase A is added in the next release.
+
+### Files touched
+
+- `azt_collabd/repo.py`: added `_all_commits_descend_from` next to `_is_ancestor`; added the diagnostic trace at the entry to the push loop.
+
+### What ships next (step 2+)
+
+Tracked in the topic-branch spec laid out in conversation. Phase A (chunked push to `refs/heads/azt-pending-<lang>-<device>`) is the next code drop. Then Phase B (re-fetch + conditional re-merge), Phase C (promote merge commit to `main` — tiny pack since blobs already on server), Phase D (cleanup). Sync-state persistence in `$AZT_HOME/sync_state.json` for resume across daemon respawns.
+
+## 0.44.6 — low-memory device politeness pass: three deferred OOM headroom fixes
+
+### Why
+
+The 0.44.4 audit (`project_oom_followups_after_0.44.4.md`) found
+three sibling OOM-prone patterns beyond the `_walk_tree` /
+`_merge_diverged` fix that already shipped in 0.44.4. None were
+on the critical path of the field user's stuck-merge symptom, so
+they were deferred to this release. Each closes a small amount
+of unnecessary RAM pressure that becomes painful on tight-heap
+Android devices when stacked with other concurrent work.
+
+### Fix 1 — `atomic_recovery._reconcile_orphan` gates on memory
+
+`azt_collabd/atomic_recovery.py:_recover_under_lock` calls
+`lift_merge.three_way_merge` to reconcile orphan-pending LIFT
+files. Same ~150 MB peak as `_merge_diverged`. It runs from
+`reconcile_on_startup` — exactly when memory may be tight (the
+daemon process is just spawning, competing with the picker
+activity for heap). Silent OOM-kill there would lose the entire
+recovery batch with no signal.
+
+Imports `_check_memory_for_merge` from `.repo` and refuses the
+merge when free memory is below `sync.min_free_mem_mb_for_merge`.
+On refusal:
+
+- Orphan stays on disk (still valid; the file is byte-complete)
+- New `summary['skipped_low_memory']` counter increments
+- Returns from `_recover_under_lock` early — if we can't fit
+  this merge, we won't fit the next either, no point burning
+  time on a doomed loop
+
+Next startup with more memory available runs the recovery.
+
+### Fix 2 — `_h_atomic_commit` streams SHA-256 + byte count
+
+`azt_collabd/server.py:_h_atomic_commit` was reading the entire
+pending audio file (3–10 MB) into a Python bytes object just to
+compute `len(data)` and `hashlib.sha256(data).hexdigest()` for
+the `ATOMIC_COMMITTED` response. Replaced with the canonical
+streaming-hash pattern:
+
+```python
+h = hashlib.sha256()
+bytes_written = 0
+with open(pending_real, 'rb') as f:
+    for chunk in iter(lambda: f.read(64 * 1024), b''):
+        h.update(chunk)
+        bytes_written += len(chunk)
+```
+
+Peak heap: 64 KB instead of file size. Minor on its own, but
+stacks badly when concurrent with a LIFT merge or push pack-
+build — those can already push the heap close to its cap on
+low-end devices.
+
+### Fix 3 — loopback HTTP body cap
+
+`azt_collabd/server.py:_read_json` was reading the full
+`Content-Length` from `rfile` with no upper bound. Desktop-
+only (Android peers use ContentProvider), so not Android-OOM-
+relevant, but a buggy peer / test harness that sends a wrong
+`Content-Length` would let the daemon allocate gigabytes
+before the JSON parse failed. Added a 64 MB cap — far past
+any legitimate body on this path (largest legit is a credential
+blob, <1 KB) — that returns a quick refusal instead.
+
+### Files touched
+
+- `azt_collabd/atomic_recovery.py`: imported
+  `_check_memory_for_merge` from `.repo`; added pre-flight at
+  the `three_way_merge` call site; new `skipped_low_memory`
+  counter on `summary`.
+- `azt_collabd/server.py`: streaming hash in
+  `_h_atomic_commit`; 64 MB `_MAX_BODY_BYTES` cap in
+  `_read_json`.
+
+### Not yet wired (intentional)
+
+Defense-in-depth equivalents on the loopback transport for
+other large-body endpoints (e.g. credential upload) — those
+already inherit the new `_read_json` cap since they share the
+helper. The 64 MB cap can be tightened later if any legitimate
+path approaches it; current ceiling is the credential blob at
+under 1 KB, so headroom is ~64,000× what's actually needed.
+
+## 0.44.5 — self-update no longer locks out users with crowded Downloads folders
+
+### Why
+
+Field user 2026-05-21: in-app Update failed with `Install failed:
+JVM exception occurred: failed to build unique file:
+/storage/.../aztcollab.apk`. The user's Downloads folder had
+accumulated 30+ orphan `aztcollab.apk` / `aztcollab (1).apk` /
+… `aztcollab (32).apk` entries from prior install attempts,
+hitting Android's `MediaProvider.buildUniqueFile()` retry cap.
+Once the cap is hit there's no recovery from the Update button
+— the user's only option was to open the Files app and manually
+delete all those orphans.
+
+### Fix — `azt_collab_client/ui/update.py:_media_store_uri`
+
+Two layers of defence:
+
+1. **Pre-insert cleanup.** New `_clear_prior_downloads()` queries
+   MediaStore Downloads for rows whose `_display_name` matches
+   the asset name (`aztcollab.apk`) and that this app owns, then
+   deletes each. Scoped-storage permissions limit us to our own
+   rows — which is exactly what we want, since the orphans are
+   from our own prior install attempts. Other apps' files of the
+   same name stay put.
+
+2. **Timestamped fallback.** If the canonical-name insert still
+   fails (other apps own enough same-named files to push us over
+   the cap, or the scoped-storage delete refused), retry once
+   with a UTC-timestamped display name
+   (`aztcollab-20260521-145922.apk`). The install Intent only
+   needs the `content://` URI; the system installer reads the
+   APK manifest for the user-facing app identity, so the
+   timestamped filename never appears in any UI.
+
+Logs `[update] cleared N prior MediaStore Downloads row(s)
+named X` when cleanup happens; logs the fallback case explicitly
+when the timestamped name is used.
+
+### Manual recovery for users already locked out
+
+Users who are stuck on the pre-0.44.5 build can self-recover
+without any rebuild:
+
+1. Open the Files app
+2. Navigate to Internal storage → Download
+3. Delete every `aztcollab.apk` / `aztcollab (N).apk`
+4. Re-tap Update
+
+Then they pick up 0.44.5+ via the in-app updater and the issue
+doesn't recur.
+
+### Files touched
+
+- `azt_collab_client/ui/update.py`: added
+  `_clear_prior_downloads`; refactored `_media_store_uri` to
+  pre-clear + retry with timestamped name.
+
+## 0.44.4 — `_merge_diverged` no longer slurps every audio file into Python (OOM-kill on merge fixed); pre-flight memory check
+
+### Why
+
+Field log baf 2026-05-21 15:45 → 15:52 (after 0.44.3 was
+installed): every drain cycle did the right thing — fetched,
+saw remote had moved to `7a0e17`, logged `merge_diverged
+begin` — and then the daemon process died silently at 49 s,
+65 s, 127 s mid-merge with no traceback. The shrinking
+intervals (127 → 65 → 49) were the giveaway: heap-fragmentation
+accelerating until the OOM-killer caught a smaller spike. The
+respawn boot logs never showed `reconcile_on_startup:
+interrupted=N` either, because nothing in the merge path was
+job-tracked.
+
+Root cause: `_walk_tree` in `azt_collabd/repo.py` returned
+`path → blob.data (bytes)` for **every file** in a commit tree.
+`_merge_diverged` called it three times (base, head, remote) at
+the top of the function. For a 1700-entry baf project with
+audio per entry, each side pulled ~200 MB of audio bytes into a
+Python dict, totalling ~600 MB peak before the LIFT XML parse
+even started. Android's `:provider` service heap cap (~256–512
+MB depending on device) couldn't fit that, so the process was
+OOM-killed before any merge work happened. Same bug existed in
+the fast-forward path (`_apply_tree_to_workdir`) — that's now
+fixed by the same change.
+
+### Fix — SHA-only tree walk, lazy byte loading
+
+- `_walk_tree` returns `dict[path → blob sha (bytes)]` instead of
+  `dict[path → blob.data]`. ~tens of KB per snapshot regardless
+  of audio file count, vs hundreds of MB before.
+- New `_blob_bytes(repo, sha)` helper resolves a single blob to
+  bytes on demand.
+- `_merge_diverged` compares by SHA (git's invariant: identical
+  content → identical SHA), loads bytes only when:
+  - About to call `lift_merge.three_way_merge` on a `.lift`
+    file (then `del b_bytes, o_bytes, t_bytes` immediately after
+    the merge returns so the peak is "one LIFT merge worth",
+    not "every file in every snapshot")
+  - About to write a path whose target SHA differs from the
+    HEAD SHA (skips the no-op rewrite of files whose content
+    didn't change — most of the working tree)
+- `_apply_tree_to_workdir` (fast-forward path) gets the same
+  treatment.
+
+Peak memory budget after the change:
+
+- 3 × `_walk_tree` SHA dicts: ~150 KB
+- LIFT XML parse + merge state (the actual cost): ~100–150 MB
+- One blob read at a time during apply: max ~1 MB (largest
+  audio file)
+- **Total: ~150–200 MB**, comfortably under Android's heap cap.
+
+### Pre-flight memory check (defensive)
+
+Even with the slurp gone, the LIFT XML parse + merge step still
+wants ~150 MB peak. On a device where another app is hogging
+RAM the merge could still OOM. Added a pre-flight check that
+reads `MemAvailable` from `/proc/meminfo` and refuses the merge
+if it's below `sync.min_free_mem_mb_for_merge` (default 200
+MB). Returns a typed `S.INSUFFICIENT_MEMORY_FOR_MERGE` with
+`mem_available_mb` and `min_required_mb` params; the next drain
+cycle re-reads memory and proceeds when it recovers. Beats the
+silent OOM-kill: the user (and the log) get a clear "not
+enough memory right now, will retry" instead of a process
+disappearance.
+
+All three `_merge_diverged` call sites are gated:
+- `sync_repo` needs_merge path
+- Forced-merge after non-FF-no-progress
+- Retry-merge after race-on-fetch
+
+On non-Linux platforms `/proc/meminfo` isn't readable; the check
+treats that as passing (returns None). Desktop / sandbox doesn't
+OOM-kill the way Android's `:provider` does.
+
+### New tracing
+
+`_merge_diverged` now emits `[merge-trace] _walk_tree done
+base=N head=N remote=N`, then `[merge-trace] resolution done
+writes=N deletes=N conflicts=N`, then `[merge-trace] apply done
+writes_done=N deletes=N`. The pre-0.44.4 log shape was just
+`merge_diverged begin` followed by silence — impossible to tell
+whether the death was during walk, resolution, or write.
+
+### Files touched
+
+- `azt_collabd/repo.py`: rewrote `_walk_tree`, added
+  `_blob_bytes`, `_mem_available_mb`, `_check_memory_for_merge`;
+  refactored `_merge_diverged` body around (kind, value) tuples
+  in `merged_writes`; gated all three `_merge_diverged` call
+  sites on the memory check.
+- `azt_collabd/status.py` + `azt_collab_client/status.py`:
+  added `INSUFFICIENT_MEMORY_FOR_MERGE` (with mirrored comment
+  on the client side documenting the routing contract).
+- `azt_collab_client/translate.py`: translation for the new
+  code with `{mem_available_mb}` / `{min_required_mb}` params.
+- `azt_collabd/settings.py`: `min_free_mem_mb_for_merge()`
+  knob, default 200 MB.
+- `azt_collab_client/CLIENT_INTEGRATION.md` §17: new row in
+  the routing table (silent in auto-sync, translated toast in
+  user-initiated sync), the silence list in the auto-commit
+  example and the transient-toast branch in the
+  user-initiated example both updated, constants list extended.
+
+### Tuning notes
+
+`sync.min_free_mem_mb_for_merge` is conservatively set at 200
+MB. If a device is consistently triggering the pre-flight
+refusal but the merge would actually succeed (post-fix it
+should fit in ~150 MB), drop to 150 via
+`AZT_HOME/config.json`. Setting to 0 disables the check
+entirely.
+
+## 0.44.3 — persisted chunk_n hint now uses the smallest attempted, not the last (in-call revert no longer wipes progress)
+
+### Why
+
+0.44.2 introduced cross-drain hint persistence but the within-call
+"revert to full local tip" path defeated it. Field log baf 2026-
+05-21 14:31 → 14:58 showed the loop:
+
+```
+14:45:22 resuming with hint chunk_n=211     ← good, hint worked
+14:45:23 push raised: DivergedBranches at 211
+14:45:25 non-FF — reverting to full local tip
+14:45:25 push attempt chunk_n=422           ← back to full
+14:58:15 408 timeout at chunk_n=422
+14:58:15 remembered chunk_n=422             ← LAST chunk_n, not smallest
+         next drain cycle will start at 211 ← back where we began
+```
+
+Result: indefinite loop at hint=211, since the budget always
+caught the post-revert full attempt and persisted that value.
+Net progress across cycles: zero.
+
+### Fix
+
+Track `smallest_attempted_n` across the entire `_push_step_locked`
+call. On budget-exceeded or consecutive-failures-cap exit, persist
+**that** value instead of the current `chunk_n`. Each cycle then
+halves the actual floor, not the post-revert ceiling.
+
+Expected behavior for the stuck device:
+
+```
+Cycle 1: try 422 → budget → smallest=422 → store 211
+Cycle 2: hint=211 → try 211 → DivergedBranches → revert to 422 →
+         budget at 422 → smallest=211 → store 105
+Cycle 3: hint=105 → try 105 → … → smallest=105 → store 52
+… halves about every drain cycle (5-15 min each) until a chunk
+  fits the network window.
+```
+
+Each cycle makes real progress now, regardless of whether the
+within-call revert kicks in.
+
+### Files
+
+- `azt_collabd/repo.py` — added `smallest_attempted_n` tracking;
+  used in both budget-exceeded and consecutive-failures-cap
+  persist sites.
+
+### What still doesn't fix itself
+
+The within-call "non-FF with no remote movement — reverting to
+full local tip" escalation still re-enlarges chunk_n inside a
+single call, burning the rest of the budget on a doomed full-tip
+attempt. That's wasted time per cycle but no longer wasted
+progress across cycles. A future fix could cap the revert at
+`smallest_attempted_n` instead of going all the way to `local_sha`,
+but that touches the diagnostic-escalation contract more
+substantially — defer until we see whether the across-call
+convergence alone is enough.
+
+## 0.44.2 — push loop remembers failed `chunk_n` across drain cycles so backlogs converge on slow networks
+
+### Why
+
+Field log baf 2026-05-21 09:38 → 11:11 (daemon 0.44.0): device
+had 419 unpushed commits accumulated over ~24 hours of flaky
+connectivity. Each scheduler drain cycle:
+
+1. `push attempt target=966b6714 chunk_n=419 consecutive_failures=0`
+2. ~12 minutes later: `POST .../git-receive-pack 408` (GitHub server
+   gave up on the slow upload)
+3. `push budget exceeded (300s) — giving up; pending commits
+   requeued for next sync`
+4. 30 s later: drain cycle fires again, **starts at chunk_n=419**
+5. Loop repeats indefinitely; backlog grows; backlog never drains.
+
+The 0.43.22 chunk-halving adaptive loop *does* exist — it would
+bisect 419 → 209 → … → 1 inside a single call until it finds a
+size the network can sustain. But each single call typically can
+only do one push attempt before the 300 s budget cuts it off, and
+the next call has no memory of what just failed. Every drain
+cycle wastes 5–13 minutes on a chunk_n the previous cycle already
+proved was too big.
+
+(See the 0.43.18 session at 12:46–13:21 in the same log: chunk
+halving 302 → 151 → 75 → 37 → 18 → 9 → 4 → 2 → 1 worked when
+given uninterrupted time. The budget — necessary to free the
+project lock for other clients — defeated it once it was added.)
+
+### What
+
+In-process `_LAST_FAILED_CHUNK_N` dict in `azt_collabd/repo.py`
+keyed by `project_dir`. Three touch points:
+
+1. **Loop preamble:** if the dict has a hint for this project, use
+   `_pick_intermediate_sha(repo, remote_sha, local_sha, hint)` as
+   the initial `target_sha` instead of `local_sha`. Logged as
+   `[sync-trace] resuming with hint chunk_n=N`.
+2. **Budget exceeded / consecutive_failures cap:** before
+   returning `SYNC_GIVING_UP_TRANSIENT` / `PUSH_FAILED`, store
+   `max(1, chunk_n // 2)` for this project. Next drain cycle
+   picks it up via (1).
+3. **Full successful push (`PUSHED`):** clear the entry. The
+   network just demonstrated it can handle the current size; no
+   constraint to carry forward.
+
+Net effect for the user's stuck device:
+
+- Cycle 1: start at chunk_n=419, budget expires at chunk_n=419 →
+  store hint=209
+- Cycle 2: start at chunk_n=209, budget expires → store hint=104
+- Cycle 3: start at chunk_n=104, budget expires → store hint=52
+- … converges on a chunk_n the network can sustain inside 300 s
+- Once a push at the converged size succeeds, the loop continues
+  with `working_batch_n` locked in and drains the queue.
+
+Across daemon restarts the dict resets — that's fine, the next
+cycle is at most one 300 s budget worse off than otherwise.
+
+### Files
+
+- `azt_collabd/repo.py` — `_LAST_FAILED_CHUNK_N` dict;
+  `_hint_chunk_n`, `_remember_failed_chunk_n`,
+  `_clear_failed_chunk_n` helpers; three integration points in
+  `_push_step_locked`.
+
+### Recovery for currently-stuck field user (0.43.20 with 419-commit backlog)
+
+Their 0.43.20 has the un-budgeted halving loop (worked over ~35
+minutes per push in the 0.43.18 log) and 0.44.0/0.44.1 has the
+budgeted-but-non-adaptive loop (never converges). 0.44.2 is the
+first version that both bounds individual attempts AND converges
+across drain cycles.
+
+```bash
+adb install -r path/to/0.44.2.apk
+# tap AZT Collaboration once (Activity-side bundle refresh)
+# then leave the device on a reliable network for an hour
+```
+
+The drain loop will work its way down to a working chunk_n over
+the course of a few cycles (5–15 minutes per cycle); once it
+finds one, it locks in and drains the 419 commits over the next
+~30 minutes. No user action required between install and "drained."
+
+## 0.44.1 — service-side bundle re-extract was extracting the WRONG asset; replace with marker invalidation
+
+### Why
+
+0.44.0's `_extract_bundle_from_apk` extracted
+`assets/private.tar.gz` into `_python_bundle/`. But
+`private.tar.gz` contains **app code** (`main.py`, `service.py`),
+not the Python bundle. The Python bundle (`stdlib.zip`,
+`modules/`, `site-packages/`) ships in
+`lib/<abi>/libpybundle.so`, which p4a's `PythonUtil.unpackPyBundle`
+extracts with prefix `"pybundle"` stripped to produce
+`_python_bundle/`.
+
+End result of the wrong extract: `_python_bundle/` was
+structurally present (so bootstrap.c said "exists" and
+proceeded) but functionally empty — no `stdlib.zip`, no
+`modules/`, no `site-packages/`. Python's interpreter init
+succeeded at the C level, but `_bridge_stdio_to_logcat` failed
+to import anything (no Python stdlib reachable), prints went to
+`/dev/null`, process died silently. **Exactly the silent
+:provider death symptom this whole 0.43.22–0.44.0 chain was
+supposed to fix.** We've been chasing the wrong root cause
+since 0.43.22 — every "stale unpack" fix made things worse by
+overwriting `_python_bundle/` with the wrong contents.
+
+Field log 22:59:02 shows the loop cleanly:
+1. :provider boots from a pre-swap bundle → `[boot-trace-daemon]`
+   lines fire, `_maybe_reextract_python_bundle` detects stale
+2. `_extract_bundle_from_apk` extracts `private.tar.gz` (app
+   code) into `_python_bundle.new/`, swaps, exits
+3. Next :provider spawn loads from the corrupted bundle →
+   silent death → cascade-kill of peer
+
+### Fix
+
+`_maybe_reextract_python_bundle` no longer extracts. On stale
+mtime detection it:
+
+1. **Deletes `files/app/private.version` and
+   `files/app/libpybundle.version`** — the markers
+   `PythonUtil.unpackAsset` and `unpackPyBundle` use to skip
+   re-extract. With them gone, the next picker Activity launch
+   triggers a proper re-extract.
+2. **Logs a clear warning** that the bundle is stale and the
+   user should open AZT Collaboration to refresh.
+3. **Stamps our own marker forward** so we don't repeat the
+   invalidation on every spawn.
+4. **Does NOT touch `_python_bundle/`** — daemon continues with
+   the existing (possibly stale) code until the picker
+   refreshes things.
+
+`_extract_bundle_from_apk` is kept in the file as a deprecated
+stub with a long comment explaining why it was wrong; it has
+no callers.
+
+### Trade-off
+
+The "peer opens before picker after `install -r`" case now
+runs the daemon on stale code until the user opens AZT
+Collaboration. This is **the pre-0.43.22 default behavior**.
+Worse than a hypothetical "perfect" recovery, but vastly better
+than a silently-corrupted bundle.
+
+Recovery path for `install -r` is now:
+
+1. `adb install -r bin/aztcollab.apk` (or sideload)
+2. **Tap AZT Collaboration once** before opening the peer.
+   PythonActivity sees the version mismatch (which
+   `private_version` advances per build), runs
+   `recursiveDelete(files/app/)` + extract → fresh bundle.
+3. Open the peer. `:provider` lazy-spawns from the now-fresh
+   bundle.
+
+If the peer is opened first by mistake:
+- `:provider` runs on stale code (functional, just not the new
+  version)
+- The new service.py (once loaded) will detect the mtime
+  mismatch on FIRST spawn and invalidate the markers
+- Next picker launch then triggers the proper extract
+
+### Recovery for currently-stuck device
+
+If you have the 0.44.0 broken bundle on disk:
+
+1. Tap AZT Collaboration on the device. PythonActivity should
+   detect the mismatch and run a proper extract.
+2. If that fails (which would mean PythonActivity's own path
+   is also broken), `adb install -r 0.44.1.apk` first, then
+   tap AZT Collaboration.
+
+### Files
+
+- `server_apk/service.py` — `_maybe_reextract_python_bundle`
+  now invalidates markers instead of extracting;
+  `_extract_bundle_from_apk` deprecated with explanatory
+  comment.
+
+## 0.44.0 — stuck-bundle recovery milestone: bz2 fix + Java recovery hatch + boot diagnostic
+
+Consolidation release. Public 0.43.27 shipped with a latent
+self-perpetuating broken state (the bz2-broken stale-unpack code
+from 0.43.22 onward) that left any device which `install -r`'d
+between 0.43.22 and 0.43.31 unable to refresh `_python_bundle/`
+without losing `$AZT_HOME`. 0.44.0 packages the full recovery
+chain into one release suitable for the public update channel.
+
+The development history is in the 0.43.32–0.43.38 entries below;
+the net surface for an end user is:
+
+- **Stale-unpack actually works on `install -r` going forward.**
+  bz2 import is optional in `_extract_bundle_from_apk`; gzip
+  handles the modern `private.tar.gz` path. (was 0.43.32)
+- **`azt_home()` is cached.** The OpenFile ContentProvider
+  callback no longer burns 3-4 JNI calls per FD serve from the
+  Binder dispatch thread — that was the 15:00:12 binder-thread
+  NPE class. (was 0.43.32)
+- **File-based boot diagnostic.** Service.py writes phase markers
+  to `<filesDir>/service_boot.log` from the very first lines of
+  module load. The last line before a process dies tells us
+  exactly where it died, surviving any later stdio failure.
+  `faulthandler` tracebacks land in the same file. (was 0.43.35)
+- **`BundleResetReceiver` (Java).** Pure-Java BroadcastReceiver
+  that wipes `files/app/_python_bundle/` AND the `.version`
+  markers (`private.version` + `libpybundle.version`) — loads
+  from `classes.dex`, never from `_python_bundle/`, so it fires
+  even when every Python entrypoint is unrunnable. Reachable via
+  `adb shell am broadcast -a org.atoznback.aztcollab.RESET_PYTHON_BUNDLE
+  -p org.atoznback.aztcollab`. (was 0.43.33 + 0.43.34's marker fix)
+- **`RecoveryActivity` (Java, hidden).** Class declared in the
+  manifest, exported, but without a LAUNCHER intent-filter — end
+  users see one launcher icon. Support / future re-enablement
+  reaches it via `adb shell am start -n
+  org.atoznback.aztcollab/.RecoveryActivity`. (was 0.43.36)
+
+### Hard rule reminder
+
+`adb uninstall` and `pm clear` are NOT recovery paths — they
+wipe `$AZT_HOME` (projects, recordings, credentials, jobs.json).
+`adb install -r` preserves data and now (with the 0.44.0 bz2
+fix) actually refreshes the bundle on every reinstall.
+
+For currently-stuck devices, the recovery is:
+
+```bash
+adb install -r path/to/0.44.0.apk
+# tap AZT Collaboration on the device
+```
+
+The build's fresh `private_version` resource string mismatches
+what's on disk → PythonActivity's UnpackFilesTask re-extracts
+`_python_bundle/` from the new APK assets → daemon boots from
+fresh code. `$AZT_HOME` preserved throughout.
+
+### Unfinished
+
+The original silent `:provider` boot-death root cause is still
+unidentified. The boot diagnostic in 0.44.0 catches and locates
+any future occurrence; pinpointing the existing case requires a
+recurrence to read the diag from.
+
+## 0.43.36 — hide AZT Recovery launcher icon (keep the class + receiver for later)
+
+### Why
+
+0.43.35's RecoveryActivity unstuck the field device, but the
+second launcher icon ("AZT Recovery") sitting next to the
+normal "AZT Collaboration" icon is noise for the >99% of users
+who never need it. Recovery surfaces should appear only when
+the underlying stuck-bundle bug class returns in the wild.
+
+### What
+
+Removed the `<intent-filter>` (MAIN + LAUNCHER) from the
+`<activity>` declaration. The `RecoveryActivity` class,
+`BundleResetReceiver`, file-based boot diagnostic, and the
+"Show service boot log" button all remain in the APK. End
+users see one launcher icon.
+
+Recovery is still reachable for future use:
+
+- **Field support with adb access:**
+  ```
+  adb shell am start -n org.atoznback.aztcollab/.RecoveryActivity
+  ```
+  Activity stays `exported="true"`, same-package addressing
+  works.
+- **Daemon-broadcast path:**
+  ```
+  adb shell am broadcast -a org.atoznback.aztcollab.RESET_PYTHON_BUNDLE -p org.atoznback.aztcollab
+  ```
+  The receiver is unchanged — `RESET_PYTHON_BUNDLE` action
+  still wipes the bundle + `.version` markers.
+- **Future release re-add:** if the stuck-bundle class
+  re-emerges and we want users to self-recover without
+  rebuilding, a future p4a_hook.py revision can put the
+  LAUNCHER intent-filter back. The Activity code itself
+  doesn't change.
+
+### Files
+
+- `/home/kentr/bin/raspy/buildozer_tweaks/p4a_hook.py` —
+  removed the LAUNCHER intent-filter block from
+  `_BUNDLE_RESET_RECEIVER_BLOCK` injection. Activity is now
+  self-closing without any intent-filter.
+
+## 0.43.35 — file-based boot diagnostic for `:provider` silent death + RecoveryActivity log viewer
+
+### Why
+
+0.43.34 successfully re-extracted `_python_bundle/` on field rebuild,
+confirming the bundle-stale recovery chain works end-to-end. But
+`:provider` STILL dies within 17-65 ms of spawn with no Python
+output anywhere — the original cascade-kill root cause that
+predated the bundle issue. Bundle was a distraction; the real bug
+is that something in service.py module load aborts Python silently.
+
+`faulthandler.enable(file=sys.stderr)` from 0.43.32 didn't help
+because PythonService doesn't redirect stderr to logcat (only
+PythonActivity does). The traceback was being written, just to a
+file descriptor going nowhere.
+
+Worse: service.py dies so early that `_bridge_stdio_to_logcat`
+hasn't installed yet, so even ordinary `print()` calls are
+invisible. Without ANY logcat output between `Run user program`
+(bootstrap.c's last line) and `Python for android ended.`
+(bootstrap.c's exit line), we have no signal at all.
+
+### What
+
+Phase markers written to a real file from the very first lines
+of service.py module load. The file:
+
+- Lives at `<filesDir>/service_boot.log` (hardcoded path; can't
+  use jnius-based resolution because jnius may be the thing
+  failing).
+- Survives process death (line-buffered + flushed per write).
+- Receives a phase marker at every checkpoint:
+  `module_load_start`, `imports_done`, `path_setup_done`,
+  `faulthandler_enabled`, `thread_excepthook_set`,
+  `before_bridge_stdio`, `after_bridge_stdio`, then
+  `boot_trace:module_loaded`, `boot_trace:main_entered`,
+  `boot_trace:before_import_azt_collabd`, etc.
+- Is the file `faulthandler.enable(file=...)` writes its
+  SIGSEGV tracebacks into, so a native crash also lands here.
+- Rotates at 100 KB (renamed to `.prev`) so the diag doesn't
+  fill flash under repeated crash loops.
+
+The **last line** of this file before a process dies tells us
+EXACTLY where it died.
+
+### Surface
+
+`RecoveryActivity` gets a second button — "Show service boot
+log" — that reads `<filesDir>/service_boot.log` (and `.prev`)
+and displays the last ~200 lines in a scrollable monospace
+TextView. Pure Java, doesn't depend on Python or the daemon —
+works even when everything else is broken. Field users surface
+the diagnostic without adb.
+
+### Files
+
+- **`server_apk/service.py`** — `_diag(phase)` helper at the
+  top of module load (before any import that could fail), and
+  `faulthandler.enable(file=_BOOT_DIAG_FD)` pointed at the diag
+  file instead of stderr.
+- **`android/src/main/java/.../RecoveryActivity.java`** — added
+  "Show service boot log" button + scrollable display.
+
+### Recovery procedure for current stuck device
+
+```bash
+cd server_apk && bash build.sh
+adb install -r bin/aztcollab.apk
+# tap AZT Collaboration on the device
+# if it doesn't boot, tap AZT Recovery → "Show service boot log"
+# the LAST line before each spawn died tells us where to look
+```
+
+The build-version bump alone re-extracts `_python_bundle/`
+(version mismatch between disk's `private.version` and the new
+APK's `private_version` string). After that, the diag file
+accumulates phase markers from each :provider spawn.
+
+## 0.43.34 — `BundleResetReceiver` also wipes `.version` markers (0.43.33's wipe wasn't enough)
+
+### Why
+
+0.43.33 shipped the receiver + RecoveryActivity, and field testing
+confirmed both surfaces work to remove `_python_bundle/`. But
+re-extract on next Activity launch **didn't fire** — UnpackFilesTask
+saw the surviving `private.version` / `libpybundle.version` markers
+matched the APK's `private_version` string resource and short-
+circuited the extract. Bundle stayed missing forever; field-log
+showed `_python_bundle does not exist...should we expect a crash
+soon?` repeating across 100+ process spawns over 2 minutes.
+
+The relevant p4a code (in `PythonUtil.unpackAsset` /
+`unpackPyBundle`) keys the extract on a version comparison, not
+on directory existence. Wiping the directory alone is invisible
+to that path. The previous `_python_bundle/` was extracted by
+the same APK build that's on disk now, so the markers match
+the APK and "no extract needed."
+
+### Fix
+
+`BundleResetReceiver` now also deletes:
+- `files/app/private.version`
+- `files/app/libpybundle.version`
+
+Both markers gone → next UnpackFilesTask reads an empty
+`diskVersion`, mismatches the APK's `private_version` →
+`recursiveDelete(target)` wipes any remaining files/app/ junk
+→ `extractTar` lays down fresh `_python_bundle/` from the APK.
+
+### Recovery for the currently-stuck device
+
+Two paths land you the same place:
+
+**Path A (rebuild-and-reinstall, easier):**
+
+```bash
+cd server_apk && bash build.sh
+adb install -r bin/aztcollab.apk
+# tap AZT Collaboration on the device
+```
+
+A new build's `private_version` (timestamp-based) differs from
+what's on disk → UnpackFilesTask sees the mismatch → extracts
+fresh `_python_bundle/`. No need to touch AZT Recovery this
+time; the version mismatch alone unsticks the install.
+
+**Path B (use 0.43.34's fixed AZT Recovery):**
+
+```bash
+adb install -r bin/aztcollab.apk
+# tap AZT Recovery → Repair sync service → Close
+# tap AZT Collaboration
+```
+
+The fixed receiver wipes the markers too, so even without an
+intervening APK-version bump the re-extract fires.
+
+Both paths preserve `$AZT_HOME` (projects, recordings,
+credentials, daemon.log).
+
+## 0.43.33 — Java-only `BundleResetReceiver` + `RecoveryActivity` (second launcher icon) for stuck `_python_bundle/`
+
+### Why
+
+0.43.32 fixed the bz2-broken stale-unpack code, so devices going
+forward can self-refresh their `_python_bundle/` on `install -r`.
+But 0.43.27 already shipped publicly, and any device that
+`install -r`'d between 0.43.22 and 0.43.31 is stuck — the loaded
+`service.py` (from the stale bundle) still has the broken bz2
+import, so the 0.43.32 fix on disk can't activate. The only ways
+out of the stuck state were data-destructive (`adb uninstall`,
+`pm clear` — both wipe `$AZT_HOME` with the user's projects,
+credentials, jobs.json). Unacceptable for field-deployed peers
+that hold weeks of recording work.
+
+### What
+
+A pure-Java `BroadcastReceiver` that wipes
+`files/app/_python_bundle/` from inside the app's UID
+(satisfying Android's UID isolation) without depending on
+`_python_bundle/` (satisfying the "Python is broken" failure
+mode). Java classes load from the APK's `classes.dex`, never
+from the extracted Python bundle, so this works even when every
+Python entrypoint is unrunnable.
+
+After the wipe, the next picker Activity launch triggers p4a's
+Activity-side extract-on-missing branch, which re-extracts from
+the fresh APK assets. The `:provider` service then lazy-spawns
+from the now-current bundle and the daemon recovers. `$AZT_HOME`
+(`files/azt/`) is **not touched** — the wipe is scoped strictly
+to `files/app/_python_bundle/`.
+
+The 0.43.12 attempt failed because it fired auto-wipe on
+`MY_PACKAGE_REPLACED` and the service-side bootstrap (at that
+time) couldn't re-extract on missing dir, crash-looping under
+`START_STICKY`. The 0.43.33 receiver:
+
+- Fires **only manually** via a custom action
+  (`org.atoznback.aztcollab.RESET_PYTHON_BUNDLE`), never
+  automatically. Never on package replace.
+- Recovery flow guides the user to open the Activity (which
+  *does* extract on missing) before any peer triggers a service
+  spawn, so the service always boots from a present bundle.
+
+### Two recovery surfaces
+
+**The receiver alone isn't enough for field deployment.** Field
+machines (SIL linguists' tablets) don't have adb. They need a
+purely in-app path that works when the picker Activity can't
+boot — which is exactly the case when this recovery is needed
+(`:provider` cascade-killing the picker means the picker won't
+stay open long enough for the user to find a settings button).
+
+So 0.43.33 ships two surfaces:
+
+1. **`BundleResetReceiver`** — fires on the custom action
+   `org.atoznback.aztcollab.RESET_PYTHON_BUNDLE`. Available via
+   `adb shell am broadcast` for developers on stuck-but-USB-
+   connected devices, and from inside the app via
+   `sendBroadcast` from `RecoveryActivity`.
+2. **`RecoveryActivity`** — a **second launcher icon** labeled
+   "AZT Recovery". Pure Java, no SDL, no Kivy, no Python — so
+   it launches even when every Python entrypoint in the APK is
+   unrunnable. UI is built programmatically (no layout XML
+   resource) so no res-pipeline changes were needed. The
+   "Repair sync service" button fires the same broadcast, so
+   both surfaces converge on the same wipe code.
+
+The two icons let a field user recover from a stuck install
+without leaving the device — open app drawer, tap "AZT
+Recovery", tap "Repair sync service", tap "Close", reopen "AZT
+Collaboration" normally.
+
+### Files
+
+- **New:** `android/src/main/java/org/atoznback/aztcollab/BundleResetReceiver.java`
+- **New:** `android/src/main/java/org/atoznback/aztcollab/RecoveryActivity.java`
+- **Touched (one-time sandbox carve-out):**
+  `/home/kentr/bin/raspy/buildozer_tweaks/p4a_hook.py` —
+  added `_inject_bundle_reset_receiver` (gated on
+  `dist_name == 'aztcollab'`), which injects both the
+  `<receiver>` AND the `<activity>` with `MAIN`/`LAUNCHER`
+  intent-filter, mirroring the existing
+  `_inject_self_replace_receiver` pattern.
+
+### Recovery procedure (field — no adb)
+
+1. Open the device's app drawer.
+2. Tap the **AZT Recovery** icon (second launcher icon, next to
+   AZT Collaboration).
+3. Tap **Repair sync service**.
+4. After ~1 second, tap **Close**.
+5. Tap the **AZT Collaboration** launcher icon to reopen the
+   picker. p4a's Activity bootstrap re-extracts `_python_bundle/`
+   from the fresh APK assets.
+
+`$AZT_HOME` (projects, recordings, credentials, jobs.json) is
+preserved throughout. The wipe is scoped strictly to
+`files/app/_python_bundle/`.
+
+### Recovery procedure (developer — with adb)
+
+```bash
+adb install -r server_apk/bin/aztcollab.apk
+adb shell am broadcast \
+    -a org.atoznback.aztcollab.RESET_PYTHON_BUNDLE \
+    -p org.atoznback.aztcollab
+# then tap AZT Collaboration on the device
+```
+
+If the broadcast doesn't take the first time (Android's
+broadcast queue can drop receivers during heavy backoff), wait
+~30 s and re-fire. Confirm via `adb shell dumpsys activity
+services org.atoznback.aztcollab` — the `Restarting services`
+backoff section should empty out once `:provider` boots cleanly.
+
+### What this *doesn't* fix
+
+The underlying root-cause crash (the silent `:provider` death
+within 90 ms of spawn that triggered the bind/unbind cascade)
+hasn't been pinpointed yet — but with a fresh bundle that
+includes 0.43.32's `faulthandler.enable(all_threads=True)`, any
+future crash will dump a Python traceback to logcat before the
+process dies. Diagnosis-blocker removed.
+
+## 0.43.32 — stale-unpack survives missing `_bz2`; cache `azt_home()`; faulthandler for `:provider`
+
+### Why
+
+Two field bugs falling out of the 2026-05-20 baf logs.
+
+**Stale-unpack always silently failed.** `_extract_bundle_from_apk`
+imported `bz2` at the top, but p4a's default build doesn't include
+the `_bz2` C extension, so the import raised `ModuleNotFoundError`
+before any decompression ran. Every "stale marker → re-extract"
+attempt failed at the import boundary; the function returned False
+to the caller's `except Exception`, the daemon kept loading old
+Python code from the existing `_python_bundle/`, and the user
+saw "I rebuilt and the bug is still there" on every iteration.
+This made the entire 0.43.22 stale-unpack mechanism a no-op for
+anyone whose p4a build matched the default — i.e. everyone.
+
+**ContentProvider `openFile` callback path was crashing
+`:provider` under sustained cawl-image traffic.** Tombstone at
+pid=23550 tid=23558 (binder:23550_1) showed
+`art::JNI::CallObjectMethodA` NPE in the same class as the
+pre-0.43.23 dispatch-thread crash. Cause: `_resolve_path`
+(the openFile callback's hot path) called `azt_home()`, which
+re-fired `ActivityThread.currentApplication().getFilesDir()
+.getAbsolutePath()` — 3-4 JNI invocations on the Java Binder
+dispatch thread per FD serve. The 0.43.23 fix moved
+`_check_self_updated` off the Dispatch path; the **OpenFile path
+was untouched** and burned more JNI per call than DispatchCallback
+ever did.
+
+### Changes
+
+1. **`bz2` is now optional in `_extract_bundle_from_apk`.** Wrapped
+   in try/except; if `_bz2` is missing, the bz2 decoder is omitted
+   from the decompressor list and `private.tar.gz` (gzip) still
+   handles the modern p4a build path. Only the legacy
+   `private.mp3` (bz2-renamed-to-dodge-asset-compression) path
+   requires `_bz2`, which current p4a doesn't emit.
+
+2. **`azt_collabd/paths.py:azt_home()` caches its result.** First
+   call hits jnius (or platform fallbacks); every subsequent call
+   reads a module global. Cache is safe — the Android `filesDir`
+   value is UID-scoped and never changes for the lifetime of a
+   process. Module-level `_AZT_HOME_CACHE` documents the field-log
+   incident.
+
+3. **`faulthandler.enable(file=sys.stderr, all_threads=True)`** at
+   the top of `server_apk/service.py` module load. Next SIGSEGV
+   from `:provider` will dump a Python-side traceback per thread
+   into logcat under tag `python` before the process dies. With
+   logcat-bridged stderr, this means the actual `*.py:line` site
+   of the crash is now visible without symbols for `jnius.so`.
+
+4. **`threading.excepthook`** installed to log uncaught worker-
+   thread exceptions with the thread's `name`. Background failures
+   in `azt_collabd-watcher`, `commit-fire-<lang>`,
+   `cawl-prefetch-<repo>`, and the new `self-update-poll*` Timer
+   threads now surface to logcat instead of silently disappearing.
+
+5. **Name the remaining unnamed `threading.Timer` instances** in
+   `azt_collabd/android_cp/service.py` —
+   `self-update-poll-init`, `self-update-poll`,
+   `self-update-exit`. Pairs with the existing memory note that
+   every daemon thread must be named so future tombstones
+   self-identify.
+
+### Files touched
+
+- `server_apk/service.py` — `bz2` optional; `faulthandler.enable`;
+  `threading.excepthook`.
+- `azt_collabd/paths.py` — `azt_home()` cache.
+- `azt_collabd/android_cp/service.py` — Timer naming.
+- `azt_collab_client/__init__.py` — version bump to 0.43.32.
+
+## 0.43.22 — sync push loop: stop the 35-minute hang on flaky-DNS networks
+
+### Why
+
+Field log baf 2026-05-20 captured the disaster cleanly. A user
+tapped Sync on a metered tether; the daemon spent **35 minutes**
+losing a fight that could have ended in one HTTPS request:
+
+1. `[12:47:32] [collab.store] github refresh failed: Token refresh
+   network error: <urlopen error timed out>` — the proactive token
+   refresh failed at sync setup. The daemon kept the existing
+   access token in play. It was about to expire.
+2. DNS to github.com was flapping at ~5 % uptime — DoH AAAA+A
+   timing out, system resolver dead, brief recoveries between
+   long outages.
+3. The push retry loop saw `NameResolutionError` and *halved
+   chunk_n*: 302 → 151 → 75 → 37 → 18 → 9 → 4 → 2 → 1. Halving
+   pack size doesn't fix DNS — same number of TCP connections
+   needed regardless — so the loop was bisecting on the wrong
+   axis.
+4. When DNS finally cooperated for one request at chunk_n=1,
+   the server returned **401** — the access token had gone past
+   its 8 h cliff during the storm. The daemon ate the 401, kept
+   trying, and only stopped when `consecutive_failures` hit 12.
+5. Final codes: `['COMMITTED_LOCAL', 'PULL_FAILED', 'PUSH_FAILED',
+   'AUTH_REFRESH_STALE']`. The AUTH bit was emitted post-hoc by
+   `_annotate_with_auth_health`, not because the loop noticed.
+
+A second sync attempt on the same project the same day uploaded
+the pack successfully at chunk_n=20 (server reported
+`DivergedBranches(old=9ee637c..., new=580e2a49...)` — meaning the
+push *landed* on the server) but the read side of the connection
+dropped with `IncompleteRead(0 bytes)`. The daemon reverted to
+"push full local tip" instead of trusting the server's report,
+re-pushed, looped through more DivergedBranches → IncompleteRead
+cycles, then got OOM-killed mid-retry at the 10-minute mark.
+
+### Changes (push loop hardening)
+
+Five mitigations, none of which is "DNS caching" but one of which
+extends the existing DoH negative cache:
+
+1. **Pre-flight credentials probe** in `_push_step_locked`. When
+   `store.github_refresh_state()['broken']` is True AND the
+   remote is a GitHub URL, run `test_github_credentials(token)`
+   against `api.github.com/user` (15 s cap) before entering the
+   retry loop. If the token is rejected, emit `AUTH_REQUIRED` +
+   return — the loop never starts. Best-effort: any exception
+   in the probe falls through to the normal loop.
+2. **401 short-circuit** in both fetch and push paths. `_is_http_401`
+   matches both dulwich's typed `HTTPUnauthorized` and the bare
+   `\b401\b` message shape. Treating 401 as a transient network
+   failure (pre-0.43.22 behaviour, because nothing matched it)
+   was the proximate cause of the 12-failure halving storm.
+3. **DNS-class failures no longer halve** `chunk_n`. New branch
+   in the retry-after-backoff section: `if
+   _is_dns_resolution_failure(exc): continue` (after the back-off
+   sleep, holding target + working_batch_n). When DNS recovers
+   we resume on the chunk size that previously worked. Halving
+   on DNS failure was pure overhead — pack size has zero effect
+   on whether the resolver returns an address.
+4. **Trust `DivergedBranches`'s reported remote tip.** The
+   exception's `args[0]` is the server's authoritative view of
+   the ref ("current_sha"); when refetch fails (e.g.
+   `IncompleteRead` mid-handshake), use the rejection's reported
+   SHA as `new_remote` and write it to
+   `refs/remotes/origin/<branch>` so the next iteration doesn't
+   re-discover it. New helper `_extract_diverged_remote(exc)`.
+5. **Wall-clock budget on the push loop.** New setting
+   `sync.push_budget_s` (default 300 s, env
+   `AZT_SYNC_PUSH_BUDGET_S`, 0 disables). When the loop's
+   monotonic elapsed time exceeds the budget on a network-class
+   failure, emit the new `SYNC_GIVING_UP_TRANSIENT` status code
+   carrying `budget_s` + `commits_pending` and bail with
+   `PUSH_FAILED`. The pending commits stay queued; the next
+   sync run picks them up. This bounds wedged sessions so the
+   project lock frees for other operations.
+
+### Changes (DoH resolver)
+
+6. **Exponential negative-cache TTL** in `net.py`. The existing
+   5 s negative cache was poisoning sustained-outage scenarios:
+   every DNS lookup paid the full 2.5 s DoH round-trip, so on a
+   35-minute storm the resolver alone burned ~12 minutes of
+   wall time. Now consecutive failures for the same host extend
+   the negative TTL exponentially: 5 s → 10 s → 20 s → 40 s →
+   60 s (`_DOH_NEGATIVE_TTL_MAX_S`). A single positive resolve
+   resets the counter, so a brief outage followed by reconnect
+   returns to the tight 5 s probe cadence. Cache value tuple
+   widened from `(expiry, records)` to
+   `(expiry, records, neg_count)`; in-process so no migration.
+
+### Changes (status + translation)
+
+- `S.SYNC_GIVING_UP_TRANSIENT` added in both
+  `azt_collabd/status.py` and the `azt_collab_client/status.py`
+  mirror. Carries `budget_s` and `commits_pending` params.
+- French + English translations added; matches the auto/user
+  silence contract (auto-sync silences this code, user-initiated
+  Sync surfaces the toast).
+- `sync.push_budget_s` documented in `settings.py`.
+
+### Files
+
+- `azt_collabd/repo.py` — `_is_http_401`,
+  `_extract_diverged_remote`, fetch 401 short-circuit, push 401
+  short-circuit, pre-flight probe, DNS-no-halve branch,
+  DivergedBranches authoritative-remote, wall-clock budget.
+- `azt_collabd/status.py` — `SYNC_GIVING_UP_TRANSIENT`.
+- `azt_collabd/settings.py` — `sync.push_budget_s` default + env
+  map + `push_budget_s()` accessor.
+- `azt_collabd/net.py` — exponential negative TTL.
+- `azt_collab_client/__init__.py` — version 0.43.21 → 0.43.22.
+- `azt_collab_client/status.py` — mirror.
+- `azt_collab_client/translate.py` — English string.
+- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+  — French translation.
+
+### Restart-server button: layout + force-kill fallback
+
+Two follow-ups on the 0.43.20 button after a field session.
+
+- **Stacked instead of side-by-side.** French labels are too long
+  to share a row at phone widths: "Partager le journal du service"
+  + "Redémarrer le service" overflow the dp(52) row regardless of
+  spacing. Moved Restart to its own row below Share daemon log.
+  English is unaffected.
+- **Bootstrap reboot-to-apply popup auto-resolves via cooperative
+  restart.** `_prompt_server_reboot_to_apply` in
+  `azt_collab_client/ui/bootstrap.py` fires when the peer detects
+  `installed > running` on the server APK (new APK on disk, old
+  daemon still in `:provider`). Pre-0.43.22 it surfaced a
+  "restart your device" popup. The peer can't `Process.killProcess`
+  across UID boundaries, but it CAN ask the running daemon to
+  restart itself via `POST /v1/admin/restart` (shipped 0.43.20).
+  Try that first; on RESTARTING re-probe compat via
+  `_post_install_continuation`. Only fall through to the popup
+  when the daemon is too old to know the endpoint — the genuinely-
+  stuck pre-0.43.20 case where reboot is the only way out.
+- **Loop guard on the cooperative restart**, attached to ``ctx``.
+  Tracks attempted `(installed, running)` pairs in
+  `ctx._cooperative_restart_attempts`. If `_post_install_continuation`
+  re-probes and the SAME running version comes back, the restart
+  didn't actually load new code — the respawned daemon re-imported
+  a stale `_python_bundle/` from filesDir. Without this guard the
+  cooperative restart loops forever at ~once per 2 s, burning
+  battery. With it: one attempt per pair, then fall through to
+  the popup. Updated popup body to explain the stale-unpack
+  cause rather than blaming Android's package-replace process
+  preservation.
+- **Service-side stale-unpack fix** in `server_apk/service.py`.
+  The bootstrap loop guard above prevents the symptomatic cycle
+  but doesn't fix the underlying issue. p4a's C bootstrap
+  extracts `assets/private.*` to `_python_bundle/` only when the
+  directory is missing — never on APK update — so on reinstall
+  the respawned `:provider` Python interpreter imports the
+  previous APK's code from disk. Documented as a TODO in
+  `SuiteSelfReplaceReceiver.java`'s NOTE on stale p4a unpack
+  (Activity-launch-from-receiver or service-side
+  extract-on-missing; this is the service-side branch).
+  - `_maybe_reextract_python_bundle()` runs in `service.py:main()`
+    BEFORE `import azt_collabd`. Compares the running APK's
+    mtime (via `ApplicationInfo.sourceDir`) to a marker file at
+    `_python_bundle/.apk_mtime`. On mismatch: re-extracts
+    `assets/private.{tar.gz,tar,mp3}` to `_python_bundle.new/`,
+    atomically renames the old bundle aside, swaps the new one
+    in, writes the marker, and `os._exit(0)`s. Android's
+    ContentProvider auto-spawn brings up a fresh `:provider`
+    that imports the new code. First-launch path stamps the
+    marker without re-extracting (p4a's C code already
+    extracted from this APK).
+  - Handles all three p4a asset names (`.tar.gz`, `.tar`,
+    `.mp3` — the renamed bz2 from older p4a that dodges
+    Android's auto-compression) and detects the decompressor by
+    trying gzip → bz2 → plain in order.
+  - Atomic swap via rename so concurrent peer calls (which can
+    trigger lazy-spawn during the swap window) either see the
+    pre-update bundle or the post-update bundle, never a
+    half-written one.
+  - Best-effort: any failure (no jnius, can't read APK, extract
+    error) falls through. Worst case the daemon runs old code
+    one more cycle and the bootstrap loop guard surfaces the
+    popup.
+- **Version strip refreshes after restart.** The
+  `client X · server Y` strip at the bottom of the settings page
+  is populated by ``_probe_server_version`` at app startup and was
+  never re-fetched afterwards. After a successful Restart the
+  daemon's version changed but the strip stayed frozen at the old
+  value, so the restart looked like it did nothing visible.
+  ``SettingsScreen._refresh_version_strip_after_restart`` now
+  schedules a fresh ``_probe_server_version`` call on the running
+  App (works for both ``CollabUIApp`` desktop and ``PickerApp``
+  Android since both expose the method) 2 s after the cooperative
+  or force-kill restart fires, so the strip rerenders with the
+  new daemon version. Best-effort: silent failure leaves the strip
+  stale but doesn't break anything else.
+- **Force-kill fallback** in `SettingsScreen.restart_server`. The
+  cooperative path (`POST /v1/admin/restart`) returns
+  `SERVER_ERROR` against a daemon too old to know the endpoint —
+  which is the exact scenario users tap the button for ("I just
+  installed a new APK, the running daemon is still the old code,
+  please get rid of it"). The toast previously said "Could not
+  reach the sync service to restart it", leaving the user with
+  no recovery path. Now: on `SERVER_ERROR` / `SERVER_UNAVAILABLE`,
+  fall through to the same kill-by-PID mechanism
+  `SuiteSelfReplaceReceiver` uses on
+  `ACTION_MY_PACKAGE_REPLACED`:
+  - **Android**: jnius → `ActivityManager.getRunningAppProcesses`
+    → `Process.killProcess(pid)` for each non-self PID (same UID,
+    no permission needed, bypasses the `:provider` service's
+    `IMPORTANCE_SERVICE` pin). `killBackgroundProcesses(pkg)` as
+    belt-and-braces fallback for any process the enumeration
+    missed.
+  - **Desktop**: read `$AZT_HOME/server.json::pid`, `os.kill(pid,
+    SIGTERM)`. Auto-spawn picks the daemon back up on the next
+    RPC.
+  Either path: settings UI process is unaffected (different
+  process from the daemon on both platforms). Successful kill
+  surfaces the same "Sync service is restarting…" toast the
+  cooperative path uses; failure adds a parenthetical detail
+  string ("no sibling processes found to kill", "no pid in
+  server.json", etc.) to the original "Could not reach" toast so
+  the user has a diagnostic.
+
+### Connectivity watcher now starts on Android (auto-push restored)
+
+Field log baf 2026-05-20 17:22:58–17:25:41: `COMMITTED_LOCAL`
+fires, peer polls `/v1/projects/.../status` every 10 s for
+3+ minutes, **no `[scheduler] drain pushes:` line ever appears**.
+User-gestured Sync via the Sync button works (path through
+`_h_project_sync`); only the auto-drain is broken.
+
+Root cause: `server_apk/service.py` (the Android `:provider`
+entry point) calls `scheduler.reconcile_on_startup()` but
+**never `scheduler.start_watcher()`**. The watcher is wired only
+in `server.run()` (the desktop loopback entry path). On Android
+the daemon commits locally on every `commit_project` RPC,
+sets `pending_push=true` in projects.json, and then ... nothing.
+No thread to drive the drain loop.
+
+Every Android peer on every version of `azt_collabd` has been in
+this state since the commit/push split landed (0.43.0). The
+visible symptom — "+N commits ahead of github" with no
+auto-push — has been there the whole time; the Sync button
+masks it because users routinely tap it.
+
+Fix: one line in `server_apk/service.py::main()` immediately
+after `reconcile_on_startup()`:
+
+```python
+scheduler.start_watcher()
+```
+
+Restores parity with the desktop daemon. Watcher ticks every
+`sync.connectivity_poll_s` (30 s default), checks
+`_has_internet()` + `sync.work_offline` + 60 s post-online
+grace, then calls `_drain_pending_push()` which pushes any
+`pending_push=true` projects.
+
+### Sweep pre-0.37 `.cawl_image_urls.json` orphans on daemon startup
+
+Field log baf 2026-05-20 surfaced `[data-loss-risk] uncommittable
+file in project_dir: '.cawl_image_urls.json'` on every commit step
+for projects that existed before the 0.37 CAWL daemon migration.
+
+Pre-0.37, peers maintained per-project URL caches at
+`<working_dir>/.cawl_image_urls.json`. 0.37 moved ownership to the
+daemon (`$AZT_HOME/cawl/index.json`, 24h TTL, lock-coalesced) and
+peers stopped writing the per-project file — but on devices that
+crossed the migration boundary, the existing files were never
+cleaned up. Nothing in current code reads or writes them (grep
+returns zero hits across `azt_collabd/` and `azt_collab_client/`);
+they're inert bytes that the staging filter flags every commit.
+
+`reconcile_on_startup` now calls `_sweep_legacy_orphans()` which
+iterates `projects.json::*::working_dir` and `os.remove`s any
+known-stale files. Currently just `.cawl_image_urls.json`;
+catalogue lives in `_LEGACY_ORPHAN_PATHS` for future migrations to
+extend. Idempotent (missing files are a no-op), best-effort (per-
+file failures log and continue), runs outside the scheduler lock
+(touches FS, not the jobs registry). One log line per file
+removed: `[scheduler] orphan sweep: removed 'en-UY-x-kent'/
+.cawl_image_urls.json (pre-migration leftover)`.
+
+### `:provider` SIGSEGV fix — self-update poll off the dispatch thread
+
+Field log baf 2026-05-20 16:03:42 captured a `:provider` tombstone
+on a 6GB device (so not memory pressure):
+
+```
+F libc : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault
+        addr 0x0 in tid 8912 (Thread-3), pid 8859 (collab:provider)
+F DEBUG : Cause: null pointer dereference
+F DEBUG :   #00 art::InvokeVirtualOrInterfaceWithJValues
+F DEBUG :   #01 art::JNI<false>::CallObjectMethodA
+F DEBUG :   #02 jnius.so
+F DEBUG :   #03 jnius.so
+F DEBUG :   #04 libpython3.11.so (_PyObject_MakeTpCall+328)
+```
+
+The cascade was visible in the same trace:
+
+```
+ActivityManager: Killing 8874:org.atoznback.aztrecorder ... depends
+on provider org.atoznback.aztcollab/.AZTCollabProvider in dying
+proc org.atoznback.aztcollab:provider
+```
+
+**Root cause** — the documented jnius-on-worker pattern (see
+memory `feedback_jnius_prewarm_main_thread.md`). The dispatch
+callback in `azt_collabd/android_cp/service.py` called
+`_check_self_updated()` on every RPC, which did two
+`PackageManager` JNI calls per call. The Java-side dispatch
+thread is a Python worker attached to the JVM with the
+bootclassloader; sustained jnius traffic from there eventually
+NPE'd `art::JNI::CallObjectMethodA`. Cawl image prefetch (~3–4
+RPCs/sec) made this a near-certainty per session.
+
+**Fix** — move the PackageManager poll off the dispatch path.
+- `_self_update_poller()` runs on a main-thread Timer
+  (60 s cadence). It calls `_pkg_last_update_time()`,
+  compares to the snapshot, and flips a module-level bool
+  on detection.
+- `_check_self_updated()` now reads the bool. Zero jnius
+  per RPC. Single-writer / single-reader bool — GIL covers
+  the race.
+- 60 s detection latency is fine: the only consumer is the
+  `_schedule_exit_for_update` gate, and the user's next
+  ContentResolver call after install almost always arrives
+  within seconds anyway.
+- Belt-and-braces: `server_apk/main.py` step 2a.1 extends
+  the existing jnius prewarm to cover `PythonService`,
+  `Context.getPackageManager`, and
+  `PackageManager.getPackageInfo` from the main thread. Any
+  future worker-thread caller of these gets the cached
+  classloader bindings without paying the bootclassloader
+  penalty.
+
+**Memory budget**: the change adds ZERO new threads (the Timer
+re-spawns itself with `threading.Timer` after each tick, same
+as the connectivity poller). Memory delta ≈ one Python bool.
+Appropriate for the 6GB target.
+
+### Drive-by drift fixes (caught while running the 0.43.22 test suite)
+
+- `_ensure_remote_repo` no longer returns `REMOTE_CREATE_FAILED`
+  on URLs without an `owner/repo` path (e.g.
+  `http://127.0.0.1:NNNN/` from `dulwich.web`-fronted local
+  servers, or any LAN git host with a flat-root URL). The
+  parse-failure path now falls through to the unknown-host
+  branch (`True, None` — let push attempt and surface the real
+  error). Unblocks all four `test_local_git_remote.py` tests
+  that had been failing since 0.43.21.
+- `test_local_git_remote.py::test_pull_repo_fetches_updates_from_local_server`
+  and `::test_sync_repo_round_trip_via_local_server` asserted
+  `result.has(S.COMMITTED)`, but `commit_repo` / `sync_repo`
+  correctly emit `COMMITTED_LOCAL` (the 0.43.0 split between
+  commit-and-push and commit-only). `S.COMMITTED` is only used
+  by `init_repo`'s initial commit. Tests updated to assert
+  `S.COMMITTED_LOCAL`.
+- Translation drift: three msgids that AST-walked in source
+  but were absent from the French .po — added with French
+  strings. `'Network reachable, but the sync host could not
+  be resolved.'` (DNS_RESOLUTION_FAILED toast),
+  `'Servers'` (section label in daemon settings),
+  `'Work offline:'` (toggle label in daemon settings).
+- Translation drift (Restart server, 0.43.20-era):
+  `'Restart server'`, `'Sync service is restarting…'`,
+  `'Could not reach the sync service to restart it.'`, and
+  `'Restart request returned an unexpected response.'` were
+  added to the .po as `msgstr ""` placeholders when the
+  Restart-server button shipped in 0.43.20, but never
+  populated. In a French locale that meant `_('Restart
+  server')` returned `''` — the button rendered with an
+  empty label between "Partager le journal du service" and
+  the end of the row, looking like a phantom-sized gap.
+  Populated with French translations.
+
+### Not done (intentional follow-ups)
+
+- The "duplicate poller" pattern visible from the peer side
+  (status flood at ~2 Hz, 2× "cache warm" log line, two
+  `commit_project` calls 30 s apart returning NOTHING_TO_COMMIT)
+  is on the peer, not the daemon. The daemon log shows clean
+  single-commit debounce for hours of work. Fix lives in
+  `azt_recorder` — out of lane for this repo.
+- Pre-0.43.22 also lacked typed status emission during long
+  syncs (peer polls `project_status` for minutes with no signal
+  beyond "running"). `SYNC_GIVING_UP_TRANSIENT` is the first
+  step; in-progress status emission (e.g.
+  `SYNC_PROGRESS(chunk_n, retries)`) is a separate feature.
+
 ## 0.43.21 — startup probe gives up fast on DNS failure + local-HTTP-git-remote test coverage
 
 ### Why (startup probe)

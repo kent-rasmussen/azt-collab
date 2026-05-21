@@ -199,7 +199,13 @@ def reconcile_on_startup():
     (azt_collabd.server.run) and the Android service entry
     (server_apk/service.py). Idempotent — re-running on a daemon
     that's already done one pass is a no-op (everything is already
-    DONE)."""
+    DONE).
+
+    Also runs the legacy-orphan sweeps (see
+    ``_sweep_legacy_orphans``) — currently just the pre-0.37
+    ``.cawl_image_urls.json`` files left behind in project
+    working_dirs when CAWL ownership moved from peer to daemon.
+    """
     with _lock:
         loaded = _load_persisted_locked()
         now = time.time()
@@ -228,6 +234,76 @@ def reconcile_on_startup():
         if interrupted or stale:
             print(f'[scheduler] reconcile_on_startup: '
                   f'interrupted={interrupted} gc={len(stale)}', flush=True)
+    # Run outside the scheduler lock — touches the filesystem, not
+    # the jobs registry. Best-effort; never raises.
+    _sweep_legacy_orphans()
+
+
+# ── legacy-orphan sweeps ────────────────────────────────────────────────────
+#
+# Migrations that moved ownership of a per-project file from peer to
+# daemon (or just changed where a file lives) leave detritus behind
+# on devices that crossed the migration boundary. Every commit step
+# then flags the orphan as ``DATA_LOSS_RISK`` ("you're writing to a
+# path we won't back up") — a true statement about the daemon's
+# staging filter but a false alarm in this case, since the writer is
+# long gone. The sweep deletes known orphans at daemon startup,
+# scoped to project working_dirs read from projects.json.
+#
+# Add new orphan patterns here as future migrations create them.
+# Each one needs:
+#   - the relative path inside a project working_dir
+#   - the migration version that obsoleted it (in the comment, for
+#     future archaeologists)
+# Idempotent: missing files are a no-op; the function is safe to
+# re-run on every daemon spawn.
+
+_LEGACY_ORPHAN_PATHS = (
+    # CAWL URL cache: pre-0.37 peer-owned per-project cache. Moved
+    # to daemon-owned ``$AZT_HOME/cawl/index.json`` in 0.37 (May
+    # 2026). Files in project working_dirs are detritus from that
+    # transition; nothing in current code reads or writes them.
+    '.cawl_image_urls.json',
+)
+
+
+def _sweep_legacy_orphans():
+    """Remove known-stale per-project files left behind by past
+    migrations. See ``_LEGACY_ORPHAN_PATHS`` for the catalogue.
+
+    Best-effort: any per-file failure (permission denied, FS error)
+    is logged but doesn't block other projects or the daemon
+    startup itself."""
+    try:
+        all_projects = projects._load_raw()
+    except Exception as ex:
+        print(f'[scheduler] orphan sweep skipped (projects.json '
+              f'read failed): {ex}', flush=True)
+        return
+    removed = 0
+    for langcode, raw in (all_projects or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        working_dir = raw.get('working_dir') or ''
+        if not working_dir or not os.path.isdir(working_dir):
+            continue
+        for rel in _LEGACY_ORPHAN_PATHS:
+            target = os.path.join(working_dir, rel)
+            if not os.path.isfile(target):
+                continue
+            try:
+                os.remove(target)
+                removed += 1
+                print(f'[scheduler] orphan sweep: removed '
+                      f'{langcode!r}/{rel} (pre-migration '
+                      f'leftover)', flush=True)
+            except OSError as ex:
+                print(f'[scheduler] orphan sweep: could not remove '
+                      f'{target!r}: {ex}', flush=True)
+    if removed:
+        print(f'[scheduler] orphan sweep: removed={removed} '
+              f'across {len(all_projects or {})} project(s)',
+              flush=True)
 
 
 def _set_pending_push(langcode, value):

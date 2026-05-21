@@ -63,6 +63,16 @@ PUSH_FAILED = 'PUSH_FAILED'
 # Sync, route to an informational toast telling the user to check
 # device DNS / VPN / restricted-data settings; do not navigate.
 DNS_RESOLUTION_FAILED = 'DNS_RESOLUTION_FAILED'
+# Wall-clock cap on the daemon's push loop (``sync.push_budget_s``,
+# default 300 s) was hit before the loop could drain the queue. The
+# pending commits stay queued; the next sync run picks them up.
+# Params: ``budget_s`` (the cap that fired), ``commits_pending``
+# (commits still ahead of remote). Route silent on auto-sync (next
+# scheduled run picks up where this left off); on user-initiated
+# sync, surface a toast naming the retry-on-next-run behaviour —
+# distinct from PUSH_FAILED + dulwich-error-blob which is what
+# pre-0.43.22 surfaced after a 30-minute hang.
+SYNC_GIVING_UP_TRANSIENT = 'SYNC_GIVING_UP_TRANSIENT'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
@@ -72,6 +82,24 @@ BUSY = 'BUSY'
 CONFLICTS = 'CONFLICTS'
 SERVICE_RESTARTED = 'SERVICE_RESTARTED'
 JOB_INTERRUPTED = 'JOB_INTERRUPTED'
+# Daemon refused a three-way merge because the device's free
+# memory (``MemAvailable`` from /proc/meminfo) was below
+# ``sync.min_free_mem_mb_for_merge`` (default 200 MB) — preserving
+# the chance the merge would have OOM-killed the ``:provider``
+# service. Params: ``mem_available_mb`` (int), ``min_required_mb``
+# (int). Treat as transient + retryable; next drain cycle re-reads
+# memory. Routing contract: silent in auto-sync (nothing the user
+# can fix mid-recording), translated toast in user-initiated sync.
+# 0.44.4+.
+INSUFFICIENT_MEMORY_FOR_MERGE = 'INSUFFICIENT_MEMORY_FOR_MERGE'
+# Topic-branch (used for chunked upload of diverged history) already
+# exists on the server with foreign content (a SHA we don't recognize).
+# Two devices probably share a device_name. Surfaced by sync_project /
+# the auto-sync drain when the topic-branch push refuses to force-push.
+# Params: ``topic_branch``, ``server_tip`` (hex prefix). User fix:
+# change device_name to something unique in the daemon settings UI.
+# Since 0.44.8.
+TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
 
 AUTH_REQUIRED = 'AUTH_REQUIRED'
 APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'

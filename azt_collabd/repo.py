@@ -49,6 +49,52 @@ _FETCH_TIMEOUT_S = 60.0
 _PUSH_TIMEOUT_S = 180.0
 
 
+# Per-project memory of the chunk_n that *failed* on the previous
+# push attempt. Used so the scheduler's drain loop converges on a
+# working chunk size across calls instead of restarting at full tip
+# every retry. Persisted only in-process (resets on daemon restart;
+# the bundle survives because the failing chunk was demonstrably too
+# big and trying again at the same size wastes another budget).
+# Cleared on full-tip push success.
+#
+# Field log baf 2026-05-21 09:38–11:05: device had 419 unpushed
+# commits, each drain cycle restarted at chunk_n=419, hit 408
+# ``unexpected http resp`` after ~12 minutes, ``push budget exceeded
+# (300s) — giving up``, requeued, repeated for hours. Halving inside
+# a single call existed (302 → 151 → … → 1 in the 0.43.18 era) but
+# its progress was discarded on the next ``_push_step_locked``
+# invocation. The fix is to remember the failed chunk_n across calls
+# so the next attempt starts smaller.
+_LAST_FAILED_CHUNK_N = {}
+
+
+def _hint_chunk_n(project_dir):
+    """Return the remembered chunk_n hint for *project_dir*, or
+    ``None`` if no prior failure recorded. The hint is the chunk_n
+    that was demonstrably too large on the previous attempt — the
+    caller should use it as an upper bound on the new attempt's
+    initial chunk size."""
+    return _LAST_FAILED_CHUNK_N.get(project_dir)
+
+
+def _remember_failed_chunk_n(project_dir, n):
+    """Persist a failed chunk_n so the next drain cycle for this
+    project starts smaller. Stored as ``max(1, n // 2)`` so the
+    next cycle attempts half the failed size — same shrinkage the
+    in-call halving would do, just preserved across calls."""
+    try:
+        _LAST_FAILED_CHUNK_N[project_dir] = max(1, int(n) // 2)
+    except Exception:
+        pass
+
+
+def _clear_failed_chunk_n(project_dir):
+    """Drop the remembered chunk_n for *project_dir*. Called on a
+    full successful push — the queue is empty, no constraint to
+    remember for next time."""
+    _LAST_FAILED_CHUNK_N.pop(project_dir, None)
+
+
 @contextlib.contextmanager
 def _socket_timeout(seconds):
     """Set ``socket.setdefaulttimeout`` for the body. Restores prior
@@ -186,9 +232,13 @@ def _apply_tree_to_workdir(repo, project_dir, old_sha, new_sha):
         return
     new_blobs = _walk_tree(repo, new_commit.tree)
 
-    # Write changed / added files.
-    for path, content in new_blobs.items():
-        if old_blobs.get(path) == content:
+    # Write changed / added files. ``_walk_tree`` returns SHA-only;
+    # most paths short-circuit on SHA equality with no byte read.
+    for path, blob_sha in new_blobs.items():
+        if old_blobs.get(path) == blob_sha:
+            continue
+        content = _blob_bytes(repo, blob_sha)
+        if content is None:
             continue
         full = os.path.join(project_dir, path)
         parent = os.path.dirname(full) or project_dir
@@ -227,7 +277,17 @@ def _apply_tree_to_workdir(repo, project_dir, old_sha, new_sha):
 
 
 def _walk_tree(repo, tree_sha, prefix=b''):
-    """Return dict[path-as-str → blob bytes] for every file under *tree_sha*."""
+    """Return dict[path-as-str → blob sha (bytes)] for every file under
+    *tree_sha*. SHA-only — callers load blob bytes lazily via
+    ``_blob_bytes`` only for paths that actually need content.
+
+    Returning bytes eagerly (pre-0.44.4) loaded every audio file in
+    every snapshot into Python dicts; with ``_merge_diverged`` calling
+    this three times for base/head/remote on a 1700-entry baf project,
+    peak allocation was ~1 GB and Android's ``:provider`` service got
+    OOM-killed before the first ``[merge-trace]`` line. Comparing by
+    SHA (identical content → identical sha is git's contract) lets
+    most paths short-circuit with no byte allocation at all."""
     out = {}
     if not tree_sha:
         return out
@@ -241,12 +301,62 @@ def _walk_tree(repo, tree_sha, prefix=b''):
         if mode & 0o040000:
             out.update(_walk_tree(repo, sha, full))
         else:
-            try:
-                blob = repo[sha]
-                out[full.decode('utf-8', errors='replace')] = blob.data
-            except KeyError:
-                pass
+            out[full.decode('utf-8', errors='replace')] = sha
     return out
+
+
+def _blob_bytes(repo, sha):
+    """Return the bytes for blob *sha*, or None if missing. Companion
+    to ``_walk_tree``'s SHA-only return — call this only for paths
+    you actually need to read content for."""
+    if sha is None:
+        return None
+    try:
+        return repo[sha].data
+    except KeyError:
+        return None
+
+
+def _mem_available_mb():
+    """Return ``MemAvailable`` from /proc/meminfo in MB, or None when
+    the file isn't readable (non-Linux desktop, sandbox). ``MemAvailable``
+    is the kernel's estimate of memory that can be allocated without
+    swapping — what we need for "can this LIFT merge finish without
+    OOM-kill". Cheaper and more accurate than ``MemFree``."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    # Format: "MemAvailable:   123456 kB"
+                    kb = int(line.split()[1])
+                    return kb // 1024
+    except (FileNotFoundError, PermissionError, ValueError, OSError):
+        pass
+    return None
+
+
+def _check_memory_for_merge():
+    """Pre-flight memory check for ``_merge_diverged``. Returns a
+    ``Status('INSUFFICIENT_MEMORY_FOR_MERGE', ...)`` if free memory
+    is below ``sync.min_free_mem_mb_for_merge``, else None. Callers
+    add the returned Status to their Result and skip the merge —
+    the next drain cycle re-reads memory and proceeds when it
+    recovers. On platforms where ``/proc/meminfo`` isn't readable
+    we treat the check as passing (returns None) — desktop / sandbox
+    won't OOM-kill the way Android's ``:provider`` does."""
+    min_mb = _settings.min_free_mem_mb_for_merge()
+    if min_mb <= 0:
+        return None
+    available = _mem_available_mb()
+    if available is None:
+        return None
+    if available >= min_mb:
+        return None
+    return Status(
+        S.INSUFFICIENT_MEMORY_FOR_MERGE,
+        mem_available_mb=available,
+        min_required_mb=min_mb,
+    )
 
 
 def _find_merge_base(repo, a_sha, b_sha):
@@ -338,6 +448,69 @@ def _is_ancestor(repo, ancestor_sha, descendant_sha):
     return False
 
 
+def _all_commits_descend_from(repo, ancestor_sha, descendant_sha):
+    """Return True iff every commit reachable from *descendant_sha*
+    but not from *ancestor_sha* has *ancestor_sha* as one of its
+    ancestors. False if any commit in the delta is on a parallel
+    branch that diverged before *ancestor_sha* (typical post-merge
+    state: the local-side parent chain of the merge commit doesn't
+    descend from the current remote).
+
+    Routing decision for push:
+    - True: direct-push + chunk-halving against *ancestor_sha*
+      (the remote ref) is structurally viable — every intermediate
+      the chunk picker can choose has *ancestor_sha* as an
+      ancestor, so the server accepts the FF.
+    - False: at least one intermediate is on a diverged branch
+      → direct push of any intermediate gets ``DivergedBranches``
+      at the server → route through the topic-branch path
+      (Phase A → B → C) so the diverged commits land on an
+      ours-only ref first.
+
+    Algorithm: O(N) one-pass over the delta. Walk all commits
+    reachable from descendant but not ancestor; check that every
+    parent of every such commit is either *ancestor_sha* itself
+    (the FF root) or another commit in the delta (still on our
+    line). Any parent that's neither means we touched a third
+    branch — i.e., we have a merge whose other parent isn't the
+    ancestor we're pushing to."""
+    if not ancestor_sha or not descendant_sha:
+        return False
+    if ancestor_sha == descendant_sha:
+        return True
+    try:
+        walker = repo.get_walker(
+            include=[descendant_sha], exclude=[ancestor_sha])
+    except Exception:
+        # Walker errors are rare (missing object, etc.); safest
+        # default is "not FF" so we route through topic-branch,
+        # which is the more robust path.
+        return False
+    delta = set()
+    commits = []
+    for entry in walker:
+        delta.add(entry.commit.id)
+        commits.append(entry.commit)
+    if not commits:
+        # Empty delta — descendant equals ancestor or is unreachable.
+        # Equal case handled above; unreachable means we have no
+        # commits to push, treat as vacuously True (caller's
+        # "nothing to push" branch will handle it).
+        return True
+    for commit in commits:
+        for parent_sha in commit.parents:
+            if parent_sha == ancestor_sha:
+                continue
+            if parent_sha in delta:
+                continue
+            # Parent is neither the FF root nor in our delta — it
+            # lives on a third branch we don't reach by walking
+            # from descendant_sha. The current commit is on a
+            # diverged side of a merge.
+            return False
+    return True
+
+
 def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
     """Three-way merge ours (local_sha) and theirs (remote_sha) into the
     working tree. .lift files merge via lift_merge; other paths use
@@ -350,13 +523,28 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
     remote_commit = repo[remote_sha]
     base_commit = repo[base_sha] if base_sha else None
 
+    # ``_walk_tree`` returns ``path → blob sha`` (SHA-only since
+    # 0.44.4) so building these three dicts costs ~tens of KB each,
+    # not hundreds of MB. Bytes for any individual path are fetched
+    # lazily via ``_blob_bytes`` and only for paths that actually
+    # need merging or writing.
     base_blobs = _walk_tree(repo, base_commit.tree) if base_commit else {}
     head_blobs = _walk_tree(repo, head_commit.tree)
     remote_blobs = _walk_tree(repo, remote_commit.tree)
+    lift_merge.trace(
+        f'[merge-trace] _walk_tree done '
+        f'base={len(base_blobs)} head={len(head_blobs)} '
+        f'remote={len(remote_blobs)}')
 
     all_paths = set(base_blobs) | set(head_blobs) | set(remote_blobs)
     conflicts = []
-    merged_writes = {}    # path → bytes
+    # path → ('sha', sha) for content already in git, or
+    # ('bytes', bytes) for content from a LIFT merge that isn't a
+    # blob yet. Holding (kind, value) tuples keeps this dict tiny —
+    # in the pre-0.44.4 layout ``merged_writes`` held raw bytes for
+    # every audio file, replicating what ``_walk_tree`` already
+    # over-allocated.
+    merged_writes = {}
     deletes = []          # paths to remove
 
     for path in sorted(all_paths):
@@ -369,8 +557,16 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
             continue
 
         if path.endswith('.lift') and o is not None and t is not None and o != t:
-            mr = lift_merge.three_way_merge(b or b'', o, t, path=path)
-            merged_writes[path] = mr.merged_bytes
+            # Heavy path — load bytes only here. Free them as soon
+            # as the merge call returns so the dict-of-bytes peak
+            # stays at "one LIFT merge worth", not "every audio
+            # file in every snapshot".
+            b_bytes = _blob_bytes(repo, b) if b is not None else b''
+            o_bytes = _blob_bytes(repo, o) or b''
+            t_bytes = _blob_bytes(repo, t) or b''
+            mr = lift_merge.three_way_merge(
+                b_bytes or b'', o_bytes, t_bytes, path=path)
+            merged_writes[path] = ('bytes', mr.merged_bytes)
             conflicts.extend(mr.conflicts)
             # Persist a forensic dump for any guard trip. The dump
             # lands under ``<working_dir>/.azt-collab/diagnostics/``
@@ -386,54 +582,77 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
                         local_sha=_sha_str(local_sha),
                         remote_sha=_sha_str(remote_sha),
                         base_sha=_sha_str(base_sha) if base_sha else '',
-                        base_bytes=b or b'', ours_bytes=o,
-                        theirs_bytes=t,
+                        base_bytes=b_bytes or b'', ours_bytes=o_bytes,
+                        theirs_bytes=t_bytes,
                         merged_bytes=mr.merged_bytes,
                         conflict_fields=_c.fields)
                     break   # one dump per merged file is enough
+            del b_bytes, o_bytes, t_bytes
             continue
 
         if o == t:
-            merged_writes[path] = (o if o is not None else t)
-            if merged_writes[path] is None:
-                merged_writes.pop(path, None)
+            if o is None:
                 deletes.append(path)
+            else:
+                merged_writes[path] = ('sha', o)
             continue
         if o == b:
             # Only theirs changed — take theirs (or accept their delete)
             if t is None:
                 deletes.append(path)
             else:
-                merged_writes[path] = t
+                merged_writes[path] = ('sha', t)
             continue
         if t == b:
             # Only ours changed — take ours
             if o is None:
                 deletes.append(path)
             else:
-                merged_writes[path] = o
+                merged_writes[path] = ('sha', o)
             continue
         # Both changed differently for a non-LIFT file → take ours,
         # surface the conflict for the commit message.
         if o is not None:
-            merged_writes[path] = o
+            merged_writes[path] = ('sha', o)
         elif t is not None:
-            merged_writes[path] = t
+            merged_writes[path] = ('sha', t)
         conflicts.append(lift_merge.Conflict(
             path=path, guid='', kind='non-lift-modify-modify'))
 
-    # Apply to the working tree
-    for path, content in merged_writes.items():
+    lift_merge.trace(
+        f'[merge-trace] resolution done '
+        f'writes={len(merged_writes)} deletes={len(deletes)} '
+        f'conflicts={len(conflicts)}')
+
+    # Apply to the working tree. For ``'sha'`` entries, skip the
+    # write when the target SHA already matches HEAD — the working
+    # tree presumably has that content already, so re-reading the
+    # blob just to overwrite identical bytes is pure heap pressure.
+    # For ``'bytes'`` entries (LIFT merge output) we always write.
+    writes_done = 0
+    for path, (kind, value) in merged_writes.items():
+        if kind == 'sha':
+            if head_blobs.get(path) == value:
+                continue
+            content = _blob_bytes(repo, value)
+            if content is None:
+                continue
+        else:
+            content = value
         full = os.path.join(project_dir, path)
         os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
         with open(full, 'wb') as f:
             f.write(content)
+        writes_done += 1
     for path in deletes:
         full = os.path.join(project_dir, path)
         try:
             os.remove(full)
         except OSError:
             pass
+    lift_merge.trace(
+        f'[merge-trace] apply done writes_done={writes_done} '
+        f'deletes={len(deletes)}')
 
     _stage_all(repo, project_dir)
 
@@ -614,9 +833,18 @@ def _ensure_remote_repo(remote_url, username, token):
     parsed = urlparse(remote_url)
     host = parsed.hostname or ''
     parts = parsed.path.strip('/').removesuffix('.git').split('/')
+    is_known_host = 'github.com' in host or 'gitlab' in host
     if len(parts) < 2:
-        return False, Status(S.REMOTE_CREATE_FAILED,
-                             {'error': f'cannot parse owner/repo from {remote_url}'})
+        if is_known_host:
+            return False, Status(S.REMOTE_CREATE_FAILED,
+                                 {'error': f'cannot parse owner/repo from {remote_url}'})
+        # Unknown host (gitea / forgejo / local dulwich.web / LAN
+        # git-daemon) with no owner/repo path component — nothing
+        # to auto-create, let push proceed. Pre-0.43.22 this
+        # returned REMOTE_CREATE_FAILED unconditionally, which
+        # blocked every non-github sync against a flat-root URL
+        # (every test_local_git_remote case).
+        return True, None
     owner, repo_name = parts[0], parts[1]
 
     if 'github.com' in host:
@@ -1266,6 +1494,62 @@ def _is_dns_resolution_failure(exc):
     return any(m in s for m in _DNS_FAILURE_MARKERS)
 
 
+# Auth-class failures the daemon sees when an access token has gone
+# stale after a failed refresh (typical sequence: refresh attempt
+# during sync setup fails with a network error → access token rides
+# on past its 8h cliff → server returns 401 on git-receive-pack). The
+# pre-0.43.22 push loop never recognised this shape: 401 doesn't match
+# ``_is_http_403`` (so the diagnose_403 short-circuit doesn't fire)
+# AND 401 doesn't match any of the network markers either (so
+# adaptive batching gives up via consecutive_failures rather than
+# AUTH_REQUIRED). Result: a 35-minute chunk-halving storm on a flaky
+# tether where the underlying problem was a stale token discoverable
+# in one HTTPS request.
+_HTTP_401_RE = re.compile(r'\b401\b')
+_HTTPUNAUTHORIZED_MARKERS = (
+    'httpunauthorized',
+    'no valid credentials provided',
+)
+
+
+def _is_http_401(exc):
+    """Return True if *exc* looks like an HTTP 401 from a git endpoint.
+    Matches both dulwich's typed ``HTTPUnauthorized`` and the bare
+    ``unexpected http resp 401`` shape some transport paths surface."""
+    if _HTTP_401_RE.search(str(exc)):
+        return True
+    s = str(exc).lower()
+    return any(m in s for m in _HTTPUNAUTHORIZED_MARKERS)
+
+
+def _extract_diverged_remote(exc):
+    """If *exc* is a dulwich ``DivergedBranches``, return the SHA the
+    server says its ref currently holds (the ``old`` side of the
+    rejected ref update). Else return None.
+
+    ``DivergedBranches.args`` is ``(current_sha, new_sha)``: the
+    server's current value of the ref, and the value our push wanted
+    to set. The server's view is authoritative — more reliable than
+    re-fetching ``refs/remotes/origin/<branch>`` when DNS is flapping
+    and ``porcelain.fetch`` raises ``IncompleteRead`` so the local
+    tracking ref stays frozen at clone-time. Field log baf 2026-05-20
+    showed the retry loop bouncing on a stale ``remote_sha`` for
+    minutes while ``DivergedBranches`` was carrying the truth.
+
+    Returns ``bytes`` to match the rest of the ref-handling code in
+    this module."""
+    try:
+        from dulwich.errors import DivergedBranches
+    except ImportError:
+        return None
+    if not isinstance(exc, DivergedBranches):
+        return None
+    args = getattr(exc, 'args', ()) or ()
+    if len(args) >= 1 and isinstance(args[0], (bytes, bytearray)):
+        return bytes(args[0])
+    return None
+
+
 def _format_push_error(exc):
     """Best-effort human-readable string from a push exception.
 
@@ -1365,6 +1649,231 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     return commits[min(n, len(commits)) - 1]
 
 
+def _topic_branch_name(langcode, device_name):
+    """Return the topic-branch ref name (without ``refs/heads/`` prefix)
+    for chunked uploads from this device of this project. Format:
+    ``azt-pending-<sanitized-langcode>-<sanitized-device>``.
+
+    Sanitization replaces anything outside ``[A-Za-z0-9._-]`` with ``_``
+    so the name is a valid git ref segment regardless of how loose the
+    langcode or device_name validation is upstream."""
+    safe_lang = re.sub(r'[^A-Za-z0-9._-]', '_', langcode or 'unset')
+    safe_dev = re.sub(r'[^A-Za-z0-9._-]', '_', device_name or 'unset')
+    return f'azt-pending-{safe_lang}-{safe_dev}'
+
+
+def _push_chunked_to_ref(
+    repo, project_dir, username, token, remote_url,
+    target_sha, topic_ref_name, branch_for_main,
+):
+    """Phase A of the topic-branch push: push *target_sha* to
+    ``refs/heads/<topic_ref_name>`` on the remote in adaptive chunks
+    so each chunk's pack fits inside the server's per-request timeout.
+    The topic-branch is ours alone (per-device naming) — each chunk
+    fast-forwards our own previous progress on this ref, so there's
+    no ``DivergedBranches`` handling needed here.
+
+    Used when ``_all_commits_descend_from(remote_sha, local_sha)``
+    returned False (typical post-merge state) and a direct push to
+    main would force the entire ~150 MB pack across one HTTP
+    request. The topic-branch lets the blobs land in 5–20 MB chunks
+    first; the subsequent push of ``target_sha`` to main becomes a
+    tiny pack since the server already has every reachable object.
+
+    Returns a tuple ``(success: bool, status: Status | None,
+    last_pushed_sha: bytes | None)``:
+
+    - ``success=True``: server's topic-branch ref is now at
+      *target_sha*. Caller proceeds to push to main.
+    - ``success=False`` + ``status=Status('TOPIC_BRANCH_CONFLICT', …)``:
+      topic-branch already exists on server with content that isn't
+      our ancestor (another device sharing our ``device_name``).
+      Caller surfaces the status; user must change device_name.
+    - ``success=False`` + ``status=None``: per-chunk failures
+      exhausted the consecutive-failures cap. Caller treats as
+      ``PUSH_FAILED`` transient; next drain cycle re-reads the
+      server's topic-branch tip and resumes from there.
+
+    Resume across daemon respawns: no on-disk state — the server's
+    topic-branch ref IS the progress record. Each successful chunk
+    push lands on the server; on next drain the fetch repopulates
+    ``refs/remotes/origin/<topic_ref_name>`` and this helper picks
+    up where the last run left off."""
+    from dulwich import porcelain
+
+    TEMP_REF = b'refs/azt-collab/topic_partial_push'
+
+    def _cleanup_temp_ref():
+        try:
+            del repo.refs[TEMP_REF]
+        except KeyError:
+            pass
+
+    # 1. Probe server-side state via the local mirror that ``fetch``
+    # populated earlier in ``_push_step_locked``. ``KeyError`` means
+    # the topic-branch doesn't exist on server yet — the first
+    # chunk push will create it.
+    topic_remote_ref = _enc(f'refs/remotes/origin/{topic_ref_name}')
+    main_remote_ref = _enc(f'refs/remotes/origin/{branch_for_main}')
+    try:
+        server_topic_tip = repo.refs[topic_remote_ref]
+    except KeyError:
+        server_topic_tip = None
+
+    target_label = _sha_str(target_sha)[:8] if target_sha else '?'
+    lift_merge.trace(
+        f'[sync-trace] topic-push begin ref={topic_ref_name!r} '
+        f'target={target_label} '
+        f'server_topic_tip={_sha_str(server_topic_tip)[:8] if server_topic_tip else "(none)"!r}')
+
+    # 2. Already done? Nothing to push.
+    if server_topic_tip == target_sha:
+        lift_merge.trace(
+            f'[sync-trace] topic-push: server already at target; skip')
+        return True, None, target_sha
+
+    # 3. Foreign content check. If the topic-branch exists on the
+    # server and isn't an ancestor of our target, we're stepping on
+    # someone else's ref (another device sharing device_name). Refuse.
+    if server_topic_tip is not None and not _is_ancestor(
+            repo, server_topic_tip, target_sha):
+        lift_merge.trace(
+            f'[sync-trace] topic-push: server tip '
+            f'{_sha_str(server_topic_tip)[:8]!r} is NOT an ancestor of '
+            f'target {target_label!r} — foreign content, refusing')
+        return False, Status(
+            S.TOPIC_BRANCH_CONFLICT,
+            {'topic_branch': topic_ref_name,
+             'server_tip': _sha_str(server_topic_tip)[:8]}
+        ), server_topic_tip
+
+    # 4. Pick the chunk base. If server already has some of our
+    # work on this branch, walk from there; otherwise walk from
+    # main_remote_ref (every commit in our delta past main is
+    # potentially new to the server). Falling back to ``None`` is
+    # safe — ``_pick_intermediate_sha`` returns the tip in that
+    # case and the chunk-halving still drives the loop.
+    if server_topic_tip is not None:
+        chunk_base = server_topic_tip
+    else:
+        try:
+            chunk_base = repo.refs[main_remote_ref]
+        except KeyError:
+            chunk_base = None
+
+    # 5. Chunk-halving loop. Reuse the constants and shape of the
+    # main push loop but without the DivergedBranches branch — the
+    # topic-branch is FF-clean by construction (per-device naming
+    # + we just verified ancestry).
+    MAX_CONSECUTIVE_FAILURES = 12
+    consecutive_failures = 0
+    backoff_s = 1.0
+    initial_n = _settings.topic_branch_chunk_size()
+    working_n = None
+    chunk_n = initial_n
+
+    while consecutive_failures < MAX_CONSECUTIVE_FAILURES:
+        # Refresh chunk_base each iteration in case a previous
+        # chunk advanced the server-side ref. Our local mirror is
+        # updated below on each successful push.
+        try:
+            chunk_base = repo.refs[topic_remote_ref]
+        except KeyError:
+            pass  # keep prior (main or None)
+        remaining = _count_commits_between(repo, chunk_base, target_sha) \
+            if chunk_base else None
+        if remaining == 0:
+            # Server caught up to target via the last chunk push.
+            _cleanup_temp_ref()
+            lift_merge.trace(
+                f'[sync-trace] topic-push: done '
+                f'(server topic-branch at target)')
+            return True, None, target_sha
+        if remaining is not None and remaining <= chunk_n:
+            # Last chunk — push the tip directly.
+            intermediate = target_sha
+        else:
+            n = working_n if working_n is not None else chunk_n
+            intermediate = _pick_intermediate_sha(
+                repo, chunk_base, target_sha, n)
+        try:
+            label = _sha_str(intermediate)[:8]
+        except Exception:
+            label = '?'
+        lift_merge.trace(
+            f'[sync-trace] topic-push attempt target={label} '
+            f'chunk_n={chunk_n} remaining={remaining} '
+            f'consecutive_failures={consecutive_failures}')
+
+        # Park the intermediate sha under TEMP_REF so dulwich can
+        # resolve the lhs of the refspec.
+        _cleanup_temp_ref()
+        repo.refs[TEMP_REF] = intermediate
+        refspec = _enc(
+            f'{TEMP_REF.decode()}:refs/heads/{topic_ref_name}')
+        try:
+            with _socket_timeout(_PUSH_TIMEOUT_S):
+                porcelain.push(
+                    repo, remote_url, refspec,
+                    username=username, password=token,
+                    errstream=io.BytesIO(),
+                )
+            lift_merge.trace(
+                f'[sync-trace] topic-push chunk OK '
+                f'(advanced to {label})')
+            # Advance local mirror.
+            try:
+                repo.refs[topic_remote_ref] = intermediate
+            except Exception as ex:
+                lift_merge.trace(
+                    f'[sync-trace] topic-push: local mirror update '
+                    f'failed: {ex!r}')
+            consecutive_failures = 0
+            backoff_s = 1.0
+            if working_n is None:
+                working_n = chunk_n
+                lift_merge.trace(
+                    f'[sync-trace] topic-push batch size '
+                    f'locked at {working_n}')
+            if intermediate == target_sha:
+                _cleanup_temp_ref()
+                return True, None, target_sha
+            continue
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] topic-push raised: {exc!r}')
+            if _is_http_403(exc):
+                _cleanup_temp_ref()
+                return False, diagnose_403(token, remote_url), None
+            if _is_http_401(exc):
+                _cleanup_temp_ref()
+                return False, Status(S.AUTH_REQUIRED), None
+            consecutive_failures += 1
+            # Halve the chunk size and try again. Floor at 1 — a
+            # single-commit chunk is the smallest unit; if even
+            # that fails repeatedly we'll exit on the consecutive-
+            # failures cap.
+            if working_n is None:
+                # Never had a successful push at this size — halve
+                # the next attempt's size directly.
+                chunk_n = max(1, chunk_n // 2)
+            else:
+                # We had earlier success at working_n; halve from
+                # there. (Don't grow chunk_n past what worked.)
+                chunk_n = max(1, working_n // 2)
+                working_n = None  # need to re-discover working size
+            time.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, 16.0)
+            continue
+
+    _cleanup_temp_ref()
+    lift_merge.trace(
+        f'[sync-trace] topic-push giving up — consecutive failures '
+        f'exceeded cap ({MAX_CONSECUTIVE_FAILURES}); will resume '
+        f'next drain')
+    return False, None, None
+
+
 def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     """Fetch + merge + push on an already-opened repo. Mutates
     *result* in place. Caller holds the project lock and has
@@ -1420,6 +1929,20 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
         if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
             return result
+        if _is_http_401(exc):
+            # Stale access token (refresh failed earlier, current
+            # token has expired). Short-circuit before push so we
+            # don't burn the chunk-halving budget on doomed retries.
+            # ``_annotate_with_auth_health`` upstream adds
+            # AUTH_REFRESH_STALE based on the store's refresh-broken
+            # flag; AUTH_REQUIRED here triggers the credential-fix
+            # flow on the peer regardless of whether the broken-flag
+            # was set in time.
+            lift_merge.trace(
+                '[sync-trace] fetch failed with 401 — '
+                'aborting before push')
+            result.add(S.AUTH_REQUIRED)
+            return result
         # Non-fatal: maybe remote is empty or temporarily unreachable.
         # Trace explicitly so a stale ``refs/remotes/origin/*`` read
         # downstream isn't misread as authoritative — pre-0.43.19
@@ -1468,6 +1991,16 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
         lift_merge.trace('[sync-trace] local ahead of remote')
         pass
     elif needs_merge:
+        mem_block = _check_memory_for_merge()
+        if mem_block is not None:
+            lift_merge.trace(
+                f'[sync-trace] merge_diverged skipped '
+                f'(mem_available={mem_block.params.get("mem_available_mb")}MB '
+                f'< min={mem_block.params.get("min_required_mb")}MB)')
+            result.statuses.append(mem_block)
+            result.add(S.PULL_FAILED, error='insufficient memory for merge')
+            return result
+
         lift_merge.trace('[sync-trace] merge_diverged begin')
         try:
             merged_sha, conflicts = _merge_diverged(
@@ -1485,6 +2018,97 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             result.add(S.PULL_FAILED,
                        error=f'merge failed: {_format_push_error(exc)}')
             return result
+
+    # Routing decision for push: can we direct-push to ``branch`` with
+    # chunk-halving, or do we need the topic-branch path to handle a
+    # diverged history?
+    #
+    # Direct push + chunk-halving works iff every commit between
+    # ``remote_sha`` and ``local_sha`` descends from ``remote_sha`` —
+    # i.e., the local chain is a fast-forward of the server. The
+    # canonical failure mode (this rule's reason for existing) is the
+    # post-merge state where local has a merge commit at the tip; the
+    # merge commit itself descends from remote, but the ~hundreds of
+    # pre-merge commits on the local side don't, and any intermediate
+    # the chunk picker selects from that side gets ``DivergedBranches``
+    # from the server. See ``_all_commits_descend_from`` for the
+    # algorithm.
+    #
+    # When the routing rule says "topic-branch", run Phase A
+    # (chunked push to a per-device topic ref) before letting the
+    # existing direct-push loop run. After Phase A, every blob
+    # reachable from ``local_sha`` is on the server (under the
+    # topic-branch ref); the subsequent direct push to ``main``
+    # negotiates a tiny pack (just the merge commit + tree + merged
+    # LIFT bytes) and completes inside the server's per-request
+    # timeout. Phase B (re-fetch + conditional re-merge on race) is
+    # handled implicitly by the existing post-non-FF retry loop;
+    # Phase C (promote to main) is the existing direct push itself;
+    # Phase D (cleanup of topic-branch) is deferred to a later
+    # release — leaving the topic ref on the server is purely
+    # cosmetic until the janitor lands.
+    if remote_sha and local_sha != remote_sha:
+        can_direct_push = _all_commits_descend_from(
+            repo, remote_sha, local_sha)
+        lift_merge.trace(
+            f'[sync-trace] route: '
+            f'{"direct-push" if can_direct_push else "topic-branch"}')
+        if not can_direct_push:
+            from . import store as _store
+            from . import projects as _projects
+            langcode = _projects.find_langcode_by_working_dir(
+                project_dir) or 'unset'
+            device_name = _store.get_device_name() or 'unset'
+            topic_ref_name = _topic_branch_name(langcode, device_name)
+            success, conflict_status, _last = _push_chunked_to_ref(
+                repo, project_dir, username, token, remote_url,
+                local_sha, topic_ref_name, branch)
+            if success:
+                # Phase A complete. Topic-branch on server now
+                # contains every reachable object from ``local_sha``.
+                # Fall through to the existing direct-push loop —
+                # its first attempt pushes ``local_sha`` to
+                # ``refs/heads/<branch>`` and negotiates a pack
+                # containing only objects the server doesn't have,
+                # which is just the bare minimum (merge commit + a
+                # few small objects). The pack will fit in one
+                # HTTP request, the push succeeds, queue is cleared.
+                lift_merge.trace(
+                    '[sync-trace] topic-push complete — falling '
+                    'through to direct push of merge commit (tiny '
+                    'pack)')
+            elif conflict_status is not None:
+                # Typed status from the topic-push helper. Three
+                # shapes:
+                # - TOPIC_BRANCH_CONFLICT: foreign content on our
+                #   topic-branch ref. Add PUSH_FAILED too for
+                #   peers without specific routing on the new
+                #   code; user fix is a device_name change.
+                # - AUTH_REQUIRED (401): bail without PUSH_FAILED
+                #   per the existing 401 convention.
+                # - 403 diagnosis: bail with the diagnosis but
+                #   without PUSH_FAILED (matches the existing
+                #   direct-push behaviour).
+                result.statuses.append(conflict_status)
+                if conflict_status.code == S.TOPIC_BRANCH_CONFLICT:
+                    result.add(S.PUSH_FAILED,
+                               error='topic-branch conflict — '
+                                     'device_name collision')
+                return result
+            else:
+                # Per-chunk failures exhausted the cap. The server
+                # has whatever chunks did succeed; next drain
+                # resumes from the new topic-branch tip (the
+                # server's ref is the progress record). Surface as
+                # PUSH_FAILED; the existing peer routing treats
+                # PUSH_FAILED as transient + retryable.
+                lift_merge.trace(
+                    '[sync-trace] topic-push could not complete '
+                    'this run; will resume next drain')
+                result.add(S.PUSH_FAILED,
+                           error='topic-branch chunked upload '
+                                 'incomplete — will resume')
+                return result
 
     # Adaptive-batching push loop.
     #
@@ -1527,6 +2151,21 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     backoff_s = 1.0
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = 12
+
+    # Smallest chunk_n we attempted during this push call. Used to
+    # persist a hint across drain cycles that reflects what the
+    # network actually couldn't handle, not what the last attempt
+    # happened to be using. Without this, the in-call "revert to
+    # full local tip" path (raised when DivergedBranches at a
+    # smaller chunk forces escalation) makes the budget-exceeded
+    # path remember the post-revert full size — so the next cycle
+    # starts at half-full and immediately re-enters the same revert
+    # cycle. Field log baf 2026-05-21 14:45 → 14:58: cycle started
+    # at hint=211, hit DivergedBranches, reverted to 422, hit 408
+    # at 422, "remembered chunk_n=422" → next cycle hint=211 →
+    # loop. Tracking the smallest attempted instead means next
+    # cycle hint becomes 211/2 = 105, making actual progress.
+    smallest_attempted_n = None
     # Counter for forced-merge attempts triggered by the pathological
     # case where the server rejects a push as non-fast-forward AND
     # the immediately-following re-fetch shows the tracking ref
@@ -1548,6 +2187,73 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     lift_merge.trace(
         f'[sync-trace] push loop begin commits_to_push={initial_to_push}')
 
+    # If the previous drain cycle (or any prior push attempt for this
+    # project in this daemon process) failed at a particular chunk_n,
+    # use that as a hint for the initial target_sha. Without this, a
+    # flaky-network device with a large backlog (419 commits) keeps
+    # retrying at full size every cycle, hits the push budget, gives
+    # up, repeats forever — exactly the field log baf 2026-05-21
+    # symptom that motivated 0.44.2.
+    #
+    # The hint is half the previously-failed chunk_n (set by
+    # ``_remember_failed_chunk_n``), so each cycle effectively
+    # continues the halving the previous cycle was forced to abandon.
+    # Eventually converges on a size the network can handle inside
+    # ``push_budget_s``.
+    hint_chunk_n = _hint_chunk_n(project_dir)
+    if hint_chunk_n is not None and hint_chunk_n < initial_to_push:
+        try:
+            target_sha = _pick_intermediate_sha(
+                repo, remote_sha, local_sha, hint_chunk_n)
+            lift_merge.trace(
+                f'[sync-trace] resuming with hint chunk_n='
+                f'{hint_chunk_n} (prior cycle failed at larger '
+                f'size; remembered across drain calls)')
+        except Exception as ex:
+            # _pick_intermediate_sha can raise on malformed refs;
+            # fall back to full tip rather than crash the push.
+            lift_merge.trace(
+                f'[sync-trace] hint chunk_n={hint_chunk_n} '
+                f'unusable ({ex!r}); reverting to full tip')
+
+    # Wall-clock budget for the whole push loop. Hits SYNC_GIVING_UP_
+    # TRANSIENT and bails when exceeded — see the in-loop check below.
+    # 0 disables (preserves pre-0.43.22 behaviour).
+    push_start_s = time.monotonic()
+    push_budget_s = _settings.push_budget_s()
+
+    # Pre-flight: if the persisted refresh state is broken AND a quick
+    # probe against api.github.com confirms the access token is
+    # rejected, abort BEFORE the retry loop. Skipped when refresh is
+    # healthy (the probe is a network round-trip we don't want to pay
+    # on every sync) and skipped for non-GitHub remotes (the probe is
+    # GitHub-specific). The post-hoc ``_annotate_with_auth_health``
+    # still appends AUTH_REFRESH_STALE; this just short-circuits the
+    # 30-minute chunk-halving storm that field log baf 2026-05-20
+    # demonstrated. The cliff for an 8h GitHub token after a 7h
+    # proactive-refresh attempt is short, so any sync that hits this
+    # gate is one the user needs to act on (re-run device flow).
+    try:
+        from . import store as _store
+        from .auth import test_github_credentials
+        if _store.github_refresh_state().get('broken') \
+                and 'github.com' in (remote_url or ''):
+            probe = test_github_credentials(token)
+            if not probe.get('valid'):
+                lift_merge.trace(
+                    f'[sync-trace] pre-flight: refresh broken + '
+                    f'token probe rejected '
+                    f'({probe.get("error", "")!r}) — '
+                    f'aborting push')
+                result.add(S.AUTH_REQUIRED)
+                return result
+    except Exception as ex:
+        # Pre-flight is best-effort. Any failure (import, store I/O,
+        # probe timeout) falls through to the normal loop, which still
+        # has the in-loop 401 short-circuit as a backstop.
+        lift_merge.trace(
+            f'[sync-trace] pre-flight probe skipped: {ex!r}')
+
     # Temp ref used to push an intermediate SHA. dulwich's
     # ``porcelain.push`` resolves the refspec's left-hand side via
     # ``repo.refs[lh]`` — a raw hex SHA on the lhs ``KeyError``s.
@@ -1565,6 +2271,16 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
 
     while consecutive_failures < MAX_CONSECUTIVE_FAILURES:
         chunk_n = _count_commits_between(repo, remote_sha, target_sha)
+        # Track the smallest chunk_n we attempted across the loop;
+        # used by ``_remember_failed_chunk_n`` on budget/cap exit so
+        # the next drain cycle's hint reflects the floor, not the
+        # post-revert ceiling. See ``smallest_attempted_n`` rationale
+        # above the loop.
+        if chunk_n > 0:
+            if smallest_attempted_n is None:
+                smallest_attempted_n = chunk_n
+            else:
+                smallest_attempted_n = min(smallest_attempted_n, chunk_n)
         try:
             _target_label = target_sha[:8].decode('ascii')
         except Exception:
@@ -1606,8 +2322,12 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             backoff_s = 1.0
             nonff_forced_merges = 0
             if target_sha == local_sha:
-                # Queue cleared.
+                # Queue cleared. Drop any remembered failed chunk_n
+                # — the network just demonstrated it can handle a
+                # full push at the current size, so there's no
+                # constraint to carry into future cycles.
                 _cleanup_temp_ref()
+                _clear_failed_chunk_n(project_dir)
                 result.add(S.PUSHED, branch=branch)
                 return result
             # More commits to push. Lock in the batch size that
@@ -1627,8 +2347,59 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 _cleanup_temp_ref()
                 result.statuses.append(diagnose_403(token, remote_url))
                 return result
+            if _is_http_401(exc):
+                # Stale access token — see fetch-path comment. Bail
+                # without consuming the chunk-halving budget.
+                lift_merge.trace(
+                    '[sync-trace] push raised 401 — '
+                    'aborting (stale credentials)')
+                _cleanup_temp_ref()
+                result.add(S.AUTH_REQUIRED)
+                return result
+            # Wall-clock budget: when DNS / TLS / connection-reset
+            # storms exhaust the network for minutes, the logical-
+            # attempts cap (``consecutive_failures``) can take 30+
+            # minutes to bottom out because each "halve and retry"
+            # makes nominal progress while pre-fetch + per-attempt
+            # urllib3 retries multiply the wall time. Cap separately
+            # so a wedged session frees the project lock for the
+            # next sync run.
+            if push_budget_s > 0 and (
+                    time.monotonic() - push_start_s) > push_budget_s:
+                # Remember the SMALLEST chunk_n attempted this call —
+                # not the last, which may have been a revert-to-
+                # full-tip escalation. If we managed to try chunk_n=
+                # 211 once before reverting to 422 and exceeding the
+                # budget, the next cycle should start at 211/2=105,
+                # not at 422/2=211 (which would loop us right back
+                # into the same revert).
+                remember_n = smallest_attempted_n or chunk_n
+                _remember_failed_chunk_n(project_dir, remember_n)
+                lift_merge.trace(
+                    f'[sync-trace] push budget exceeded '
+                    f'({push_budget_s}s) — giving up; '
+                    f'pending commits requeued for next sync '
+                    f'(remembered chunk_n={remember_n}; next drain '
+                    f'cycle will start at {_hint_chunk_n(project_dir)})')
+                _cleanup_temp_ref()
+                result.add(S.SYNC_GIVING_UP_TRANSIENT,
+                           budget_s=push_budget_s,
+                           commits_pending=_count_commits_between(
+                               repo, remote_sha, local_sha))
+                _add_push_failure(result, exc)
+                return result
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                # Persist the smallest chunk_n attempted this call so
+                # the next drain cycle's hint reflects the actual
+                # floor, not the post-revert ceiling. Same rationale
+                # as the budget-exceeded path above.
+                remember_n = smallest_attempted_n or chunk_n
+                _remember_failed_chunk_n(project_dir, remember_n)
+                lift_merge.trace(
+                    f'[sync-trace] consecutive_failures cap reached '
+                    f'(remembered chunk_n={remember_n}; next drain '
+                    f'cycle will start at {_hint_chunk_n(project_dir)})')
                 _cleanup_temp_ref()
                 _add_push_failure(result, exc)
                 return result
@@ -1647,6 +2418,27 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 lift_merge.trace(
                     f'[sync-trace] retry fetch failed: {ex!r}')
                 new_remote = remote_sha
+            # If the push raised DivergedBranches, the exception itself
+            # carries the server's current view of the ref — more
+            # reliable than the re-fetch result when DNS is flapping
+            # and ``porcelain.fetch`` raised IncompleteRead so the
+            # local tracking ref stayed frozen at clone-time. Adopt
+            # the server's value, both for this iteration's ancestor
+            # logic and for the on-disk mirror so the next iteration
+            # doesn't re-discover it.
+            diverged_old = _extract_diverged_remote(exc)
+            if diverged_old and diverged_old != new_remote:
+                lift_merge.trace(
+                    f'[sync-trace] DivergedBranches reports '
+                    f'remote tip={diverged_old[:8]!r}; '
+                    f'using over fetch result {(new_remote or b"")[:8]!r}')
+                new_remote = diverged_old
+                try:
+                    repo.refs[remote_ref] = diverged_old
+                except Exception as ex:
+                    lift_merge.trace(
+                        f'[sync-trace] DivergedBranches mirror '
+                        f'update failed: {ex!r}')
             lift_merge.trace(
                 f'[sync-trace] retry fetch new_remote={new_remote!r} '
                 f'remote_sha={remote_sha!r} local_sha={local_sha!r}')
@@ -1766,6 +2558,18 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                             '[sync-trace] retry: non-FF on full '
                             'local tip — forcing merge against '
                             'remote_sha')
+                        mem_block = _check_memory_for_merge()
+                        if mem_block is not None:
+                            lift_merge.trace(
+                                f'[sync-trace] forced merge skipped '
+                                f'(mem_available='
+                                f'{mem_block.params.get("mem_available_mb")}MB '
+                                f'< min='
+                                f'{mem_block.params.get("min_required_mb")}MB)')
+                            _cleanup_temp_ref()
+                            result.statuses.append(mem_block)
+                            _add_push_failure(result, exc)
+                            return result
                         try:
                             merged_sha, _ = _merge_diverged(
                                 repo, project_dir, branch,
@@ -1808,6 +2612,18 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 else:
                     lift_merge.trace(
                         '[sync-trace] retry: diverged; merging')
+                    mem_block = _check_memory_for_merge()
+                    if mem_block is not None:
+                        lift_merge.trace(
+                            f'[sync-trace] retry merge skipped '
+                            f'(mem_available='
+                            f'{mem_block.params.get("mem_available_mb")}MB '
+                            f'< min='
+                            f'{mem_block.params.get("min_required_mb")}MB)')
+                        _cleanup_temp_ref()
+                        result.statuses.append(mem_block)
+                        _add_push_failure(result, exc)
+                        return result
                     try:
                         merged_sha, _ = _merge_diverged(
                             repo, project_dir, branch,
@@ -1850,6 +2666,19 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 lift_merge.trace(
                     '[sync-trace] retry at same target_sha '
                     '(non-network exception)')
+                continue
+            if _is_dns_resolution_failure(exc):
+                # DNS-class failure. Halving ``chunk_n`` is the wrong
+                # response: pack size has zero effect on whether the
+                # resolver returns an address. Field log baf 2026-
+                # 05-20 showed 302 → 151 → … → 1 walked all the way
+                # down on pure ``NameResolutionError`` while the real
+                # answer was "wait for DNS to come back." Hold target
+                # + ``working_batch_n`` so when DNS recovers we
+                # resume on the chunk size that previously worked.
+                lift_merge.trace(
+                    '[sync-trace] retry at same target_sha '
+                    '(DNS resolution failure — no halving)')
                 continue
             if chunk_n <= 1:
                 # Already pushing one commit at a time and it

@@ -134,6 +134,7 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 
 from .. import check_server_compat
+from .. import status as S
 from ..paths import azt_home
 from ..translate import tr as _tr
 from .update import check_for_update
@@ -373,16 +374,30 @@ class _Ctx:
                  # than waiting the full 60s budget. Reset whenever
                  # a 503 or any other kind shows up — those are
                  # progress signals.
-                 'null_bundle_streak')
+                 'null_bundle_streak',
+                 # Set of ``(installed, running)`` server-version
+                 # pairs we've already attempted a cooperative
+                 # restart against. Surfaces the reboot popup when
+                 # the same pair recurs after re-probe — the only
+                 # way that happens is a stale p4a unpack where
+                 # restart didn't actually load new code. See
+                 # ``_prompt_server_reboot_to_apply``.
+                 '_cooperative_restart_attempts')
 
     def __init__(self, **kw):
         # Default to None for slots the caller doesn't pass.
         # Counters get a numeric default so the warmup loop can
         # increment without an isinstance check on first use.
+        # Sets default to a fresh empty set per-instance so the
+        # cooperative-restart loop guard tracks attempts within a
+        # single bootstrap session.
         _numeric = {'null_bundle_streak'}
+        _sets = {'_cooperative_restart_attempts'}
         for k in self.__slots__:
             if k in _numeric:
                 setattr(self, k, kw.get(k, 0) or 0)
+            elif k in _sets:
+                setattr(self, k, kw.get(k) or set())
             else:
                 setattr(self, k, kw.get(k))
 
@@ -793,39 +808,110 @@ def _prompt_server_reboot_to_apply(ctx, installed_version,
                                     running_version):
     """The user has installed a newer server APK but Android kept
     the old daemon process alive across the replace, so /v1/health
-    still reports the old version. Tell them to reboot.
+    still reports the old version.
 
-    Specifically a transition-period helper: daemon 0.41.30+
-    ships ``SuiteSelfReplaceReceiver`` with the in-APK reap step,
-    which kills the surviving old process during the install and
-    makes this whole branch unreachable. Until every field daemon
-    is at 0.41.30 or later, this is the cleanest way to nudge a
-    user who installed the new APK out of the "I installed it but
-    it's still saying I need to update" loop.
+    **First try: cooperative restart.** If the running daemon is
+    at least 0.43.20 (where ``POST /v1/admin/restart`` shipped) we
+    can ask it to exit, and Android's ContentProvider auto-spawn
+    will respawn from the newer on-disk bytes on the next peer
+    call. No popup, no user intervention. After the RPC accepts
+    we schedule ``_post_install_continuation`` to re-probe compat
+    after a brief warm-up delay.
+
+    **Fall through: show the reboot popup.** If the cooperative
+    path fails (the running daemon is too old to know the
+    endpoint, or unreachable, or returns an unexpected response)
+    we surface the existing reboot-to-apply popup. That's the
+    pre-0.43.20 transition case — the only way out is reboot or
+    reinstall. The popup is the right tool for that.
+
+    The peer running this code is in a different package (UID)
+    from the daemon, so it cannot ``Process.killProcess`` the
+    daemon directly. The cooperative endpoint is our only seam
+    across the UID boundary.
 
     Re-uses the ``_show_update_blocked_popup`` shape (Check again
-    + Quit + maintainer email link) — same UI vocabulary as the
-    other terminal popups in this module. Does NOT fire on_done."""
+    + Quit + maintainer email link). Does NOT fire on_done."""
+    # First-line defense: cooperative restart against the running
+    # daemon. Cheap (single RPC) and silent on success.
+    #
+    # Loop guard: track which ``(installed, running)`` pairs we've
+    # already attempted a cooperative restart for. If we see the
+    # same pair recur (i.e. ``_post_install_continuation`` re-
+    # probed compat and we landed here AGAIN with the same running
+    # version), the restart didn't actually load new code — the
+    # daemon respawned but p4a re-imported the stale
+    # ``_python_bundle/`` from disk instead of extracting the new
+    # APK's assets. This is the documented stale-unpack issue
+    # (see ``SuiteSelfReplaceReceiver.java`` NOTE on stale p4a
+    # unpack). Restarting won't fix it; the user needs to reboot
+    # or reinstall to force p4a to re-extract on missing-bundle.
+    # Without this guard the peer pings the daemon ~once per 2 s
+    # forever, burning battery and never converging.
+    attempted = ctx._cooperative_restart_attempts
+    pair = (installed_version, running_version)
+    if pair in attempted:
+        print(f'[bootstrap] cooperative restart already attempted '
+              f'for installed={installed_version!r} '
+              f'running={running_version!r}; daemon respawned '
+              f'with stale p4a unpack — surfacing popup',
+              file=sys.stderr, flush=True)
+    else:
+        attempted.add(pair)
+        try:
+            from .. import restart_server as _restart
+            res = _restart()
+            if res.has(S.RESTARTING):
+                print(f'[bootstrap] cooperative restart accepted '
+                      f'(installed={installed_version!r} '
+                      f'running={running_version!r}); re-probing '
+                      f'compat after warm-up',
+                      file=sys.stderr, flush=True)
+                _on_ui(_ui_status, ctx,
+                       _tr('Restarting the sync service…'))
+                # Same continuation the post-install path uses: wait
+                # a beat for lazy-spawn, then re-run _check_server.
+                # If the new daemon's running_version equals the old
+                # (stale unpack), the loop guard above will catch
+                # the recursion and surface the popup.
+                _on_ui(_post_install_continuation, ctx)
+                return
+            print(f'[bootstrap] cooperative restart declined: '
+                  f'codes={res.codes()!r}; falling back to popup',
+                  file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[bootstrap] cooperative restart raised: {ex!r}; '
+                  f'falling back to popup',
+                  file=sys.stderr, flush=True)
     body_text = _tr(
-        'You have {name} {installed} installed, but the version '
-        'currently running is {running}. Restart your device to '
-        'switch to the newer version, then reopen this app.\n\n'
-        'If reboot doesn\'t help, '
+        'You have {name} {installed} installed, but the running '
+        'process keeps reloading version {running}. The new code '
+        'is on disk but the runtime is reading from a stale '
+        'unpack cache.\n\n'
+        'Reboot your device, or uninstall and reinstall '
+        '{name}, then reopen this app.\n\n'
+        'If neither helps, '
         '[ref=email][color=4ea1ff][u]send the developer an Email'
         '[/u][/color][/ref].'
     ).format(name=ctx.server_display_name,
              installed=installed_version,
              running=running_version)
     subject = (
-        f'{ctx.server_display_name}: installed {installed_version} '
-        f'but running process is {running_version}')
+        f'{ctx.server_display_name}: stale p4a unpack — '
+        f'installed {installed_version} running {running_version}')
     msg_body = (
         f'{ctx.server_display_name} installed-on-disk: '
         f'{installed_version}\n'
         f'{ctx.server_display_name} running process:    '
         f'{running_version}\n\n'
-        f'The new APK is on disk but the old daemon process is '
-        f'still serving. Reboot should normally clear it.\n\n'
+        f'A cooperative POST /v1/admin/restart succeeded but the '
+        f'respawned process re-imported the same stale\n'
+        f'_python_bundle/ from filesDir — p4a only extracts from '
+        f'APK assets when the bundle is missing, never when it\n'
+        f'is stale. SuiteSelfReplaceReceiver kills sibling '
+        f'processes on package replace but does not wipe the\n'
+        f'bundle (wiping breaks the :provider service whose p4a '
+        f'bootstrap has no extract-on-missing branch).\n\n'
         f'(Sent from the in-app "send the developer an Email" '
         f'link.)'
     )

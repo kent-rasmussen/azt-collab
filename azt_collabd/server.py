@@ -2028,13 +2028,20 @@ def _h_project_atomic_finalize(langcode, body):
     if not os.path.isfile(pending_real):
         return 404, {"ok": False, "error": "pending_not_found"}
     _touch_project(langcode)
-    # Read once for size + hash before the rename moves the inode.
-    # Hashing 3-10 MB is in the tens of ms range; cheaper than the
-    # network round-trips this whole flow saves vs. the JSON-RPC
-    # path it replaces.
+    # Stream the pending file through SHA-256 + a byte counter
+    # rather than slurping it into RAM. A typical audio recording
+    # is 3–10 MB — bounded, but on a low-memory device every
+    # multi-MB allocation matters, especially when it can stack
+    # with a concurrent LIFT merge or push pack-build. 64 KB
+    # chunks keep peak heap at ~64 KB instead of the file size
+    # (0.44.6+).
     try:
+        h = hashlib.sha256()
+        bytes_written = 0
         with open(pending_real, 'rb') as f:
-            data = f.read()
+            for chunk in iter(lambda: f.read(64 * 1024), b''):
+                h.update(chunk)
+                bytes_written += len(chunk)
     except OSError as ex:
         return 500, {"ok": False, "error": f"read_pending: {ex}"}
     try:
@@ -2052,8 +2059,8 @@ def _h_project_atomic_finalize(langcode, body):
             pass
         return 500, {"ok": False, "error": str(ex)}
     res = Result().add(S.ATOMIC_COMMITTED,
-                       bytes_written=len(data),
-                       sha256=hashlib.sha256(data).hexdigest())
+                       bytes_written=bytes_written,
+                       sha256=h.hexdigest())
     return 200, {"ok": True, "result": res.to_dict()}
 
 
@@ -2288,10 +2295,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # Defensive cap on loopback HTTP body size. Loopback is the
+    # desktop transport (Android peers use ContentProvider); the
+    # largest legitimate body on this path is a credential blob
+    # (<1 KB) or a project-config write (<10 KB). 64 MB is far
+    # past anything legit while preventing accidental DoS from a
+    # buggy desktop peer / test harness that sends a multi-GB
+    # Content-Length and OOMs the daemon during the
+    # ``self.rfile.read(n)`` allocation.
+    _MAX_BODY_BYTES = 64 * 1024 * 1024
+
     def _read_json(self):
         n = int(self.headers.get('Content-Length', '0') or '0')
         if n <= 0:
             return {}
+        if n > self._MAX_BODY_BYTES:
+            print(f'[server] rejecting request body of {n} bytes '
+                  f'(cap {self._MAX_BODY_BYTES})',
+                  file=sys.stderr, flush=True)
+            return None
         raw = self.rfile.read(n)
         try:
             return json.loads(raw)

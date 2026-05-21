@@ -86,6 +86,18 @@ PUSH_FAILED = 'PUSH_FAILED'
 # *both* the system resolver and Cloudflare DoH-via-1.1.1.1 failed
 # for the same hostname.
 DNS_RESOLUTION_FAILED = 'DNS_RESOLUTION_FAILED'
+# Wall-clock cap on the adaptive push loop (``sync.push_budget_s``,
+# default 300 s) was hit before the loop could drain the local
+# queue. The local commits stay queued; the next sync run picks
+# them up. Params: ``budget_s`` (the cap that fired) and
+# ``commits_pending`` (commits still ahead of remote). Distinct
+# from PUSH_FAILED so peers can route the user-initiated path
+# differently — "we gave up on this attempt, try again later"
+# is actionable; the generic PUSH_FAILED + dulwich error blob is
+# not. Auto-sync paths silence this code per the auto/user
+# contract; user-initiated sync surfaces a toast naming the
+# retry-on-next-run behaviour.
+SYNC_GIVING_UP_TRANSIENT = 'SYNC_GIVING_UP_TRANSIENT'
 PULL_FAILED = 'PULL_FAILED'
 CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
@@ -101,6 +113,25 @@ SERVICE_RESTARTED = 'SERVICE_RESTARTED'
 # typed transient-failure result instead of silence. Treat as
 # retryable; the underlying operation is idempotent.
 JOB_INTERRUPTED = 'JOB_INTERRUPTED'
+# Pre-flight memory check failed: ``MemAvailable`` from
+# ``/proc/meminfo`` was below ``sync.min_free_mem_mb`` (default 200 MB)
+# when ``_merge_diverged`` was about to start. The merge needs ~150 MB
+# peak (parsed LIFT XML + merge state) and would OOM-kill the
+# ``:provider`` service silently if it ran. Params: ``mem_available_mb``,
+# ``min_required_mb``. Treat as transient + retryable; next drain cycle
+# re-reads memory and proceeds when it recovers. Distinct from
+# PULL_FAILED so peers can route silently in the auto-sync path —
+# nothing the user can do mid-session, the daemon will retry.
+INSUFFICIENT_MEMORY_FOR_MERGE = 'INSUFFICIENT_MEMORY_FOR_MERGE'
+# Topic-branch (``azt-pending-<lang>-<device>``) we use for chunked
+# upload of diverged history already exists on the server with content
+# that isn't an ancestor of the SHA we want to push. Most likely cause:
+# two devices share the same ``device_name`` and are stepping on each
+# other's topic-branch refs. The daemon refuses to force-push someone
+# else's work and surfaces this so the user can set a unique device
+# name. Params: ``topic_branch`` (the ref name), ``server_tip``
+# (the foreign SHA we saw, hex prefix). Since 0.44.8.
+TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
 
 # ── 403 diagnosis ──────────────────────────────────────────────────────────
 AUTH_REQUIRED = 'AUTH_REQUIRED'

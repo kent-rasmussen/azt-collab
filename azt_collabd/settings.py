@@ -15,6 +15,15 @@ Keys:
                                 Sync button returns S.WORK_OFFLINE_ENABLED
                                 without attempting any push. Commits still
                                 happen normally; only push is suppressed.
+    sync.push_budget_s        — wall-clock cap (seconds) on the adaptive
+                                push loop in repo._push_step_locked. When
+                                exceeded the loop emits SYNC_GIVING_UP_
+                                TRANSIENT + PUSH_FAILED and bails so the
+                                project lock frees for the next sync run.
+                                0 disables the cap. Default 300 (5 min);
+                                bumped from "no cap" to bound the field-
+                                observed 35-minute chunk-halving storm on
+                                flaky-DNS networks.
 
 Env-var overrides take precedence at startup:
     AZT_SYNC_DEBOUNCE_MS
@@ -22,6 +31,7 @@ Env-var overrides take precedence at startup:
     AZT_SYNC_CONNECTIVITY_POLL_S
     AZT_SYNC_POST_ONLINE_GRACE_S
     AZT_SYNC_WORK_OFFLINE
+    AZT_SYNC_PUSH_BUDGET_S
 """
 
 import json
@@ -38,6 +48,7 @@ _DEFAULTS = {
     'sync.connectivity_poll_s': 30,
     'sync.post_online_grace_s': 60,
     'sync.work_offline': False,
+    'sync.push_budget_s': 300,
 }
 _ENV_MAP = {
     'sync.debounce_ms': 'AZT_SYNC_DEBOUNCE_MS',
@@ -45,6 +56,7 @@ _ENV_MAP = {
     'sync.connectivity_poll_s': 'AZT_SYNC_CONNECTIVITY_POLL_S',
     'sync.post_online_grace_s': 'AZT_SYNC_POST_ONLINE_GRACE_S',
     'sync.work_offline': 'AZT_SYNC_WORK_OFFLINE',
+    'sync.push_budget_s': 'AZT_SYNC_PUSH_BUDGET_S',
 }
 
 _lock = threading.Lock()
@@ -129,6 +141,40 @@ def post_online_grace_s():
 
 def work_offline():
     return bool(get('sync.work_offline', False))
+
+
+def push_budget_s():
+    """Wall-clock cap on the adaptive push loop, in seconds. 0 disables
+    the cap (preserves pre-0.43.22 behaviour where the loop only exited
+    on logical-attempts cap)."""
+    return max(0, int(get('sync.push_budget_s', 300)))
+
+
+def min_free_mem_mb_for_merge():
+    """Minimum ``MemAvailable`` (from ``/proc/meminfo``) the daemon
+    will allow before starting a three-way merge. Default 200 MB —
+    the LIFT XML parse + merge step itself wants ~100–150 MB peak,
+    plus headroom for Python interpreter + dulwich packfile reads.
+    0 disables the check (desktop, or if the user knows their RAM
+    headroom and accepts OOM-kill risk).
+
+    Surfaced as ``S.INSUFFICIENT_MEMORY_FOR_MERGE`` when the check
+    refuses; the next drain cycle re-reads memory and proceeds when
+    it recovers. The check is a pre-flight only — we don't track
+    memory mid-merge."""
+    return max(0, int(get('sync.min_free_mem_mb_for_merge', 200)))
+
+
+def topic_branch_chunk_size():
+    """Initial chunk_n for the Phase A topic-branch push (used when
+    ``_all_commits_descend_from`` reports non-FF and the direct push
+    to main can't chunk-halve effectively). Lower for slower
+    networks; the helper halves adaptively on per-chunk failure
+    like the existing direct-push chunking. Default 50 — sized so a
+    chunk of average audio-bearing commits is well under GitHub's
+    per-request timeout (typical audio commit ~200–500 KB, so 50
+    commits ≈ 10–25 MB pack)."""
+    return max(1, int(get('sync.topic_branch_chunk_size', 50)))
 
 
 def set_work_offline(value: bool):

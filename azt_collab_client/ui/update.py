@@ -428,11 +428,88 @@ def _download(url, dest, total_bytes, on_progress, on_status=None,
         raise last_exc
 
 
+def _clear_prior_downloads(resolver, downloads_uri, asset_filename):
+    """Delete any MediaStore Downloads rows whose ``_display_name``
+    equals ``asset_filename`` and that this app owns. Returns the
+    count deleted (0 if none, or on any error — best-effort).
+
+    Why: every prior Update attempt inserts a row with
+    ``_display_name='aztcollab.apk'`` (or whatever the asset name
+    is). Android's ``MediaProvider.buildUniqueFile()`` makes the
+    on-disk file unique by appending ` (1)`, ` (2)`, …; the retry
+    cap is ~32. After enough install attempts (failed cancels,
+    re-tries, debug installs) the user's Downloads folder accumulates
+    enough orphan ``aztcollab.apk``/``aztcollab (N).apk`` entries
+    that the next insert throws ``Failed to build unique file:
+    /storage/.../aztcollab.apk`` and Update is permanently broken
+    for that user until they clean Downloads manually.
+
+    Scoped storage on Android 11+ only lets us delete rows our own
+    package created — which is exactly what we need: our prior
+    install-attempt rows. Other apps' files (browser downloads of
+    the same name) stay put. If they alone push us over the
+    unique-file cap, the timestamped-fallback path in
+    ``_media_store_uri`` covers it."""
+    from jnius import autoclass
+    ContentUris = autoclass('android.content.ContentUris')
+    deleted = 0
+    cursor = None
+    try:
+        cursor = resolver.query(
+            downloads_uri,
+            ['_id'],                # projection: just the row id
+            '_display_name = ?',    # selection
+            [asset_filename],       # selection args
+            None,                   # sort order
+        )
+        if cursor is None:
+            return 0
+        while cursor.moveToNext():
+            row_id = cursor.getLong(0)
+            row_uri = ContentUris.withAppendedId(downloads_uri, row_id)
+            try:
+                deleted += int(resolver.delete(row_uri, None, None) or 0)
+            except Exception as ex:
+                # Best-effort; one row's permission issue shouldn't
+                # block the rest of the cleanup.
+                print(f'[update] _clear_prior_downloads: delete '
+                      f'row_id={row_id} failed: {ex}',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[update] _clear_prior_downloads: query failed: {ex}',
+              file=sys.stderr, flush=True)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+    if deleted:
+        print(f'[update] cleared {deleted} prior MediaStore '
+              f'Downloads row(s) named {asset_filename!r}',
+              file=sys.stderr, flush=True)
+    return deleted
+
+
 def _media_store_uri(apk_path, asset_filename):
     """Insert ``apk_path`` into MediaStore Downloads and return the
     resulting ``content://`` URI. Mirrors the share.py code path so the
     install intent can grant a per-URI read to the system installer
-    without configuring a separate FileProvider."""
+    without configuring a separate FileProvider.
+
+    Retry pattern (added 2026-05-21 after field report of
+    ``JVM exception: failed to build unique file:
+    /storage/.../aztcollab.apk``):
+
+    1. Clear our prior Downloads rows of the same name (orphans
+       from earlier install attempts).
+    2. Insert with the canonical ``asset_filename``.
+    3. On failure, retry once with a UTC-timestamped display name
+       (``aztcollab-20260521-145922.apk``) so we never depend on
+       Android's unique-name builder. The install intent only needs
+       the ``content://`` URI; the user never sees this fallback
+       name (the system installer reads the APK manifest for the
+       app name)."""
     from jnius import autoclass, cast
     PythonActivity = autoclass('org.kivy.android.PythonActivity')
     ContentValues = autoclass('android.content.ContentValues')
@@ -440,12 +517,50 @@ def _media_store_uri(apk_path, asset_filename):
     activity = PythonActivity.mActivity
     context = cast('android.content.Context', activity)
     resolver = context.getContentResolver()
-    values = ContentValues()
-    values.put('_display_name', asset_filename)
-    values.put('mime_type', 'application/vnd.android.package-archive')
-    uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+    downloads_uri = MediaStoreDownloads.EXTERNAL_CONTENT_URI
+
+    # 1. Clear our prior entries with the same name. Best-effort —
+    # if scoped-storage permissions block the delete, the
+    # timestamped fallback below still rescues the install.
+    _clear_prior_downloads(resolver, downloads_uri, asset_filename)
+
+    base, ext = os.path.splitext(asset_filename)
+    # Two attempts: canonical name, then timestamped. The system
+    # installer reads the app identity from the APK manifest so the
+    # user-facing app name doesn't depend on this filename.
+    candidates = [
+        asset_filename,
+        f'{base}-{time.strftime("%Y%m%d-%H%M%S", time.gmtime())}{ext}',
+    ]
+    last_exc = None
+    uri = None
+    for candidate in candidates:
+        values = ContentValues()
+        values.put('_display_name', candidate)
+        values.put('mime_type', 'application/vnd.android.package-archive')
+        try:
+            uri = resolver.insert(downloads_uri, values)
+        except Exception as ex:
+            last_exc = ex
+            print(f'[update] MediaStore insert raised for '
+                  f'display_name={candidate!r}: {ex}',
+                  file=sys.stderr, flush=True)
+            continue
+        if uri:
+            if candidate != asset_filename:
+                print(f'[update] MediaStore: fell back to '
+                      f'timestamped name {candidate!r} '
+                      f'(canonical {asset_filename!r} blocked by '
+                      f'buildUniqueFile cap)',
+                      file=sys.stderr, flush=True)
+            break
+        print(f'[update] MediaStore insert returned None for '
+              f'display_name={candidate!r}', file=sys.stderr, flush=True)
     if not uri:
+        if last_exc is not None:
+            raise last_exc
         raise RuntimeError('MediaStore insert refused')
+
     fos = resolver.openOutputStream(uri)
     try:
         with open(apk_path, 'rb') as f:

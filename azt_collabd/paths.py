@@ -72,20 +72,52 @@ def _android_files_dir():
     return None
 
 
+# Cached resolution of azt_home(). First call computes (which on
+# Android costs 3-4 JNI calls into ActivityThread / PythonService /
+# PythonActivity); every subsequent call reads this module global.
+#
+# Why cache: pre-0.43.30 azt_home() re-fired _android_files_dir on
+# every call, which meant the ContentProvider OpenFile callback
+# (which routes through _resolve_path → azt_home for cawl/audio FD
+# serves) burned ~4 JNI invocations per request on the Java Binder
+# dispatch thread. Under sustained traffic (cawl image prefetch
+# does many openFile per second), one of those eventually NPE'd
+# inside art::JNI::CallObjectMethodA — same crash class as the
+# pre-0.43.23 dispatch-thread bug but on the OpenFile path that
+# the earlier fix didn't cover. Field log baf 2026-05-20 caught it
+# at pid=23550 tid=23558 (binder:23550_1).
+#
+# Safe to cache: the value depends only on the running APK's UID-
+# scoped filesDir, which never changes for the lifetime of a
+# process. Setting via env (AZT_HOME) is also handled by the
+# cache — module reload (e.g. test rig) is the only way to flush.
+_AZT_HOME_CACHE = None
+
+
 def azt_home():
     """Return the AZT server's home directory (created on first use by the
-    server). Respects $AZT_HOME; falls back to platform conventions."""
+    server). Respects $AZT_HOME; falls back to platform conventions.
+
+    Cached after the first call — see ``_AZT_HOME_CACHE``."""
+    global _AZT_HOME_CACHE
+    if _AZT_HOME_CACHE is not None:
+        return _AZT_HOME_CACHE
     p = os.environ.get('AZT_HOME')
     if p:
+        _AZT_HOME_CACHE = p
         return p
     android_dir = _android_files_dir()
     if android_dir:
-        return os.path.join(android_dir, 'azt')
+        _AZT_HOME_CACHE = os.path.join(android_dir, 'azt')
+        return _AZT_HOME_CACHE
     if sys.platform == 'darwin':
-        return os.path.expanduser('~/Library/Application Support/azt')
+        _AZT_HOME_CACHE = os.path.expanduser(
+            '~/Library/Application Support/azt')
+        return _AZT_HOME_CACHE
     xdg = os.environ.get('XDG_DATA_HOME') or os.path.expanduser(
         '~/.local/share')
-    return os.path.join(xdg, 'azt')
+    _AZT_HOME_CACHE = os.path.join(xdg, 'azt')
+    return _AZT_HOME_CACHE
 
 
 def server_info_path():

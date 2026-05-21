@@ -170,6 +170,31 @@ def main():
         _store.get_device_name()
     except Exception as ex:
         print(f'[server_apk] jnius prewarm skipped: {ex}', flush=True)
+    # 2a.1. Belt-and-braces prewarm of the PackageManager classes
+    # used by ``android_cp/service.py::_pkg_last_update_time``.
+    # The 60 s self-update poller runs on a main-spawned Timer
+    # thread, but the dispatch callback (Thread-3) historically
+    # also touched these classes — moved off that path in 0.43.23
+    # but kept the prewarm here so any future code that ends up
+    # calling getPackageManager/getPackageInfo from a worker
+    # thread starts with the classes already cached. Field log
+    # baf 2026-05-20 captured the original SIGSEGV in
+    # ``art::JNI::CallObjectMethodA`` here.
+    try:
+        from jnius import autoclass
+        _PythonService = autoclass('org.kivy.android.PythonService')
+        ctx = getattr(_PythonService, 'mService', None)
+        if ctx is not None:
+            # Resolve the chain we'll later traverse from the
+            # dispatch thread. These calls cache the classloader
+            # bindings so subsequent worker-thread invocations
+            # don't pay the bootclassloader penalty.
+            pm = ctx.getPackageManager()
+            if pm is not None:
+                pm.getPackageInfo(ctx.getPackageName(), 0)
+    except Exception as ex:
+        print(f'[server_apk] PackageManager prewarm skipped: {ex}',
+              flush=True)
 
     # 2b. Crash-marker bookkeeping. Detect "previous process didn't
     #    run atexit" (SIGSEGV / SIGKILL / OOM-kill / kernel kill —

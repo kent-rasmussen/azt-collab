@@ -189,7 +189,7 @@ def test_pull_repo_fetches_updates_from_local_server(local_git_server,
     # Seed-side adds a commit and pushes it.
     (seed / "added.lift").write_bytes(b"<added/>\n")
     commit_result = azt_repo.commit_repo(str(seed), "Seeder")
-    assert commit_result.has(S.COMMITTED), (
+    assert commit_result.has(S.COMMITTED_LOCAL), (
         f"seed-side commit should land; codes={commit_result.codes()!r}")
     push_result = azt_repo.push_repo(str(seed), "u", "t")
     assert push_result.has(S.PUSHED), (
@@ -225,7 +225,7 @@ def test_sync_repo_round_trip_via_local_server(local_git_server, tmp_path):
     # A adds a file, A syncs (commit + push).
     (a / "a_change.lift").write_bytes(b"<a/>\n")
     a_sync = azt_repo.sync_repo(str(a), "u", "t", "Alice")
-    assert a_sync.has(S.COMMITTED), a_sync.codes()
+    assert a_sync.has(S.COMMITTED_LOCAL), a_sync.codes()
     assert a_sync.has(S.PUSHED), a_sync.codes()
 
     # B pulls, sees A's change.

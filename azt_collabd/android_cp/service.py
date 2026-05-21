@@ -159,16 +159,86 @@ def _pkg_last_update_time():
 
 def _check_self_updated():
     """``True`` iff the running APK's ``lastUpdateTime`` has advanced
-    since this process started. Cheap (single PackageManager call)
-    and side-effect-free; the caller decides what to do (typically
-    schedule a clean exit so the next ContentResolver call lazy-
-    spawns the freshly-installed code)."""
-    if _initial_pkg_update_time is None:
-        return False
-    current = _pkg_last_update_time()
-    if current is None:
-        return False
-    return current > _initial_pkg_update_time
+    since this process started. Reads a cached flag updated by the
+    main-thread poller ``_self_update_poller``.
+
+    Pre-0.43.23 this called ``_pkg_last_update_time()`` inline on
+    every dispatch — two jnius method invocations per RPC, all
+    running on the Java dispatch thread. The dispatch thread is a
+    Python-spawned worker that attaches to JVM with the
+    bootclassloader; under sustained jnius traffic from there, one
+    of the calls eventually NPE'd inside ``art::JNI::CallObject-
+    MethodA`` and SIGSEGV'd ``:provider``. Field log baf 2026-05-20
+    captured the tombstone at pid=8859 tid=8912 (Thread-3) right
+    after a cawl image FD serve — the Activity Manager then
+    cascade-killed the peer ("depends on provider in dying proc")
+    and the user saw the recorder die on every other restart.
+
+    Now the PackageManager poll runs on a 60-second main-thread
+    timer (started from ``install_callbacks``). Dispatch reads the
+    flag with zero jnius calls. Up-to-60s detection latency for a
+    package replace is well within the existing
+    ``_schedule_exit_for_update`` 0.5 s grace window, so the
+    user-visible behaviour is unchanged."""
+    return _self_updated_flag
+
+
+# Set by ``_self_update_poller`` on the main thread; read by the
+# dispatch callback on Thread-3. Single-writer / single-reader bool
+# — no lock needed (Python's GIL covers the load/store).
+_self_updated_flag = False
+
+
+def _self_update_poller():
+    """Main-thread loop: every ``_SELF_UPDATE_POLL_S`` seconds, ask
+    PackageManager whether the running APK's ``lastUpdateTime`` has
+    advanced past the snapshot taken at ``install_callbacks``. On a
+    positive read, flip ``_self_updated_flag`` to True; the next
+    dispatch picks it up and schedules the exit. The poller itself
+    never exits — it just stops being relevant after the flag flips.
+
+    Runs on a daemon Timer thread spawned from the main thread
+    after ``install_callbacks`` is called from
+    ``server_apk/main.py``. The thread inherits the app classloader
+    via that main-thread chain, so its jnius calls (
+    ``_pkg_last_update_time`` → ``PackageManager.getPackageInfo``)
+    run from a properly-initialised JNIEnv — distinct from the
+    Java-spawned dispatch thread that crashed pre-0.43.23.
+
+    60 s is a deliberate compromise: faster polling gains nothing
+    (the only consumer is the schedule-exit gate, which can
+    tolerate up-to-respawn-cadence latency) and burns flash / CPU
+    on a hot device. On most upgrade flows the next peer call
+    arrives within a second of install completion anyway, so the
+    user sees the new daemon on their first interaction."""
+    global _self_updated_flag
+    if _self_updated_flag:
+        return  # already flipped; nothing to do
+    try:
+        current = _pkg_last_update_time()
+    except Exception as ex:
+        # Treat any failure as "no signal" — the next tick retries.
+        # A persistent failure leaves the flag False forever, which
+        # is the conservative answer (better than spurious exits).
+        print(f'[android_cp] self-update poll failed: {ex}',
+              file=sys.stderr, flush=True)
+        current = None
+    if current is not None and _initial_pkg_update_time is not None:
+        if current > _initial_pkg_update_time:
+            _self_updated_flag = True
+            print(f'[android_cp] self-update detected: '
+                  f'apk_update_time {_initial_pkg_update_time} → '
+                  f'{current}',
+                  file=sys.stderr, flush=True)
+            return
+    t = threading.Timer(
+        _SELF_UPDATE_POLL_S, _self_update_poller)
+    t.name = 'self-update-poll'
+    t.daemon = True
+    t.start()
+
+
+_SELF_UPDATE_POLL_S = 60.0
 
 
 _exit_scheduled = False
@@ -185,7 +255,10 @@ def _schedule_exit_for_update():
     print('[android_cp] APK was updated — exiting so the next '
           'peer call lazy-spawns the new code',
           file=sys.stderr, flush=True)
-    threading.Timer(0.5, lambda: os._exit(0)).start()
+    t = threading.Timer(0.5, lambda: os._exit(0))
+    t.name = 'self-update-exit'
+    t.daemon = True
+    t.start()
 
 
 def install_callbacks():
@@ -207,6 +280,18 @@ def install_callbacks():
     # wired so a stale process never sees a "self-updated" reading
     # against an uninitialised baseline.
     _initial_pkg_update_time = _pkg_last_update_time()
+
+    # Kick off the main-thread self-update poller. The first tick
+    # runs after ``_SELF_UPDATE_POLL_S`` seconds; ``_check_self_
+    # updated`` reads a cached flag the poller maintains so the
+    # dispatch callback (on Thread-3) never touches jnius itself.
+    # See ``_self_update_poller`` for the full rationale on why
+    # this had to move off the dispatch path.
+    t = threading.Timer(
+        _SELF_UPDATE_POLL_S, _self_update_poller)
+    t.name = 'self-update-poll-init'
+    t.daemon = True
+    t.start()
 
     Provider = autoclass(
         'org.atoznback.aztcollab.AZTCollabProvider')

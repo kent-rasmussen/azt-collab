@@ -172,6 +172,10 @@ _HANDLERS = {
         'Sync will retry automatically when this clears. If it persists, '
         'check this device’s Private DNS, VPN, or per-app data '
         'restrictions.'),
+    S.SYNC_GIVING_UP_TRANSIENT: lambda p: _fmt(_tr(
+        'Sync gave up after {budget_s}s on a flaky network. '
+        '{commits_pending} commit(s) still pending — they will go '
+        'out on the next sync attempt.'), p),
     S.PULL_FAILED:            lambda p: _fmt(_tr('Pull failed: {error}'), p),
     S.CLONE_FAILED:           lambda p: _fmt(_tr('Clone failed: {error}'), p),
     S.CLONE_AUTH_REQUIRED:    lambda p: _fmt(_tr(
@@ -218,6 +222,10 @@ _HANDLERS = {
                                           _tr('Merge conflicts; review the entries flagged azt-lift-conflict.')),
     S.JOB_INTERRUPTED:        lambda p: _tr(
         'Sync was interrupted; please retry.'),
+    S.INSUFFICIENT_MEMORY_FOR_MERGE: lambda p: _fmt(_tr(
+        'Not enough memory to merge right now '
+        '({mem_available_mb} MB available, {min_required_mb} MB needed). '
+        'Close other apps and the next sync will retry.'), p),
 
     # Transport-layer synthetics from the client (not emitted by the backend)
     'SERVER_UNAVAILABLE':     lambda p: _fmt(_tr('Sync service unavailable: {error}'), p),

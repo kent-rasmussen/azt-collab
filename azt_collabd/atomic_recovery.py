@@ -217,6 +217,7 @@ def recover_project_orphans(project_dir, lift_path, langcode=''):
     summary = {
         'scanned': 0, 'deleted_garbage': 0, 'recovered': 0,
         'unmergeable': 0, 'skipped_young': 0,
+        'skipped_low_memory': 0,
         'errors': 0,
     }
     if not project_dir or not os.path.isdir(project_dir):
@@ -265,7 +266,7 @@ def _recover_under_lock(project_dir, lift_path, langcode,
     """Inner loop: caller holds ``project_lock``. Iterates the
     pending dir's entries and disposes of each. Mutates
     ``summary`` in place."""
-    from .repo import _get_repo
+    from .repo import _get_repo, _check_memory_for_merge
     for name in names:
         orphan_path = os.path.join(pending_dir, name)
         if not os.path.isfile(orphan_path):
@@ -336,6 +337,28 @@ def _recover_under_lock(project_dir, lift_path, langcode,
         # Merge path. ``base=b''`` per three_way_merge's
         # "no shared history" semantics — orphan and current
         # diverged from an unknown point.
+        #
+        # Memory pre-flight: parsing two LIFT XMLs side-by-side
+        # peaks at ~100–150 MB on a 1700-entry project. Daemon
+        # startup is exactly when memory may be tight (picker
+        # activity also spawning), and a silent OOM-kill here
+        # would lose the entire recovery batch with no signal.
+        # Refuse the merge cleanly: leave the orphan on disk
+        # (it stays valid; next startup retries when memory has
+        # recovered) and bail the rest of the batch — if we
+        # couldn't fit this merge, we won't fit the next either.
+        mem_block = _check_memory_for_merge()
+        if mem_block is not None:
+            print(f'[atomic-recovery] orphan {name!r}: skipping '
+                  f'merge — only '
+                  f'{mem_block.params.get("mem_available_mb")} MB '
+                  f'free, need '
+                  f'{mem_block.params.get("min_required_mb")} MB. '
+                  f'Orphan stays on disk; next startup with more '
+                  f'memory will recover it.',
+                  file=sys.stderr, flush=True)
+            summary['skipped_low_memory'] += 1
+            return
         try:
             mr = three_way_merge(
                 base_bytes=b'', ours_bytes=current_bytes,
