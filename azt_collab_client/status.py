@@ -100,16 +100,15 @@ INSUFFICIENT_MEMORY_FOR_MERGE = 'INSUFFICIENT_MEMORY_FOR_MERGE'
 # change device_name to something unique in the daemon settings UI.
 # Since 0.44.8.
 TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
-# Phase A chunk-halving has bottomed out at chunk_n=1 (single commit
-# per push attempt) and the pre-flight pack-size estimate still
-# exceeds the per-attempt budget — the bytes that need to cross the
-# wire for one commit are larger than what the server's receive-pack
-# endpoint accepts inside its per-request timeout on this connection.
-# Params: ``commit_sha`` (hex prefix), ``raw_bytes`` (estimate, pre-
-# compression upper bound), ``budget_bytes``, ``object_count``.
-# Genuine remedies are a faster connection or moving audio out of git
-# history (LFS / external store); the daemon can't work around it.
-# Since 0.44.11.
+# Phase A chunk-halving has bottomed out at chunk_n=1 and one of two
+# gates tripped: pack estimate > budget (default 3 MB) OR second
+# chunk_n=1 failure regardless of size. Either way the bytes that
+# need to cross the wire for one commit don't fit inside the server's
+# per-request timeout on this connection. Params: ``commit_sha``
+# (hex prefix), ``raw_bytes`` (estimate, pre-compression upper
+# bound), ``budget_bytes``, ``object_count``. Genuine remedies are
+# a faster connection or moving audio out of git history (LFS /
+# external store); the daemon can't work around it. Since 0.44.11.
 COMMIT_PACK_EXCEEDS_NETWORK_BUDGET = 'COMMIT_PACK_EXCEEDS_NETWORK_BUDGET'
 
 AUTH_REQUIRED = 'AUTH_REQUIRED'

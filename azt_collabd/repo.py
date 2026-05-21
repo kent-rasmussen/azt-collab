@@ -1928,6 +1928,12 @@ def _push_chunked_to_ref(
     # + we just verified ancestry).
     MAX_CONSECUTIVE_FAILURES = 12
     consecutive_failures = 0
+    # Bail after the *second* chunk_n=1 failure regardless of pack
+    # size — the field shows chunk_n=1 408s are persistent on
+    # too-slow connections, not transient. First failure could still
+    # be a network blip; second is a pattern. (The size-based gate
+    # bails on the first failure when bytes > budget — see below.)
+    chunk_n_1_failures = 0
     backoff_s = 1.0
     initial_n = _settings.topic_branch_chunk_size()
     working_n = None
@@ -2019,18 +2025,27 @@ def _push_chunked_to_ref(
             if _is_http_401(exc):
                 _cleanup_temp_ref()
                 return False, Status(S.AUTH_REQUIRED), None
-            # Budget-bail at chunk_n=1: no smaller unit to fall back to,
-            # and the pre-flight estimate says the single commit's pack
-            # exceeds the per-attempt budget. Surface the typed status
-            # so the user sees a concrete diagnosis instead of waiting
-            # out MAX_CONSECUTIVE_FAILURES retries.
+            # Two OR'd bails at chunk_n=1 (no smaller unit to fall back
+            # to). Either trips → surface S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET.
+            #   1. Size gate: pre-flight estimate > budget — we already
+            #      measured the unit as too big, no point retrying.
+            #   2. Persistence gate: second chunk_n=1 failure regardless
+            #      of size — the field shows chunk_n=1 408s are persistent
+            #      on too-slow connections, not transient.
+            if chunk_n == 1:
+                chunk_n_1_failures += 1
             budget = _settings.commit_pack_byte_budget()
-            if chunk_n == 1 and budget > 0 and raw_bytes > budget:
+            oversize = (
+                chunk_n == 1 and budget > 0 and raw_bytes > budget)
+            exhausted = (chunk_n == 1 and chunk_n_1_failures >= 2)
+            if oversize or exhausted:
                 _cleanup_temp_ref()
+                reason = 'oversize' if oversize else 'exhausted'
                 lift_merge.trace(
-                    f'[sync-trace] topic-push: chunk_n=1 pack '
-                    f'({raw_bytes:,} bytes) exceeds per-attempt budget '
-                    f'({budget:,} bytes); surfacing typed status')
+                    f'[sync-trace] topic-push: chunk_n=1 bail '
+                    f'({reason}) pack={raw_bytes:,} bytes '
+                    f'budget={budget:,} failures={chunk_n_1_failures}; '
+                    f'surfacing typed status')
                 return False, Status(
                     S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET,
                     {'commit_sha': label,

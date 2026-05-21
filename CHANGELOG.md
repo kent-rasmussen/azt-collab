@@ -28,10 +28,12 @@ fix itself by waiting.
 This release adds a pre-flight pack-size estimate to every Phase A
 attempt (traced) and surfaces a typed
 ``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` when chunk-halving has
-already reached ``chunk_n=1`` *and* the single-commit pack
-estimate exceeds the per-attempt byte budget. The user gets a
-concrete diagnosis ("this one commit is too big for this
-connection") instead of indefinite retries.
+already reached ``chunk_n=1`` and either of two OR'd gates trips:
+the single-commit pack estimate exceeds the per-attempt budget
+(default 3 MB), or the second chunk_n=1 attempt has failed
+regardless of size. The user gets a concrete diagnosis ("this
+one commit is too big for this connection") instead of indefinite
+retries.
 
 ### What landed
 
@@ -43,23 +45,26 @@ connection") instead of indefinite retries.
   walk (~1–3 s for a 50-commit range, sub-second at chunk_n=1).
   Wired into `_push_chunked_to_ref` as a pre-flight trace
   (`[sync-trace] topic-push pack-size: N objects, X bytes`).
-- `_push_chunked_to_ref` adds a budget-bail: when
-  `chunk_n == 1` AND the just-attempted push raised AND
-  `raw_bytes > commit_pack_byte_budget()`, returns
-  `Status(COMMIT_PACK_EXCEEDS_NETWORK_BUDGET, {commit_sha,
+- `_push_chunked_to_ref` adds two OR'd bails at chunk_n=1:
+  the size gate (estimate > `commit_pack_byte_budget()`) fires on
+  the first chunk_n=1 failure when we've already measured the
+  unit as too big; the persistence gate fires on the second
+  chunk_n=1 failure regardless of size (field shows the failure
+  is persistent on too-slow connections, not transient). Either
+  returns `Status(COMMIT_PACK_EXCEEDS_NETWORK_BUDGET, {commit_sha,
   raw_bytes, budget_bytes, object_count})` instead of looping on.
-  Bail trace: `[sync-trace] topic-push: chunk_n=1 pack (X bytes)
-  exceeds per-attempt budget (Y bytes); surfacing typed status`.
+  Bail trace: `[sync-trace] topic-push: chunk_n=1 bail (oversize|
+  exhausted) pack=X bytes budget=Y failures=N; surfacing typed
+  status`.
 - `_push_step_locked` handles the new status code alongside
   `TOPIC_BRANCH_CONFLICT` — surfaces it on the Result and adds
   `PUSH_FAILED` for peers without specific routing on the new
   code.
 - `azt_collabd/settings.py`: new
   `commit_pack_byte_budget()` settings function. Default
-  10 MB (10 × 1024 × 1024). 0 disables the typed bail (helper
-  continues to MAX_CONSECUTIVE_FAILURES instead). Tune via
-  `sync.commit_pack_byte_budget` in
-  `$AZT_HOME/config.json`.
+  3 MB (3 × 1024 × 1024). 0 disables the size gate only —
+  the second-failure gate still fires. Tune via
+  `sync.commit_pack_byte_budget` in `$AZT_HOME/config.json`.
 - `azt_collabd/status.py` + `azt_collab_client/status.py`:
   `COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` mirrored.
 - `azt_collab_client/translate.py`: human-readable message for
