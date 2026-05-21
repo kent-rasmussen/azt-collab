@@ -1649,6 +1649,43 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     return commits[min(n, len(commits)) - 1]
 
 
+def _estimate_delta_size(repo, have_sha, want_sha):
+    """Walk the missing-objects set for a ``(have_sha → want_sha)``
+    delta and return ``(object_count, raw_bytes)``.
+
+    Bytes are pre-compression upper bound (sums each object's
+    ``raw_length()``); the pack negotiated by dulwich for the actual
+    push will be smaller after deltas + zlib. Good enough for a
+    diagnostic — the per-request budget on slow field links measured
+    in raw_bytes is the right gauge for 'will this fit in the server's
+    receive-pack timeout window?'
+
+    Returns ``(0, 0)`` on any walk failure (treated by callers as
+    'estimate unavailable, don't gate on it')."""
+    if not want_sha:
+        return (0, 0)
+    try:
+        from dulwich.object_store import MissingObjectFinder
+        finder = MissingObjectFinder(
+            repo.object_store,
+            haves=[have_sha] if have_sha else [],
+            wants=[want_sha],
+        )
+        count = 0
+        total_bytes = 0
+        for sha, _hint in finder:
+            count += 1
+            try:
+                total_bytes += repo.object_store[sha].raw_length()
+            except Exception:
+                pass
+        return (count, total_bytes)
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] pack-size estimate failed: {exc!r}')
+        return (0, 0)
+
+
 # Per-daemon-lifetime memo of (project_dir,) we've already swept
 # orphan topic-branches for. Janitor runs once per project per
 # daemon spawn — finding stragglers from earlier daemon lives or
@@ -1929,6 +1966,16 @@ def _push_chunked_to_ref(
             f'chunk_n={chunk_n} remaining={remaining} '
             f'consecutive_failures={consecutive_failures}')
 
+        # Pre-flight pack-size estimate. Pre-compression upper bound;
+        # the wire pack will be smaller, but raw_bytes is the right
+        # gauge for 'fits in the receive-pack timeout window.' Used
+        # below for the chunk_n=1 budget-bail diagnosis.
+        obj_count, raw_bytes = _estimate_delta_size(
+            repo, chunk_base, intermediate)
+        lift_merge.trace(
+            f'[sync-trace] topic-push pack-size: {obj_count} objects, '
+            f'{raw_bytes:,} bytes (uncompressed upper bound)')
+
         # Park the intermediate sha under TEMP_REF so dulwich can
         # resolve the lhs of the refspec.
         _cleanup_temp_ref()
@@ -1972,11 +2019,30 @@ def _push_chunked_to_ref(
             if _is_http_401(exc):
                 _cleanup_temp_ref()
                 return False, Status(S.AUTH_REQUIRED), None
+            # Budget-bail at chunk_n=1: no smaller unit to fall back to,
+            # and the pre-flight estimate says the single commit's pack
+            # exceeds the per-attempt budget. Surface the typed status
+            # so the user sees a concrete diagnosis instead of waiting
+            # out MAX_CONSECUTIVE_FAILURES retries.
+            budget = _settings.commit_pack_byte_budget()
+            if chunk_n == 1 and budget > 0 and raw_bytes > budget:
+                _cleanup_temp_ref()
+                lift_merge.trace(
+                    f'[sync-trace] topic-push: chunk_n=1 pack '
+                    f'({raw_bytes:,} bytes) exceeds per-attempt budget '
+                    f'({budget:,} bytes); surfacing typed status')
+                return False, Status(
+                    S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET,
+                    {'commit_sha': label,
+                     'raw_bytes': raw_bytes,
+                     'budget_bytes': budget,
+                     'object_count': obj_count},
+                ), chunk_base
             consecutive_failures += 1
             # Halve the chunk size and try again. Floor at 1 — a
             # single-commit chunk is the smallest unit; if even
             # that fails repeatedly we'll exit on the consecutive-
-            # failures cap.
+            # failures cap (or the budget bail above).
             if working_n is None:
                 # Never had a successful push at this size — halve
                 # the next attempt's size directly.
@@ -2391,12 +2457,17 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                     error='topic-branch promote: too many races')
                 return result
             elif conflict_status is not None:
-                # Typed status from the topic-push helper. Three
+                # Typed status from the topic-push helper. Four
                 # shapes:
                 # - TOPIC_BRANCH_CONFLICT: foreign content on our
                 #   topic-branch ref. Add PUSH_FAILED too for
                 #   peers without specific routing on the new
                 #   code; user fix is a device_name change.
+                # - COMMIT_PACK_EXCEEDS_NETWORK_BUDGET: chunk_n=1 and
+                #   the single-commit pack is bigger than the
+                #   per-attempt budget. Add PUSH_FAILED for the same
+                #   reason; the underlying fix is a bigger pipe or a
+                #   structural change to where audio lives.
                 # - AUTH_REQUIRED (401): bail without PUSH_FAILED
                 #   per the existing 401 convention.
                 # - 403 diagnosis: bail with the diagnosis but
@@ -2407,6 +2478,11 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                     result.add(S.PUSH_FAILED,
                                error='topic-branch conflict — '
                                      'device_name collision')
+                elif conflict_status.code == \
+                        S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET:
+                    result.add(S.PUSH_FAILED,
+                               error='single-commit pack exceeds '
+                                     'per-attempt budget')
                 return result
             else:
                 # Per-chunk failures exhausted the cap. The server

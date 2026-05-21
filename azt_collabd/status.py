@@ -132,6 +132,20 @@ INSUFFICIENT_MEMORY_FOR_MERGE = 'INSUFFICIENT_MEMORY_FOR_MERGE'
 # name. Params: ``topic_branch`` (the ref name), ``server_tip``
 # (the foreign SHA we saw, hex prefix). Since 0.44.8.
 TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
+# Phase A chunk-halving has bottomed out at ``chunk_n=1`` and the
+# pre-flight pack-size estimate for that single commit still exceeds
+# ``sync.commit_pack_byte_budget`` (default 10 MB). The bytes that
+# need to cross the wire for this one commit are larger than what the
+# server's git-receive-pack endpoint will accept inside its per-request
+# timeout on this connection. No smaller chunk exists to fall back to;
+# surface this so the user gets a concrete diagnosis instead of waiting
+# out MAX_CONSECUTIVE_FAILURES retries. Params: ``commit_sha`` (hex
+# prefix of the commit whose pack is too big), ``raw_bytes`` (estimate,
+# pre-compression upper bound), ``budget_bytes``, ``object_count``.
+# Genuine remedies are a faster connection or moving audio out of git
+# history (LFS / external store); the daemon can't work around it.
+# Since 0.44.11.
+COMMIT_PACK_EXCEEDS_NETWORK_BUDGET = 'COMMIT_PACK_EXCEEDS_NETWORK_BUDGET'
 
 # ── 403 diagnosis ──────────────────────────────────────────────────────────
 AUTH_REQUIRED = 'AUTH_REQUIRED'

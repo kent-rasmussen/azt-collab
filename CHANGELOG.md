@@ -9,6 +9,82 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.44.11 — Phase A pre-flight pack-size diagnostic + COMMIT_PACK_EXCEEDS_NETWORK_BUDGET bail
+
+### Why
+
+Field log from a 0.44.10 tester (baf, ~150 MB / 424-commit backlog)
+showed Phase A chunk-halving running all the way down to
+``chunk_n=1`` and still getting HTTP 408 from
+``git-receive-pack`` at ~29 s per attempt — i.e. the bytes that
+need to cross the wire for a *single* commit don't fit inside the
+server's per-request timeout on this connection. The architecture
+(chunk-halving to fit pack size into per-request budget) bottoms
+out at 1 commit per chunk; there's no smaller unit to fall back
+to. Before 0.44.11 this just spun on ``MAX_CONSECUTIVE_FAILURES``
+with no indication to the user that the problem isn't going to
+fix itself by waiting.
+
+This release adds a pre-flight pack-size estimate to every Phase A
+attempt (traced) and surfaces a typed
+``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` when chunk-halving has
+already reached ``chunk_n=1`` *and* the single-commit pack
+estimate exceeds the per-attempt byte budget. The user gets a
+concrete diagnosis ("this one commit is too big for this
+connection") instead of indefinite retries.
+
+### What landed
+
+- `azt_collabd/repo.py`: `_estimate_delta_size(repo, have_sha,
+  want_sha)` — walks `dulwich.object_store.MissingObjectFinder`
+  and sums `raw_length()` over the missing-objects set. Returns
+  `(object_count, raw_bytes)` (pre-compression upper bound). One
+  call per Phase A attempt; cost dominated by the missing-objects
+  walk (~1–3 s for a 50-commit range, sub-second at chunk_n=1).
+  Wired into `_push_chunked_to_ref` as a pre-flight trace
+  (`[sync-trace] topic-push pack-size: N objects, X bytes`).
+- `_push_chunked_to_ref` adds a budget-bail: when
+  `chunk_n == 1` AND the just-attempted push raised AND
+  `raw_bytes > commit_pack_byte_budget()`, returns
+  `Status(COMMIT_PACK_EXCEEDS_NETWORK_BUDGET, {commit_sha,
+  raw_bytes, budget_bytes, object_count})` instead of looping on.
+  Bail trace: `[sync-trace] topic-push: chunk_n=1 pack (X bytes)
+  exceeds per-attempt budget (Y bytes); surfacing typed status`.
+- `_push_step_locked` handles the new status code alongside
+  `TOPIC_BRANCH_CONFLICT` — surfaces it on the Result and adds
+  `PUSH_FAILED` for peers without specific routing on the new
+  code.
+- `azt_collabd/settings.py`: new
+  `commit_pack_byte_budget()` settings function. Default
+  10 MB (10 × 1024 × 1024). 0 disables the typed bail (helper
+  continues to MAX_CONSECUTIVE_FAILURES instead). Tune via
+  `sync.commit_pack_byte_budget` in
+  `$AZT_HOME/config.json`.
+- `azt_collabd/status.py` + `azt_collab_client/status.py`:
+  `COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` mirrored.
+- `azt_collab_client/translate.py`: human-readable message for
+  the new code, plus a previously-missing entry for
+  `TOPIC_BRANCH_CONFLICT` (added 0.44.8, never translated; would
+  have fallen through to `[CODE] params!r`).
+- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`:
+  French translations for both messages.
+
+### Wire format
+
+Additive status code. Peers that don't know
+`COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` fall through to the generic
+`[CODE] params` formatter — no crash, no wire-incompatibility.
+No `MIN_CLIENT_VERSION` bump.
+
+### What this doesn't fix
+
+The underlying limitation — a single commit's audio bytes
+exceeding what one HTTP receive-pack request can carry on a slow
+connection — is structural. The genuine remedies are a faster
+network or moving audio out of git history (git-lfs / external
+store). Phase A still tries first; the new bail just stops the
+loop with a clear message once it's exhausted its options.
+
 ## 0.44.10 — topic-branch Phase D + startup janitor: clean up merged topic-branches
 
 ### Why

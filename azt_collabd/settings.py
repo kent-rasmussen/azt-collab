@@ -177,6 +177,22 @@ def topic_branch_chunk_size():
     return max(1, int(get('sync.topic_branch_chunk_size', 50)))
 
 
+def commit_pack_byte_budget():
+    """Per-attempt pack-byte budget for Phase A. When the chunk-halving
+    loop reaches ``chunk_n=1`` (single commit per attempt) and the
+    estimated pack bytes for that one commit still exceed this budget,
+    the helper surfaces ``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` so the
+    user sees a concrete diagnosis instead of indefinite retries.
+
+    Default 10 MB — empirically GitHub's git-receive-pack edge returns
+    HTTP 408 in ~30 s on slow field connections, and 10 MB through ~30 s
+    is the rough envelope for 'this connection can carry it.' Tune lower
+    on observably-slow links; tune to 0 to disable the typed bail (loop
+    continues to MAX_CONSECUTIVE_FAILURES). The trace line emitted
+    pre-push reports raw bytes regardless of this knob."""
+    return max(0, int(get('sync.commit_pack_byte_budget', 10 * 1024 * 1024)))
+
+
 def set_work_offline(value: bool):
     """Persist the work-offline toggle. Triggering an immediate
     drain on transition OFF is the scheduler's responsibility —

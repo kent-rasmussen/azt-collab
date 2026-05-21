@@ -1165,3 +1165,27 @@ msgstr "L'enregistrement dans git a échoué {count} fois de suite ({error}). Vo
 
 msgid "first_name last_name"
 msgstr "prénom nom"
+
+# ── 0.44.x: topic-branch push (Phase A) ───────────────────────────
+
+msgid ""
+"Another device is using the same device name and our staging "
+"branch ({topic_branch}) collided with theirs (server tip "
+"{server_tip}). Change this device's name in the daemon settings "
+"to something unique and try again."
+msgstr ""
+"Un autre appareil utilise le même nom et notre branche temporaire "
+"({topic_branch}) est entrée en collision avec la sienne (pointe "
+"serveur {server_tip}). Changez le nom de cet appareil dans les "
+"paramètres du service pour quelque chose d'unique, puis réessayez."
+
+msgid ""
+"A single commit ({commit_sha}) is too large ({raw_bytes:,} bytes) "
+"for this connection to upload inside the server's per-request "
+"timeout. No smaller unit to retry with. Try again on a faster "
+"connection."
+msgstr ""
+"Un seul commit ({commit_sha}) est trop volumineux "
+"({raw_bytes:,} octets) pour que cette connexion l'envoie dans le "
+"délai par requête du serveur. Aucune unité plus petite à réessayer. "
+"Réessayez sur une connexion plus rapide."

@@ -226,6 +226,16 @@ _HANDLERS = {
         'Not enough memory to merge right now '
         '({mem_available_mb} MB available, {min_required_mb} MB needed). '
         'Close other apps and the next sync will retry.'), p),
+    S.TOPIC_BRANCH_CONFLICT: lambda p: _fmt(_tr(
+        'Another device is using the same device name and our staging '
+        'branch ({topic_branch}) collided with theirs '
+        '(server tip {server_tip}). Change this device\'s name in '
+        'the daemon settings to something unique and try again.'), p),
+    S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET: lambda p: _fmt(_tr(
+        'A single commit ({commit_sha}) is too large '
+        '({raw_bytes:,} bytes) for this connection to upload inside '
+        'the server\'s per-request timeout. No smaller unit to retry '
+        'with. Try again on a faster connection.'), p),
 
     # Transport-layer synthetics from the client (not emitted by the backend)
     'SERVER_UNAVAILABLE':     lambda p: _fmt(_tr('Sync service unavailable: {error}'), p),
