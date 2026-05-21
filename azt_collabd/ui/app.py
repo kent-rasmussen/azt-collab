@@ -587,6 +587,51 @@ KV_TEMPLATE = '''
                         id: work_offline_no_btn
                         text: _('no')
                         on_press: root.set_work_offline_mode(False)
+                # LAN sync (0.45.0). Daemon-wide toggle for the
+                # device-to-device fan-out transport (parked design
+                # in ``docs/local_lan_sync_stub.md``). When on, the
+                # listener thread runs + (Android) the :provider
+                # service is promoted to a foreground service of
+                # type specialUse. Hot-applied — flipping does NOT
+                # need a daemon restart.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    BodyLabel:
+                        text: _('Local-network sync:')
+                        size_hint_x: None
+                        width: dp(160)
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    RecBtn:
+                        id: lan_yes_btn
+                        text: _('yes')
+                        on_press: root.set_lan_allow_sync(True)
+                    RecBtn:
+                        id: lan_no_btn
+                        text: _('no')
+                        on_press: root.set_lan_allow_sync(False)
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(48)
+                    spacing: dp(8)
+                    Button:
+                        text: _('Pair a phone')
+                        on_press: root.open_pair_phone()
+                    Button:
+                        text: _('Paired devices')
+                        on_press: root.open_paired_phones()
+                BodyLabel:
+                    id: lan_status_label
+                    text: ''
+                    size_hint_y: None
+                    height: dp(28)
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
+                    font_size: sp(11)
                 # Cache images — daemon-side CAWL prefetch policy.
                 # Default is one image per CAWL line (the preferred
                 # ``__`` variant); peers can still on-demand-fetch
@@ -1253,6 +1298,10 @@ class SettingsScreen(Screen):
         except Exception:
             pass
         try:
+            self._refresh_lan_state()
+        except Exception:
+            pass
+        try:
             self._refresh_cawl_variants_state()
         except Exception:
             pass
@@ -1687,6 +1736,88 @@ class SettingsScreen(Screen):
             yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
         if no_btn is not None:
             no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
+
+    # LAN sync (parked design, 0.45.0). Toggle + open-pair / open-list
+    # entry points; the actual UI lives in
+    # ``azt_collab_client.ui.lan_popups`` so the picker can reuse the
+    # scan-to-pair flow from the same module.
+
+    def set_lan_allow_sync(self, enabled):
+        from azt_collab_client import lan_set_toggle as _lst
+        new_state = bool(enabled)
+        try:
+            applied = _lst(new_state)
+        except Exception as ex:
+            label = self.ids.get('lan_status_label')
+            if label is not None:
+                label.text = _tr(
+                    'Failed to update local-network setting: {error}'
+                ).format(error=str(ex))
+            return
+        self._lan_enabled = bool(applied.get('on'))
+        self._lan_endpoint = applied.get('endpoint', '')
+        self._refresh_lan_buttons()
+        self._refresh_lan_status()
+
+    def _refresh_lan_state(self):
+        from azt_collab_client import lan_toggle as _lt
+        try:
+            state = _lt()
+        except Exception:
+            state = {'on': False, 'endpoint': ''}
+        self._lan_enabled = bool(state.get('on'))
+        self._lan_endpoint = state.get('endpoint', '')
+        self._refresh_lan_buttons()
+        self._refresh_lan_status()
+
+    def _refresh_lan_buttons(self):
+        enabled = bool(getattr(self, '_lan_enabled', False))
+        yes_btn = self.ids.get('lan_yes_btn')
+        no_btn = self.ids.get('lan_no_btn')
+        if yes_btn is not None:
+            yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
+        if no_btn is not None:
+            no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
+
+    def _refresh_lan_status(self):
+        label = self.ids.get('lan_status_label')
+        if label is None:
+            return
+        enabled = bool(getattr(self, '_lan_enabled', False))
+        endpoint = getattr(self, '_lan_endpoint', '') or ''
+        if not enabled:
+            label.text = ''
+            return
+        if endpoint:
+            label.text = _tr('Listening on {endpoint}').format(
+                endpoint=endpoint)
+        else:
+            label.text = _tr('Local-network sharing is on (listener '
+                             'not yet bound).')
+
+    def open_pair_phone(self):
+        try:
+            from azt_collab_client.ui.lan_popups import (
+                share_pairing_qr_popup,
+            )
+            share_pairing_qr_popup()
+        except Exception as ex:
+            label = self.ids.get('lan_status_label')
+            if label is not None:
+                label.text = _tr('Could not open pairing QR: '
+                                 '{error}').format(error=str(ex))
+
+    def open_paired_phones(self):
+        try:
+            from azt_collab_client.ui.lan_popups import (
+                paired_phones_popup,
+            )
+            paired_phones_popup()
+        except Exception as ex:
+            label = self.ids.get('lan_status_label')
+            if label is not None:
+                label.text = _tr('Could not open paired-devices '
+                                 'list: {error}').format(error=str(ex))
 
     def share_daemon_log(self):
         """Dispatch the daemon log through Android's share sheet —

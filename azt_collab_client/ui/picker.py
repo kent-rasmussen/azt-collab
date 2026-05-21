@@ -37,6 +37,7 @@ _KV_TEMPLATE = '''
 #:import sp kivy.metrics.sp
 #:import T azt_collab_client.ui.theme
 #:import _ azt_collab_client.translate.tr
+#:import LAN_POPUPS azt_collab_client.ui.lan_popups
 #:set FONT '{font_name}'
 
 <ProjectPickerScreen>:
@@ -117,6 +118,18 @@ _KV_TEMPLATE = '''
                         text: _('Clone Internet Repository')
                         normal_color: T.BTN_INACTIVE
                         on_release: app.clone_dialog()
+                    RecBtn:
+                        text: _('Pair with another phone')
+                        normal_color: T.BTN_INACTIVE
+                        # Calls the free function directly so every
+                        # picker host (recorder, viewer, server APK)
+                        # gets the affordance without needing a
+                        # ``scan_to_pair_dialog`` method on its
+                        # ``App`` class. On platforms where QR
+                        # scanning isn't available the scanner
+                        # short-circuits with a translated status
+                        # message.
+                        on_release: LAN_POPUPS.scan_to_pair()
                     RecBtn:
                         text: _('Start New')
                         normal_color: T.BTN_INACTIVE

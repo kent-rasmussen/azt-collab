@@ -1,9 +1,16 @@
 # Local LAN / device-to-device sync — design spec
 
-**Status:** parked. Spec drafted 2026-05-19 from research into
-mDNS-on-Android, Android 14+ foreground-service rules, dulwich's
-HTTP smart-protocol server, and offline-first peer-to-peer git
-patterns (Syncthing, Radicle, git-annex, Dat). Not yet started.
+**Status:** shipped in 0.45.0 (2026-05-21). RPC layer, TLS
+listener, cert middleware + ACL, hello auto-reverse-record,
+discovery (NsdManager on Android, python-zeroconf on desktop),
+scheduler fan-out, FGS promotion, daemon settings UI affordances,
+and picker "Pair with another phone" entry are all in. Spec
+remains the source of truth for design rationale; the field test
+matrix in ``docs/test_plan.md`` is where new failures get logged.
+Partial follow-ups documented in CHANGELOG 0.45.0 (French
+translations for new UI strings; bump NsdManager browse to
+``DiscoveryRequest`` + ``FLAG_SHOW_PICKER`` when the suite
+targets SDK 37).
 
 ## Problem
 

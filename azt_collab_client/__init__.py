@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.44.13"
+__version__ = "0.45.1"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -861,6 +861,189 @@ def set_device_name(name):
         call('POST', '/v1/config/device_name', {'device_name': name})
     except ServerUnavailable:
         pass
+
+
+# ── LAN sync identity + paired list (phase 1) ──────────────────────────────
+#
+# Daemon-owned per-device identity for the parked LAN-sync transport
+# (``docs/local_lan_sync_stub.md`` in the canonical repo). These
+# getters are query-shaped and follow the standard rule: never raise
+# from a query wrapper; on transport failure return the empty
+# equivalent so a peer offline can still render its settings UI.
+
+def lan_peer_id():
+    """Return ``{'peer_id': hex, 'fp': hex, 'device_name': str}`` for
+    this daemon's LAN identity. Empty dict on transport failure or
+    if the daemon can't create the identity (e.g. ``cryptography``
+    unavailable on this platform).
+
+    The ``peer_id`` is the lowercase hex ed25519 pubkey (64 chars);
+    the ``fp`` is the lowercase hex SHA-256 of the X.509 cert in
+    DER form (64 chars), matching ``openssl x509 -fingerprint
+    -sha256`` minus the colons."""
+    try:
+        resp = call('GET', '/v1/lan/peer_id')
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return {
+        'peer_id': str(resp.get('peer_id', '') or ''),
+        'fp': str(resp.get('fp', '') or ''),
+        'device_name': str(resp.get('device_name', '') or ''),
+    }
+
+
+def lan_list_peers():
+    """Return the daemon's paired-peers list as a list of dicts
+    (``peer_id``, ``device_name``, ``fp``, ``endpoints``,
+    ``static_endpoints``, ``shared_projects``, ``paired_at``,
+    ``last_seen_at``). Empty list on transport failure or no
+    peers."""
+    try:
+        resp = call('GET', '/v1/lan/peers')
+    except ServerUnavailable:
+        return []
+    if not resp.get('ok'):
+        return []
+    out = resp.get('peers') or []
+    if not isinstance(out, list):
+        return []
+    return out
+
+
+def lan_pair_qr(endpoint=''):
+    """Return the JSON payload to render as a pairing QR. Empty
+    dict on transport failure or if the daemon can't create the
+    identity. ``endpoint`` is the daemon's current LAN endpoint
+    (``ip:port``) to embed in the QR — phase 4 will populate this
+    from the listener; for the phase-2 desktop smoke the caller
+    passes it directly. The returned dict has the shape
+    ``{v: 1, peer_id, fp, endpoint, device_name}``."""
+    try:
+        resp = call('POST', '/v1/lan/pair/qr', {'endpoint': endpoint})
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    payload = resp.get('payload') or {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def lan_toggle():
+    """Read the daemon-wide LAN-sync toggle and the listener's
+    bound endpoint. Returns ``{'on': bool, 'endpoint': 'ip:port'}``;
+    on transport failure returns ``{'on': False, 'endpoint': ''}``
+    so peers offline can still render their settings UI."""
+    try:
+        resp = call('GET', '/v1/lan/toggle')
+    except ServerUnavailable:
+        return {'on': False, 'endpoint': ''}
+    if not resp.get('ok'):
+        return {'on': False, 'endpoint': ''}
+    return {
+        'on': bool(resp.get('on')),
+        'endpoint': str(resp.get('endpoint', '') or ''),
+    }
+
+
+def lan_set_toggle(on):
+    """Flip the daemon-wide LAN-sync toggle. Hot-applied — the
+    listener thread starts/stops synchronously with the RPC return
+    (Android FGS promotion happens in the same call too once the
+    Android-side wiring lands). Returns the post-reconcile shape
+    from ``lan_toggle()``."""
+    try:
+        resp = call('POST', '/v1/lan/toggle', {'on': bool(on)})
+    except ServerUnavailable:
+        return {'on': False, 'endpoint': ''}
+    if not resp.get('ok'):
+        return {'on': False, 'endpoint': ''}
+    return {
+        'on': bool(resp.get('on')),
+        'endpoint': str(resp.get('endpoint', '') or ''),
+    }
+
+
+def lan_set_static_endpoints(peer_id, endpoints):
+    """Replace ``peer_id``'s static-endpoint fallback list (phase 7).
+    ``endpoints`` is a list of ``'ip:port'`` strings; empty list
+    clears. Returns the updated peer entry on success, or empty
+    dict on transport failure / unknown peer."""
+    try:
+        resp = call('POST', '/v1/lan/static_endpoints',
+                    {'peer_id': peer_id,
+                     'endpoints': list(endpoints or [])})
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return resp.get('peer') or {}
+
+
+def lan_share_project(langcode, peer_id):
+    """Add ``langcode`` to ``peer_id``'s outbound share list. Returns
+    the updated peer entry (canonical shape) on success, or empty
+    dict on transport failure / unknown peer."""
+    try:
+        resp = call('POST', '/v1/lan/share_project',
+                    {'langcode': langcode, 'peer_id': peer_id})
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return resp.get('peer') or {}
+
+
+def lan_unshare_project(langcode, peer_id):
+    """Remove ``langcode`` from ``peer_id``'s outbound share list.
+    Symmetric counterpart to ``lan_share_project``."""
+    try:
+        resp = call('POST', '/v1/lan/unshare_project',
+                    {'langcode': langcode, 'peer_id': peer_id})
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return resp.get('peer') or {}
+
+
+def lan_unpair(peer_id):
+    """Forget a paired peer. Returns a ``Result`` carrying
+    ``S.LAN_UNPAIRED`` on success."""
+    try:
+        resp = call('POST', '/v1/lan/unpair', {'peer_id': peer_id})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_pair_accept(payload):
+    """Record a peer into the daemon's ``peers.json`` from a
+    scanned-QR payload. ``payload`` is the dict the picker's QR
+    scanner decoded. Returns a ``Result``; ``Result.has(S.LAN_PAIRED)``
+    means success. On bad payload or transport failure the result
+    carries ``S.SERVER_ERROR`` / ``S.SERVER_UNAVAILABLE`` so the
+    caller can branch off ``result.has_any(...)`` instead of
+    inspecting strings."""
+    try:
+        resp = call('POST', '/v1/lan/pair/accept', {'payload': payload})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown'),
+             'detail': resp.get('detail', '')})])
+    return Result.from_dict(resp.get('result') or {})
 
 
 def get_cawl_prefetch_all_variants():
@@ -1871,6 +2054,9 @@ __all__ = [
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
+    'lan_peer_id', 'lan_list_peers', 'lan_pair_qr', 'lan_pair_accept',
+    'lan_share_project', 'lan_unshare_project', 'lan_unpair',
+    'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
     'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',

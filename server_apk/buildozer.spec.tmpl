@@ -99,11 +99,21 @@ version.regex = __version__ = ['"](.*)['"]
 # imports resolve to.
 version.filename = %(source.dir)s/../azt_collab_client/__init__.py
 
-requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3,typing_extensions,segno
+requirements = python3,kivy,pyjnius,dulwich,certifi,urllib3,typing_extensions,segno,cryptography,zeroconf
 # segno: pure-Python QR-code generator (~50 KB, no native deps).
 # Used by the daemon UI's "Share repo" popup to render the repo
 # URL as a QR for pairing with another device. PNG output uses
 # Pillow which is already pulled in via kivy.
+# cryptography: ed25519 keypair + self-signed X.509 cert generation
+# for the LAN sync transport (``azt_collabd.peer_id``). Phase 1 of
+# the parked design in ``docs/local_lan_sync_stub.md``; identity
+# files are created lazily on first ``GET /v1/lan/peer_id`` so the
+# cost is only paid by users who actually engage LAN sync.
+# zeroconf: pure-Python mDNS/DNS-SD library, used on the desktop
+# side of ``azt_collabd.lan_discovery``. On Android the daemon
+# prefers ``NsdManager`` via pyjnius (FLAG_SHOW_PICKER dodges the
+# Android 17 ACCESS_LOCAL_NETWORK runtime permission), but the
+# zeroconf import on Android is harmless — it's never called.
 # Pulled in via path symlink at packaging time. (See setup.sh in this
 # directory for the symlink dance — we mirror the sister-app pattern
 # documented in README.md so the server APK source tree contains
@@ -135,10 +145,22 @@ android.ndk = 29
 # every peer APK. Without that match, install-time grant is denied
 # and peers cannot reach this provider — desired failure mode. The
 # same permission gates bindService against AZTServiceProviderhost.
-android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, org.atoznback.AZT_COLLAB_ACCESS
+android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, CHANGE_WIFI_MULTICAST_STATE, ACCESS_WIFI_STATE, org.atoznback.AZT_COLLAB_ACCESS
 # CAMERA: required by the picker's "Scan QR to clone" affordance,
 # which dispatches to ZXing's CaptureActivity. ZXing requests the
 # runtime grant itself at launch; we only need the manifest entry.
+# FOREGROUND_SERVICE + FOREGROUND_SERVICE_SPECIAL_USE: required to
+# promote the :provider service to a foreground service while the
+# LAN sync toggle is on (parked design, phase 4). The "specialUse"
+# subtype is "lan-peer-git-sync" — declared in the manifest via
+# p4a_hook.py's _AZTCOLLAB_SERVICE_BLOCK once it carries the
+# foregroundServiceType + inner <property> attributes (TODO in
+# ~/bin/raspy/buildozer_tweaks/p4a_hook.py).
+# CHANGE_WIFI_MULTICAST_STATE + ACCESS_WIFI_STATE: required by
+# NsdManager advertise/browse + the WifiManager.MulticastLock the
+# daemon acquires on toggle-on (phase 5). Without the multicast
+# permission the system silently drops mDNS packets in either
+# direction even though the API returns success.
 
 # zxing-android-embedded: powers the picker's QR-scan-to-clone
 # button. ~500 KB AAR; lives in the server APK because the

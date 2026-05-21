@@ -1045,6 +1045,22 @@ msgstr "Veuillez définir votre nom dans les paramètres de synchronisation avan
 msgid "Work-offline mode is on. Turn it off in sync settings to push."
 msgstr "Mode hors-ligne activé. Désactivez-le dans les paramètres de synchronisation pour pousser."
 
+# LAN sync transport (parked spec, phases 1-8).
+msgid "Paired with {device_name}."
+msgstr "Appairé avec {device_name}."
+
+msgid "Forgot paired device."
+msgstr "Appareil appairé oublié."
+
+msgid "Paired device is not reachable on this network."
+msgstr "L'appareil appairé n'est pas joignable sur ce réseau."
+
+msgid "A paired device presented an unexpected security fingerprint. It may have been reinstalled; re-pair from sync settings."
+msgstr "Un appareil appairé a présenté une empreinte de sécurité inattendue. Il a peut-être été réinstallé ; appairez-le à nouveau depuis les paramètres de synchronisation."
+
+msgid "Local-network sharing is off. Turn it on in sync settings."
+msgstr "Le partage sur le réseau local est désactivé. Activez-le dans les paramètres de synchronisation."
+
 msgid "Work offline"
 msgstr "Travailler hors-ligne"
 

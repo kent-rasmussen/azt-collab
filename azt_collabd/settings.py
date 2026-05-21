@@ -49,6 +49,14 @@ _DEFAULTS = {
     'sync.post_online_grace_s': 60,
     'sync.work_offline': False,
     'sync.push_budget_s': 300,
+    # LAN sync (parked spec, phase 4+). Daemon-wide toggle for the
+    # device-to-device fan-out transport. When False (default) the
+    # listener thread + NsdManager advertise/browse are torn down;
+    # peer-app calls into the LAN endpoints still work for
+    # bookkeeping (pair/share) but no network exposure happens.
+    # Hot-applied — flipping does NOT require a daemon restart
+    # (per feedback_hot_toggle_not_restart).
+    'lan.allow_sync': False,
 }
 _ENV_MAP = {
     'sync.debounce_ms': 'AZT_SYNC_DEBOUNCE_MS',
@@ -57,6 +65,7 @@ _ENV_MAP = {
     'sync.post_online_grace_s': 'AZT_SYNC_POST_ONLINE_GRACE_S',
     'sync.work_offline': 'AZT_SYNC_WORK_OFFLINE',
     'sync.push_budget_s': 'AZT_SYNC_PUSH_BUDGET_S',
+    'lan.allow_sync': 'AZT_LAN_ALLOW_SYNC',
 }
 
 _lock = threading.Lock()
@@ -216,3 +225,18 @@ def set_work_offline(value: bool):
     drain on transition OFF is the scheduler's responsibility —
     this setter just writes the bit."""
     set_('sync.work_offline', bool(value))
+
+
+def lan_allow_sync():
+    """Read the daemon-wide LAN-sync toggle. Default False."""
+    return bool(get('lan.allow_sync', False))
+
+
+def set_lan_allow_sync(value: bool):
+    """Persist the LAN-sync toggle. The actual start/stop of the
+    listener thread + NsdManager advertise/browse is the
+    ``lan_listener`` module's responsibility — this setter just
+    writes the bit. The listener module's ``apply_toggle()`` runs
+    in the same RPC handler call so the user sees the FGS
+    notification / mDNS exposure change immediately."""
+    set_('lan.allow_sync', bool(value))

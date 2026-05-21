@@ -156,6 +156,15 @@ WORK_OFFLINE_ENABLED = 'WORK_OFFLINE_ENABLED'
 # now and unset state surfaces explicitly.
 CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 
+# ── LAN sync transport (parked spec, phases 1-8) ───────────────────────────
+# Mirror of the daemon-side codes in ``azt_collabd/status.py``. See
+# that file for the full per-code rationale.
+LAN_PAIRED = 'LAN_PAIRED'
+LAN_UNPAIRED = 'LAN_UNPAIRED'
+LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
+LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
+LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
+
 # Transport-failure codes. The client wrappers' ``except
 # ServerUnavailable`` / non-``ok`` response branches (see
 # ``sync_project``, ``project_status``, etc. in ``__init__.py``)

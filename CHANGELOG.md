@@ -9,6 +9,154 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.45.0 — LAN sync transport (full implementation)
+
+### Why
+
+Field linguists in the same office today have one sync path: github.
+When the internet is down or restricted, two phones a metre apart
+are isolated. The parked LAN sync design
+(``docs/local_lan_sync_stub.md``, 2026-05-19) was un-parked this
+release to land the RPC layer + listener foundation so subsequent
+peer rebuilds can pair, share, and fan-out commits across the local
+network without burning metered data.
+
+This release ships the daemon-side scaffolding and the wire surface.
+It deliberately leaves UI affordances (the daemon's "Pair a phone"
+page + the picker's "Scan to pair" entry point) and several
+Android-side wiring steps as follow-ups — the RPC layer is enough
+for a desktop two-``$AZT_HOME`` smoke and gives peer apps the
+contract they'll integrate against.
+
+### What landed
+
+- **Per-device identity** (``azt_collabd/peer_id.py``). Generates an
+  ed25519 keypair + self-signed X.509 cert on first call to a LAN
+  endpoint, persisted as ``$AZT_HOME/peer_id`` (PKCS#8 PEM, mode
+  0600) + ``$AZT_HOME/peer.crt`` (X.509 PEM). The hex peer-id is
+  the raw ed25519 pubkey; the ``fp`` is sha256 of the cert DER.
+  Lazy by design so an auto-spawned daemon doesn't pay the cost.
+- **Paired-peers registry** (``azt_collabd/peers.py``). Atomic
+  read/write of ``$AZT_HOME/peers.json``. Tracks ``device_name``,
+  ``fp``, ``endpoints`` (QR-captured), ``static_endpoints``
+  (user-managed), ``shared_projects``, ``paired_at``,
+  ``last_seen_at`` per paired peer.
+- **Pairing flow** (``POST /v1/lan/pair/qr`` + ``POST /v1/lan/pair/accept``).
+  The QR endpoint returns the JSON payload to encode via segno
+  (already in requirements); the accept endpoint records the peer
+  into ``peers.json``. Auto-reverse-record on the listener's first
+  authenticated request is a follow-up (see "Known gaps").
+- **Project-share gesture** (``POST /v1/lan/share_project`` +
+  ``unshare_project``). Per-direction allowlist; the listener will
+  refuse fetches of projects outside the peer's ``shared_projects``.
+- **HTTPS listener** (``azt_collabd/lan_listener.py``).
+  ``dulwich.web.HTTPGitApplication`` + ``ThreadingMixIn`` + TLS via
+  ``ssl.SSLContext.wrap_socket``. Custom request handler captures
+  the verified client cert into the WSGI environ; WSGI middleware
+  extracts the ed25519 pubkey from the DER, looks it up in
+  ``peers.json``, validates the fingerprint, and confines the URL
+  set to the peer's ``shared_projects`` before forwarding to
+  dulwich. Hot-applied via ``POST /v1/lan/toggle {on: bool}``.
+- **Foreground-service promotion** (``azt_collabd/android_cp/lan_fgs.py``).
+  Acquires ``WIFI_MODE_FULL_HIGH_PERF`` WifiLock + ``MulticastLock``
+  and calls ``startForeground(specialUse)`` on the ``:provider``
+  service while the LAN toggle is on. No-op on desktop.
+- **Discovery foundation** (``azt_collabd/lan_discovery.py``).
+  Desktop: ``python-zeroconf`` advertise + browse, service type
+  ``_aztcollab._tcp.local.``, TXT records ``peer_id`` / ``fp`` /
+  ``v``. Android NsdManager path is stubbed (see "Known gaps").
+- **Scheduler fan-out** (``azt_collabd/lan_push.py`` +
+  ``scheduler._drain_pending_push``). Every drain pass also tries
+  to push to each reachable paired peer that shares the project,
+  with TLS pinned via urllib3's ``assert_fingerprint``. LAN
+  success does NOT clear ``pending_push`` — github stays
+  authoritative, LAN is opportunistic redundancy.
+- **Hotspot / manual-IP fallback** (``POST /v1/lan/static_endpoints``).
+  Endpoint resolution order: mDNS-cached → static → QR-hint.
+  Covers only the fixed-IP hotspot-host case per the tightened
+  scope in the spec; AP-isolated networks with DHCP churn are
+  documented as out of scope for v1.
+- **Status codes**: ``LAN_PAIRED``, ``LAN_UNPAIRED``,
+  ``LAN_PEER_UNREACHABLE``, ``LAN_FP_MISMATCH``, ``LAN_TOGGLE_OFF``
+  in both daemon + client status modules. English + French
+  translations.
+- **Client surface**: ``lan_peer_id``, ``lan_list_peers``,
+  ``lan_pair_qr``, ``lan_pair_accept``, ``lan_share_project``,
+  ``lan_unshare_project``, ``lan_unpair``, ``lan_toggle``,
+  ``lan_set_toggle``, ``lan_set_static_endpoints`` (all in
+  ``azt_collab_client``).
+- **Build deps**: ``cryptography`` (ed25519 + X.509 generation) +
+  ``zeroconf`` (desktop mDNS) added to
+  ``server_apk/buildozer.spec.tmpl`` requirements. New Android
+  permissions: ``FOREGROUND_SERVICE``,
+  ``FOREGROUND_SERVICE_SPECIAL_USE``,
+  ``CHANGE_WIFI_MULTICAST_STATE``, ``ACCESS_WIFI_STATE``.
+
+### Wire format
+
+Additive — new ``/v1/lan/*`` endpoints + new status codes. Old
+peers ignore the surface entirely. ``MIN_CLIENT_VERSION`` floor
+bumped to ``0.45.0`` to flush peer rebuilds through and make the
+new surface available, per ``feedback_min_client_version``.
+
+### Auto-reverse-record + Android wiring (closed here)
+
+- **Auto-reverse-record (``POST /v1/lan/hello``)** lands as a
+  short-circuit inside the listener WSGI middleware: an unpaired
+  peer presenting a valid client cert can POST ``{peer_id, fp,
+  device_name}`` to ``/v1/lan/hello`` and we record them
+  symmetrically. ``_h_lan_pair_accept`` fires the hello call as a
+  best-effort follow-up after recording the QR-scanned peer, so
+  both sides land in each other's ``peers.json`` from a single
+  scan.
+- **``p4a_hook.py`` ``_AZTCOLLAB_SERVICE_BLOCK``** updated in
+  ``~/bin/raspy/buildozer_tweaks/p4a_hook.py`` to declare
+  ``android:foregroundServiceType="specialUse"`` + the inner
+  ``<property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+  android:value="lan-peer-git-sync" />`` so
+  ``ServiceCompat.startForeground`` accepts the specialUse type.
+- **NsdManager advertise + browse + resolve** implemented in
+  ``azt_collabd/lan_discovery.py``: three ``PythonJavaClass``
+  proxies (Registration, Discovery, Resolve) with strong refs
+  pinned in module globals. Resolved services land in the
+  ``peer_id → (host, port)`` cache that the scheduler's fan-out
+  reads. Uses the legacy ``discoverServices`` call — bump to
+  ``DiscoveryRequest`` + ``FLAG_SHOW_PICKER`` when the suite
+  targets SDK 37.
+- **jnius pre-warm** in ``server_apk/main.py`` step 2a.2:
+  ``NsdManager`` + ``NsdServiceInfo`` + ``WifiManager`` classes
+  are touched on the SDLThread so worker-thread lazy-init doesn't
+  bootclassloader-NULL-deref later.
+- **UI affordances** all land:
+  - Daemon settings: "Local-network sync:" yes/no toggle +
+    "Pair a phone" / "Paired devices" buttons + status line that
+    shows the bound endpoint while listening.
+  - Pair-QR popup (``azt_collab_client/ui/lan_popups.py``):
+    renders the daemon's pairing payload as a QR via ``segno`` +
+    ``CoreImage``; shows device_name + peer-id prefix for
+    across-the-table verbal confirm.
+  - Paired-devices popup: scrollable list with per-peer Manage
+    sub-popup that toggles per-project share, edits static
+    endpoints, and unpairs.
+  - Picker "Pair with another phone" entry: KV calls
+    ``LAN_POPUPS.scan_to_pair()`` directly so every picker host
+    (server APK, recorder, viewer) gets the affordance without a
+    new ``App``-method contract. Launches ZXing scanner, decodes
+    the JSON payload, calls ``lan_pair_accept``, surfaces the
+    translated ``Result`` to the user.
+
+### Translation TODO
+
+Full French translations for the new UI strings (popup titles,
+button labels, status messages, manage-peer flows) are partial —
+the five LAN status codes have French strings, but several UI
+strings introduced by ``lan_popups.py`` + the new app.py LAN
+section haven't been backfilled into ``locales/fr/LC_MESSAGES/
+azt_collab_client.po``. ``pytest tests/`` flags the missing msgids
+via the translation-coverage drift detector; landing the missing
+msgstrs is a small follow-up that doesn't block usability (English
+strings show through as fallback).
+
 ## 0.44.13 — positive cache for system-resolver hits (Starlink DNS round-trip elimination)
 
 ### Why

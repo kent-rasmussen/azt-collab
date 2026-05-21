@@ -195,6 +195,28 @@ def main():
     except Exception as ex:
         print(f'[server_apk] PackageManager prewarm skipped: {ex}',
               flush=True)
+    # 2a.2. Prewarm the NsdManager + WifiManager classes used by
+    # ``azt_collabd.lan_discovery`` and
+    # ``azt_collabd.android_cp.lan_fgs`` (LAN sync transport, 0.45.0).
+    # Same bootclassloader-vs-app-classloader gotcha as the other
+    # prewarms in this block: ``NsdManager.registerService`` /
+    # ``WifiManager.createMulticastLock`` lazy-init from a worker
+    # thread NULL-derefs in art::JNI on some devices; resolving the
+    # classes here while the SDLThread holds the app classloader
+    # makes the cached bindings available to any thread that follows.
+    try:
+        from jnius import autoclass
+        autoclass('android.net.nsd.NsdManager')
+        autoclass('android.net.nsd.NsdServiceInfo')
+        autoclass('android.net.wifi.WifiManager')
+        # Note: classes only — the listener PythonJavaClass proxies
+        # are built lazily inside lan_discovery the first time the
+        # LAN toggle flips on, with strong refs kept in the
+        # module's globals so the proxies survive past the call
+        # site. No need to instantiate them here.
+    except Exception as ex:
+        print(f'[server_apk] NsdManager/WifiManager prewarm skipped: '
+              f'{ex}', flush=True)
 
     # 2b. Crash-marker bookkeeping. Detect "previous process didn't
     #    run atexit" (SIGSEGV / SIGKILL / OOM-kill / kernel kill —

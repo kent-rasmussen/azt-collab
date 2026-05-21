@@ -100,7 +100,7 @@ from azt_collab_client import __version__  # noqa: F401
 # split. Also lifts the always-skip-commit-when-offline bug filed
 # in NOTES_TO_DAEMON.md (2026-05-15) — pre-0.43 daemons skip the
 # commit step entirely on offline ``request_sync``.
-MIN_CLIENT_VERSION = "0.44.0"
+MIN_CLIENT_VERSION = "0.45.0"
 
 from . import config
 from . import net

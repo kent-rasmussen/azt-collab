@@ -44,8 +44,10 @@ import time as _time
 from . import auth
 from . import cawl as _cawl
 from . import config as _config
+from . import lan_listener as _lan_listener
 from . import peer_id as _peer_id
 from . import peers as _peers
+from . import settings as _settings
 from . import projects
 from . import scheduler
 from . import store
@@ -320,6 +322,238 @@ def _h_set_device_name(body):
     name = body.get('device_name', '')
     store.set_device_name(name)
     return 200, {"ok": True, "device_name": store.get_device_name()}
+
+
+def _h_lan_peer_id(_body):
+    """Return this daemon's LAN peer identity. Phase 1 of the LAN
+    sync transport (parked design in ``docs/local_lan_sync_stub.md``).
+
+    Response: ``{ok: True, peer_id, fp, device_name}``. Lazy-creates
+    the ed25519 keypair + self-signed X.509 cert on first call. If
+    ``cryptography`` is unavailable on this platform, returns
+    ``{ok: False, error: 'identity_unavailable'}``."""
+    try:
+        info = _peer_id.ensure()
+    except RuntimeError as ex:
+        return 200, {"ok": False, "error": "identity_unavailable",
+                     "detail": str(ex)}
+    return 200, {
+        "ok": True,
+        "peer_id": info['peer_id'],
+        "fp": info['fp'],
+        "device_name": store.get_device_name(),
+    }
+
+
+def _h_lan_list_peers(_body):
+    """Return the daemon's paired-peers list. Phase 1 of the LAN
+    sync transport. Response: ``{ok: True, peers: [...]}``. Empty
+    list if nobody has been paired yet."""
+    return 200, {"ok": True, "peers": _peers.list_peers()}
+
+
+def _h_lan_pair_qr(body):
+    """Return the JSON payload to QR-encode for pairing this daemon
+    with another device. Phase 2 of the LAN sync transport.
+
+    Body: ``{endpoint: 'ip:port'}`` — the LAN endpoint to advertise
+    to the peer who'll scan the QR. Phase 4 will populate this from
+    the listener's own bound port; for the phase-2 RPC layer the
+    caller passes it (empty string is allowed for the desktop
+    two-$AZT_HOME smoke test).
+
+    Response: ``{ok: True, payload: {v, peer_id, fp, endpoint,
+    device_name}}`` — the caller renders ``json.dumps(payload)``
+    into a QR via ``segno``."""
+    try:
+        info = _peer_id.ensure()
+    except RuntimeError as ex:
+        return 200, {"ok": False, "error": "identity_unavailable",
+                     "detail": str(ex)}
+    endpoint = str((body or {}).get('endpoint', '') or '')
+    if not endpoint:
+        # Auto-populate from the running listener when present.
+        bound = _lan_listener.bound_endpoint()
+        if bound:
+            endpoint = f'{bound[0]}:{bound[1]}'
+    payload = {
+        'v': 1,
+        'peer_id': info['peer_id'],
+        'fp': info['fp'],
+        'endpoint': endpoint,
+        'device_name': store.get_device_name(),
+    }
+    return 200, {"ok": True, "payload": payload}
+
+
+def _h_lan_pair_accept(body):
+    """Record a peer into ``peers.json`` from a scanned-QR payload.
+    Phase 2 of the LAN sync transport.
+
+    Body: ``{payload: {v, peer_id, fp, endpoint, device_name}}``.
+
+    Response: ``{ok: True, result: {statuses: [LAN_PAIRED]}, peer:
+    {...}}``. Re-pair (same peer_id, new fp) refreshes the fingerprint
+    and the QR-captured endpoint but preserves existing
+    ``shared_projects`` and ``static_endpoints``. Phase 4's TLS
+    handshake is the catch for the fingerprint actually being live;
+    the LAN_FP_MISMATCH code lives there.
+
+    A v0 / unknown / missing-required-field payload returns
+    ``{ok: False, error: 'bad_payload', detail: ...}`` so the picker
+    UI can show a clear "QR data looked wrong" message."""
+    payload = (body or {}).get('payload') or {}
+    if not isinstance(payload, dict):
+        return 200, {"ok": False, "error": "bad_payload",
+                     "detail": "payload is not an object"}
+    v = payload.get('v')
+    peer_id = str(payload.get('peer_id', '') or '')
+    fp = str(payload.get('fp', '') or '')
+    endpoint = str(payload.get('endpoint', '') or '')
+    device_name = str(payload.get('device_name', '') or '')
+    if v != 1:
+        return 200, {"ok": False, "error": "bad_payload",
+                     "detail": f"unsupported version: {v!r}"}
+    if not peer_id or not fp:
+        return 200, {"ok": False, "error": "bad_payload",
+                     "detail": "peer_id / fp missing"}
+    # 32-byte ed25519 pubkey = 64 hex chars; sha256 fp = 64 hex chars.
+    if len(peer_id) != 64 or len(fp) != 64:
+        return 200, {"ok": False, "error": "bad_payload",
+                     "detail": "peer_id / fp wrong length"}
+    entry = _peers.record_pair(peer_id, fp, device_name, endpoint)
+    # Best-effort auto-reverse-record: introduce ourselves to the
+    # remote listener so the user doesn't have to scan a QR in the
+    # other direction. Network / TLS / unreachable failures are
+    # non-fatal — the local record is the durable state, and the
+    # next sync that lands on the remote will trip the listener's
+    # paired-peer check (which fires LAN_FP_MISMATCH if needed).
+    if endpoint:
+        try:
+            host, port_str = endpoint.rsplit(':', 1)
+            from . import lan_push as _lan_push
+            _lan_push.hello_to_peer(
+                host, int(port_str), fp, store.get_device_name())
+        except Exception as ex:
+            print(f'[server] hello to {peer_id[:8]!r} raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+    result = Result()
+    result.add(S.LAN_PAIRED, peer_id=peer_id, device_name=device_name)
+    return 200, {"ok": True, "result": result.to_dict(),
+                 "peer": entry}
+
+
+def _h_lan_share_project(body):
+    """Add a project to a paired peer's outbound share list. Phase 3
+    of the LAN sync transport.
+
+    Body: ``{langcode, peer_id}``. ``shared_projects`` in
+    ``peers.json`` becomes the set of langcodes this peer's listener
+    advertises to that paired phone (enforced in phase 4's listener
+    middleware). Bookkeeping-only at phase 3 — no listener exists
+    yet.
+
+    Response: ``{ok: True, peer: {...}}`` on success;
+    ``{ok: False, error: 'peer_unknown'}`` if the peer isn't paired."""
+    langcode = str((body or {}).get('langcode', '') or '')
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not langcode or not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "langcode + peer_id required"}
+    entry = _peers.add_shared_project(peer_id, langcode)
+    if entry is None:
+        return 200, {"ok": False, "error": "peer_unknown",
+                     "detail": f"peer_id {peer_id[:8]!r} not paired"}
+    return 200, {"ok": True, "peer": entry}
+
+
+def _h_lan_unshare_project(body):
+    """Remove a project from a paired peer's outbound share list.
+    Symmetric counterpart to ``_h_lan_share_project``. Body /
+    response shapes match."""
+    langcode = str((body or {}).get('langcode', '') or '')
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not langcode or not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "langcode + peer_id required"}
+    entry = _peers.remove_shared_project(peer_id, langcode)
+    if entry is None:
+        return 200, {"ok": False, "error": "peer_unknown",
+                     "detail": f"peer_id {peer_id[:8]!r} not paired"}
+    return 200, {"ok": True, "peer": entry}
+
+
+def _h_lan_get_toggle(_body):
+    """Return the daemon-wide LAN-sync toggle state and the listener's
+    bound endpoint if running. Response:
+    ``{ok: True, on: bool, endpoint: 'ip:port' or ''}``."""
+    on = _settings.lan_allow_sync()
+    bound = _lan_listener.bound_endpoint()
+    endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    return 200, {"ok": True, "on": on, "endpoint": endpoint}
+
+
+def _h_lan_set_toggle(body):
+    """Flip the daemon-wide LAN-sync toggle and reconcile the
+    listener lifecycle. Body: ``{on: bool}``. Hot-applied — listener
+    + (later) NsdManager + FGS promotion happen synchronously.
+
+    Response: ``{ok: True, on, endpoint}`` after reconciliation."""
+    desired = bool((body or {}).get('on', False))
+    _settings.set_lan_allow_sync(desired)
+    try:
+        _lan_listener.apply_toggle()
+    except Exception as ex:
+        print(f'[server] lan toggle apply failed: {ex!r}',
+              file=sys.stderr, flush=True)
+    on = _settings.lan_allow_sync()
+    bound = _lan_listener.bound_endpoint()
+    endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    return 200, {"ok": True, "on": on, "endpoint": endpoint}
+
+
+def _h_lan_set_static_endpoints(body):
+    """Replace a paired peer's static-endpoint fallback list. Phase
+    7 of the LAN sync transport — covers the "I know this paired
+    phone's current IP because I asked them" recovery path when
+    mDNS is blocked (AP isolation, hotspot, etc.).
+
+    Body: ``{peer_id, endpoints: ['ip:port', ...]}``. Empty list
+    clears.
+
+    Response: ``{ok: True, peer}`` on success;
+    ``{ok: False, error: 'peer_unknown'}`` if the peer isn't paired."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    raw = (body or {}).get('endpoints') or []
+    if not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id required"}
+    if not isinstance(raw, list):
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "endpoints must be a list"}
+    endpoints = [str(e) for e in raw if isinstance(e, str) and e]
+    entry = _peers.set_static_endpoints(peer_id, endpoints)
+    if entry is None:
+        return 200, {"ok": False, "error": "peer_unknown"}
+    return 200, {"ok": True, "peer": entry}
+
+
+def _h_lan_unpair(body):
+    """Remove a peer from ``peers.json``. Companion to
+    ``_h_lan_pair_accept``. Body: ``{peer_id}``. Response: typed
+    Result with ``LAN_UNPAIRED`` on success;
+    ``{ok: False, error: 'peer_unknown'}`` if the peer wasn't
+    paired."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id required"}
+    removed = _peers.remove_peer(peer_id)
+    if not removed:
+        return 200, {"ok": False, "error": "peer_unknown"}
+    result = Result()
+    result.add(S.LAN_UNPAIRED, peer_id=peer_id)
+    return 200, {"ok": True, "result": result.to_dict()}
 
 
 def _h_get_cawl_prefetch_all_variants(_body):
@@ -2151,6 +2385,12 @@ def dispatch(method, path, body):
             return _h_get_cawl_prefetch_all_variants(body)
         if path == '/v1/config/work_offline':
             return _h_get_work_offline(body)
+        if path == '/v1/lan/peer_id':
+            return _h_lan_peer_id(body)
+        if path == '/v1/lan/peers':
+            return _h_lan_list_peers(body)
+        if path == '/v1/lan/toggle':
+            return _h_lan_get_toggle(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -2182,6 +2422,20 @@ def dispatch(method, path, body):
             return _h_set_cawl_prefetch_all_variants(body)
         if path == '/v1/config/work_offline':
             return _h_set_work_offline(body)
+        if path == '/v1/lan/pair/qr':
+            return _h_lan_pair_qr(body)
+        if path == '/v1/lan/pair/accept':
+            return _h_lan_pair_accept(body)
+        if path == '/v1/lan/share_project':
+            return _h_lan_share_project(body)
+        if path == '/v1/lan/unshare_project':
+            return _h_lan_unshare_project(body)
+        if path == '/v1/lan/unpair':
+            return _h_lan_unpair(body)
+        if path == '/v1/lan/toggle':
+            return _h_lan_set_toggle(body)
+        if path == '/v1/lan/static_endpoints':
+            return _h_lan_set_static_endpoints(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':

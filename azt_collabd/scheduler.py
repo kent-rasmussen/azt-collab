@@ -709,3 +709,19 @@ def _drain_pending_push():
         if 'PUSHED' in codes:
             _set_pending_push(langcode, False)
             projects.set_last_sync(langcode)
+        # LAN fan-out (parked spec, phase 6): opportunistically push
+        # to every reachable paired peer that shares this project.
+        # Success here does NOT clear pending_push — LAN is
+        # sneakernet redundancy alongside the github-authoritative
+        # path, per the spec's "GitHub convergence" property.
+        # Silently skipped when the daemon-wide LAN toggle is off
+        # or LAN delivery isn't available.
+        try:
+            from . import settings as _settings
+            if _settings.lan_allow_sync():
+                from . import lan_push as _lan_push
+                _lan_push.fan_out(p)
+        except Exception as ex:
+            print(f'[scheduler] LAN fan-out raised for '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)

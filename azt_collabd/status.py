@@ -215,6 +215,34 @@ WORK_OFFLINE_ENABLED = 'WORK_OFFLINE_ENABLED'
 # ``set_contributor`` (typically through the daemon settings UI).
 CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 
+# ── LAN sync transport (parked spec, phases 1-8) ───────────────────────────
+# Status codes for the device-to-device LAN sync transport
+# (``docs/local_lan_sync_stub.md``). Each code is mirrored in
+# ``azt_collab_client/status.py``.
+#
+# LAN_PAIRED:           Peer entry written to peers.json on a successful
+#                       pair-accept (phase 2) or auto-reverse-record (phase 4).
+#                       Params: ``peer_id``, ``device_name``.
+# LAN_UNPAIRED:         Peer removed from peers.json. Params: ``peer_id``.
+# LAN_PEER_UNREACHABLE: Tried every known endpoint (mDNS-resolved + static +
+#                       QR-hint) for this peer and none responded. Params:
+#                       ``peer_id``. Surfaced from user-initiated LAN ops;
+#                       auto-sync silently no-ops per the standard
+#                       network-class contract.
+# LAN_FP_MISMATCH:      TLS cert fingerprint received from a paired peer's
+#                       endpoint differs from the value recorded in
+#                       peers.json. Params: ``peer_id``, ``expected_fp``,
+#                       ``got_fp``. Either a phone was wiped + re-paired
+#                       without telling us, or a MITM is on the LAN.
+# LAN_TOGGLE_OFF:       Caller invoked a LAN op while the daemon-wide
+#                       ``Allow LAN sync`` toggle is off. Surfaced from
+#                       user-initiated LAN ops; auto paths skip silently.
+LAN_PAIRED = 'LAN_PAIRED'
+LAN_UNPAIRED = 'LAN_UNPAIRED'
+LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
+LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
+LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
+
 # Transport-failure codes. Mirror of the client-side constants
 # (the daemon doesn't emit these — they're produced by the
 # client wrappers' transport-failure branches — but keeping the

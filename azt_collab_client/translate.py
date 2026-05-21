@@ -190,6 +190,18 @@ _HANDLERS = {
         'Please set your name in the sync settings before publishing or syncing.'),
     S.WORK_OFFLINE_ENABLED:   lambda p: _tr(
         'Work-offline mode is on. Turn it off in sync settings to push.'),
+    # LAN sync transport (parked spec, phases 1-8).
+    S.LAN_PAIRED:             lambda p: _fmt(
+        _tr('Paired with {device_name}.'), p),
+    S.LAN_UNPAIRED:           lambda p: _tr('Forgot paired device.'),
+    S.LAN_PEER_UNREACHABLE:   lambda p: _tr(
+        'Paired device is not reachable on this network.'),
+    S.LAN_FP_MISMATCH:        lambda p: _tr(
+        'A paired device presented an unexpected security '
+        'fingerprint. It may have been reinstalled; re-pair from '
+        'sync settings.'),
+    S.LAN_TOGGLE_OFF:         lambda p: _tr(
+        'Local-network sharing is off. Turn it on in sync settings.'),
     S.APP_NOT_INSTALLED:      lambda p: _fmt(_tr('App not installed. Visit {url} and select "All repositories".'), p),
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),
