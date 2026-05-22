@@ -331,12 +331,26 @@ def _h_lan_peer_id(_body):
     Response: ``{ok: True, peer_id, fp, device_name}``. Lazy-creates
     the ed25519 keypair + self-signed X.509 cert on first call. If
     ``cryptography`` is unavailable on this platform, returns
-    ``{ok: False, error: 'identity_unavailable'}``."""
+    ``{ok: False, error: 'identity_unavailable', detail: …}``.
+
+    Broad Exception catch on top of the RuntimeError catch: any
+    unexpected error during ``ensure()`` would otherwise propagate
+    to the HTTP handler as a 500 and the peer would see "request
+    failed" with no diagnostic. Wrapping here lets the peer-side
+    popup render the actual error text so the user (and us) can
+    diagnose without grovelling through logcat."""
     try:
         info = _peer_id.ensure()
     except RuntimeError as ex:
         return 200, {"ok": False, "error": "identity_unavailable",
                      "detail": str(ex)}
+    except Exception as ex:
+        import traceback
+        print(f'[server] lan/peer_id raised: {type(ex).__name__}: '
+              f'{ex}\n{traceback.format_exc()}',
+              file=sys.stderr, flush=True)
+        return 200, {"ok": False, "error": "identity_unavailable",
+                     "detail": f"{type(ex).__name__}: {ex}"}
     return 200, {
         "ok": True,
         "peer_id": info['peer_id'],
@@ -370,18 +384,48 @@ def _h_lan_pair_qr(body):
     except RuntimeError as ex:
         return 200, {"ok": False, "error": "identity_unavailable",
                      "detail": str(ex)}
-    endpoint = str((body or {}).get('endpoint', '') or '')
+    body = body or {}
+    endpoint = str(body.get('endpoint', '') or '')
     if not endpoint:
         # Auto-populate from the running listener when present.
         bound = _lan_listener.bound_endpoint()
         if bound:
             endpoint = f'{bound[0]}:{bound[1]}'
+    # Optional combined-pair-share-clone fields. When the user taps
+    # "Share {langcode} project" → "Show QR code", the daemon UI
+    # passes the active langcode here; we look up the registered
+    # remote_url + vernlang so the receiver gets the complete
+    # bundle in one scan per the parked-spec "Combined scan flow".
+    #
+    # ``vernlang`` is the linguistic code for LIFT entries being
+    # *analyzed* (the value LIFT writers stamp). Distinct from
+    # ``langcode`` (project key); we send both because a project
+    # named ``MyEnglishProject`` analyzes vernlang ``en`` —
+    # the receiver needs vernlang separately to write entries
+    # correctly. ``effective_vernlang()`` falls back to langcode
+    # for projects registered before the field existed.
+    langcode = str(body.get('langcode', '') or '')
+    repo_url = ''
+    vernlang = ''
+    if langcode:
+        try:
+            proj = projects.get(langcode)
+            if proj is not None:
+                repo_url = str(getattr(proj, 'remote_url', '') or '')
+                vernlang = proj.effective_vernlang()
+        except Exception as ex:
+            print(f'[server] pair_qr: project lookup failed for '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
     payload = {
         'v': 1,
         'peer_id': info['peer_id'],
         'fp': info['fp'],
         'endpoint': endpoint,
         'device_name': store.get_device_name(),
+        'langcode': langcode,
+        'repo_url': repo_url,
+        'vernlang': vernlang,
     }
     return 200, {"ok": True, "payload": payload}
 
@@ -432,8 +476,16 @@ def _h_lan_pair_accept(body):
         try:
             host, port_str = endpoint.rsplit(':', 1)
             from . import lan_push as _lan_push
+            # Pass the QR's ``langcode`` so the remote's hello
+            # handler can add it to their shared_projects allowlist
+            # for us in the same gesture — symmetric share without a
+            # second tap on the owner side. Empty payload langcode
+            # = pair-only QR (no auto-share).
+            qr_langcode = str(payload.get('langcode', '') or '')
             _lan_push.hello_to_peer(
-                host, int(port_str), fp, store.get_device_name())
+                host, int(port_str), fp,
+                store.get_device_name(),
+                langcode=qr_langcode)
         except Exception as ex:
             print(f'[server] hello to {peer_id[:8]!r} raised: '
                   f'{ex!r}', file=sys.stderr, flush=True)
@@ -510,6 +562,196 @@ def _h_lan_set_toggle(body):
     bound = _lan_listener.bound_endpoint()
     endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
     return 200, {"ok": True, "on": on, "endpoint": endpoint}
+
+
+def _h_lan_clone(body):
+    """LAN-clone a paired peer's project. Phase 4-6+ combined flow:
+    pair → clone-over-LAN → register (no auto-origin-adopt; adopt is
+    confirmed via a separate pending decision).
+
+    Body: ``{peer_id, langcode, remote_url?}``. Synchronous; LAN is
+    fast and the picker UX needs the result inline.
+
+    Response: ``{ok: True, result: <Result dict>}`` carrying one of
+    ``LAN_PROJECT_CLONED`` / ``LAN_PROJECT_REOPENED`` /
+    ``LAN_PROJECT_COLLISION_UNRELATED`` (+ optional
+    ``LAN_ADOPT_ORIGIN_NEEDED`` / ``LAN_REMOTE_CONFLICT`` overlay)."""
+    from . import lan_clone as _lan_clone_mod
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    langcode = str((body or {}).get('langcode', '') or '')
+    remote_url = str((body or {}).get('remote_url', '') or '')
+    vernlang = str((body or {}).get('vernlang', '') or '')
+    if not peer_id or not langcode:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id + langcode required"}
+    result = _lan_clone_mod.clone_from_peer(
+        peer_id, langcode, incoming_url=remote_url,
+        incoming_vernlang=vernlang)
+    # Set last_project on a successful clone / reopen so the picker
+    # exits straight into the project the user just acquired.
+    if result.has_any(S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED):
+        try:
+            store.set_last_langcode(langcode)
+        except Exception:
+            pass
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _h_lan_pending(_body):
+    """List pending UI decisions (share offers, adopt-origin
+    prompts, remote conflicts). Powers the "Decisions waiting (N)"
+    surface in settings and the "Receive a project from another
+    phone (N waiting)" picker badge."""
+    from . import pending_decisions as _pending
+    return 200, {"ok": True, "decisions": _pending.list_all()}
+
+
+def _h_lan_accept_offer(body):
+    """Accept a pending share-offer: triggers the LAN clone for the
+    referenced peer + langcode, then removes the pending decision.
+
+    Body: ``{decision_id}``."""
+    from . import pending_decisions as _pending
+    from . import lan_clone as _lan_clone_mod
+    decision_id = str((body or {}).get('decision_id', '') or '')
+    decision = _pending.get(decision_id) if decision_id else None
+    if (decision is None
+            or decision.get('kind') != _pending.KIND_SHARE_OFFER):
+        return 200, {"ok": False, "error": "not_found"}
+    params = decision.get('params') or {}
+    result = _lan_clone_mod.clone_from_peer(
+        str(params.get('peer_id', '') or ''),
+        str(params.get('langcode', '') or ''),
+        incoming_url=str(params.get('repo_url', '') or ''),
+        incoming_vernlang=str(params.get('vernlang', '') or ''))
+    _pending.remove(decision_id)
+    if result.has_any(S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED):
+        try:
+            store.set_last_langcode(
+                str(params.get('langcode', '') or ''))
+        except Exception:
+            pass
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _h_lan_decline_offer(body):
+    """Decline a pending share-offer. Best-effort nack to the
+    sender. Body: ``{decision_id}``."""
+    from . import pending_decisions as _pending
+    from . import lan_push as _lan_push
+    decision_id = str((body or {}).get('decision_id', '') or '')
+    decision = _pending.get(decision_id) if decision_id else None
+    if (decision is None
+            or decision.get('kind') != _pending.KIND_SHARE_OFFER):
+        return 200, {"ok": False, "error": "not_found"}
+    params = decision.get('params') or {}
+    _pending.remove(decision_id)
+    # Best-effort nack to the sender so their UI / log reflects it.
+    try:
+        _lan_push.share_declined(
+            str(params.get('peer_id', '') or ''),
+            str(params.get('langcode', '') or ''))
+    except Exception as ex:
+        print(f'[server] share_declined nack raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
+
+
+def _h_lan_adopt_origin(body):
+    """Resolve an adopt-origin pending decision. On accept, set
+    ``origin`` for the project; on decline, just remove the
+    decision. Body: ``{decision_id, accept: bool}``."""
+    from . import pending_decisions as _pending
+    decision_id = str((body or {}).get('decision_id', '') or '')
+    accept = bool((body or {}).get('accept', False))
+    decision = _pending.get(decision_id) if decision_id else None
+    if (decision is None
+            or decision.get('kind') != _pending.KIND_ADOPT_ORIGIN):
+        return 200, {"ok": False, "error": "not_found"}
+    params = decision.get('params') or {}
+    result = Result()
+    if accept:
+        langcode = str(params.get('langcode', '') or '')
+        url = str(params.get('url', '') or '')
+        try:
+            projects.set_remote_url(langcode, url)
+            result.add(S.LAN_PROJECT_ADOPTED_REMOTE,
+                       langcode=langcode, url=url)
+        except Exception as ex:
+            result.add(S.SERVER_ERROR,
+                       error=f'set_remote_url failed: {ex!r}')
+            return 200, {"ok": True, "result": result.to_dict()}
+    _pending.remove(decision_id)
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _h_lan_resolve_conflict(body):
+    """Resolve a remote_conflict pending decision. Body:
+    ``{decision_id, mode}`` where mode is one of:
+
+      - ``'use_theirs'`` — replace local ``remote_url`` with theirs.
+      - ``'keep_mine'`` — leave local ``remote_url`` unchanged.
+      - ``'dual_publish'`` — leave local unchanged; the dual-push
+        mechanism is a follow-up (no daemon-side action here, just
+        a tag on the decision so the user's choice is recorded)."""
+    from . import pending_decisions as _pending
+    decision_id = str((body or {}).get('decision_id', '') or '')
+    mode = str((body or {}).get('mode', '') or '')
+    decision = _pending.get(decision_id) if decision_id else None
+    if (decision is None
+            or decision.get('kind') != _pending.KIND_REMOTE_CONFLICT):
+        return 200, {"ok": False, "error": "not_found"}
+    params = decision.get('params') or {}
+    if mode == 'use_theirs':
+        langcode = str(params.get('langcode', '') or '')
+        incoming_url = str(params.get('incoming_url', '') or '')
+        try:
+            projects.set_remote_url(langcode, incoming_url)
+        except Exception as ex:
+            return 200, {"ok": False,
+                         "error": f'set_remote_url failed: {ex!r}'}
+    elif mode not in ('keep_mine', 'dual_publish'):
+        return 200, {"ok": False,
+                     "error": f'unknown mode: {mode!r}'}
+    _pending.remove(decision_id)
+    return 200, {"ok": True}
+
+
+def _h_lan_send_share_offer(body):
+    """Local-side helper called from the daemon settings UI when the
+    user taps "Share project with paired phone Y". Updates our
+    shared_projects allowlist AND fires the courtesy offer to Y's
+    listener so Y sees a pending decision on their side.
+
+    Body: ``{peer_id, langcode}``."""
+    from . import lan_push as _lan_push
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    langcode = str((body or {}).get('langcode', '') or '')
+    if not peer_id or not langcode:
+        return 200, {"ok": False, "error": "bad_request"}
+    entry = _peers.add_shared_project(peer_id, langcode)
+    if entry is None:
+        return 200, {"ok": False, "error": "peer_unknown"}
+    # Look up our own remote_url + vernlang for this project so the
+    # offer carries them. receiver uses repo_url for the always-
+    # confirm adopt-origin prompt and vernlang to tag the LIFT
+    # writes correctly post-clone.
+    repo_url = ''
+    vernlang = ''
+    try:
+        proj = projects.get(langcode)
+        if proj is not None:
+            repo_url = str(getattr(proj, 'remote_url', '') or '')
+            vernlang = proj.effective_vernlang()
+    except Exception:
+        pass
+    try:
+        _lan_push.send_share_offer(peer_id, langcode, repo_url,
+                                   vernlang=vernlang)
+    except Exception as ex:
+        print(f'[server] send_share_offer raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True, "peer": entry}
 
 
 def _h_lan_set_static_endpoints(body):
@@ -1375,7 +1617,8 @@ def _clone_error_looks_like_auth(result):
 
 def _clone_worker(job_id, remote_url, dest_dir, username, token,
                   retry_anonymous_on_auth_fail=True,
-                  override_langcode=''):
+                  override_langcode='',
+                  override_vernlang=''):
     from .repo import clone_repo as _clone_repo
 
     def _on_progress(line):
@@ -1429,6 +1672,21 @@ def _clone_worker(job_id, remote_url, dest_dir, username, token,
                 projects.register(job_langcode, dest_dir,
                                   lift_path=lift_path,
                                   remote_url=remote_url)
+                # Stamp vernlang separately if it differs from the
+                # project-key langcode. Pre-0.45.0 the two were
+                # conflated; new clones can carry the user's
+                # confirmed vernlang from the clone-url popup so
+                # LIFT writers tag entries correctly even when the
+                # project name doesn't match the linguistic code
+                # (``MyEnglishProject`` analyzing ``en``).
+                if (override_vernlang
+                        and override_vernlang != job_langcode):
+                    try:
+                        projects.set_vernlang(job_langcode,
+                                              override_vernlang)
+                    except Exception as ex:
+                        print(f'[server] set_vernlang failed: '
+                              f'{ex!r}', file=sys.stderr, flush=True)
                 _touch_project(job_langcode)
                 # Confirm the registry write hit disk (the user
                 # reported previously-cloned projects not showing
@@ -1498,6 +1756,7 @@ def _h_clone_project(body):
     remote_url = body.get('remote_url', '')
     dest_dir = body.get('dest_dir', '')
     override_langcode = (body.get('langcode') or '').strip()
+    override_vernlang = (body.get('vernlang') or '').strip()
     if not remote_url or not dest_dir:
         return 400, {"ok": False,
                      "error": "missing_remote_url_or_dest_dir"}
@@ -1514,7 +1773,8 @@ def _h_clone_project(body):
     t = threading.Thread(
         target=_clone_worker,
         args=(job_id, remote_url, dest_dir, git_user, token),
-        kwargs={'override_langcode': override_langcode},
+        kwargs={'override_langcode': override_langcode,
+                'override_vernlang': override_vernlang},
         daemon=True,
         name=f'clone-{job_id[:8]}',
     )
@@ -1721,7 +1981,73 @@ def _h_project_status(langcode, _body):
         # alongside the per-project commits_ahead count without a
         # second RPC. Pre-0.43 callers ignore the unknown key.
         "work_offline": _settings.work_offline(),
+        # LAN-sync toggle (since 0.45.0). Carried alongside
+        # work_offline so peers can render the joint state — the
+        # combination work_offline=on + lan_allow_sync=on is
+        # "LAN-only", which is delivery-active (paired phones get
+        # commits) and shouldn't be labeled as "offline" in the
+        # peer sync-indicator. Same daemon-wide-bool-on-per-
+        # project-response shape as work_offline.
+        "lan_allow_sync": _settings.lan_allow_sync(),
+        # Sharing-status accounting (since 0.45.0). Powers the
+        # peer-side ``+unshared/+ahead`` and ``LANOK`` sync
+        # indicator: a local commit is "shared somewhere" if it's
+        # an ancestor of either ``refs/remotes/origin/main`` (last
+        # known github state) or ``last_lan_pushed_sha`` (latest
+        # SHA we've successfully LAN-delivered to a peer).
+        # ``unshared_commits`` counts commits in local HEAD's
+        # ancestry that are on NEITHER. Zero means LANOK — every
+        # commit exists somewhere besides this phone, so the user
+        # can't be wiped out by a phone loss.
+        "unshared_commits": _unshared_commit_count(p),
+        "lan_pushed_sha": projects.get_last_lan_pushed_sha(langcode),
     }
+
+
+def _unshared_commit_count(project):
+    """Count commits reachable from local HEAD that are ancestors
+    of neither ``refs/remotes/origin/main`` (github's last-fetched
+    state) nor ``last_lan_pushed_sha`` (latest LAN-delivered SHA).
+    Zero = every local commit lives somewhere besides this phone.
+
+    Walks the commit graph via dulwich's ``get_walker`` with the
+    union of both remote heads as the exclude set, so the walk
+    terminates at the first ancestor that's already replicated.
+    Cheap for typical project sizes (a few hundred commits)."""
+    try:
+        from dulwich.repo import Repo
+        repo = Repo(project.working_dir)
+    except Exception:
+        return 0
+    try:
+        try:
+            local_head = repo.refs[b'HEAD']
+        except KeyError:
+            return 0
+        excludes = []
+        for ref in (b'refs/remotes/origin/main',
+                    b'refs/remotes/origin/master'):
+            try:
+                excludes.append(repo.refs[ref])
+            except KeyError:
+                continue
+        lan_sha_hex = projects.get_last_lan_pushed_sha(project.langcode)
+        if lan_sha_hex:
+            try:
+                excludes.append(lan_sha_hex.encode('ascii'))
+            except Exception:
+                pass
+        try:
+            walker = repo.get_walker(
+                include=[local_head], exclude=excludes)
+            return sum(1 for _ in walker)
+        except Exception:
+            return 0
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
 
 
 def _h_set_project_last_sync(langcode, body):
@@ -2391,6 +2717,8 @@ def dispatch(method, path, body):
             return _h_lan_list_peers(body)
         if path == '/v1/lan/toggle':
             return _h_lan_get_toggle(body)
+        if path == '/v1/lan/pending':
+            return _h_lan_pending(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -2436,6 +2764,18 @@ def dispatch(method, path, body):
             return _h_lan_set_toggle(body)
         if path == '/v1/lan/static_endpoints':
             return _h_lan_set_static_endpoints(body)
+        if path == '/v1/lan/clone':
+            return _h_lan_clone(body)
+        if path == '/v1/lan/accept_offer':
+            return _h_lan_accept_offer(body)
+        if path == '/v1/lan/decline_offer':
+            return _h_lan_decline_offer(body)
+        if path == '/v1/lan/adopt_origin':
+            return _h_lan_adopt_origin(body)
+        if path == '/v1/lan/resolve_conflict':
+            return _h_lan_resolve_conflict(body)
+        if path == '/v1/lan/send_share_offer':
+            return _h_lan_send_share_offer(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':
@@ -2921,6 +3261,20 @@ def run(host='127.0.0.1', port=0):
     # Start the connectivity watcher so projects with pending_push get
     # drained on offline→online transitions.
     scheduler.start_watcher()
+
+    # Auto-start the LAN listener if the persisted toggle is on.
+    # ``lan.allow_sync`` survives a daemon restart in config.json
+    # but the listener thread / WifiLock / FGS state don't, so
+    # without this reconciliation a daemon respawn would leave us
+    # in the "toggle says yes, listener says no" split-brain state
+    # — paired peers' fan-out would silently fail with no endpoint
+    # to bind to. Idempotent: ``apply_toggle`` is a no-op when the
+    # listener's already running.
+    try:
+        _lan_listener.apply_toggle()
+    except Exception as ex:
+        print(f'[azt_collabd] lan_listener startup apply failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
 
     def _graceful(signum, frame):
         print(f'[azt_collabd] signal {signum}, shutting down', flush=True)

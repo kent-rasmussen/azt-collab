@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.45.1"
+__version__ = "0.45.22"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -872,25 +872,37 @@ def set_device_name(name):
 # equivalent so a peer offline can still render its settings UI.
 
 def lan_peer_id():
-    """Return ``{'peer_id': hex, 'fp': hex, 'device_name': str}`` for
-    this daemon's LAN identity. Empty dict on transport failure or
-    if the daemon can't create the identity (e.g. ``cryptography``
-    unavailable on this platform).
+    """Return ``{'peer_id', 'fp', 'device_name', 'error', 'detail'}``
+    for this daemon's LAN identity. On success ``peer_id`` is the
+    lowercase hex ed25519 pubkey (64 chars) and ``error`` /
+    ``detail`` are empty. On any failure ``peer_id`` is empty and
+    ``error`` + ``detail`` carry the daemon's diagnostic (e.g.
+    ``error='identity_unavailable'`` /
+    ``detail='cryptography unavailable: …'`` when the build didn't
+    include ``cryptography``).
 
-    The ``peer_id`` is the lowercase hex ed25519 pubkey (64 chars);
-    the ``fp`` is the lowercase hex SHA-256 of the X.509 cert in
+    The ``fp`` is the lowercase hex SHA-256 of the X.509 cert in
     DER form (64 chars), matching ``openssl x509 -fingerprint
-    -sha256`` minus the colons."""
+    -sha256`` minus the colons.
+
+    Callers branch on ``info.get('peer_id')``; the diagnostic
+    fields are for UI consumption only when the identity path
+    fails."""
     try:
         resp = call('GET', '/v1/lan/peer_id')
-    except ServerUnavailable:
-        return {}
+    except ServerUnavailable as ex:
+        return {'peer_id': '', 'fp': '', 'device_name': '',
+                'error': 'server_unavailable', 'detail': str(ex)}
     if not resp.get('ok'):
-        return {}
+        return {'peer_id': '', 'fp': '', 'device_name': '',
+                'error': str(resp.get('error', 'unknown') or 'unknown'),
+                'detail': str(resp.get('detail', '') or '')}
     return {
         'peer_id': str(resp.get('peer_id', '') or ''),
         'fp': str(resp.get('fp', '') or ''),
         'device_name': str(resp.get('device_name', '') or ''),
+        'error': '',
+        'detail': '',
     }
 
 
@@ -912,16 +924,23 @@ def lan_list_peers():
     return out
 
 
-def lan_pair_qr(endpoint=''):
+def lan_pair_qr(endpoint='', langcode=''):
     """Return the JSON payload to render as a pairing QR. Empty
     dict on transport failure or if the daemon can't create the
     identity. ``endpoint`` is the daemon's current LAN endpoint
-    (``ip:port``) to embed in the QR — phase 4 will populate this
-    from the listener; for the phase-2 desktop smoke the caller
-    passes it directly. The returned dict has the shape
-    ``{v: 1, peer_id, fp, endpoint, device_name}``."""
+    (``ip:port``) — auto-populated from the running listener when
+    not passed. ``langcode`` is the optional project the owner is
+    sharing; when set, the daemon looks up its ``remote_url`` and
+    includes both in the payload so a single scan does pair +
+    share + clone (and proposes the origin URL for adopt-after-
+    confirm).
+
+    The returned dict has the shape ``{v, peer_id, fp, endpoint,
+    device_name, langcode, repo_url}`` — empty ``langcode`` /
+    ``repo_url`` mean "pair only, no project in this QR."""
     try:
-        resp = call('POST', '/v1/lan/pair/qr', {'endpoint': endpoint})
+        resp = call('POST', '/v1/lan/pair/qr',
+                    {'endpoint': endpoint, 'langcode': langcode})
     except ServerUnavailable:
         return {}
     if not resp.get('ok'):
@@ -984,17 +1003,126 @@ def lan_set_static_endpoints(peer_id, endpoints):
 
 
 def lan_share_project(langcode, peer_id):
-    """Add ``langcode`` to ``peer_id``'s outbound share list. Returns
-    the updated peer entry (canonical shape) on success, or empty
-    dict on transport failure / unknown peer."""
+    """Share *langcode* with a paired peer: updates the
+    ``shared_projects`` allowlist AND fires a best-effort courtesy
+    offer to the peer's listener so they see a pending decision
+    on their side. Returns the updated peer entry on success;
+    empty dict on transport failure or unknown peer.
+
+    Since 0.45.0 the call is "share with notification" — the
+    bookkeeping-only flavour is gone. Receiver's UI surfaces the
+    offer; they can accept (LAN clone) or decline (rolls our
+    allowlist back)."""
     try:
-        resp = call('POST', '/v1/lan/share_project',
+        resp = call('POST', '/v1/lan/send_share_offer',
                     {'langcode': langcode, 'peer_id': peer_id})
     except ServerUnavailable:
         return {}
     if not resp.get('ok'):
         return {}
     return resp.get('peer') or {}
+
+
+def lan_clone(peer_id, langcode, remote_url='', vernlang=''):
+    """LAN-clone *langcode* from *peer_id* (combined pair-share-
+    clone flow). Synchronous. ``vernlang`` is the project's
+    linguistic code (LIFT ``<form lang="…">`` value for new
+    entries); separate from ``langcode`` (project key) — pass the
+    value the owner sent in the QR / share-offer payload so the
+    recipient registers it correctly even when the project name
+    isn't a real BCP-47 code (``MyEnglishProject``). Returns a
+    ``Result`` carrying one of ``LAN_PROJECT_CLONED`` /
+    ``LAN_PROJECT_REOPENED`` / ``LAN_PROJECT_COLLISION_UNRELATED``
+    / ``LAN_PEER_UNREACHABLE``, optionally overlaid with
+    ``LAN_ADOPT_ORIGIN_NEEDED`` or ``LAN_REMOTE_CONFLICT``."""
+    try:
+        resp = call('POST', '/v1/lan/clone',
+                    {'peer_id': peer_id, 'langcode': langcode,
+                     'remote_url': remote_url,
+                     'vernlang': vernlang})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_pending():
+    """Return the daemon's pending UI decisions (share offers +
+    adopt-origin prompts + remote conflicts) as a list of dicts.
+    Empty list on transport failure."""
+    try:
+        resp = call('GET', '/v1/lan/pending')
+    except ServerUnavailable:
+        return []
+    if not resp.get('ok'):
+        return []
+    out = resp.get('decisions') or []
+    if not isinstance(out, list):
+        return []
+    return out
+
+
+def lan_accept_offer(decision_id):
+    """Accept a pending share offer. Triggers the LAN clone for the
+    referenced peer + langcode and removes the decision. Returns
+    the clone ``Result``."""
+    try:
+        resp = call('POST', '/v1/lan/accept_offer',
+                    {'decision_id': decision_id})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_decline_offer(decision_id):
+    """Decline a pending share offer. Best-effort nack to the
+    sender. Returns True on success."""
+    try:
+        resp = call('POST', '/v1/lan/decline_offer',
+                    {'decision_id': decision_id})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
+
+
+def lan_adopt_origin(decision_id, accept):
+    """Resolve an adopt-origin pending decision. ``accept=True``
+    sets the project's ``origin`` to the proposed URL;
+    ``accept=False`` just clears the decision. Returns a Result
+    that may carry ``LAN_PROJECT_ADOPTED_REMOTE`` on accept."""
+    try:
+        resp = call('POST', '/v1/lan/adopt_origin',
+                    {'decision_id': decision_id,
+                     'accept': bool(accept)})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_resolve_conflict(decision_id, mode):
+    """Resolve a remote_conflict pending decision. ``mode`` is one
+    of ``'use_theirs'`` / ``'keep_mine'`` / ``'dual_publish'``.
+    Returns True on success."""
+    try:
+        resp = call('POST', '/v1/lan/resolve_conflict',
+                    {'decision_id': decision_id, 'mode': mode})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
 
 
 def lan_unshare_project(langcode, peer_id):
@@ -1380,7 +1508,7 @@ def create_project_from_template(vernlang, dest_dir, template_url=''):
 
 
 def clone_project(remote_url, dest_dir, on_progress=None,
-                  poll_interval=0.5, langcode=''):
+                  poll_interval=0.5, langcode='', vernlang=''):
     """Drive a server-side clone job to completion. Synchronous: blocks
     until the clone finishes (or fails). Returns
     ``{'ok': True, 'lift_path': str, 'result': Result}`` on success or
@@ -1391,7 +1519,9 @@ def clone_project(remote_url, dest_dir, on_progress=None,
     Clock-driven progress loop), call ``clone_project_start`` +
     ``clone_project_status`` directly."""
     import time as _time
-    kicked = clone_project_start(remote_url, dest_dir, langcode=langcode)
+    kicked = clone_project_start(remote_url, dest_dir,
+                                 langcode=langcode,
+                                 vernlang=vernlang)
     if not kicked.get('ok'):
         return {'ok': False,
                 'error': kicked.get('error', 'unknown'),
@@ -1430,21 +1560,29 @@ def clone_project(remote_url, dest_dir, on_progress=None,
                     'result': resp.get('result')}
 
 
-def clone_project_start(remote_url, dest_dir, langcode=''):
-    """Kick off a server-side clone job. Returns ``{ok, job_id}`` on
-    success or ``{ok: False, error}`` on failure. Poll progress with
-    ``clone_project_status``.
+def clone_project_start(remote_url, dest_dir, langcode='',
+                        vernlang=''):
+    """Kick off a server-side clone job. Returns ``{ok, job_id}``
+    on success or ``{ok: False, error}`` on failure. Poll progress
+    with ``clone_project_status``.
 
-    ``langcode`` is the user-confirmed key the daemon will register
-    the project under (collected by the picker's confirm-langcode
-    popup before this call). Empty string falls back to the daemon's
-    auto-derivation from the LIFT filename / repo URL — matches the
-    legacy desktop / scripted-call shape."""
+    ``langcode`` is the project name / key the daemon will
+    register the project under (derived from the URL slug by the
+    clone-url popup; not user-editable). Empty string falls back
+    to the daemon's auto-derivation from the LIFT filename / URL.
+
+    ``vernlang`` is the linguistic language code (LIFT
+    ``<form lang="…">`` value for new entries). Separate from
+    ``langcode`` since 0.45.0 — a project named ``MyEnglishProject``
+    analyzes ``vernlang='en'``. Empty string falls back to
+    ``langcode`` for back-compat with the pre-0.45.0 conflated
+    behavior."""
     try:
         resp = call('POST', '/v1/projects/clone', {
             'remote_url': remote_url,
             'dest_dir': dest_dir,
             'langcode': langcode,
+            'vernlang': vernlang,
         })
     except ServerUnavailable as ex:
         return {'ok': False, 'error': f'server_unavailable: {ex}'}
@@ -2057,6 +2195,8 @@ __all__ = [
     'lan_peer_id', 'lan_list_peers', 'lan_pair_qr', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
+    'lan_clone', 'lan_pending', 'lan_accept_offer',
+    'lan_decline_offer', 'lan_adopt_origin', 'lan_resolve_conflict',
     'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',

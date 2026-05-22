@@ -111,6 +111,21 @@ _KV_TEMPLATE = '''
                     height: self.minimum_height
                     spacing: dp(20)
                     RecBtn:
+                        # Hidden in 0.45.0 — the open-file pathway is
+                        # currently rough on Android (SAF picker
+                        # returns a content:// URI the daemon can't
+                        # walk back to a directory). Kept in the KV
+                        # tree so the wiring is one prop flip away
+                        # when we decide to re-enable it. Per the
+                        # Kivy hide/show pattern in
+                        # `~/.claude-sil/CLAUDE.md`: explicit
+                        # ``height: 0`` + ``opacity: 0`` + disabled
+                        # so the button has no hit area and can't
+                        # steal focus.
+                        size_hint_y: None
+                        height: 0
+                        opacity: 0
+                        disabled: True
                         text: _('I have one on my phone')
                         normal_color: T.ACCENT
                         on_release: app.open_file()
@@ -119,17 +134,17 @@ _KV_TEMPLATE = '''
                         normal_color: T.BTN_INACTIVE
                         on_release: app.clone_dialog()
                     RecBtn:
-                        text: _('Pair with another phone')
+                        text: _('Receive a project from another phone')
                         normal_color: T.BTN_INACTIVE
+                        # Opens the pending-offers chooser: shows
+                        # share offers waiting from already-paired
+                        # phones AND a "Scan QR code" fallthrough
+                        # for first-time pair-with-a-new-phone.
                         # Calls the free function directly so every
                         # picker host (recorder, viewer, server APK)
-                        # gets the affordance without needing a
-                        # ``scan_to_pair_dialog`` method on its
-                        # ``App`` class. On platforms where QR
-                        # scanning isn't available the scanner
-                        # short-circuits with a translated status
-                        # message.
-                        on_release: LAN_POPUPS.scan_to_pair()
+                        # gets the affordance without needing an
+                        # App-method contract.
+                        on_release: LAN_POPUPS.pending_offers_popup()
                     RecBtn:
                         text: _('Start New')
                         normal_color: T.BTN_INACTIVE

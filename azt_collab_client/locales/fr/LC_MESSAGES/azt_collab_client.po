@@ -38,6 +38,18 @@ msgstr ""
 msgid "e.g. en-x-pilot"
 msgstr "par ex. en-x-pilot"
 
+msgid "e.g. en, fra, sw-x-pilot"
+msgstr "par ex. en, fra, sw-x-pilot"
+
+msgid "project: "
+msgstr "projet : "
+
+msgid "language: "
+msgstr "langue : "
+
+msgid "change"
+msgstr "changer"
+
 msgid "Confirm"
 msgstr "Confirmer"
 
@@ -1060,6 +1072,223 @@ msgstr "Un appareil appairé a présenté une empreinte de sécurité inattendue
 
 msgid "Local-network sharing is off. Turn it on in sync settings."
 msgstr "Le partage sur le réseau local est désactivé. Activez-le dans les paramètres de synchronisation."
+
+msgid "LAN-only mode. GitHub push is suppressed, but paired phones still receive commits over the local network."
+msgstr "Mode LAN seulement. L'envoi vers GitHub est suspendu, mais les téléphones appairés reçoivent toujours les modifications sur le réseau local."
+
+# LAN sync — settings strings.
+msgid "Local-network sync:"
+msgstr "Synchronisation sur le réseau local :"
+
+msgid "Pair a phone"
+msgstr "Appairer un téléphone"
+
+msgid "Paired devices"
+msgstr "Appareils appairés"
+
+msgid "Pair with another phone"
+msgstr "Appairer avec un autre téléphone"
+
+msgid "Failed to update local-network setting: {error}"
+msgstr "Impossible de mettre à jour le paramètre réseau local : {error}"
+
+msgid "Listening on {endpoint}"
+msgstr "À l'écoute sur {endpoint}"
+
+msgid "Local-network sharing is on (listener not yet bound)."
+msgstr "Partage sur le réseau local activé (en attente d'attachement)."
+
+msgid "Could not open pairing QR: {error}"
+msgstr "Impossible d'ouvrir le QR d'appairage : {error}"
+
+msgid "Could not open paired-devices list: {error}"
+msgstr "Impossible d'ouvrir la liste des appareils appairés : {error}"
+
+# LAN sync — pair-QR popup.
+msgid "QR generator not available: "
+msgstr "Générateur de QR indisponible : "
+
+msgid "Could not render QR."
+msgstr "Impossible de générer le QR."
+
+msgid "LAN identity is not available on this device."
+msgstr "L'identité réseau local n'est pas disponible sur cet appareil."
+
+msgid "this device"
+msgstr "cet appareil"
+
+msgid "Peer ID: "
+msgstr "Identifiant : "
+
+msgid "Turn on local-network sharing in sync settings so the other phone can connect after scanning."
+msgstr "Activez le partage sur le réseau local dans les paramètres pour que l'autre téléphone puisse se connecter après avoir scanné."
+
+msgid "Endpoint: "
+msgstr "Adresse : "
+
+msgid "Could not generate pairing QR."
+msgstr "Impossible de générer le QR d'appairage."
+
+msgid "Close"
+msgstr "Fermer"
+
+# LAN sync — scan-to-pair flow.
+msgid "QR scanning is not available on this device."
+msgstr "La lecture de QR n'est pas disponible sur cet appareil."
+
+msgid "Scanned data is not valid pairing JSON."
+msgstr "Les données scannées ne sont pas un JSON d'appairage valide."
+
+msgid "Pairing cancelled."
+msgstr "Appairage annulé."
+
+msgid "Scan the pairing QR shown on the other phone."
+msgstr "Scannez le QR d'appairage affiché sur l'autre téléphone."
+
+# LAN sync — paired-devices list + per-peer manage popup.
+msgid "Unnamed device"
+msgstr "Appareil sans nom"
+
+msgid "(no projects shared)"
+msgstr "(aucun projet partagé)"
+
+msgid "Manage"
+msgstr "Gérer"
+
+msgid "Shared projects"
+msgstr "Projets partagés"
+
+msgid "Shared"
+msgstr "Partagé"
+
+msgid "Share"
+msgstr "Partager"
+
+msgid "Manual IP / port (comma-separated)"
+msgstr "Adresse IP / port manuels (séparés par des virgules)"
+
+msgid "Save manual IPs"
+msgstr "Enregistrer les adresses manuelles"
+
+msgid "Forget this device"
+msgstr "Oublier cet appareil"
+
+msgid "Manage paired device"
+msgstr "Gérer l'appareil appairé"
+
+msgid "No paired devices. Use \"Pair a phone\" to scan another phone's QR."
+msgstr "Aucun appareil appairé. Utilisez « Appairer un téléphone » pour scanner le QR d'un autre téléphone."
+
+# Settings labels — 0.45.0 wording polish.
+msgid "Servers (set up at least one)"
+msgstr "Serveurs (en configurer au moins un)"
+
+msgid "Invite collaborator to project"
+msgstr "Inviter un collaborateur au projet"
+
+msgid "Share this project (QR)"
+msgstr "Partager ce projet (QR)"
+
+# Combined pair-share-clone flow (0.45.0).
+
+msgid "Share [{langcode}] project"
+msgstr "Partager le projet [{langcode}]"
+
+msgid "Share project"
+msgstr "Partager le projet"
+
+msgid "Share with a paired phone:"
+msgstr "Partager avec un téléphone appairé :"
+
+msgid "No paired phones yet. Use \"Show QR code\" below to pair one."
+msgstr "Aucun téléphone appairé. Utilisez « Afficher le code QR » ci-dessous pour en appairer un."
+
+msgid "— or someone not yet paired —"
+msgstr "— ou quelqu'un pas encore appairé —"
+
+msgid "Show QR code"
+msgstr "Afficher le code QR"
+
+msgid "— Add permission by github username —"
+msgstr "— Ajouter une permission par nom d'utilisateur GitHub —"
+
+msgid "Invite someone who isn't here"
+msgstr "Inviter quelqu'un qui n'est pas ici"
+
+msgid "Push project {langcode} to {url} too?"
+msgstr "Envoyer aussi le projet {langcode} vers {url} ?"
+
+msgid "{device_name} uses this URL for the same project. Adopting it means future commits will go to GitHub too, not just over the local network."
+msgstr "{device_name} utilise cette URL pour le même projet. L'adopter signifie que les futurs commits iront aussi sur GitHub, pas seulement sur le réseau local."
+
+msgid "No, just local"
+msgstr "Non, local seulement"
+
+msgid "Yes, use it"
+msgstr "Oui, utiliser"
+
+msgid "Use the same GitHub URL?"
+msgstr "Utiliser la même URL GitHub ?"
+
+msgid "Receive a project from another phone"
+msgstr "Recevoir un projet d'un autre téléphone"
+
+msgid "No paired phones are offering a project right now."
+msgstr "Aucun téléphone appairé ne propose un projet pour l'instant."
+
+msgid "{device_name} offers project {langcode}"
+msgstr "{device_name} propose le projet {langcode}"
+
+msgid "Decline"
+msgstr "Refuser"
+
+msgid "Accept"
+msgstr "Accepter"
+
+msgid "— or pair with a new phone —"
+msgstr "— ou appairer avec un nouveau téléphone —"
+
+msgid "Scan QR code"
+msgstr "Scanner le code QR"
+
+msgid "Could not open share popup: {error}"
+msgstr "Impossible d'ouvrir le panneau de partage : {error}"
+
+msgid "a paired phone"
+msgstr "un téléphone appairé"
+
+# Status-code translations for the combined flow.
+
+msgid "Got project {langcode} from {device_name}."
+msgstr "Projet {langcode} reçu de {device_name}."
+
+msgid "Project {langcode} already here; paired phone added."
+msgstr "Le projet {langcode} est déjà ici ; téléphone appairé ajouté."
+
+msgid "Now also pushing project {langcode} to {url}."
+msgstr "Le projet {langcode} est aussi envoyé vers {url}."
+
+msgid "A different project named {langcode} already exists. Rename or remove it first."
+msgstr "Un projet différent nommé {langcode} existe déjà. Renommez ou supprimez-le d'abord."
+
+msgid "Confirm: push project {langcode} to {url} also?"
+msgstr "Confirmer : envoyer aussi le projet {langcode} vers {url} ?"
+
+msgid "Project {langcode}: {device_name} uses {incoming_url}, you use {existing_url}."
+msgstr "Projet {langcode} : {device_name} utilise {incoming_url}, vous utilisez {existing_url}."
+
+msgid "{device_name} wants to share project {langcode}."
+msgstr "{device_name} veut partager le projet {langcode}."
+
+msgid "Share for {langcode} was declined."
+msgstr "Le partage du projet {langcode} a été refusé."
+
+msgid "Accepted share offer for {langcode}."
+msgstr "Offre de partage pour {langcode} acceptée."
+
+# Fallback when the daemon's identity-error code is missing.
+msgid "unknown"
+msgstr "inconnu"
 
 msgid "Work offline"
 msgstr "Travailler hors-ligne"

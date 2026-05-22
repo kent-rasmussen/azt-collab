@@ -531,18 +531,25 @@ def _watcher_loop():
             except Exception as ex:
                 print(f'[cawl] on_online_edge dispatch failed: {ex}',
                       file=sys.stderr, flush=True)
-        # Push drain: every tick, gated by online + post-online
-        # grace + work_offline. The grace gate avoids burning the
-        # user's MB if they enabled a brief tether for some other
-        # reason.
-        if online and not _settings.work_offline():
-            grace = _settings.post_online_grace_s()
-            if _online_since is not None and (now - _online_since) >= grace:
-                try:
-                    _drain_pending_push()
-                except Exception as ex:
-                    print(f'[scheduler] _drain_pending_push failed: {ex}',
-                          file=sys.stderr, flush=True)
+        # Drain tick: github push is gated by online + post-online
+        # grace + work_offline; LAN fan-out is gated separately on
+        # ``lan.allow_sync`` (LAN works offline by definition, so
+        # work_offline=on + LAN=on means "LAN-only sync"). Run the
+        # drain whenever *either* channel might fire so a
+        # work-offline user with LAN paired phones still gets their
+        # commits sneakernet'd across. Inside ``_drain_pending_push``
+        # each channel re-checks its own gate.
+        grace = _settings.post_online_grace_s()
+        github_eligible = (online and not _settings.work_offline()
+                           and _online_since is not None
+                           and (now - _online_since) >= grace)
+        lan_eligible = _settings.lan_allow_sync()
+        if github_eligible or lan_eligible:
+            try:
+                _drain_pending_push()
+            except Exception as ex:
+                print(f'[scheduler] _drain_pending_push failed: {ex}',
+                      file=sys.stderr, flush=True)
         # Every tick (not just on edges): retry stuck commits with
         # exponential backoff so an idle device discovers a
         # persistent failure without needing the user to gesture
@@ -673,11 +680,13 @@ def _drain_stuck_commits():
 
 def _drain_pending_push():
     """Push any project flagged ``pending_push`` (or with local
-    commits ahead of remote). Called every watcher tick from
-    ``_watcher_loop`` once the post-online grace has elapsed and
-    ``sync.work_offline`` is off. Skips projects with no
-    contributor / no credentials / no remote — they'll get
-    surfaced through a future user gesture instead."""
+    commits ahead of remote). Called every watcher tick when at
+    least one channel might fire — github (gated on online +
+    post-online grace + ``!work_offline``) or LAN (gated on
+    ``lan.allow_sync``). Each channel re-checks its own gate
+    inside the loop so a work-offline user with LAN paired phones
+    still gets their commits sneakernet'd across, and a no-LAN
+    user with normal connectivity gets just the github push."""
     try:
         data = projects._load_raw()
     except Exception:
@@ -688,40 +697,54 @@ def _drain_pending_push():
         return
     print(f'[scheduler] drain pushes: {candidates!r}',
           file=sys.stderr, flush=True)
+    from . import settings as _settings
+    github_enabled = not _settings.work_offline()
+    lan_enabled = _settings.lan_allow_sync()
     for langcode in candidates:
         p = projects.get(langcode)
         if p is None:
             continue
-        git_user, token = get_sync_credentials(p.remote_url)
-        if not token:
-            # No credentials — leave pending_push set; next user
-            # gesture will route the AUTH_REQUIRED prompt.
-            continue
-        try:
-            res = _push_repo(p.working_dir, git_user, token)
-        except Exception as ex:
-            print(f'[scheduler] drain push {langcode!r} raised: {ex!r}',
+        # ── GitHub push (gated by !work_offline) ───────────────
+        if github_enabled:
+            git_user, token = get_sync_credentials(p.remote_url)
+            if not token:
+                # No credentials — leave pending_push set; next
+                # user gesture will route the AUTH_REQUIRED prompt.
+                pass
+            else:
+                try:
+                    res = _push_repo(p.working_dir, git_user, token)
+                except Exception as ex:
+                    print(f'[scheduler] drain push {langcode!r} '
+                          f'raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+                    res = None
+                if res is not None:
+                    codes = res.codes()
+                    print(f'[scheduler] drain push {langcode!r} '
+                          f'codes={codes!r}',
+                          file=sys.stderr, flush=True)
+                    if 'PUSHED' in codes:
+                        _set_pending_push(langcode, False)
+                        projects.set_last_sync(langcode)
+        else:
+            print(f'[scheduler] drain push {langcode!r} skipped '
+                  f'(work_offline=on)',
                   file=sys.stderr, flush=True)
-            continue
-        codes = res.codes()
-        print(f'[scheduler] drain push {langcode!r} codes={codes!r}',
-              file=sys.stderr, flush=True)
-        if 'PUSHED' in codes:
-            _set_pending_push(langcode, False)
-            projects.set_last_sync(langcode)
-        # LAN fan-out (parked spec, phase 6): opportunistically push
-        # to every reachable paired peer that shares this project.
-        # Success here does NOT clear pending_push — LAN is
-        # sneakernet redundancy alongside the github-authoritative
-        # path, per the spec's "GitHub convergence" property.
-        # Silently skipped when the daemon-wide LAN toggle is off
-        # or LAN delivery isn't available.
-        try:
-            from . import settings as _settings
-            if _settings.lan_allow_sync():
+        # ── LAN fan-out (gated by lan.allow_sync) ──────────────
+        # Independent of github — fires even when work_offline is
+        # on (that's the entire point of LAN sync). Success here
+        # does NOT clear pending_push: github stays authoritative,
+        # LAN is opportunistic redundancy / offline-mode sneakernet.
+        if lan_enabled:
+            try:
                 from . import lan_push as _lan_push
                 _lan_push.fan_out(p)
-        except Exception as ex:
-            print(f'[scheduler] LAN fan-out raised for '
-                  f'{langcode!r}: {ex!r}',
+            except Exception as ex:
+                print(f'[scheduler] LAN fan-out raised for '
+                      f'{langcode!r}: {ex!r}',
+                      file=sys.stderr, flush=True)
+        else:
+            print(f'[lan-fanout] {langcode!r}: skipped '
+                  f'(lan.allow_sync=off)',
                   file=sys.stderr, flush=True)

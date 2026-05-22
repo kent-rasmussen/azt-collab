@@ -113,6 +113,36 @@ class ProjectStatus:
     # though it's daemon-wide (not per-project) so peers can
     # render the badge without a second RPC.
     work_offline: bool = False
+    # Daemon-wide LAN-sync toggle (since daemon 0.45.0). Carried
+    # alongside ``work_offline`` so peers can render the joint
+    # state — github push and LAN fan-out are independent gates,
+    # so the four-cell matrix (work_offline × lan_allow_sync) maps
+    # to four user-visible sync states:
+    #
+    #   work_offline=off, lan=off → "github only"            (no suffix)
+    #   work_offline=off, lan=on  → "github + LAN"           (no suffix today)
+    #   work_offline=on,  lan=off → "offline"                (suffix == "offline")
+    #   work_offline=on,  lan=on  → "LAN-only"               (suffix == "LAN-only")
+    #
+    # The peer-side sync-indicator should swap "offline" for
+    # "LAN-only" when both bits are set — paired phones still
+    # receive commits, github push is the only thing suspended.
+    lan_allow_sync: bool = False
+    # Count of local commits reachable from HEAD that are NOT yet on
+    # any remote (neither github's last-fetched ``main`` nor any LAN
+    # peer's last-known ``main``). Zero = "shared somewhere":
+    # every local commit exists on at least one other device, so
+    # this phone could be wiped without losing data. Peer-side
+    # sync indicator uses this together with ``commits_ahead`` to
+    # render ``LANOK +5`` (5 ahead of github, all shared) vs
+    # ``+1/5`` (5 ahead, 1 not shared with anyone). Since 0.45.0.
+    unshared_commits: int = 0
+    # SHA hex of the most recent commit successfully LAN-delivered
+    # to at least one paired peer. Empty when nothing has been
+    # LAN-delivered yet. The daemon uses this as part of the
+    # "shared somewhere" computation above; peers can read it for
+    # diagnostic display. Since 0.45.0.
+    lan_pushed_sha: str = ''
 
     @classmethod
     def from_dict(cls, d):
@@ -137,4 +167,7 @@ class ProjectStatus:
             n_recovered_today=int(
                 d.get('n_recovered_today', 0) or 0),
             work_offline=bool(d.get('work_offline', False)),
+            lan_allow_sync=bool(d.get('lan_allow_sync', False)),
+            unshared_commits=int(d.get('unshared_commits', 0) or 0),
+            lan_pushed_sha=str(d.get('lan_pushed_sha', '') or ''),
         )

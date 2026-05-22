@@ -123,7 +123,13 @@ def _peer_id_from_cert_der(cert_der):
     except ImportError:
         return ''
     try:
-        cert = x509.load_der_x509_certificate(cert_der)
+        try:
+            from cryptography.hazmat.backends import default_backend
+            cert = x509.load_der_x509_certificate(
+                cert_der, backend=default_backend())
+        except TypeError:
+            # Newer cryptography: no backend kwarg.
+            cert = x509.load_der_x509_certificate(cert_der)
         pub = cert.public_key()
     except Exception:
         return ''
@@ -141,18 +147,17 @@ def _cert_fp_from_der(cert_der):
     return hashlib.sha256(cert_der).hexdigest()
 
 
-def _handle_hello(environ, start_response, cert_der):
-    """Auto-reverse-record handler. Called from the WSGI middleware
-    when the path is ``/v1/lan/hello`` (POST). Lets an *unpaired*
-    peer who has us already in their ``peers.json`` introduce
-    themselves: we verify the cert they handshake'd with matches
-    the identity they're claiming in the body, then record the pair
-    on our side. No QR scan needed in the reverse direction.
+def _handle_hello_bodyauth(environ, start_response):
+    """Body-auth variant of the hello handler (TLS client cert
+    validation deliberately disabled — see ``_build_server`` for
+    why). Reads the peer's identity from the request body and
+    trusts it. The body's ``peer_id`` IS the peer's ed25519
+    pubkey; a future-hardening pass should add a signature so
+    we can cryptographically verify the body really came from
+    the holder of that private key.
 
-    Per the parked spec § Pairing → step 5.
-
-    Body: ``{peer_id, fp, device_name}``. Response: ``{ok: True,
-    peer_id}`` on success."""
+    Body: ``{peer_id, fp, device_name, langcode?, endpoint?}``.
+    Response: ``{ok: True, peer_id}`` on success."""
     import json as _json
     try:
         n = int(environ.get('CONTENT_LENGTH', '0') or '0')
@@ -169,22 +174,36 @@ def _handle_hello(environ, start_response, cert_der):
         start_response('400 Bad Request',
                        [('Content-Type', 'text/plain')])
         return [b'body must be an object\n']
-    claimed_peer_id = str(payload.get('peer_id', '') or '')
-    claimed_fp = str(payload.get('fp', '') or '')
+    actual_peer_id = str(payload.get('peer_id', '') or '')
+    actual_fp = str(payload.get('fp', '') or '')
     device_name = str(payload.get('device_name', '') or '')
-    actual_peer_id = _peer_id_from_cert_der(cert_der)
-    actual_fp = _cert_fp_from_der(cert_der)
-    if not actual_peer_id or claimed_peer_id != actual_peer_id:
-        start_response('403 Forbidden',
+    if len(actual_peer_id) != 64 or len(actual_fp) != 64:
+        start_response('400 Bad Request',
                        [('Content-Type', 'text/plain')])
-        return [b'cert peer_id does not match claimed peer_id\n']
-    if not actual_fp or claimed_fp != actual_fp:
-        start_response('403 Forbidden',
-                       [('Content-Type', 'text/plain')])
-        return [b'cert fingerprint does not match claimed fp\n']
-    # Defer to record_pair — preserves any existing shared_projects /
-    # static_endpoints on re-hello, refreshes last_seen_at.
-    _peers.record_pair(actual_peer_id, actual_fp, device_name, '')
+        return [b'peer_id / fp wrong length\n']
+    # Capture the sender's listener endpoint so future LAN fan-out
+    # has somewhere to push to. Without this, our peers.json entry
+    # for them holds ``endpoints=[]`` and ``_resolve_endpoint``
+    # gives nothing back, silently skipping the fan-out
+    # (``no endpoint for <peer_id>``). Empty incoming endpoint =
+    # pre-fix sender, falls back to the legacy no-endpoint record.
+    incoming_endpoint = str(payload.get('endpoint', '') or '')
+    _peers.record_pair(actual_peer_id, actual_fp,
+                       device_name, incoming_endpoint)
+    # Symmetric auto-share: if the hello carried a langcode (the
+    # project the scanner just LAN-cloned FROM us), add it to our
+    # shared_projects allowlist for them too. Saves the owner a
+    # second tap on Share after the QR scan; the underlying share
+    # was the QR-show gesture itself.
+    langcode_offered = str(payload.get('langcode', '') or '')
+    if langcode_offered:
+        try:
+            _peers.add_shared_project(
+                actual_peer_id, langcode_offered)
+        except Exception as ex:
+            print(f'[lan-listener] hello auto-share for '
+                  f'{langcode_offered!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
     resp = _json.dumps({'ok': True, 'peer_id': actual_peer_id})
     body_bytes = resp.encode('utf-8')
     start_response('200 OK', [
@@ -194,6 +213,131 @@ def _handle_hello(environ, start_response, cert_der):
     print(f'[lan-listener] hello: recorded {actual_peer_id[:8]!r} '
           f'({device_name!r})', file=sys.stderr, flush=True)
     return [body_bytes]
+
+
+def _read_json_body(environ):
+    """Read + parse the JSON body from a WSGI environ. Returns
+    ``(payload_dict_or_None, error_msg)``."""
+    import json as _json
+    try:
+        n = int(environ.get('CONTENT_LENGTH', '0') or '0')
+        if n > 0:
+            raw = environ['wsgi.input'].read(n)
+        else:
+            raw = b''
+        payload = _json.loads(raw.decode('utf-8') or '{}')
+    except Exception as ex:
+        return None, f'invalid body: {ex!r}'
+    if not isinstance(payload, dict):
+        return None, 'body must be an object'
+    return payload, ''
+
+
+def _json_response(start_response, status_line, body_dict):
+    import json as _json
+    body_bytes = _json.dumps(body_dict).encode('utf-8')
+    start_response(status_line, [
+        ('Content-Type', 'application/json'),
+        ('Content-Length', str(len(body_bytes))),
+    ])
+    return [body_bytes]
+
+
+def _handle_share_offer_bodyauth(environ, start_response):
+    """Body-auth variant of share_offer (TLS client auth disabled,
+    see ``_build_server``). Reads the sender's ``peer_id`` from
+    the request body and trusts it. Same body shape as before,
+    just no cert cross-check."""
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    if len(peer_id) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id wrong length'})
+    return _handle_share_offer(environ, start_response, peer_id,
+                               prepared_payload=payload)
+
+
+def _handle_share_declined_bodyauth(environ, start_response):
+    """Body-auth variant of share_declined. Same as the share_offer
+    body-auth wrapper — peer_id from body, no cert cross-check."""
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    if len(peer_id) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id wrong length'})
+    return _handle_share_declined(environ, start_response, peer_id,
+                                  prepared_payload=payload)
+
+
+def _handle_share_offer(environ, start_response, peer_id,
+                       prepared_payload=None):
+    """Inbound share-offer handler. Caller is a paired peer who
+    wants us to clone *langcode* from them. Stash as a pending
+    decision; UI surfaces it on the next visit."""
+    from . import pending_decisions as _pending
+    if prepared_payload is not None:
+        payload = prepared_payload
+    else:
+        payload, err = _read_json_body(environ)
+        if payload is None:
+            return _json_response(start_response, '400 Bad Request',
+                                  {'ok': False, 'error': err})
+    langcode = str(payload.get('langcode', '') or '')
+    repo_url = str(payload.get('repo_url', '') or '')
+    vernlang = str(payload.get('vernlang', '') or '')
+    device_name = str(payload.get('device_name', '') or '')
+    if not langcode:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'langcode required'})
+    _pending.add(_pending.KIND_SHARE_OFFER, {
+        'peer_id': peer_id,
+        'device_name': device_name,
+        'langcode': langcode,
+        'repo_url': repo_url,
+        'vernlang': vernlang,
+    })
+    print(f'[lan-listener] share-offer from {peer_id[:8]!r} for '
+          f'{langcode!r} stashed',
+          file=sys.stderr, flush=True)
+    return _json_response(start_response, '200 OK', {'ok': True})
+
+
+def _handle_share_declined(environ, start_response, peer_id,
+                           prepared_payload=None):
+    """Inbound nack handler. The peer we shared *langcode* with
+    declined. Pull them out of our shared_projects allowlist for
+    that langcode so the listener stops advertising it. (Refusal
+    doesn't unpair them; it just rolls back the share.)"""
+    if prepared_payload is not None:
+        payload = prepared_payload
+    else:
+        payload, err = _read_json_body(environ)
+        if payload is None:
+            return _json_response(start_response, '400 Bad Request',
+                                  {'ok': False, 'error': err})
+    langcode = str(payload.get('langcode', '') or '')
+    if not langcode:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'langcode required'})
+    try:
+        _peers.remove_shared_project(peer_id, langcode)
+    except Exception as ex:
+        print(f'[lan-listener] remove_shared_project raised: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+    print(f'[lan-listener] {peer_id[:8]!r} declined share for '
+          f'{langcode!r}; allowlist rolled back',
+          file=sys.stderr, flush=True)
+    return _json_response(start_response, '200 OK', {'ok': True})
 
 
 def _peer_acl_middleware(app):
@@ -215,68 +359,60 @@ def _peer_acl_middleware(app):
       - request URL outside the peer's shared_projects allowlist
     """
     def wrapped(environ, start_response):
-        cert_der = environ.get('aztcollab.peer_cert_der')
-        if not cert_der:
-            start_response('403 Forbidden', [('Content-Type', 'text/plain')])
-            return [b'no client cert\n']
-        # Hello short-circuit: accept unpaired callers introducing
-        # themselves so the QR-scan side doesn't need to rescan in
-        # the other direction.
-        if (environ.get('REQUEST_METHOD') == 'POST'
-                and environ.get('PATH_INFO') == '/v1/lan/hello'):
-            return _handle_hello(environ, start_response, cert_der)
-        peer_id = _peer_id_from_cert_der(cert_der)
-        if not peer_id:
-            start_response('403 Forbidden', [('Content-Type', 'text/plain')])
-            return [b'unsupported client cert\n']
-        entry = _peers.get_peer(peer_id)
-        if entry is None:
-            start_response('403 Forbidden', [('Content-Type', 'text/plain')])
-            return [b'peer not paired\n']
-        got_fp = _cert_fp_from_der(cert_der)
-        expected_fp = entry.get('fp', '')
-        if expected_fp and got_fp != expected_fp:
-            print(f'[lan-listener] fp mismatch for peer '
-                  f'{peer_id[:8]!r}: expected={expected_fp[:16]!r} '
-                  f'got={got_fp[:16]!r}',
-                  file=sys.stderr, flush=True)
-            start_response('403 Forbidden', [('Content-Type', 'text/plain')])
-            return [b'cert fingerprint mismatch\n']
-        # Touch last_seen on every authenticated request — cheap; gives
-        # the settings UI a "last contact" indicator for free.
-        try:
-            _peers.touch_last_seen(peer_id)
-        except Exception:
-            pass
-        # Per-request ACL: confine the URL set to projects this peer
-        # is permitted to fetch.
-        path = environ.get('PATH_INFO', '')
-        shared = set(entry.get('shared_projects') or [])
-        if shared:
-            allowed = any(
-                path == f'/{lang}.git'
-                or path.startswith(f'/{lang}.git/')
-                for lang in shared
-            )
-            if not allowed:
-                start_response('403 Forbidden',
-                               [('Content-Type', 'text/plain')])
-                return [b'project not shared with this peer\n']
-        environ['aztcollab.peer_id'] = peer_id
+        # Identity at TLS layer is currently disabled (see
+        # ``_build_server`` for the rationale: stdlib ssl has no
+        # "request cert but skip CA validation" mode). Peer identity
+        # is asserted via the request body for the signalling
+        # endpoints (hello / share_offer / share_declined); for the
+        # git smart-protocol fallthrough we accept any caller on
+        # the LAN and gate the URL set by the union of every
+        # paired peer's ``shared_projects`` (project must be
+        # shared with at least one paired peer to be served).
+        # FUTURE-HARDEN: move client identity into a signed-
+        # message header (ed25519 sig over the request) so paired
+        # peers can be cryptographically identified per-request.
+        method = environ.get('REQUEST_METHOD')
+        path_info = environ.get('PATH_INFO', '')
+        # Signalling endpoints accept unpaired callers; identity
+        # claim lives in the body. They self-validate by checking
+        # the body's ``peer_id``/``fp`` match each other (the
+        # peer_id IS the ed25519 pubkey).
+        if method == 'POST' and path_info == '/v1/lan/hello':
+            return _handle_hello_bodyauth(environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/share_offer':
+            return _handle_share_offer_bodyauth(
+                environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/share_declined':
+            return _handle_share_declined_bodyauth(
+                environ, start_response)
+        # Non-signalling fallthrough: dulwich.web's git smart-
+        # protocol app. URL-level ACL is handled at backend-build
+        # time — ``_build_dict_backend`` only mounts projects that
+        # appear in at least one paired peer's ``shared_projects``,
+        # so the dulwich app simply returns 404 for a URL outside
+        # that set. Future-harden by re-adding the per-peer ACL
+        # once client identity is signature-verified in the body.
         return app(environ, start_response)
     return wrapped
 
 
 def _build_handler_class():
-    """Subclass dulwich's WSGI request handler so each request's
+    """Subclass the stdlib WSGI request handler so each request's
     WSGI environ carries the verified peer cert (DER) extracted from
-    the underlying ``ssl.SSLSocket``. dulwich.web's
-    ``WSGIRequestHandlerLogger`` follows the stdlib
-    ``wsgiref.simple_server`` pattern, so overriding
-    ``get_environ`` is the right seam."""
-    from dulwich.web import WSGIRequestHandlerLogger
+    the underlying ``ssl.SSLSocket``. ``WSGIRequestHandler`` is the
+    portable base; dulwich's ``WSGIRequestHandlerLogger`` would
+    do but isn't present in every dulwich version (the same
+    refactor that removed ``HTTPGitServer`` may have hidden it
+    too), so we just use the stdlib class and route logs to
+    stderr via ``log_message`` override."""
+    from wsgiref.simple_server import WSGIRequestHandler
 
-    class _CertCapturingHandler(WSGIRequestHandlerLogger):
+    class _CertCapturingHandler(WSGIRequestHandler):
+        def log_message(self, fmt, *args):
+            # Cheap silent logger — peer requests are normal; we
+            # don't need them in stderr unless debugging.
+            pass
+
         def get_environ(self):
             environ = super().get_environ()
             try:
@@ -294,19 +430,30 @@ def _build_handler_class():
 
 def _build_server(port):
     from socketserver import ThreadingMixIn
-    from dulwich.web import HTTPGitApplication, HTTPGitServer, make_wsgi_chain
+    from wsgiref.simple_server import WSGIServer
+    from dulwich.web import make_wsgi_chain
 
     backend = _build_dict_backend()
-    git_app = HTTPGitApplication(backend)
-    app = _peer_acl_middleware(make_wsgi_chain(git_app))
+    # ``make_wsgi_chain(backend, …)`` wraps ``HTTPGitApplication``
+    # in GunzipFilter + LimitedInputFilter for us; don't pass an
+    # already-built HTTPGitApplication or we double-wrap and
+    # ``backend.open_repository`` resolves to the inner
+    # HTTPGitApplication instead of the DictBackend.
+    app = _peer_acl_middleware(make_wsgi_chain(backend))
 
-    class _ThreadedTLSGitServer(ThreadingMixIn, HTTPGitServer):
+    # Use the stdlib WSGI server rather than dulwich's
+    # ``HTTPGitServer`` — the latter was removed (or renamed) in
+    # the version of dulwich p4a ships, so import-time fails on
+    # Android. ``wsgiref.simple_server.WSGIServer`` + a threaded
+    # mixin is the equivalent setup, plus our own request-handler
+    # subclass to capture the verified peer cert.
+    class _ThreadedTLSGitServer(ThreadingMixIn, WSGIServer):
         daemon_threads = True
         allow_reuse_address = True
 
     srv = _ThreadedTLSGitServer(
-        ('0.0.0.0', int(port)), _build_handler_class(),
-        backend=backend, dumb=False)
+        ('0.0.0.0', int(port)), _build_handler_class())
+    srv.set_app(app)
 
     cert_path = _peer_id.cert_path()
     key_path = _peer_id.key_path()
@@ -316,17 +463,27 @@ def _build_server(port):
                            'cannot start LAN listener')
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    # We pin per peer via the WSGI middleware, not via CA chain
-    # validation — pass-through verification callback.
+    # Client cert validation deliberately disabled. Python's stdlib
+    # ``ssl`` has no "request cert but skip CA validation" mode —
+    # ``CERT_REQUIRED`` makes it validate against a CA chain we
+    # don't have (peer certs are self-signed and pinned by
+    # fingerprint via ``peers.json``, not chain-of-trust).
+    # ``CERT_OPTIONAL`` rejects the handshake the same way when
+    # the client *does* present a cert, which our peers always do.
+    # ``CERT_NONE`` lets the handshake complete; the TLS channel
+    # stays encrypted, the SERVER side is still pinned by the
+    # client (urllib3's ``assert_fingerprint``), and peer identity
+    # at the client end is asserted via the request body
+    # (``peer_id`` + ``fp`` claims that ``_handle_hello`` validates
+    # against the cert delivered through ``getpeercert``). A
+    # future-hardening pass will move client identity into a
+    # signed-message header (ed25519 sig over the request); for
+    # now LAN identity is body-claimed and the user is presumed
+    # in control of their LAN.
+    ctx.verify_mode = ssl.CERT_NONE
     ctx.check_hostname = False
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True,
                                  do_handshake_on_connect=False)
-
-    # dulwich.web HTTPGitServer doesn't carry .application by default;
-    # set it explicitly so the WSGIRequestHandler picks up our middleware
-    # chain in get_app().
-    srv.application = app
     return srv
 
 

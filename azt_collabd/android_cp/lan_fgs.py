@@ -164,13 +164,22 @@ def start_fgs():
             return
         try:
             from jnius import autoclass
-            ServiceCompat = autoclass(
-                'androidx.core.app.ServiceCompat')
             ServiceInfo = autoclass(
                 'android.content.pm.ServiceInfo')
-            ServiceCompat.startForeground(
-                svc, _NOTIFICATION_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            Build = autoclass('android.os.Build$VERSION')
+            # Call Service.startForeground directly. The Service
+            # base class has had startForeground(int, Notification)
+            # since API 5 and the 3-arg overload with
+            # foregroundServiceType since API 29. Skip the
+            # ServiceCompat wrapper — jnius static-method resolution
+            # against the androidx helper class doesn't see the
+            # ``startForeground`` overloads on this build.
+            if Build.SDK_INT >= 29:
+                svc.startForeground(
+                    _NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            else:
+                svc.startForeground(_NOTIFICATION_ID, notification)
         except Exception as ex:
             print(f'[lan-fgs] startForeground failed: {ex!r}',
                   file=sys.stderr, flush=True)
@@ -193,11 +202,12 @@ def stop_fgs():
             _STATE['foreground'] = False
             return
         try:
-            from jnius import autoclass
-            ServiceCompat = autoclass(
-                'androidx.core.app.ServiceCompat')
-            ServiceCompat.stopForeground(
-                svc, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            # Same reason as start_fgs: call Service.stopForeground
+            # directly. The boolean removeNotification arg has been
+            # there since API 5; the Service.STOP_FOREGROUND_REMOVE
+            # int variant only exists in N+ via ServiceCompat which
+            # jnius can't see here.
+            svc.stopForeground(True)
         except Exception as ex:
             print(f'[lan-fgs] stopForeground failed: {ex!r}',
                   file=sys.stderr, flush=True)

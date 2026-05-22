@@ -1637,13 +1637,43 @@ doesn't wait a full ``connectivity_poll_s`` tick.
 
 ```python
 # Render the badge from project_status without a second RPC.
+# Since 0.45.0 the indicator encodes two orthogonal axes:
+#
+#   - commits_ahead vs github (existing axis since 0.43)
+#   - unshared_commits vs ANY remote (github OR any LAN peer)
+#
+# unshared_commits=0 + commits_ahead>0 means "5 ahead of github
+# but all 5 exist on at least one paired phone" → render as
+# ``LANOK +5``: the user can't lose data even if this phone dies.
+#
+# unshared_commits>0 means at least one local commit lives nowhere
+# else → render as ``+{unshared}/{ahead}``: data-loss-risk that
+# count of commits are wholly local. The slash is the read: 1 of 5.
+#
+# work_offline + lan_allow_sync combos still affect the suffix:
+#
+#   work_offline=off, lan=off  → no suffix (github-mediated)
+#   work_offline=off, lan=on   → no suffix (github + LAN both push)
+#   work_offline=on,  lan=off  → "offline"
+#   work_offline=on,  lan=on   → "LAN-only"
 ps = project_status(langcode)
-if ps.work_offline:
-    sync_indicator.text = f"+{ps.commits_ahead} · offline"
-elif ps.commits_ahead:
-    sync_indicator.text = f"+{ps.commits_ahead}"
+
+if ps.work_offline and ps.lan_allow_sync:
+    mode_suffix = " · LAN-only"
+elif ps.work_offline:
+    mode_suffix = " · offline"
 else:
-    sync_indicator.text = ""  # all up to date
+    mode_suffix = ""
+
+if ps.commits_ahead == 0:
+    sync_indicator.text = ""  # all up to date with github
+elif ps.unshared_commits == 0:
+    # Every local commit is on github OR a paired phone.
+    sync_indicator.text = f"LANOK +{ps.commits_ahead}{mode_suffix}"
+else:
+    # ``+unshared/ahead`` — N commits live nowhere else.
+    sync_indicator.text = (
+        f"+{ps.unshared_commits}/{ps.commits_ahead}{mode_suffix}")
 ```
 
 ### Badge refresh obligation — peer MUST re-poll after every sync gesture

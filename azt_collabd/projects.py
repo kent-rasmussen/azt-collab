@@ -32,6 +32,7 @@ pushed" vs. "13:45 backed up". Filed by azt_recorder 1.37.3 in
 
 import json
 import os
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -65,13 +66,23 @@ class Project:
     # Per-project override for the GitHub repo *name* (last segment of
     # the remote URL) used by the publish path. Empty → callers treat
     # as equal to ``langcode`` (no override; the typical case).
-    # Non-empty values let the user keep a vanity / project-style /
-    # collision-avoiding repo name while the LIFT ``<form lang="…">``
-    # tag (== ``langcode``) stays canonical. Recorder 1.41.3 removed
-    # its peer-side ``collab_langcode`` peer_pref under the
-    # no-daemon-owned-caches rule; this field is the canonical home
-    # for that data.
     repo_slug: str = ''
+    # The linguistic vernacular-language code (BCP-47) for entries
+    # being *analyzed* in this project — the value LIFT writers stamp
+    # as ``<form lang="…">`` for new entries. Distinct from
+    # ``langcode``, which is the project *key* / human-readable
+    # project name (``MyEnglishProject``, ``baf-test``, …) and may
+    # have nothing to do with the linguistic code. The two are equal
+    # in single-language projects (the common case); they diverge
+    # in multilingual dictionaries and in projects whose name was
+    # chosen for organizational reasons rather than linguistic ones.
+    #
+    # Empty → callers fall back to ``langcode`` for back-compat
+    # with every project registered before 0.45.0 (the field
+    # didn't exist; the old conflation IS the implicit value). New
+    # projects and LAN clones explicitly populate it from the
+    # handshake / template input.
+    vernlang: str = ''
 
     def to_dict(self):
         return {
@@ -84,6 +95,7 @@ class Project:
             'created_at': self.created_at,
             'cawl_image_repo': self.cawl_image_repo,
             'repo_slug': self.repo_slug,
+            'vernlang': self.vernlang,
         }
 
     @classmethod
@@ -98,7 +110,16 @@ class Project:
             created_at=float(d.get('created_at', 0.0)),
             cawl_image_repo=d.get('cawl_image_repo', ''),
             repo_slug=d.get('repo_slug', ''),
+            vernlang=d.get('vernlang', ''),
         )
+
+    def effective_vernlang(self):
+        """The vernlang to feed LIFT writers with. Returns
+        ``self.vernlang`` if explicitly set, else ``self.langcode``
+        (the pre-0.45.0 implicit value). Use this everywhere a
+        LIFT ``<form lang="…">`` is written so the conflation
+        fallback stays in one place."""
+        return self.vernlang or self.langcode
 
 
 # ── load / save ─────────────────────────────────────────────────────────────
@@ -111,7 +132,23 @@ def _load_raw():
         return {}
     except Exception as ex:
         print(f'[collab.projects] load failed: {ex}')
-        return {}
+        # Sentinel: distinguishes "load failed" from "file legitimately
+        # empty / missing." ``_update`` refuses to save when this comes
+        # back so a transient parse failure can't clobber the on-disk
+        # registry with an empty dict. Callers that just *read*
+        # (``get``, ``list_all``) get an empty dict view as before — a
+        # ``KeyError``-free missing-project lookup degrades the same
+        # way regardless of the underlying reason.
+        return _LoadFailed()
+
+
+class _LoadFailed(dict):
+    """Empty-dict sentinel returned when ``projects.json`` couldn't
+    be parsed. ``isinstance(d, _LoadFailed)`` flags the case in
+    ``_update`` so the mutator's write step is skipped. Inherits
+    from ``dict`` so existing read-path callers (``get``,
+    ``list_all``) see an empty mapping without special-casing."""
+    pass
 
 
 def _save_raw(data):
@@ -133,6 +170,14 @@ def _save_raw(data):
 
 def _update(mutator):
     d = _load_raw()
+    if isinstance(d, _LoadFailed):
+        # Parse failure: leave the on-disk file alone. Saving would
+        # overwrite the (presumably) recoverable corrupt file with
+        # an empty registry and silently destroy every project entry.
+        print('[collab.projects] _update aborted — load failed; '
+              'on-disk projects.json left untouched',
+              file=sys.stderr, flush=True)
+        return
     mutator(d)
     _save_raw(d)
 
@@ -154,6 +199,16 @@ def register(langcode, working_dir, lift_path='', remote_url='',
     if not working_dir:
         raise ValueError('working_dir required')
     data = _load_raw()
+    if isinstance(data, _LoadFailed):
+        # Same guard as ``_update``: refuse to clobber a corrupt
+        # ``projects.json`` with a registry that contains *only* the
+        # newly-registered project. Caller is expected to surface
+        # the failure and let the user / a future recovery pass
+        # restore the file.
+        raise RuntimeError(
+            'projects.json could not be parsed; refusing to '
+            'register over a corrupt registry — inspect and '
+            'recover the on-disk file first')
     entry = dict(data.get(langcode, {}))
     entry['working_dir'] = working_dir
     if lift_path:
@@ -298,6 +353,36 @@ def set_remote_url(langcode, url):
     _update(mut)
 
 
+def set_last_lan_pushed_sha(langcode, sha):
+    """Record the most recent commit we've successfully LAN-delivered
+    to *any* paired peer for *langcode*. Used by the sync-indicator
+    "OK" branch — a local commit is "shared somewhere" if it's an
+    ancestor of either ``refs/remotes/origin/main`` (github) or this
+    SHA (LAN). Empty string clears."""
+    def mut(d):
+        if langcode in d:
+            d[langcode]['last_lan_pushed_sha'] = sha
+    _update(mut)
+
+
+def get_last_lan_pushed_sha(langcode):
+    entry = _load_raw().get(langcode) or {}
+    return entry.get('last_lan_pushed_sha', '') or ''
+
+
+def set_vernlang(langcode, vernlang):
+    """Persist the per-project linguistic vernacular code (the
+    LIFT ``<form lang="…">`` value for newly-written entries).
+    Distinct from ``langcode`` (the project key); see
+    ``Project.vernlang`` and ``Project.effective_vernlang()``.
+    Empty string clears the field — callers then fall back to
+    ``langcode`` per the back-compat rule."""
+    def mut(d):
+        if langcode in d:
+            d[langcode]['vernlang'] = vernlang
+    _update(mut)
+
+
 # ── derivation helpers (used for auto-registration) ─────────────────────────
 
 def derive_remote_url(working_dir):
@@ -366,7 +451,19 @@ def create_from_template(template_url, vernlang, dest_dir,
             pass
         raise
 
-    return register(vernlang, project_dir, lift_path=lift_path)
+    # langcode is the project key (== the slug used in the filename
+    # and the registry); vernlang is the linguistic code for LIFT
+    # writes. For template-created projects the two are equal by
+    # design (the BCP-47 picker collected one value before this
+    # function ran), so we stamp them both. Distinct from the
+    # clone path where ``langcode`` is the repo slug and ``vernlang``
+    # may differ.
+    p = register(vernlang, project_dir, lift_path=lift_path)
+    try:
+        set_vernlang(vernlang, vernlang)
+    except Exception:
+        pass
+    return p
 
 
 def derive_langcode(working_dir, lift_path=''):

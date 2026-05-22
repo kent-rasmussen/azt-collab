@@ -165,6 +165,18 @@ LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
 LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
 LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
 
+# Combined-pair-share-clone flow codes — see ``azt_collabd/status.py``
+# for the full per-code rationale.
+LAN_PROJECT_CLONED = 'LAN_PROJECT_CLONED'
+LAN_PROJECT_REOPENED = 'LAN_PROJECT_REOPENED'
+LAN_PROJECT_ADOPTED_REMOTE = 'LAN_PROJECT_ADOPTED_REMOTE'
+LAN_PROJECT_COLLISION_UNRELATED = 'LAN_PROJECT_COLLISION_UNRELATED'
+LAN_ADOPT_ORIGIN_NEEDED = 'LAN_ADOPT_ORIGIN_NEEDED'
+LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
+LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
+LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
+LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+
 # Transport-failure codes. The client wrappers' ``except
 # ServerUnavailable`` / non-``ok`` response branches (see
 # ``sync_project``, ``project_status``, etc. in ``__init__.py``)

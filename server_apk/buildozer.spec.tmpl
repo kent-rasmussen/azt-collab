@@ -145,7 +145,7 @@ android.ndk = 29
 # every peer APK. Without that match, install-time grant is denied
 # and peers cannot reach this provider — desired failure mode. The
 # same permission gates bindService against AZTServiceProviderhost.
-android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, CHANGE_WIFI_MULTICAST_STATE, ACCESS_WIFI_STATE, org.atoznback.AZT_COLLAB_ACCESS
+android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, CHANGE_WIFI_MULTICAST_STATE, ACCESS_WIFI_STATE, WAKE_LOCK, org.atoznback.AZT_COLLAB_ACCESS
 # CAMERA: required by the picker's "Scan QR to clone" affordance,
 # which dispatches to ZXing's CaptureActivity. ZXing requests the
 # runtime grant itself at launch; we only need the manifest entry.
@@ -161,6 +161,12 @@ android.permissions = INTERNET, REQUEST_INSTALL_PACKAGES, CAMERA, FOREGROUND_SER
 # daemon acquires on toggle-on (phase 5). Without the multicast
 # permission the system silently drops mDNS packets in either
 # direction even though the API returns success.
+# WAKE_LOCK: required by ``WifiManager.WifiLock.acquire()`` —
+# the high-perf WifiLock is the actual battery-cost knob behind
+# the LAN sync toggle; without WAKE_LOCK, jnius raises
+# SecurityException on acquire and the listener falls back to
+# whatever Wi-Fi power state the OS happens to be in (multicast
+# unreliable, idle drops connections).
 
 # zxing-android-embedded: powers the picker's QR-scan-to-clone
 # button. ~500 KB AAR; lives in the server APK because the

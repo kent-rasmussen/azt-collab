@@ -507,7 +507,7 @@ KV_TEMPLATE = '''
                 # the same "what does the daemon do on the network"
                 # group).
                 SectionLabel:
-                    text: _('Servers')
+                    text: _('Servers (set up at least one)')
                 # GitHub: a single state-aware button. ``refresh()``
                 # flips the label between "Connect to GitHub" (until
                 # verified) and "GitHub Settings" (once verified).
@@ -613,13 +613,16 @@ KV_TEMPLATE = '''
                         id: lan_no_btn
                         text: _('no')
                         on_press: root.set_lan_allow_sync(False)
+                # "Pair a phone" entry was vestigial after 0.45.0 —
+                # showing the daemon's QR is now the "Show QR code"
+                # affordance inside the per-project Share popup,
+                # which carries the project + repo_url too (combined
+                # pair-share-clone). "Paired devices" stays as the
+                # management surface (unpair, static endpoints).
                 BoxLayout:
                     size_hint_y: None
                     height: dp(48)
                     spacing: dp(8)
-                    Button:
-                        text: _('Pair a phone')
-                        on_press: root.open_pair_phone()
                     Button:
                         text: _('Paired devices')
                         on_press: root.open_paired_phones()
@@ -685,15 +688,21 @@ KV_TEMPLATE = '''
                         size_hint_y: None
                         height: self.texture_size[1] + dp(4)
                     RecBtn:
-                        id: grant_collab_btn
-                        text: _('Grant collaborator access')
+                        id: share_project_btn
+                        # The Share popup folds in three sharing
+                        # modes (paired phones, QR for an in-person
+                        # new phone, github invite for a remote
+                        # collaborator). Used to be three buttons
+                        # before 0.45.0; consolidated so the user
+                        # sees one entry point. {{ }} are doubled
+                        # because KV_TEMPLATE itself goes through
+                        # Python ``.format()`` in ``register_kv``,
+                        # which would otherwise try to substitute
+                        # ``{{langcode}}`` at load time and
+                        # KeyError on the missing kwarg.
+                        text: _('Share [{{langcode}}] project').format(langcode=root.current_langcode_label)
                         normal_color: T.SURFACE
-                        on_press: root.grant_collaborator()
-                    RecBtn:
-                        id: share_repo_btn
-                        text: _('Share this repo (QR)')
-                        normal_color: T.SURFACE
-                        on_press: root.share_repo_qr()
+                        on_press: root.share_project()
                     BodyLabel:
                         id: project_actions_msg
                         text: ''
@@ -1092,6 +1101,12 @@ class SettingsScreen(Screen):
     # Empty string → no back button (standalone settings host).
     back_to = StringProperty('')
 
+    # Updated by ``_refresh_project_actions_row`` so the
+    # "Share {langcode} project" button label tracks the
+    # currently-resolved project. Empty until the row finds a
+    # publish candidate.
+    current_langcode_label = StringProperty('')
+
     def on_enter(self):
         # Defer to next frame: on_enter can fire before the KV rule's
         # nested BoxLayout children have all been added to ``self.ids``
@@ -1418,7 +1433,7 @@ class SettingsScreen(Screen):
         row = self.ids.get('project_actions_row')
         info = self.ids.get('project_actions_info')
         msg = self.ids.get('project_actions_msg')
-        btn = self.ids.get('grant_collab_btn')
+        btn = self.ids.get('share_project_btn')
         if row is None or btn is None:
             return
         # Default hidden; flip on only if all gates pass. Detach
@@ -1438,7 +1453,13 @@ class SettingsScreen(Screen):
         self._detach_project_actions_children()
         project = self._pick_publish_candidate()
         if project is None:
+            self.current_langcode_label = ''
             return
+        # Used by the consolidated "Share {langcode} project" button
+        # label (0.45.0). Empty when no project is resolved so the
+        # button text reads "Share  project" (cosmetic — the button
+        # is hidden in that case too).
+        self.current_langcode_label = project.langcode
         # Live remote_url — same plumbing the publish row uses to
         # detect a freshly-pushed remote that hasn't propagated to
         # the cached Project record yet.
@@ -1457,13 +1478,13 @@ class SettingsScreen(Screen):
                 'Project: {langcode}\nRemote: {remote_url}').format(
                     langcode=project.langcode,
                     remote_url=live_remote_url)
-        # Heights: section label (dp 32) + info (~dp 40) + grant
-        # button (dp 52) + share button (dp 52) + msg (dp 20) +
-        # 4× spacing (dp 8 each). Switch-project lives OUTSIDE
-        # this row now (always visible), so it doesn't contribute
-        # to the gated row's height.
-        row.height = (dp(32) + dp(40) + dp(52) + dp(52)
-                      + dp(20) + dp(8) * 4)
+        # Heights (0.45.0): section label (dp 32) + info (~dp 40) +
+        # share-project button (dp 52) + msg (dp 20) + 3× spacing
+        # (dp 8 each). The separate grant_collab button is gone in
+        # 0.45.0 — folded into the share popup's three-section
+        # body. Switch-project lives OUTSIDE this row.
+        row.height = (dp(32) + dp(40) + dp(52) + dp(20)
+                      + dp(8) * 3)
         row.opacity = 1
         # Restore the children that ``_detach_project_actions_children``
         # may have removed during a previous refresh while the row
@@ -1509,6 +1530,31 @@ class SettingsScreen(Screen):
             return
         self._set_project_actions_msg(_tr(
             'Switch project is unavailable from this entry point.'))
+
+    def share_project(self):
+        """Open the consolidated "Share {langcode} project" popup.
+        Folds three sharing modes into one panel: paired phones
+        list, in-person QR for a new phone, github invite for a
+        remote collaborator. Replaced the three separate buttons
+        (Grant collaborator + Share repo QR + …) in 0.45.0 to give
+        the user a single entry point. The popup itself dispatches
+        per the user's choice."""
+        project = self._pick_publish_candidate()
+        if project is None:
+            self._set_project_actions_msg(_tr(
+                'No project selected.'))
+            return
+        try:
+            from azt_collab_client.ui.lan_popups import (
+                share_project_popup,
+            )
+            share_project_popup(
+                langcode=project.langcode,
+                font_name=App.get_running_app().font_name)
+        except Exception as ex:
+            self._set_project_actions_msg(_tr(
+                'Could not open share popup: {error}').format(
+                    error=str(ex)))
 
     def share_repo_qr(self):
         """Open a popup that renders the current project's remote
@@ -1697,16 +1743,8 @@ class SettingsScreen(Screen):
             return
         self._work_offline_enabled = bool(applied)
         self._refresh_work_offline_buttons()
-        status = self.ids.get('work_offline_status')
-        if status is not None:
-            if self._work_offline_enabled:
-                status.text = _tr(
-                    'Push suppressed. Commits will accumulate locally '
-                    'until you turn this off.')
-            else:
-                status.text = _tr(
-                    'Pushing enabled. Pending commits will go out '
-                    'when the network is reachable.')
+        self._refresh_work_offline_status_text(
+            just_toggled_off=not self._work_offline_enabled)
 
     def _refresh_work_offline_state(self):
         """Read the daemon's current toggle state. Called from
@@ -1718,15 +1756,46 @@ class SettingsScreen(Screen):
         except Exception:
             self._work_offline_enabled = False
         self._refresh_work_offline_buttons()
+        self._refresh_work_offline_status_text(just_toggled_off=False)
+
+    def _refresh_work_offline_status_text(self, just_toggled_off=False):
+        """Compose the status line under the Work-offline yes/no
+        buttons. Considers BOTH ``work_offline`` and ``lan.allow_sync``
+        so the user sees the actual delivery shape:
+
+          - work_offline=off → only show a transient "pushing enabled"
+            confirmation when the user just flipped it off; otherwise
+            the row is silent (default state needs no label).
+          - work_offline=on + LAN=off → push fully suppressed; commits
+            accumulate.
+          - work_offline=on + LAN=on  → "LAN-only": github push
+            suppressed but paired phones still receive commits over
+            the local network."""
         status = self.ids.get('work_offline_status')
         if status is None:
             return
-        if self._work_offline_enabled:
+        if not self._work_offline_enabled:
+            if just_toggled_off:
+                status.text = _tr(
+                    'Pushing enabled. Pending commits will go out '
+                    'when the network is reachable.')
+            else:
+                status.text = ''
+            return
+        try:
+            from azt_collab_client import lan_toggle as _lt
+            lan_on = bool(_lt().get('on'))
+        except Exception:
+            lan_on = False
+        if lan_on:
+            status.text = _tr(
+                'LAN-only mode. GitHub push is suppressed, but '
+                'paired phones still receive commits over the '
+                'local network.')
+        else:
             status.text = _tr(
                 'Push suppressed. Commits will accumulate locally '
                 'until you turn this off.')
-        else:
-            status.text = ''
 
     def _refresh_work_offline_buttons(self):
         enabled = bool(getattr(self, '_work_offline_enabled', False))
@@ -1758,6 +1827,16 @@ class SettingsScreen(Screen):
         self._lan_endpoint = applied.get('endpoint', '')
         self._refresh_lan_buttons()
         self._refresh_lan_status()
+        # The work-offline status text describes the joint state
+        # of (work_offline, lan_allow_sync) — flipping LAN flips
+        # the meaning from "fully offline" to "LAN-only" without
+        # changing the work_offline toggle itself. Re-render so
+        # the user sees the change immediately.
+        try:
+            self._refresh_work_offline_status_text(
+                just_toggled_off=False)
+        except Exception:
+            pass
 
     def _refresh_lan_state(self):
         from azt_collab_client import lan_toggle as _lt

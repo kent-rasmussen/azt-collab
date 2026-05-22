@@ -202,6 +202,26 @@ _HANDLERS = {
         'sync settings.'),
     S.LAN_TOGGLE_OFF:         lambda p: _tr(
         'Local-network sharing is off. Turn it on in sync settings.'),
+    S.LAN_PROJECT_CLONED:     lambda p: _fmt(
+        _tr('Got project {langcode} from {device_name}.'), p),
+    S.LAN_PROJECT_REOPENED:   lambda p: _fmt(
+        _tr('Project {langcode} already here; paired phone added.'), p),
+    S.LAN_PROJECT_ADOPTED_REMOTE: lambda p: _fmt(
+        _tr('Now also pushing project {langcode} to {url}.'), p),
+    S.LAN_PROJECT_COLLISION_UNRELATED: lambda p: _fmt(
+        _tr('A different project named {langcode} already exists. '
+            'Rename or remove it first.'), p),
+    S.LAN_ADOPT_ORIGIN_NEEDED: lambda p: _fmt(
+        _tr('Confirm: push project {langcode} to {url} also?'), p),
+    S.LAN_REMOTE_CONFLICT:    lambda p: _fmt(
+        _tr('Project {langcode}: {device_name} uses {incoming_url}, '
+            'you use {existing_url}.'), p),
+    S.LAN_SHARE_OFFER:        lambda p: _fmt(
+        _tr('{device_name} wants to share project {langcode}.'), p),
+    S.LAN_SHARE_DECLINED:     lambda p: _fmt(
+        _tr('Share for {langcode} was declined.'), p),
+    S.LAN_OFFER_ACCEPTED:     lambda p: _fmt(
+        _tr('Accepted share offer for {langcode}.'), p),
     S.APP_NOT_INSTALLED:      lambda p: _fmt(_tr('App not installed. Visit {url} and select "All repositories".'), p),
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),

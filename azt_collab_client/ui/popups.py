@@ -138,14 +138,9 @@ def grant_collaborator_popup(langcode, on_done=None, font_name='Roboto'):
         orientation='vertical', spacing=dp(10), padding=dp(12))
 
     # Project disambiguation header — make it impossible for the
-    # user to misread which repo they're acting on. Bold project
-    # langcode, dim line for the remote URL.
-    content.add_widget(Label(
-        text=_tr('Invite a collaborator to:'),
-        size_hint_y=None, height=dp(22),
-        font_size=sp(13), color=theme.TEXT, font_name=font_name,
-        halign='left', valign='middle',
-    ))
+    # user to misread which repo they're acting on. The popup's
+    # title bar already says "Invite collaborator"; we just need
+    # to show *which* project. Bold langcode + dim remote URL.
     proj_label = Label(
         text=str(langcode),
         size_hint_y=None, height=dp(28),
@@ -279,27 +274,40 @@ def _derive_langcode_from_url(url):
 
 def clone_url_popup(on_submit, font_name='Roboto'):
     """Show a popup asking for a git repository URL. Calls
-    ``on_submit(clone_url, langcode)`` when the user submits;
-    ``langcode`` is the daemon's auto-derived value by default,
-    overridable through the inline *change code* affordance.
+    ``on_submit(clone_url, langcode, vernlang)`` when the user
+    submits.
 
-    Two mutually-exclusive edit modes (only one input is active at
-    a time, so the on-screen keyboard never argues with itself):
+    Since 0.45.0 the popup distinguishes two daemon-owned values
+    that used to be conflated:
+
+      - ``langcode`` is the **project name**, auto-derived from
+        the github repo slug (the part of the URL after the last
+        ``/``, with any ``.git`` suffix stripped). Not user-
+        editable here — repo renames happen on github, not in
+        this app.
+      - ``vernlang`` is the **linguistic language code** the LIFT
+        will tag entries with (``<form lang="…">``). User-
+        supplied via the "change" affordance described below.
+        Defaults to the repo slug as a starting hint when the
+        user hasn't said otherwise.
+
+    Two mutually-exclusive edit modes (only one input is active
+    at a time, so the on-screen keyboard never argues with
+    itself):
 
     Mode A — URL active (default):
-        ┌─ ``code: <derived>``                    [change code] ┐
-        ├─ URL TextInput (active, auto-focus)                   ┤
+        ┌─ project: <slug> · language: <vernlang>   [change] ┐
+        ├─ URL TextInput (active, auto-focus)                ┤
 
-    Mode B — code active (after tapping *change code*):
-        ┌─ TextInput (code, auto-focus)                    [OK] ┐
-        ├─ URL TextInput (disabled, displays the typed value)   ┤
+    Mode B — language active (after tapping *change*):
+        ┌─ TextInput (language, auto-focus)              [OK] ┐
+        ├─ URL TextInput (disabled)                           ┤
 
-    Tapping **change code** captures the current derived code into
-    the code field and disables the URL field. Tapping **OK**
-    commits the typed code, re-enables the URL field, and swaps
-    Mode A back in — but the readout now shows the user's value
-    and stops syncing with further URL edits (once the user takes
-    control, they keep it). Submit (Clone) works in either mode."""
+    Tapping **change** captures the current language hint into
+    the editable field and disables URL editing. Tapping **OK**
+    commits the typed language code and swaps Mode A back in;
+    the URL field re-enables. Submit (Clone) works in either
+    mode."""
     content = BoxLayout(
         orientation='vertical', spacing=dp(10), padding=dp(12))
     content.add_widget(Label(
@@ -308,23 +316,26 @@ def clone_url_popup(on_submit, font_name='Roboto'):
         font_size=sp(13), color=theme.TEXT, font_name=font_name,
     ))
 
-    # Mode-A widgets (preview + change_btn).
+    # Mode-A widgets: read-only "project · language" preview +
+    # the "change" button that drops into Mode B for editing the
+    # language code. The project name auto-derives from the URL
+    # slug and is NOT editable here.
     code_label = Label(
-        text=_tr('code: ') + '—',
+        text=_tr('project: ') + '— · ' + _tr('language: ') + '—',
         size_hint_x=1,
         font_size=sp(13), color=theme.TEXT_DIM, font_name=font_name,
         halign='left', valign='middle',
     )
     code_label.bind(size=lambda w, s: setattr(w, 'text_size', s))
     change_btn = Button(
-        text=_tr('change code'),
-        size_hint_x=None, width=dp(120),
+        text=_tr('change'),
+        size_hint_x=None, width=dp(100),
         font_size=sp(12), font_name=font_name,
     )
-    # Mode-B widgets (editable code + OK).
+    # Mode-B widgets (editable language code + OK).
     code_input = TextInput(
         text='',
-        hint_text=_tr('e.g. en-x-pilot'),
+        hint_text=_tr('e.g. en, fra, sw-x-pilot'),
         multiline=False,
         size_hint_x=1, size_hint_y=None, height=dp(40),
         font_size=sp(14), font_name=font_name,
@@ -416,26 +427,39 @@ def clone_url_popup(on_submit, font_name='Roboto'):
 
     state = {
         'mode': 'A',           # 'A' = URL active, 'B' = code active
-        'overridden': False,   # user has typed an explicit code at
-                               # least once; URL changes stop syncing
-        'user_code': '',
+        'overridden': False,   # user has typed an explicit vernlang
+                               # at least once; URL changes stop
+                               # syncing the language hint
+        'user_vernlang': '',
     }
 
+    def _project_name_from_url(url):
+        return _derive_langcode_from_url(url) or '—'
+
     def _refresh_label_from_url(*_):
-        if state['overridden'] or state['mode'] == 'B':
+        if state['mode'] == 'B':
             return
-        derived = _derive_langcode_from_url(url_input.text) or '—'
-        code_label.text = _tr('code: ') + derived
+        proj = _project_name_from_url(url_input.text)
+        if state['overridden']:
+            vern = state['user_vernlang']
+        else:
+            # Pre-clone the language hint defaults to the same
+            # slug as the project name. It's just a starting
+            # value the user can change — the daemon validates
+            # against actual LIFT contents after clone.
+            vern = proj if proj != '—' else '—'
+        code_label.text = (_tr('project: ') + proj + ' · '
+                           + _tr('language: ') + vern)
 
     def _enter_mode_b(*_):
-        # Capture whatever's currently shown as the starting point.
+        # Seed the edit field with the current language hint (the
+        # user's prior typed value if any, else the slug). The
+        # project name is not editable — only the language code.
         if state['overridden']:
-            seed = state['user_code']
+            seed = state['user_vernlang']
         else:
             seed = _derive_langcode_from_url(url_input.text)
         code_input.text = seed
-        # Swap Mode-A widgets out, Mode-B widgets in. URL goes
-        # disabled so only one input has focus.
         code_row.clear_widgets()
         code_row.add_widget(code_input)
         code_row.add_widget(ok_btn)
@@ -444,34 +468,36 @@ def clone_url_popup(on_submit, font_name='Roboto'):
         code_input.focus = True
 
     def _enter_mode_a(*_):
-        # Commit whatever the user typed (empty falls back to the
-        # current derivation — same as if they never entered the
-        # code-edit mode, but with overridden cleared so URL syncs
-        # resume).
+        # Commit whatever the user typed as the chosen vernlang.
+        # Empty falls back to "no override" — the label resyncs
+        # to the URL-derived slug as the hint.
         typed = code_input.text.strip()
         if typed:
-            state['user_code'] = typed
+            state['user_vernlang'] = typed
             state['overridden'] = True
-            code_label.text = _tr('code: ') + typed
         else:
             state['overridden'] = False
-            _refresh_label_from_url()
         code_row.clear_widgets()
         code_row.add_widget(code_label)
         code_row.add_widget(change_btn)
         url_input.disabled = False
         state['mode'] = 'A'
         url_input.focus = True
+        _refresh_label_from_url()
 
-    def _resolve_langcode():
-        # Mode B at submit time: take the live code-input value.
-        # Mode A: respect override or fall back to derived.
+    def _resolve_pair():
+        """Return ``(langcode, vernlang)`` to pass to on_submit.
+        ``langcode`` is always the URL-derived project slug;
+        ``vernlang`` is the user's typed value (Mode B), the
+        previously-committed override, or — failing both — the
+        slug as a starting default."""
+        slug = _derive_langcode_from_url(url_input.text)
         if state['mode'] == 'B':
-            return code_input.text.strip() \
-                or _derive_langcode_from_url(url_input.text)
+            typed = code_input.text.strip()
+            return slug, (typed or slug)
         if state['overridden']:
-            return state['user_code']
-        return _derive_langcode_from_url(url_input.text)
+            return slug, state['user_vernlang']
+        return slug, slug
 
     def _do_clone(*_args):
         clone_url = url_input.text.strip()
@@ -493,9 +519,19 @@ def clone_url_popup(on_submit, font_name='Roboto'):
         popup.dismiss()
         if not clone_url.endswith('.git'):
             clone_url += '.git'
-        langcode = _resolve_langcode()
+        langcode, vernlang = _resolve_pair()
         try:
-            on_submit(clone_url, langcode)
+            on_submit(clone_url, langcode, vernlang)
+        except TypeError:
+            # Back-compat: older host code passes a 2-arg callback.
+            # Pass the vernlang as the legacy single "code" so the
+            # old conflation still works (the daemon will register
+            # with langcode=vernlang as before). New host code
+            # should accept three args.
+            try:
+                on_submit(clone_url, vernlang)
+            except Exception as ex:
+                print(f'[clone_url_popup] on_submit raised: {ex}')
         except Exception as ex:
             print(f'[clone_url_popup] on_submit raised: {ex}')
 

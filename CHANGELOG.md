@@ -145,17 +145,149 @@ new surface available, per ``feedback_min_client_version``.
     the JSON payload, calls ``lan_pair_accept``, surfaces the
     translated ``Result`` to the user.
 
-### Translation TODO
+### Settings wording polish
 
-Full French translations for the new UI strings (popup titles,
-button labels, status messages, manage-peer flows) are partial —
-the five LAN status codes have French strings, but several UI
-strings introduced by ``lan_popups.py`` + the new app.py LAN
-section haven't been backfilled into ``locales/fr/LC_MESSAGES/
-azt_collab_client.po``. ``pytest tests/`` flags the missing msgids
-via the translation-coverage drift detector; landing the missing
-msgstrs is a small follow-up that doesn't block usability (English
-strings show through as fallback).
+- ``Servers`` section label → ``Servers (set up at least one)``
+  to nudge users away from "I'll just open the picker without
+  ever connecting GitHub or GitLab".
+- ``Grant collaborator access`` button → ``Invite collaborator
+  to project`` (matches the GitHub-side wording the user sees
+  when accepting).
+- ``Share this repo (QR)`` button → ``Share this project (QR)``
+  (the suite-facing vocabulary is "project" everywhere else;
+  "repo" was a leak from the GitHub side).
+
+### Picker polish
+
+- ``I have one on my phone`` button hidden via ``height: 0`` +
+  ``opacity: 0`` + ``disabled: True`` per the Kivy hide/show
+  pattern in ``~/.claude-sil/CLAUDE.md``. The handler
+  (``app.open_file()``) is still wired so re-enabling is one
+  prop flip away — the open-file path is currently rough on
+  Android (SAF picker returns a content:// URI the daemon
+  can't walk back to a working_dir).
+
+### Translations
+
+French msgstrs for every new UI string land in
+``locales/fr/LC_MESSAGES/azt_collab_client.po`` alongside the
+five LAN status codes. The translation-coverage drift detector
+in ``pytest tests/`` should pass cleanly.
+
+### Combined pair-share-clone flow (post-design-session redesign)
+
+After the initial RPC-layer landing the design changed shape:
+LAN pairing and project sharing collapse into one gesture, the
+QR scan does pair + LAN-clone in a single step, and ``origin``
+adoption is always behind a one-tap confirm. New surface:
+
+**New status codes** in both daemon + client (with translations):
+``LAN_PROJECT_CLONED``, ``LAN_PROJECT_REOPENED``,
+``LAN_PROJECT_ADOPTED_REMOTE``, ``LAN_PROJECT_COLLISION_UNRELATED``,
+``LAN_ADOPT_ORIGIN_NEEDED``, ``LAN_REMOTE_CONFLICT``,
+``LAN_SHARE_OFFER``, ``LAN_SHARE_DECLINED``, ``LAN_OFFER_ACCEPTED``.
+
+**New endpoints**:
+
+- ``POST /v1/lan/clone {peer_id, langcode, remote_url?}`` —
+  ``lan_clone.py`` does ls-remote collision detection, then
+  TLS-pinned dulwich clone, then ``projects.register``. Stashes
+  ``LAN_ADOPT_ORIGIN_NEEDED`` (or ``LAN_REMOTE_CONFLICT``) as a
+  pending decision rather than touching ``origin`` silently.
+- ``POST /v1/lan/send_share_offer {peer_id, langcode}`` —
+  combined "update shared_projects allowlist + POST a courtesy
+  offer to the peer's listener" call.
+- ``POST /v1/lan/share_offer`` (listener side, paired-peer short-
+  circuit) — receives an offer from a paired peer; stashes a
+  ``LAN_SHARE_OFFER`` pending decision.
+- ``POST /v1/lan/share_declined`` (listener side) — receives a
+  nack; rolls back the sender's ``shared_projects`` allowlist
+  for that peer + langcode.
+- ``POST /v1/lan/accept_offer {decision_id}`` /
+  ``POST /v1/lan/decline_offer {decision_id}`` — receiver-side
+  resolution of a share-offer pending decision.
+- ``POST /v1/lan/adopt_origin {decision_id, accept}`` /
+  ``POST /v1/lan/resolve_conflict {decision_id, mode}`` —
+  receiver-side resolution of adopt-origin / remote-conflict
+  pending decisions. ``mode`` is ``use_theirs`` / ``keep_mine`` /
+  ``dual_publish``.
+- ``GET /v1/lan/pending`` — list pending UI decisions, for the
+  settings-side "Decisions waiting (N)" surface and the picker
+  "Receive a project from another phone (N waiting)" badge.
+
+**New module** ``azt_collabd/pending_decisions.py`` — atomic
+read/write of ``$AZT_HOME/pending_decisions.json``. Three kinds:
+``share_offer``, ``adopt_origin``, ``remote_conflict``. Stable
+``id`` per (kind, peer_id, langcode) so a re-sent offer doesn't
+pile up duplicates.
+
+**New module** ``azt_collabd/lan_clone.py`` — LAN-clone path.
+Synchronous (LAN is local-network fast); the receiver's picker
+gesture exits straight into the cloned project. Collision check
+piggybacks on a single ``ls-remote`` round-trip, no full clone
+for the decision.
+
+**New client wrappers** ``lan_clone``, ``lan_pending``,
+``lan_accept_offer``, ``lan_decline_offer``, ``lan_adopt_origin``,
+``lan_resolve_conflict``. ``lan_pair_qr`` extended to accept
+``langcode=`` so the QR payload carries the project + its
+``remote_url`` (when set) — same scan does pair + share + clone.
+``lan_share_project`` is now "share with notification"
+(was bookkeeping-only) — fires the courtesy offer to the peer.
+
+**UI restructure** (``azt_collab_client/ui/lan_popups.py``):
+
+- ``share_project_popup(langcode)`` — settings-side three-section
+  popup: paired phones list (per-row one-tap Share buttons),
+  in-person QR section ("Show QR code"), github invite section
+  ("Add permission by github username" → existing
+  ``grant_collaborator_popup``). Replaces the old separate
+  "Share repo QR" + "Grant collaborator access" buttons.
+- ``scan_to_pair`` extended: dispatches on payload shape (pair-
+  only / pair+langcode / unknown). Combined payloads run pair +
+  clone + (inline) adopt-origin confirm in one gesture.
+- ``pending_offers_popup`` — picker-side entry: shows pending
+  share-offers from already-paired peers (Accept / Decline per
+  row) plus a "Scan QR code" fallthrough for first-pair-with-a-
+  new-phone.
+- ``adopt_origin_popup`` — always-confirm prompt before
+  ``origin`` registration. Reused for in-scan-flow and pending-
+  decisions resolution surfaces.
+
+**Settings page** (``azt_collabd/ui/app.py``):
+
+- "Grant collaborator access" + "Share this project (QR)"
+  buttons collapsed into one "Share {langcode} project" button
+  that opens the consolidated popup. ``current_langcode_label``
+  StringProperty drives the dynamic button label.
+- Existing ``grant_collaborator`` method retained for callers
+  (the share popup folds the same flow in via the github invite
+  section).
+
+**Picker** (``azt_collab_client/ui/picker.py``):
+
+- "Pair with another phone" → "Receive a project from another
+  phone." Tap now opens ``pending_offers_popup`` (shows pending
+  offers + a scan fallback) rather than firing the scanner
+  directly.
+- Old "I have one on my phone" button kept in the KV tree but
+  hidden via ``height: 0`` + ``opacity: 0`` + ``disabled: True``
+  per the Kivy hide/show pattern (one prop flip to re-enable).
+
+### Open follow-ups
+
+- ``POST /v1/lan/sync_remotes`` bidirectional reconciliation: the
+  recipient's response carries their view back so a single round-
+  trip fixes both sides. Scheduled but not yet implemented —
+  initial-pair exchange via the hello payload covers the common
+  case for now; ongoing periodic sync is the gap.
+- ``dual_publish`` mode in ``resolve_conflict`` currently just
+  records the user's choice; the actual dual-push mechanism is
+  follow-up work in the scheduler's fan-out.
+- Live picker-badge count "(N waiting)" — first cut shows the
+  same label regardless; pending offers appear in the
+  ``pending_offers_popup`` once tapped. A live ``StringProperty``
+  on the picker's button text is the polish-pass fix.
 
 ## 0.44.13 — positive cache for system-resolver hits (Starlink DNS round-trip elimination)
 

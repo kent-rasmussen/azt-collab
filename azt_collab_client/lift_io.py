@@ -383,9 +383,23 @@ class _UriAtomicWriteFile:
             fallback = atomic_commit_bytes(langcode, rel_path, data)
             if fallback.has(_S.ATOMIC_COMMITTED):
                 return
+        # Surface the daemon's diagnostic params alongside the code
+        # — without this, ``failed: ['SERVER_ERROR']`` tells us a
+        # call failed but not *why*. The result carries
+        # ``{error: '<daemon-side reason>'}`` on the SERVER_ERROR
+        # status; include it so logcat shows the actual cause
+        # (project_not_found, pending_not_found, path_rejected,
+        # filesystem-error string, etc.).
+        detail = ''
+        for status in result.statuses:
+            params = getattr(status, 'params', {}) or {}
+            err = params.get('error') or params.get('detail')
+            if err:
+                detail = f' ({status.code}: {err})'
+                break
         raise IOError(
             f'atomic_commit({self._uri!r}, {rel_path!r}) failed: '
-            f'{codes!r}')
+            f'{codes!r}{detail}')
 
     def close(self):
         """Release the path lock. Idempotent. Does NOT commit on

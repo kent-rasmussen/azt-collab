@@ -243,6 +243,63 @@ LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
 LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
 LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
 
+# Combined-pair-share-clone flow (parked spec § "Combined scan flow",
+# 0.45.0). The same scan gesture that pairs two phones also clones
+# the project bytes over LAN and (with user confirmation) registers
+# the github remote_url so future drains push to both. These codes
+# wire the post-clone / post-offer routing on the receiver side.
+#
+# LAN_PROJECT_CLONED:            Receiver successfully LAN-cloned the
+#                                project from the owner. Params:
+#                                ``langcode``, ``peer_id``,
+#                                ``device_name``.
+# LAN_PROJECT_REOPENED:          Receiver already had the project and
+#                                its history overlaps with the
+#                                owner's. No clone happened; the LAN
+#                                pair + share was registered. Params:
+#                                ``langcode``.
+# LAN_PROJECT_ADOPTED_REMOTE:    Receiver adopted the owner's
+#                                ``remote_url`` as ``origin`` after
+#                                user confirmation. Params: ``langcode``,
+#                                ``url``.
+# LAN_PROJECT_COLLISION_UNRELATED: Same langcode locally, zero shared
+#                                commits with the incoming project.
+#                                Refuse — user must rename or remove
+#                                first. Params: ``langcode``.
+# LAN_ADOPT_ORIGIN_NEEDED:       Stashed pending decision: the owner
+#                                has a ``remote_url`` we don't, and
+#                                we need user confirmation before
+#                                setting ``origin``. Params:
+#                                ``langcode``, ``peer_id``,
+#                                ``device_name``, ``url``.
+# LAN_REMOTE_CONFLICT:           Stashed pending decision: both peers
+#                                have a ``remote_url`` for this
+#                                project but they differ (fork case).
+#                                Params: ``langcode``, ``existing_url``,
+#                                ``incoming_url``, ``peer_id``,
+#                                ``device_name``.
+# LAN_SHARE_OFFER:               Stashed pending decision: a paired
+#                                peer wants to share a project with
+#                                us; we haven't accepted yet. Params:
+#                                ``langcode``, ``peer_id``,
+#                                ``device_name``, ``repo_url``.
+# LAN_SHARE_DECLINED:            Receiver declined the offer; sender's
+#                                ``shared_projects`` allowlist
+#                                rolled back. Params: ``langcode``,
+#                                ``peer_id``.
+# LAN_OFFER_ACCEPTED:            Receiver accepted the offer; LAN
+#                                clone follows on the same path.
+#                                Params: ``langcode``.
+LAN_PROJECT_CLONED = 'LAN_PROJECT_CLONED'
+LAN_PROJECT_REOPENED = 'LAN_PROJECT_REOPENED'
+LAN_PROJECT_ADOPTED_REMOTE = 'LAN_PROJECT_ADOPTED_REMOTE'
+LAN_PROJECT_COLLISION_UNRELATED = 'LAN_PROJECT_COLLISION_UNRELATED'
+LAN_ADOPT_ORIGIN_NEEDED = 'LAN_ADOPT_ORIGIN_NEEDED'
+LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
+LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
+LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
+LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+
 # Transport-failure codes. Mirror of the client-side constants
 # (the daemon doesn't emit these — they're produced by the
 # client wrappers' transport-failure branches — but keeping the

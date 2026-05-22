@@ -1085,20 +1085,25 @@ class PickerApp(App):
     # ── Create flow: "Clone Internet Repository" ──────────────────────
     def clone_dialog(self):
         """URL prompt → daemon clone → emit. The clone-url popup
-        already collects an explicit ``langcode`` (defaulting to the
-        URL-derived value, with an inline **change code** affordance
-        if the user wants to override). No separate confirmation
-        step — the picker just kicks the clone with whatever the
-        popup returned."""
-        def _on_submit(url, langcode):
-            self._start_clone(url, langcode)
+        collects ``langcode`` (project name, derived from the URL
+        slug, not user-editable here) and ``vernlang`` (linguistic
+        code, user-editable via the "change" affordance). Both
+        flow through to the daemon's clone endpoint; the daemon
+        registers the project under ``langcode`` and stamps
+        ``vernlang`` separately so LIFT writers know which
+        language to tag for new entries."""
+        def _on_submit(url, langcode, vernlang=''):
+            self._start_clone(url, langcode, vernlang)
 
         clone_url_popup(_on_submit)
 
-    def _start_clone(self, url, chosen_langcode):
-        """Kick the clone with the user-confirmed langcode. The
-        daemon's ``_clone_worker`` registers under this exact key;
-        ``_emit_and_quit`` later stamps the same value on the
+    def _start_clone(self, url, chosen_langcode, chosen_vernlang=''):
+        """Kick the clone with the user-confirmed langcode +
+        vernlang. The daemon's ``_clone_worker`` registers the
+        project under ``langcode`` (the project key, == the repo
+        slug) and stamps ``vernlang`` separately so LIFT writers
+        tag new entries with the right linguistic code.
+        ``_emit_and_quit`` later stamps ``langcode`` on the
         result Intent's ``langcode`` extra."""
         self._show_loading_overlay(
             _tr('Cloning {url}...').format(url=url))
@@ -1106,7 +1111,8 @@ class PickerApp(App):
 
         def _worker():
             print(f'[picker_app] clone worker starting url={url!r} '
-                  f'langcode={chosen_langcode!r}',
+                  f'langcode={chosen_langcode!r} '
+                  f'vernlang={chosen_vernlang!r}',
                   file=sys.stderr, flush=True)
             try:
                 import azt_collabd
@@ -1115,7 +1121,9 @@ class PickerApp(App):
                 dest = os.path.join(
                     azt_collabd.paths.azt_home(),
                     'projects', repo_name)
-                resp = clone_project(url, dest, langcode=chosen_langcode)
+                resp = clone_project(url, dest,
+                                     langcode=chosen_langcode,
+                                     vernlang=chosen_vernlang)
             except Exception as ex:
                 err_str = str(ex)
                 print(f'[picker_app] clone exception: {err_str}',

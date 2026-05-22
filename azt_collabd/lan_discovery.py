@@ -90,6 +90,17 @@ def known_endpoints():
         return dict(_endpoints)
 
 
+def invalidate_endpoint(peer_id_hex):
+    """Drop the cached endpoint for *peer_id_hex* so the next
+    discovery refresh (or a fresh ``resolveService`` triggered by
+    ``onServiceFound``) repopulates it. Used by the fan-out path
+    when a connection to the cached endpoint refuses — common
+    after the peer's daemon restarts and binds a new ephemeral
+    port that NsdManager hasn't surfaced an update event for."""
+    with _LOCK:
+        _endpoints.pop(peer_id_hex, None)
+
+
 def _zc_props(peer_id_hex, fp_hex):
     return {
         b'peer_id': peer_id_hex.encode('ascii'),

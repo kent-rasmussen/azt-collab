@@ -64,6 +64,58 @@ def _atomic_write(target_path, data, mode):
         raise
 
 
+def _backend():
+    """Return ``cryptography.hazmat.backends.default_backend()`` if
+    importable, else ``None``. Older ``cryptography`` versions
+    require an explicit ``backend=`` kwarg on signing /loading
+    calls; newer ones accept (and ignore) it. Passing it
+    conditionally keeps both shapes working from one code path."""
+    try:
+        from cryptography.hazmat.backends import default_backend
+        return default_backend()
+    except Exception:
+        return None
+
+
+def _sign_cert(builder, key):
+    """``CertificateBuilder.sign`` is the call that broke
+    historically: pre-3.x cryptography required a positional
+    ``backend`` and a non-None ``algorithm``; ed25519 keys want
+    ``algorithm=None``. Try with backend first; on TypeError fall
+    through to the kwarg-less newer signature."""
+    backend = _backend()
+    if backend is not None:
+        try:
+            return builder.sign(private_key=key, algorithm=None,
+                                backend=backend)
+        except TypeError:
+            pass
+    return builder.sign(private_key=key, algorithm=None)
+
+
+def _load_pem_private_key(key_pem):
+    from cryptography.hazmat.primitives import serialization
+    backend = _backend()
+    if backend is not None:
+        try:
+            return serialization.load_pem_private_key(
+                key_pem, password=None, backend=backend)
+        except TypeError:
+            pass
+    return serialization.load_pem_private_key(key_pem, password=None)
+
+
+def _load_pem_x509_cert(cert_pem):
+    from cryptography import x509
+    backend = _backend()
+    if backend is not None:
+        try:
+            return x509.load_pem_x509_certificate(cert_pem, backend=backend)
+        except TypeError:
+            pass
+    return x509.load_pem_x509_certificate(cert_pem)
+
+
 def _generate():
     """Generate a fresh ed25519 keypair + self-signed X.509 cert.
     Returns ``(key_pem, cert_pem, cert_der, pubkey_raw)``. Raises
@@ -85,7 +137,7 @@ def _generate():
         x509.NameAttribute(NameOID.COMMON_NAME, 'azt-collab-peer'),
     ])
     now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
@@ -97,8 +149,8 @@ def _generate():
             x509.BasicConstraints(ca=True, path_length=None),
             critical=True,
         )
-        .sign(private_key=key, algorithm=None)
     )
+    cert = _sign_cert(builder, key)
 
     key_pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -112,7 +164,7 @@ def _generate():
 
 def _pubkey_raw_from_key_pem(key_pem):
     from cryptography.hazmat.primitives import serialization
-    key = serialization.load_pem_private_key(key_pem, password=None)
+    key = _load_pem_private_key(key_pem)
     return key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -120,9 +172,8 @@ def _pubkey_raw_from_key_pem(key_pem):
 
 
 def _pem_to_der(cert_pem):
-    from cryptography import x509
     from cryptography.hazmat.primitives import serialization
-    cert = x509.load_pem_x509_certificate(cert_pem)
+    cert = _load_pem_x509_cert(cert_pem)
     return cert.public_bytes(serialization.Encoding.DER)
 
 
