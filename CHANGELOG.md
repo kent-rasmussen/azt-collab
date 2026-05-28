@@ -9,6 +9,2632 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.47.2 — Auto-commit after atomic_finalize / atomic_commit
+
+### Diagnosis
+
+Field session 2026-05-27 (post-0.47.1 build): phone recorded
+an entry, badge showed ``+1 red`` (n_changes=1) indefinitely
+until the user recorded another entry. Root cause: the daemon's
+``commit_project`` debounce timer fired before a final
+``atomic_finalize`` landed — the commit captured the
+pre-finalize state, then the ``project_lock``-serialized
+atomic_finalize ran *after* the commit released the lock,
+leaving the just-finalized LIFT (and any post-commit
+``[image-save]``) as uncommitted bytes on disk. The recorder
+fired ``commit_project`` only once for the whole save sequence;
+since the daemon's job was already in-flight, no further commit
+was scheduled.
+
+### Fix
+
+``_h_project_atomic_finalize`` and ``_h_project_atomic_commit``
+now call ``scheduler.commit_project(langcode)`` after the rename
+succeeds. The scheduler's 500 ms debounce coalesces bursts —
+typical record-then-save sequences with the recorder also firing
+commit_project collapse to one commit run; the daemon auto-fire
+only matters when the peer-side commit_project trigger is
+missing or dropped. Cheap (sets/resets a timer);
+``NOTHING_TO_COMMIT`` if nothing changed.
+
+### Files
+
+- ``azt_collabd/server.py`` — ``_h_project_atomic_finalize``
+  + ``_h_project_atomic_commit`` schedule a debounced commit
+  after successful rename.
+
+### Wire format
+
+None. Pure Python additive — no clean rebuild needed
+(``buildozer android debug`` is enough).
+
+## 0.47.1 — Push notifications (per-project ContentProvider URIs)
+
+### Diagnosis
+
+Polling-only project_status updates make the sync-indicator
+badge feel sluggish during sync cascades. A typical merge cycle
+takes 5-15 seconds; with a 10 s polling tick the badge can lag
+real daemon state by up to one tick — visible to the user as
+"why is it still red" after sync visibly completed in logs.
+
+The previous architecture (§ 17b "Why peer-side polling and not
+daemon-pushed notifications") rejected push because adding a
+reverse channel "would require a peer-declared service +
+permission + lifetime management — substantial Android-API
+surface." That assessment overlooked Android's existing
+``ContentResolver.notifyChange`` / ``registerContentObserver``
+pair, which uses the same ContentProvider that already carries
+all our RPC traffic — zero new permission, zero new service,
+suite signature permission already gates registration.
+
+### Fix
+
+Per-project status URIs scoped under the existing
+``org.atoznback.aztcollab`` authority:
+
+- ``content://org.atoznback.aztcollab/status/<langcode>``
+  fires for HEAD advance, peer observation update, post-
+  receive reset, absorb-reset on that one project.
+- ``content://org.atoznback.aztcollab/status`` fires for
+  daemon-wide changes (toggle flips). Observers registered
+  with ``notifyForDescendants=true`` on this URI also catch
+  every per-project notification — so a project-list /
+  picker UI subscribes once.
+
+### Daemon side
+
+- **Java** (``AZTCollabProvider.java``): static method
+  ``notifyStatusChanged(String langcode)`` that calls
+  ``getContentResolver().notifyChange``. ``onCreate`` captures
+  the application context into a static volatile field so the
+  notify method can be called from any thread without an instance
+  handle.
+- **Java** (``AZTStatusObserver.java``, new): ``ContentObserver``
+  subclass that delegates to a Python-implemented
+  ``OnChangeCallback`` interface. Pyjnius can implement Java
+  interfaces but not subclass concrete classes, so this thin
+  bridge is necessary.
+- **Python** (``azt_collabd/android_cp/notify.py``, new):
+  jnius wrapper exporting ``notify_project_changed(langcode)``
+  and ``notify_global_changed()``. No-ops off Android (loopback
+  daemon has no ContentProvider; peers fall back to polling).
+  Lazy-loads + caches the provider class on first call.
+- **Call sites**:
+  - ``repo._commit_step_locked`` after ``COMMITTED_LOCAL``
+  - ``lan_listener._reset_working_tree_after_receive`` after
+    successful hard-reset
+  - ``lan_push._push_to_peer`` after successful peer
+    observation update (lan_unshared / at_risk drop for the
+    pushing device)
+  - ``server._h_lan_set_toggle`` (global URI)
+  - ``server._h_set_work_offline`` (global URI)
+
+### Client side
+
+- **Python** (``azt_collab_client/notify.py``, new):
+  ``subscribe_project_changes(langcode, callback) → token``,
+  ``subscribe_global_changes(callback) → token``,
+  ``unsubscribe(token)``. Module state holds strong-refs to
+  the pyjnius proxy AND the Java observer so they survive
+  Python GC between events. Returns ``None`` for the token
+  off Android — peers should treat that as "fall back to
+  polling" rather than an error.
+- **Re-exported** from ``azt_collab_client/__init__.py``.
+- **CLIENT_INTEGRATION.md § 17b** rewrites the "Why peer-side
+  polling" section into "Push notifications — ContentObserver
+  subscription (v0.47.0+)" with the API + recommended polling
+  cadence (subscribe + 60-120 s heartbeat instead of 5-15 s
+  poll-only).
+
+### Wire format
+
+No JSON wire format change. The notification API is an
+additional surface on the existing ContentProvider authority,
+gated by the same suite-signature permission. ``MIN_*_VERSION``
+unchanged from 0.47.0.
+
+### Build impact
+
+**Java changes — requires a clean Android rebuild**
+(``buildozer android clean && buildozer android debug``) for the
+server APK, per ``feedback_buildozer_clean_only_for_native``.
+Pure-Python peer apps don't need to clean; incremental build
+picks up the client-side ``notify.py`` and the re-exports.
+
+### Files
+
+- ``android/src/main/java/org/atoznback/aztcollab/AZTCollabProvider.java``
+  — adds ``notifyStatusChanged`` static method + ``sContext``
+  capture in ``onCreate``.
+- ``android/src/main/java/org/atoznback/aztcollab/AZTStatusObserver.java``
+  — new ContentObserver subclass with Python-implementable
+  ``OnChangeCallback`` interface.
+- ``azt_collabd/android_cp/notify.py`` — new daemon-side jnius
+  wrapper.
+- ``azt_collabd/repo.py`` — fire notify on COMMITTED_LOCAL.
+- ``azt_collabd/lan_listener.py`` — fire notify on successful
+  post-receive reset.
+- ``azt_collabd/lan_push.py`` — fire notify on verified peer
+  push (peer_main_shas update).
+- ``azt_collabd/server.py`` — fire global notify on toggle flips
+  (work_offline + lan_allow_sync).
+- ``azt_collab_client/notify.py`` — new client-side subscription
+  API.
+- ``azt_collab_client/__init__.py`` — re-export, version → 0.47.1.
+- ``azt_collab_client/CLIENT_INTEGRATION.md`` — rewrite § 17b's
+  "Why peer-side polling" sub-section into the push-notification
+  contract.
+
+## 0.47.0 — Split sync-status into independent WAN / LAN / at_risk counts
+
+### Wire-format break
+
+`ProjectStatus.commits_ahead` and `ProjectStatus.unshared_commits`
+are gone, replaced by three independent count fields:
+
+- ``wan_unshared`` — commits on local HEAD not on
+  ``refs/remotes/origin/{main,master}`` (was ``commits_ahead``;
+  same computation, renamed). Special-case for LAN-only projects
+  (no origin URL): walks from HEAD, surfacing the whole history
+  as intentional friction for "no github backup."
+- ``lan_unshared`` — commits on local HEAD not reachable from
+  any paired-and-sharing peer's ``last_seen_main`` for this
+  langcode. Returns 0 when no peers are paired (the "nothing to
+  be behind on" convention).
+- ``at_risk`` — commits reachable from HEAD from neither origin
+  tracking refs NOR any paired peer. Set-intersection of
+  ``wan_unshared`` and ``lan_unshared`` as commit sets. Zero
+  in every state except state E ("both behind on the same
+  commits"), which is the routine transient right after a
+  fresh commit.
+
+`MIN_CLIENT_VERSION` and `MIN_SERVER_VERSION` both bump to
+``0.47.0``. Old peers paired with a new daemon (or vice versa)
+fail compatibility check with a clear error and route to the
+self-update flow — no silent mis-render. Clean rename, no
+deprecation aliases.
+
+### Rendering recipe (§ 17b)
+
+Pre-0.47 the recipe had three label branches:
+
+```
+OK / LANOK +N / +unshared/ahead
+```
+
+Post-0.47 there are five:
+
+```
+OK
+LAN-{lan}                    (only LAN behind)
+WAN-{wan}                    (only WAN behind)
+WAN-{wan}_LAN-{lan}          (split-brain — different commits each
+                              channel, no overlap; rare/anomalous)
+WAN-{wan} LAN-{lan}          (both behind on the same commits;
+                              routine transient after a commit)
+```
+
+Per-channel red rule: ``WAN-{wan}`` is red iff
+``work_offline=off``; ``LAN-{lan}`` is red iff
+``lan_allow_sync=on``; the uncommitted-changes badge (literal
+text ``+n``, drawn in red) is always red. (Earlier design notes
+used the shorthand ``R(+n)`` to denote the red uncommitted badge
+— that's notation, not literal output. Peers render ``+1`` /
+``+3`` etc.)
+Red semantically means "settings allow this storage, but it
+hasn't happened yet" — transient red is normal automation,
+persistent red signals a broken sync. Black means "settings
+preclude this resolution; you accepted it by design" (e.g.,
+phone in the forest, offline mode).
+
+Suffix table simplified: only ``· offline`` actually surfaces.
+The ``· LAN`` and ``· LAN-only`` suffixes are implied (the user
+can see the mode elsewhere in the UI; no need to call it out
+alongside every sync status). The ``OK · LAN`` ban from earlier
+drafts is preserved as a defensive collapse.
+
+State frequencies in normal workflow are ``A > B/C > E > D``:
+state E (both-behind, at-risk) is the routine transient right
+after a commit (one commit not on either channel yet); state D
+(split-brain) is rare and usually pathological (requires
+divergent history). This corrects the pre-0.47 framing that
+treated D as "safe-common" and E as "alarming-rare."
+
+### Files
+
+- ``azt_collabd/repo.py`` — ``_count_commits_ahead`` renamed to
+  ``_wan_unshared``; new ``_lan_unshared`` and ``_at_risk``
+  helpers (both take ``langcode`` for peer lookup); shared
+  ``_walk_count_log`` rate-limit cache keyed by ``(working_dir,
+  tag)`` so the three callers don't clobber each other's emit
+  state.
+- ``azt_collabd/server.py`` — ``_h_project_status`` emits the
+  three new fields, drops the old two. Computes
+  ``lan_unshared`` and ``at_risk`` inline (they need
+  ``langcode``); ``repo_status_summary`` still returns the
+  4-tuple with ``wan_unshared`` as its fourth element. Old
+  ``_unshared_commit_count`` helper removed (replaced by
+  ``repo._lan_unshared`` + ``repo._at_risk``).
+- ``azt_collabd/__init__.py`` — ``MIN_CLIENT_VERSION`` → 0.47.0.
+- ``azt_collabd/lan_push.py`` — diagnostic call updated to
+  ``_wan_unshared``; comment references the new helper names.
+  ALSO: the ``[lan-push] '<pid>' at <host>:<port> refused /
+  unreachable`` log line now classifies which errno triggered
+  the failure — ENETUNREACH (errno 101, this device has no
+  network), EHOSTUNREACH (errno 113, peer not on this network),
+  or ECONNREFUSED (errno 111, peer listener down on a known
+  endpoint). Triages field reports without an adb round-trip:
+  the log itself says whether the local device or the remote
+  device is the culprit. Examples:
+    ``refused / unreachable: this device has no network route
+    (ENETUNREACH) — check WiFi / airplane mode on THIS device``
+    ``refused / unreachable: no route to 192.168.10.110 on
+    this network (EHOSTUNREACH) — peer device is likely
+    offline or on a different network``
+    ``refused / unreachable: 192.168.10.23:34863 refused the
+    connection (ECONNREFUSED) — peer daemon / listener is down
+    or rebound to a different port``
+- ``azt_collabd/peers.py`` — comments reference the new helper
+  names and field names.
+- ``azt_collabd/scheduler.py`` — comments reference
+  ``wan_unshared`` / ``lan_unshared``.
+- ``azt_collab_client/__init__.py`` — ``__version__`` →
+  ``0.47.0``; ``MIN_SERVER_VERSION`` → ``0.47.0``.
+- ``azt_collab_client/projects.py`` — ``ProjectStatus`` drops
+  ``commits_ahead`` and ``unshared_commits``; adds
+  ``wan_unshared`` / ``lan_unshared`` / ``at_risk``.
+- ``azt_collab_client/CLIENT_INTEGRATION.md`` — § 17b rendering
+  recipe rewritten; § 17c/§ 20 references updated.
+- ``azt_collab_client/CLAUDE.md`` — daemon-owned state listing
+  references new field names.
+- ``azt_collab_client/docs/rationale/sync.md`` — reference
+  update.
+- ``azt_collab_client/NOTES_TO_DAEMON.md`` — closes the
+  ``LANOK rendering asymmetric`` entry as RESOLVED by this
+  release (new symmetric model removes the originator-vs-cloned
+  asymmetry).
+- ``examples/sister_app.py`` — prints the three new fields.
+
+### Migration
+
+Peer rebuild required. Old peers connected to a 0.47.0 daemon
+will fail the ``check_server_compat()`` check and route to the
+install/update popup with the "Update the client" branch.
+The recipe in § 17b is a five-branch model; peers re-implement
+their sync-indicator rendering to match.
+
+### Bundled: post-receive reset retry + commit-time absorb
+
+Field session 2026-05-27 surfaced a data-loss path the new
+WAN/LAN/at_risk badges exposed: tablet showed persistent red
+``+4`` (n_changes) for ~10 minutes after a phone push merged
+into its HEAD, because ``_reset_working_tree_after_receive``
+hit ``LockTimeout`` (the tablet's own outgoing
+``_merge_then_push`` held ``project_lock`` for >5 s during its
+own three-way merge), and the fallback comment "next
+commit_project will absorb the mismatch" was wrong in the
+worst way: if a ``commit_project`` ever did fire, ``_stage_all``
+would have seen the merge files as "deleted from working tree"
+and produced a commit that erased them.
+
+Two-part fix:
+
+- **Deferred-reset queue** (``azt_collabd/lan_listener.py``).
+  ``_reset_working_tree_after_receive`` now adds the langcode
+  to ``_pending_post_receive_resets`` on ``LockTimeout`` and
+  removes it on success. The set is persisted to
+  ``$AZT_HOME/pending_resets.json`` (atomic write — same shape
+  as the 0.46.9 settings fix), so a daemon restart while a
+  reset is queued doesn't lose track. The scheduler watcher
+  drains the queue every tick (~30 s default) via
+  ``drain_pending_resets``; ``reconcile_on_startup`` loads the
+  persisted set on daemon boot.
+
+- **Pre-commit absorb** (``azt_collabd/repo.py``). At the top
+  of ``_commit_repo_locked``, check
+  ``lan_listener.has_pending_reset(langcode)``; if set, run the
+  hard-reset-to-HEAD under our already-held ``project_lock``
+  and remove the queue entry before ``_commit_step_locked``
+  stages. This means even if the scheduler drain hasn't run
+  yet, the next user-driven commit absorbs the pending reset
+  silently — no silent delete of merge files possible.
+
+### Bundled-files
+
+- ``azt_collabd/lan_listener.py`` — adds the
+  ``_pending_post_receive_resets`` set + persistence +
+  ``drain_pending_resets`` + ``has_pending_reset`` /
+  ``load_pending_resets_from_disk`` public API.
+  ``_reset_working_tree_after_receive`` enqueues on
+  ``LockTimeout`` and dequeues on success.
+- ``azt_collabd/scheduler.py`` — ``_watcher_loop`` calls
+  ``lan_listener.drain_pending_resets()`` each tick;
+  ``reconcile_on_startup`` calls
+  ``lan_listener.load_pending_resets_from_disk()``.
+- ``azt_collabd/repo.py`` — ``_commit_repo_locked`` checks
+  ``has_pending_reset`` and absorbs the reset under the held
+  lock before staging.
+
+## 0.46.9 — Atomic config.json + LAN-listener self-heal + LAN-only drain bail
+
+### Diagnosis
+
+Field session 2026-05-26 surfaced four overlapping issues after a
+server APK update:
+
+1. **LAN sync silently turned off after APK update.** Persisted
+   ``lan.allow_sync`` flipped from True to False across the update,
+   visible as the toggle rendering "no" in the daemon UI. Root cause:
+   ``settings._save_raw`` wrote config.json in place (open ``'w'`` +
+   ``json.dump``), so a process kill mid-write (APK update, OOM)
+   could leave a truncated file. Next boot's ``_load_raw`` caught
+   ``json.JSONDecodeError``, logged once, and returned ``{}`` — every
+   setting silently reverted to its default. Any subsequent ``set_()``
+   call then wrote a fresh dict containing only the one key being
+   set, wiping every *other* persisted setting on disk. One
+   APK-update mishap = lan.allow_sync off, sync.work_offline off,
+   device_name reset, etc., with one log line buried among thousands.
+
+2. **Tablet drain loop hammered ``NotGitRepository`` every 2s.**
+   LAN-cloned project had ``.git/config`` ``[remote "origin"]`` with
+   ``url = `` (empty) — leftover from older dulwich's failed
+   ``strip_lan_origin_if_present``. ``_push_repo_locked`` decoded
+   the empty URL, didn't KeyError, and fed ``''`` to
+   ``_push_step_locked`` which retried fetch/push 4× per drain cycle.
+   Same shape as the 0.46.8 ``_count_commits_ahead`` fix; just
+   another consumer of the same half-stripped state.
+
+3. **Drain-loop ``[count-ahead]`` diagnostic emitted for the wrong
+   branch.** 0.46.7 hardcoded the diagnostic call to
+   ``_count_commits_ahead(repo, 'main')``. A project whose HEAD is
+   on ``refs/heads/master`` (LAN-cloned from a peer whose source
+   git config defaulted to master, or any user-renamed branch)
+   showed two ``[count-ahead]`` lines per drain — one against the
+   orphan ``refs/heads/main`` (stuck at clone-time SHA, never
+   advanced) and one against the real HEAD branch. Confusing
+   double-emission; harmless beyond log noise.
+
+4. **``apply_toggle`` startup failures attribution-less.** When
+   the LAN listener failed to start on a daemon respawn (FGS
+   denied, WifiLock denied, socket bind fail), one log line said
+   ``[lan-listener] start failed: <ex>`` with no indication of
+   *which* step raised. Hard to attribute in field logs.
+
+### Fixes
+
+- **Atomic ``settings._save_raw``.** Write to ``config.json.tmp.<pid>``,
+  ``fsync``, ``os.replace`` — crash-during-write never leaves a
+  truncated file. ``_load_raw`` now distinguishes
+  "file missing" (returns ``{}`` — clean install, fine) from
+  "file exists but unparseable" (returns ``_LoadFailed(exc)``).
+  ``set_()`` refuses to write when ``_LoadFailed`` is returned, so
+  a corrupt config.json is preserved on disk instead of being
+  overwritten with a one-key dict. Loud log line on the unreadable
+  case so the failure mode is attributable in field logs.
+
+- **LAN-listener split-brain self-heal.** Scheduler watcher tick
+  (every ``sync.connectivity_poll_s``, default 30s) calls
+  ``lan_listener.apply_toggle()`` unconditionally. Idempotent when
+  state matches; restarts the listener when persisted=True but
+  ``is_running()=False``. Repairs the (1) APK-update-killed,
+  (2) ``apply_toggle``-raised-during-boot, and
+  (3) listener-died-mid-session split-brain cases without a user
+  gesture. Pre-this-fix the only way to recover was opening the
+  pair flow (which force-re-applies via ``_auto_enable_lan``).
+
+- **``apply_toggle`` per-step error attribution.** Split the
+  single ``try/except`` around ``acquire_wifi_locks`` +
+  ``start_fgs`` + ``start`` into three. Each phase logs its own
+  ``[lan-listener] {step} failed`` line so a field log says
+  exactly which seam failed. No behaviour change beyond the log
+  line.
+
+- **Empty origin URL = NO_REMOTE.** ``_push_repo_locked`` and
+  ``_sync_repo_locked`` now ``.strip()`` the decoded URL and
+  short-circuit to ``S.NO_REMOTE`` when the result is empty. Drain
+  loop bails immediately instead of fanning out the
+  ``NotGitRepository`` storm. User-gestured Sync gets the typed
+  NO_REMOTE error so the UI can route to a "publish this project"
+  prompt instead of a generic failure.
+
+- **``lan_push.fan_out`` diagnostic uses HEAD branch.** Reads
+  ``HEAD`` symref, decodes the branch name, falls back to
+  ``'main'`` on detached or unreadable HEAD. The drain-loop
+  ``[count-ahead]`` line now matches the ``_h_project_status``
+  one for the same project.
+
+### Files
+
+- ``azt_collabd/settings.py`` — atomic ``_save_raw``;
+  ``_LoadFailed`` sentinel; ``set_()`` refuses to write on load
+  failure; loud log on unreadable config.
+- ``azt_collabd/lan_listener.py`` — ``apply_toggle`` splits the
+  start sequence into three attributable try/except blocks.
+- ``azt_collabd/scheduler.py`` — ``_watcher_loop`` calls
+  ``lan_listener.apply_toggle`` every tick (before the drain
+  gate) so split-brain self-heals.
+- ``azt_collabd/repo.py`` — ``_push_repo_locked`` /
+  ``_sync_repo_locked`` short-circuit ``S.NO_REMOTE`` on empty
+  URL.
+- ``azt_collabd/lan_push.py`` — ``fan_out`` reads HEAD symref
+  for the ``_count_commits_ahead`` diagnostic call instead of
+  hardcoding ``'main'``.
+
+### Wire format
+
+None. All daemon-internal correctness + diagnostics.
+
+## 0.46.8 — Treat empty origin URL same as no URL in `_count_commits_ahead`
+
+### Diagnosis
+
+0.46.6's ``[count-ahead]`` diagnostic surfaced the
+asymmetric-badge cause: tablet's repo had
+``[remote "origin"]`` in ``.git/config`` with an **empty
+``url`` value** (literal ``url = `` with no value). This is the
+fallback state from ``strip_lan_origin_if_present`` when the
+older dulwich on the device lacks ``config.remove_section``:
+
+```python
+try:
+    config.remove_section((b'remote', b'origin'))
+except (KeyError, AttributeError):
+    try:
+        config.set((b'remote', b'origin'), b'url', b'')
+    except Exception:
+        return False
+```
+
+The fallback writes ``url = `` (empty) instead of removing the
+section. My 0.46.1 ``_count_commits_ahead`` then read the
+config and took the "origin URL configured → 0 (OK-on-
+uncertainty)" branch even though the URL is empty (= nowhere
+to push) — masking the LAN-only walk and producing
+``OK · LAN-only`` (no count) instead of ``LANOK +N``.
+
+Phone happened to not have the half-strip state (its dulwich
+honoured ``remove_section`` cleanly), so phone hit the
+``no tracking ref + no origin URL (LAN-only) → walk-from-HEAD``
+branch and rendered ``LANOK +N`` correctly. Asymmetry sourced
+to a per-dulwich-version difference in how the strip
+completed.
+
+### Fix
+
+In ``_count_commits_ahead``'s no-tracking-ref branch, treat an
+empty / whitespace-only URL the same as no URL at all. After
+``.decode().strip()``, if the result is empty, fall through to
+the walk-from-HEAD branch.
+
+After this fix on tablet, the same poll that previously
+returned 0 will return the actual local-commit count. Recipe
+renders ``LANOK +N`` matching phone. Symmetry restored without
+needing to repair the half-stripped ``.git/config`` on disk.
+
+The on-disk half-strip state (``[remote "origin"]`` section
+with empty ``url = ``) persists — it's cosmetic git-state
+clutter, not user-visible, and harmless to ``project_status``
+once this consumer-side fix is in. A future pass could repair
+it via a non-dulwich path (write ``.git/config`` directly with
+the section removed), but no need to land that here.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  ``_count_commits_ahead``: empty-URL handling in the
+  no-tracking-ref branch.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.46.7 — Fire `[count-ahead]` diagnostic from the drain loop too
+
+0.46.6 added the ``[count-ahead]`` line in ``_count_commits_ahead``
+but that only fires when ``_h_project_status`` is called — which
+only happens when a peer (recorder / picker) is foregrounded
+and polling. Field test on a device where the server APK is
+the only thing open after a Restart server tap produced 3+
+minutes of drain cycles with no diagnostic emit. Picker
+wasn't running; nothing called status; nothing fired the
+diagnostic.
+
+Fix: ``lan_push.fan_out`` now also calls
+``_count_commits_ahead(repo, 'main')`` once per drain
+(every ~30 s). The rate-limit on ``_count_ahead_log``
+(output-change-only) still applies, so steady-state drains
+emit nothing once the state has been seen. The first drain
+after a daemon restart, or whenever the value changes,
+surfaces the line — regardless of peer activity.
+
+### Files
+
+- ``azt_collabd/lan_push.py`` —
+  ``fan_out`` opens repo + calls ``_count_commits_ahead`` for
+  diagnostic side-effect; ignores return value.
+
+### Wire format
+
+None. Diagnostic-only.
+
+## 0.46.6 — `[count-ahead]` diagnostic in `_count_commits_ahead`
+
+After 0.46.5 broke the merge loop and both phones converged on
+the same HEAD SHA, a residual badge asymmetry showed up: phone
+rendered ``LANOK +N`` (commits_ahead=N from walk-from-HEAD)
+while tablet rendered ``OK`` (commits_ahead=0). Both phones on
+0.46.5, both at the same data — so the asymmetry comes from
+each device's local ref state, not different code.
+
+Most likely cause (suspect, not yet confirmed): one phone has
+``refs/remotes/origin/main`` from clone time that's somehow at
+the converged SHA, the other has no tracking ref. The 0.46.1
+walk-from-HEAD branch fires only on the second; the first
+returns 0 via the "tracking-ref-equals-local → 0" branch.
+
+Rather than guess and patch blindly, this release adds a single
+rate-limited ``[count-ahead]`` diagnostic line per call showing
+which branch fired and the SHAs involved:
+
+```
+[count-ahead] '<project_dir>': branch='main' local='<sha>':
+  no tracking ref + no origin URL (LAN-only) →
+  walk-from-HEAD = 55
+[count-ahead] '<project_dir>': branch='main' local='<sha>':
+  tracking ref equals local → 0
+```
+
+Rate-limited by output-change (in-memory dict per working_dir):
+the line only emits when the result differs from the last one.
+Steady-state polls produce no log noise; transitions are
+visible. Will reveal the actual ref state on both phones in
+the next field run.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  ``_count_commits_ahead`` adds branch-tagged
+  ``[count-ahead]`` emit via new ``_count_ahead_log`` helper
+  (in-memory rate-limit cache).
+
+### Wire format
+
+None. Diagnostic-only.
+
+## 0.46.5 — Re-attach HEAD to refs/heads/main after receive-pack, breaking the merge loop
+
+### Field evidence (right after 0.46.4 deploy)
+
+Two phones with the 0.46.4 FF-check enabled now correctly route
+through ``_merge_then_push`` on every drain, but the loop never
+terminates:
+
+```
+[lan-push] '<peer>': peer at 'e566...' is NOT ancestor of
+  local 'a614...' — would be force-overwrite; routing through
+  merge instead
+[lan-merge] running three-way merge
+[merge-trace] resolution done writes=20 deletes=0 conflicts=0
+[merge-trace] apply done writes_done=0 deletes=0
+[lan-merge] merged → 'c504...' (conflicts=0)
+[lan-push] pushed merged → peer
+```
+
+Every cycle: ``writes_done=0`` (file content identical) +
+brand-new merge commit + push. Next cycle: same shape, new
+SHAs. Infinite.
+
+### Why
+
+``writes_done=0`` is the key signal: every merge produces a
+commit whose TREE is identical to one of its parents. So the
+data is fine; both phones have the same content. The histories
+just keep growing parallel chains of empty merge commits.
+
+The decoupling cause:
+
+- ``_merge_diverged`` calls
+  ``worktree.commit(merge_heads=[remote_sha])``. This advances
+  HEAD's pointer (whatever it is — symref or detached). In some
+  flows, HEAD ends up detached at "our last merge SHA."
+- Incoming receive-pack on the other side updates **only**
+  ``refs/heads/main`` via ``set_if_equals`` — never touches
+  HEAD. So the receiver's HEAD (detached at its last merge)
+  stays put while main advances.
+- Each side: HEAD = own last merge, main = peer's last push.
+  ls-remote of peer (prefers HEAD per 0.46.4) returns peer's
+  detached HEAD; FF check sees divergence; merge fires;
+  pushes; receiver's main advances; receiver's HEAD doesn't.
+  Repeat.
+
+### Fix
+
+In ``_reset_working_tree_after_receive``'s clean-working-tree
+branch, after the receive-pack lands and BEFORE resetting,
+check if HEAD is a symref to ``refs/heads/main``. If not
+(detached or symref to a different ref), and main's value is
+a descendant of HEAD's current value (so HEAD's content is
+fully reachable from main → safe to discard HEAD's pointer),
+**re-attach HEAD as a symref to refs/heads/main**.
+
+Implementation:
+
+1. ``repo.refs.get_symrefs()`` to check current HEAD target.
+2. If ≠ ``refs/heads/main``, walk main's ancestry looking for
+   HEAD's SHA. Safe to re-attach iff found (HEAD's content is
+   in main's history).
+3. ``repo.refs.set_symbolic_ref(b'HEAD', b'refs/heads/main')``.
+4. Reset working tree to (now-realigned) HEAD value.
+
+After this on BOTH sides: HEAD tracks main. Next drain's
+ls-remote returns the same SHA on both sides (= main = HEAD).
+FF check is satisfied; no merge fires; no new commits.
+Convergence.
+
+### Why this is safe
+
+The ancestry check is the load-bearing safety:
+
+- **HEAD's value is an ancestor of main**: HEAD's commit is in
+  main's history. Re-attaching HEAD to main moves HEAD's
+  effective value to main's tip; HEAD's old value is still
+  reachable via main's ancestry. No data loss. ✓
+- **HEAD's value is NOT an ancestor of main** (e.g., genuinely
+  diverged committed states): re-attaching would lose HEAD's
+  content. The check refuses; HEAD stays decoupled. The next
+  ``_merge_then_push`` from the local side will fold HEAD's
+  content into a merge commit on top of main, after which
+  HEAD's content IS reachable from main and the next
+  re-attach can fire. Two-cycle convergence; still terminates.
+- **HEAD == main**: no-op (both pre-check and re-attach are
+  no-ops in this case).
+
+### Files
+
+- ``azt_collabd/lan_listener.py`` —
+  ``_reset_working_tree_after_receive`` adds the HEAD re-attach
+  pass before ``porcelain.reset``.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix. The CHANGELOG of
+0.46.x is a fairly long string of these — each closes a
+specific axis of the field-observed convergence brittleness;
+together they reach honest LAN sync.
+
+## 0.46.4 — Client-side fast-forward check + prefer HEAD in LAN ls-remote
+
+### Why
+
+0.46.3 made ``unshared_commits`` honest by tracking per-peer
+observed main. But field logs from the recorder team showed
+something more fundamental was broken: two phones at LANOK+9
+and LANOK+10, both reporting no-ops with each phone seeing
+peer's ``refs/heads/main`` equal to its own HEAD — even though
+the phones' actual HEADs differed.
+
+Trace:
+
+- dulwich's smart-protocol receive-pack uses
+  ``RefsContainer.set_if_equals(ref, expected_old, new)`` for
+  every ref update. That's a **stale-write guard** ("update
+  only if current matches what I last saw"), NOT a fast-
+  forward check ("update only if new descends from current").
+- ``porcelain.push`` sends ``expected_old`` = peer's
+  ``refs/heads/main`` from its own ls-remote, ``new`` = our
+  HEAD. dulwich's receive-pack accepts ANY value as ``new``
+  as long as ``expected_old`` matches — including non-FF.
+- Result: every push silently force-overwrites the receiver's
+  ``refs/heads/main``. The receiver's own commits stay in the
+  object store but the ref no longer points at them; HEAD
+  (still a symref or detached at the receiver's actual latest)
+  decouples from main.
+- Both phones end up with: ``HEAD`` = own real latest,
+  ``refs/heads/main`` = peer's last-pushed value.
+- ls-remote (which currently prefers ``refs/heads/main``)
+  returns the clobbered value. Pre-flight no-op condition
+  ``local_head == pre_peer_head`` fires because our HEAD ==
+  what we last force-pushed (= peer's main now). No merge
+  triggers. Histories stay diverged forever.
+- Pre-0.46.3 ``last_lan_pushed_sha`` was also set to our HEAD
+  on every push success, so ``unshared = walk(HEAD, exclude=
+  HEAD) = 0`` → false-positive LANOK. 0.46.3 made unshared
+  per-peer-observed but the underlying observation
+  (peer's main) was the WRONG ref to read.
+
+### Fix
+
+Two halves of a client-side correction, both small:
+
+1. **``_peek_peer_main`` and ``_merge_then_push``'s fetch-
+   result read prefer ``HEAD`` over ``refs/heads/main``.**
+   A peer whose main has been force-clobbered still has the
+   real latest at HEAD (detached). Reading HEAD gives us the
+   peer's actual current state. For repos where HEAD is a
+   normal symref to main, both refs yield the same SHA;
+   behaviour unchanged.
+
+2. **Pre-flight fast-forward check in ``_push_to_peer``.** New
+   helper ``_peer_is_ancestor_of_local`` walks our HEAD's
+   ancestry looking for the peer's HEAD SHA (cap 10k commits
+   — safety net for pathological histories, but typical AZT
+   field projects are well under 1k). If the peer's current
+   HEAD isn't an ancestor of our local HEAD, that's a
+   divergence — route directly to ``_merge_then_push`` instead
+   of letting ``porcelain.push`` do the silent force-overwrite.
+
+   This is the pre-flight complement to the 0.45.46 post-
+   flight verify: post-flight detected silent NAKs (HTTP
+   success, protocol rejection); pre-flight here prevents
+   the silent overwrite case (protocol success that we
+   shouldn't have asked for).
+
+### Convergence for already-stuck devices
+
+Existing diverged-HEAD-decoupled state on the user's two
+phones unwinds over a couple of drain cycles:
+
+1. Phone fanout fires. ls-remote tablet → tablet's HEAD
+   (peer's real latest, NOT the force-clobbered main). Differs
+   from phone's HEAD.
+2. FF check: tablet's HEAD not in phone's ancestry. → merge.
+3. ``_merge_then_push`` fetches, three-way merges (lift-aware),
+   creates merge commit M with both HEADs as parents. Push M
+   to tablet — FF from tablet's main (one of M's parents).
+   Tablet's main advances to M.
+4. Tablet fanout. ls-remote phone → phone's HEAD = M (now).
+   FF check: M descends from tablet's HEAD (tablet's HEAD was
+   the other parent). Walking tablet's HEAD ancestry finds
+   tablet's own commit but not M (M is a descendant). →
+   merge. Tablet's ``_merge_diverged`` produces M' which has
+   tablet's HEAD as parent. Push M' to phone — FF.
+5. Each subsequent drain cycle generates one degenerate merge
+   commit until the per-peer observed-main SHAs (0.46.3)
+   stabilize on the same value. Unshared drops to 0 on both
+   sides; LANOK becomes honest.
+
+The decoupled-HEAD-vs-main state on each phone persists (HEAD
+keeps advancing on local commits; main lags behind by what the
+peer last pushed). That's an internal git-state oddity, not
+user-visible — the push refspec ``HEAD:refs/heads/main``
+carries our HEAD's content regardless, and the convergence
+above pushes the merge commits all the way through.
+
+### Files
+
+- ``azt_collabd/lan_push.py`` —
+  - ``_peek_peer_main``: prefer ``HEAD`` over
+    ``refs/heads/main``.
+  - ``_merge_then_push_locked``: same preference for
+    ``fetch_result.refs``.
+  - ``_peer_is_ancestor_of_local``: new helper.
+  - ``_push_to_peer``: pre-flight FF check; on non-ancestor,
+    routes to ``_merge_then_push``.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix. Existing peer
+daemons still accept the force-overwrite (we can't fix that
+side without coordinated rollout), but the pushing side now
+declines to issue one — so any pair where at least ONE phone
+has 0.46.4 stops force-pushing in that direction. Both phones
+on 0.46.4 means neither side force-pushes.
+
+## 0.46.3 — `unshared_commits` keyed on per-peer observed main, not what we pushed
+
+### Why
+
+Field report: phone at ``LANOK +10`` next to tablet at
+``LANOK +9``, only talking to each other, both offline=yes.
+Both can't be honest LANOK simultaneously — if every commit
+on each device existed on the other, the histories couldn't
+differ. Recorder peer team's diagnosis (correct): the daemon
+is computing ``unshared_commits`` from "have I successfully
+pushed recently?" rather than "is this exact commit on the
+peer?" — false-positive LANOK on diverged histories.
+
+### Bug
+
+``_unshared_commit_count`` excluded ``last_lan_pushed_sha``
+from the HEAD walk — a project-wide single SHA set to OUR
+HEAD on every successful push or no-op confirmation. After
+non-FF rejection / asymmetric merge / convergence failure,
+both phones end up at their own HEAD with
+``last_lan_pushed_sha == own_head``, so
+``walk(own_head, exclude=own_head) == 0`` on both → false-
+positive LANOK on diverged histories. Symptom: each phone
+told the user "your data is safe on LAN" while they were
+actually carrying commits the other didn't have.
+
+### Fix
+
+Replace project-wide ``last_lan_pushed_sha`` with **per-peer
+``last_seen_main``** in ``peers.json`` — keyed by
+``(peer_id, langcode)`` — recorded from actual observations:
+
+- Every successful ``_peek_peer_main`` (ls-remote) updates the
+  observed peer's main for the langcode.
+- Post-flight verify after ``porcelain.push`` (0.45.46) updates
+  the observed peer's main to our local HEAD when the peer is
+  confirmed to be at it.
+- No-op short-circuit (peer already at our HEAD per pre-flight)
+  also updates.
+
+``_unshared_commit_count`` now excludes the UNION of every
+paired peer's observed-main SHA for this langcode (via new
+``peers.peer_main_shas_for(langcode)``), alongside the existing
+``refs/remotes/origin/main``. ``unshared == 0`` only when every
+commit reachable from HEAD is also reachable from at least one
+observed peer's main — i.e. **provably** somewhere besides this
+phone, not just "we tried to push something recently."
+
+### Diverged-histories case after this fix
+
+Phone A at ``X``, phone B at ``Y``, ``X != Y`` (neither
+descends from the other):
+- A's ``last_seen_main[B] = Y`` (observed via ls-remote).
+- A's walk: ``include=[X], exclude=[Y]``. Y doesn't share
+  ancestry with X past their merge-base; walk yields the
+  commits unique to X. ``unshared > 0``. Recipe renders
+  ``+unshared/+ahead`` (data-loss-risk indicator), NOT LANOK.
+- Symmetric on B: ``unshared > 0``, also no LANOK.
+
+Both phones now correctly flag the divergence instead of
+both falsely showing LANOK.
+
+### Convergence case after this fix
+
+Both phones at SHA ``M`` (after a successful merge round-trip):
+- A's ``last_seen_main[B] = M`` (observed). A's walk:
+  ``include=[M], exclude=[M]`` → 0. LANOK.
+- Same on B. Both correctly LANOK with identical
+  ``commits_ahead`` counts.
+
+### Back-compat
+
+``last_lan_pushed_sha`` (project-wide field in ``projects.json``)
+is kept as a diagnostic record — ``lan_push`` continues to
+update it on success — but it's no longer used to compute
+``unshared_commits``. Pre-0.46.3 clients reading
+``ProjectStatus.lan_pushed_sha`` still see a value (last SHA we
+delivered to any peer), it just doesn't drive the indicator
+anymore.
+
+Existing ``peers.json`` entries without ``last_seen_main`` are
+normalized to empty dict on read — pre-0.46.3 peers shed no
+observed-main data; the next fan-out / no-op / ls-remote
+populates it. Cold-start daemons render conservatively
+(``unshared > 0`` until first peer observation lands) which is
+honest, not a regression.
+
+### Files
+
+- ``azt_collabd/peers.py`` —
+  - ``_normalize_entry``: ``last_seen_main`` (dict[langcode →
+    sha]) added.
+  - ``set_peer_last_seen_main`` / ``peer_main_shas_for``: new
+    setter / aggregator.
+- ``azt_collabd/lan_push.py`` —
+  ``_push_to_peer``: records peer's main from every
+  ``_peek_peer_main``, no-op branch, and post-flight-verified
+  push.
+- ``azt_collabd/server.py`` —
+  ``_unshared_commit_count``: union of paired peers'
+  observed-main SHAs replaces ``last_lan_pushed_sha`` in the
+  exclude set.
+
+### Wire format
+
+No new wire fields. ``ProjectStatus.lan_pushed_sha`` keeps the
+project-wide diagnostic field; ``unshared_commits`` value
+changes meaning slightly (more honest). Pre-0.46.3 peers
+reading ``unshared_commits`` get more accurate values; no
+behavior change required on the peer side.
+
+## 0.46.2 — Strip tracking refs alongside the LAN origin URL
+
+### Why
+
+0.45.37's ``strip_lan_origin_if_present`` removes the
+``[remote "origin"]`` section from ``.git/config`` for LAN-
+cloned projects (the URL is ephemeral — B's listener port
+changes per restart — so persisting it would also wrongly
+hide the Publish row). But it left ``refs/remotes/origin/*``
+in place, unreferenced and unmaintained. The recorder peer
+team's 2026-05-26 NOTES update flagged the user-visible
+fallout: phone A (LAN-cloned, orphan tracking ref at
+clone-time SHA) and phone B (originator, no tracking ref)
+render different ``commits_ahead`` for the same project
+state, producing asymmetric LANOK badges.
+
+### Fix
+
+``_strip_lan_origin_locked`` now does both strips in one
+pass: ``config.remove_section((b'remote', b'origin'))`` AND
+``del repo.refs[b'refs/remotes/origin/...']`` for every
+matching tracking ref. The pre-check
+(``strip_lan_origin_if_present``) recognizes the two
+conditions for taking the lock:
+
+1. Paired-peer URL present in config (existing trigger), or
+2. Orphan ``refs/remotes/origin/*`` ref present with NO URL
+   (new trigger — cleans up projects already stripped by
+   prior daemon versions that left the refs behind).
+
+On the first ``_h_project_status`` poll after 0.46.2 lands,
+existing LAN-cloned projects shed their orphan refs. After
+that, both phones (A and B) see the same "no origin remote
+at all" state, the 0.46.1 walk-from-HEAD branch fires
+uniformly, and ``commits_ahead`` is symmetric.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  - ``_strip_lan_origin_locked``: extended to strip
+    ``refs/remotes/origin/*`` alongside the config section;
+    orphan-only sweep (no URL but refs present) now runs too.
+  - ``strip_lan_origin_if_present``: pre-check recognizes
+    orphan tracking refs as a reason to take the lock.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.46.1 — `commits_ahead` counts from HEAD when no origin remote
+
+Per NOTES_TO_DAEMON 2026-05-26 (recorder peer team): a project
+LAN-cloned via ``lan_clone`` (no github remote;
+``remote_url=''``) with all commits LAN-delivered to a paired
+peer was never rendering LANOK. The § 17b recipe gates LANOK
+on ``commits_ahead > 0``, but ``_count_commits_ahead`` returns
+0 when no ``refs/remotes/origin/<branch>`` exists — so a
+LAN-only project always showed ``OK`` (or ``+u/0``) instead
+of the documented ``LANOK +N``.
+
+§ 20 hard rule 4 explicitly promises LANOK works for LAN-only
+projects; § 17b's recipe didn't. This release reconciles them
+on the daemon side, with no peer change required.
+
+### Fix
+
+``_count_commits_ahead`` distinguishes two cases when the
+tracking ref is absent:
+
+- **Origin configured, never pushed** (``remote.origin.url``
+  exists in ``.git/config``): return 0. Pre-0.46.1 behaviour
+  — "OK on uncertainty" avoids double-counting the unpushed
+  initial commit as "behind."
+- **No origin remote at all** (``KeyError`` reading
+  ``remote.origin.url``): walk from HEAD and count. Every
+  local commit IS unpublished by definition — there's
+  nowhere to push.
+
+For LAN-only projects whose commits have reached a peer,
+``commits_ahead`` now equals N (total local commits),
+``unshared_commits`` equals 0 (peer has the SHA), and the
+existing recipe renders ``LANOK +N`` correctly. No peer
+update needed — the daemon's response just becomes truthful
+for the LAN-only case.
+
+### Cost
+
+The "no origin" branch walks the full commit history from
+HEAD, which is O(n_commits). For AZT field projects this is
+typically a few hundred commits — negligible. The walk only
+fires for projects with no github remote at all; published
+projects keep the bounded "commits since last push" walk.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  ``_count_commits_ahead`` adds the no-origin branch.
+
+### Wire format
+
+None — same ``commits_ahead`` key, more truthful value when
+no remote is configured. Pre-0.46.1 peers reading this field
+get the same accuracy improvement; the existing § 17b recipe
+renders correctly without modification.
+
+## 0.46.0 — LAN sync correctness milestone
+
+Closing the iteration that ran from 0.45.39 through 0.45.48.
+Marks the suite reaching a coherent state for peer-to-peer
+LAN sync after a sustained run of field-driven fixes:
+
+- **Data paths under proper locks** (0.45.39): LAN merge path,
+  ``.git/config`` writes, `strip_lan_origin` scoping, smart
+  post-receive guard.
+- **Security gate on auto-share** (0.45.39): QR-display
+  binding so auto-share can't fire without the user's
+  consent gesture.
+- **Auto-init on project create + NOT_A_REPO recovery**
+  (0.45.42): every project has a usable ``.git/`` from day
+  one; existing broken projects recover on the next commit.
+- **Picker emits the cloned project immediately** (0.45.43):
+  no more "exit and re-enter the picker" after accepting a
+  share offer.
+- **Post-receive: merge HEAD into working tree** (0.45.44):
+  three-way merge instead of overwriting unstaged edits when
+  an incoming push lands while the user is editing.
+- **``ProjectStatus.head_sha`` + content-refresh contract**
+  (0.45.45): peers get a uniform HEAD-advance signal in
+  ``project_status``; ``CLIENT_INTEGRATION.md`` § 17b
+  generalized from "Badge refresh obligation" to "Background
+  refresh obligation" covering both badge and content. Fonts
+  fix from NOTES (Candidate #1 source-tree-relative).
+- **Detect silent non-FF rejection** (0.45.46): post-flight
+  ls-remote after ``porcelain.push`` so divergent histories
+  trigger ``_merge_then_push`` instead of staying diverged
+  forever.
+- **Pre-commit pending edits before LAN merge** (0.45.47):
+  ``_merge_diverged`` no longer overwrites unstaged
+  working-tree edits — they go into a real commit first as
+  one of the merge's parents.
+- **Stash + reapply fallback** (0.45.48): when the
+  pre-commit silently no-ops (porcelain.add edge cases the
+  user observed as "red +N hanging around"), held snapshot
+  is lift-aware-reapplied after ``_merge_diverged``;
+  second commit attempt lands it on top of the merge.
+  Worst case: edits stay uncommitted in working tree, never
+  lost.
+
+The behavior matrix that's now closed:
+
+| Receiver state | Diverged committed history? | Path |
+|---|---|---|
+| Clean WT | No (FF) | ``reset --hard HEAD`` |
+| Clean WT | Yes | ``_merge_then_push`` |
+| Unstaged edits | No (FF) | ``integrate_head_into_working_tree`` (merge into WT) |
+| Unstaged edits | Yes | ``_merge_then_push`` (auto-commit + stash + reapply) |
+
+No new wire format in 0.46.0 beyond what 0.45.45 added
+(``head_sha``). Peers built against 0.45.40+ keep working;
+peers built against 0.46.0+ pick up the content-refresh wiring
+in § 17b.
+
+## 0.45.48 — Stash + reapply fallback for failed pre-commit before LAN merge
+
+### Why
+
+0.45.47's pre-commit-before-merge assumes ``_commit_step_locked``
+will reliably capture the user's working-tree edits into a real
+commit. The user flagged that this isn't always true:
+
+> "I see red numbers hanging around after swipes sometimes. If
+> there's a write that wasn't asked to commit, what you say is
+> fine: just commit it now. But what about if there's a problem
+> committing now, for whatever reason?"
+
+Field-observed edge case: ``porcelain.add`` silently no-ops in
+some condition we haven't fully traced (file-permission race,
+dulwich internal state, …). ``_commit_step_locked`` then sees
+``has_staged = False`` and returns ``NOTHING_TO_COMMIT`` even
+though working tree has unstaged_mods. The 0.45.47 pre-commit
+treats that as "clean working tree, drop snapshot" — and then
+``_merge_diverged`` overwrites the (still-uncommitted) edits.
+
+### Fix — stash + reapply
+
+Three-step protection in ``_merge_then_push_locked``:
+
+1. **Snapshot first.** ``repo.snapshot_unstaged_paths(repo,
+   project_dir)`` reads working-tree bytes for every
+   unstaged-mod path (except daemon-internal scratch dirs)
+   into an in-memory ``dict[path_bytes, bytes]`` BEFORE the
+   pre-commit runs. Capture the pre-merge HEAD SHA at the
+   same point — needed as the merge base for the reapply.
+
+2. **Try pre-commit.** If it returns ``COMMITTED_LOCAL``, the
+   edits are now in a real commit (one of the upcoming merge's
+   parents); drop the snapshot. If ``NOTHING_TO_COMMIT``, the
+   working tree was actually clean; drop the snapshot. If
+   anything else (``COMMIT_FAILED``, ``COMMIT_REPEATEDLY_FAILED``,
+   raised exception), **keep** the snapshot — these are the
+   cases where the user's red ``+N`` lingers despite a commit
+   attempt.
+
+3. **Reapply after merge.**
+   ``repo.reapply_snapshot_after_merge(repo, project_dir,
+   snapshot, pre_merge_head_sha)`` walks the held snapshot:
+
+   - For ``.lift`` paths: three-way merge via
+     ``lift_merge.three_way_merge``. base = the snapshot's
+     pre-merge HEAD blob for that path, ours = the snapshot
+     bytes (user's unstaged edits), theirs = the working-tree
+     content the merge just wrote. Writes merged result back.
+     If ``lift_merge`` raises, restore the snapshot bytes
+     verbatim (last-resort: keep ours).
+   - For non-LIFT paths: overwrite the working-tree file with
+     the snapshot bytes. Same "keep ours on conflict" policy
+     ``_merge_diverged`` itself uses for non-LIFT modify/modify.
+
+   Then a second ``_commit_step_locked`` pass attempts to
+   commit the reapplied content on top of the merge commit so
+   the resulting push carries the user's edits. If THAT commit
+   also fails to capture (the same root cause that tripped
+   step 2), the snapshot is at least on disk in working_tree;
+   the next drain's ``commit_project`` retries, and the user's
+   edits never leave the device — they just stay uncommitted a
+   little longer.
+
+### Worst case
+
+If both commit attempts (pre-merge and post-reapply) silently
+no-op for whatever environmental reason, the user's edits are
+still in working_tree. They aren't lost — just stuck in
+unstaged limbo until the underlying commit issue clears. The
+merge commit pushed to the peer reflects committed state
+only; LAN convergence happens for the committed parts. The
+user's pending edits commit on the next successful drain
+cycle and propagate then.
+
+This is strictly better than pre-0.45.48 (which would have
+silently overwritten the unstaged edits with the committed
+merge result — true data loss). Worst-case 0.45.48 is "edits
+stay uncommitted longer"; not "edits disappear."
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  - ``snapshot_unstaged_paths(repo, project_dir)`` (new):
+    in-memory snapshot of unstaged tracked paths.
+  - ``reapply_snapshot_after_merge(repo, project_dir, snapshot,
+    base_sha)`` (new): lift-aware reapply (lift_merge for
+    ``.lift``, overwrite for binary).
+- ``azt_collabd/lan_push.py`` —
+  ``_merge_then_push_locked``: snapshot before pre-commit;
+  drop on commit-success/clean; reapply + second-commit after
+  ``_merge_diverged`` when snapshot held.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.45.47 — Pre-commit pending edits before LAN merge runs
+
+### Why
+
+0.45.46 made ``_push_to_peer`` fall through to ``_merge_then_push``
+on silent non-FF rejection. ``_merge_then_push`` calls
+``_merge_diverged``, which walks the three committed trees
+(``base``, ``head_commit.tree``, ``remote_commit.tree``) and
+writes the merged result directly to the working tree —
+**bypassing any uncommitted user edits in the working tree.**
+``_stage_all`` then runs and the merge commit captures the
+overwritten state. Net effect on a peer with a non-empty red
+``+N``: in-flight edits clobbered.
+
+User flagged this as a third axis after the 0.45.46 ship:
+"I see red +N from time to time, and I don't want us to have to
+wait for that to clear, nor to overwrite instead of waiting."
+
+### Fix
+
+Under ``project_lock`` (already held by
+``_merge_then_push_locked``), before the fetch and merge run
+``_commit_step_locked`` to bundle any pending working-tree
+edits into a real commit. The user's edits become one of the
+merge's parents — preserved, not overwritten. ``local_head``
+is re-read after the pre-commit so the merge uses the fresh
+SHA.
+
+When the working tree is clean, ``_commit_step_locked``
+returns ``NOTHING_TO_COMMIT`` and the merge proceeds
+unchanged — single ``porcelain.status`` walk overhead. When
+the pre-commit raises (rare; partial-disk-write etc.), the
+merge falls through to the committed-state-only path with a
+log line for the field; that's the pre-0.45.47 behaviour, no
+worse than before.
+
+### The three axes, fully covered
+
+| Receiver state | Diverged committed history? | Path | Where |
+|---|---|---|---|
+| Clean working tree | No (FF) | reset --hard to HEAD | lan_listener |
+| Clean working tree | Yes | _merge_then_push (auto-commit no-op + merge) | lan_push |
+| Unstaged edits | No (FF) | integrate_head_into_working_tree (merge into WT) | lan_listener (0.45.44) |
+| Unstaged edits | Yes | _merge_then_push (auto-commit pending + merge) | lan_push (this release) |
+
+The push-flight detection (0.45.46 post-flight ls-remote) is
+what bridges "yes" rows on the push side; the receive-flight
+detection (0.45.44 status walk in ``_reset_working_tree_after_receive``)
+is what bridges them on the receive side.
+
+### Files
+
+- ``azt_collabd/lan_push.py`` —
+  ``_merge_then_push_locked``: ``_commit_step_locked`` runs
+  before fetch + merge to flush pending edits.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.45.46 — `lan_push`: detect silent non-FF rejection, fall through to merge
+
+### Field repro (2026-05-26)
+
+Two phones, same project, concurrent record-then-commit. Both
+phones logged ``[lan-push] advanced <peer> main: A → B`` lines
+suggesting successful sync. SHAs in the logs revealed reality:
+
+- Phone's HEAD stayed at ``d22cd047b5c5`` across two drain
+  cycles and a "post-receive reset → HEAD (d22cd047b5c5)" line
+  that fired AFTER the tablet's push completed — i.e. the push
+  didn't actually advance phone's HEAD.
+- Tablet's HEAD stayed at ``0e79d3cdd912`` across the same
+  window for the symmetric reason — phone's push didn't
+  advance tablet's HEAD either.
+- End state: phone at ``c942c34c4899``, tablet at
+  ``0e79d3cdd912``. Diverged. Both phones' recordings only
+  exist on their own device.
+
+### Cause
+
+dulwich's smart-protocol receive-pack handler rejects a
+non-fast-forward ref update by NAKing in the protocol body —
+HTTP 200, no exception, just a ``ng <refname> non-fast-forward``
+line embedded in the response. ``porcelain.push`` returns
+normally; our code in ``lan_push._push_to_peer`` then logs
+``[lan-push] advanced ...`` based purely on the absence of an
+exception. We never look at the response body and never check
+whether the peer actually moved.
+
+The existing ``DivergedBranches``-handling path in
+``_push_to_peer`` (which falls through to ``_merge_then_push``,
+the lift-aware three-way fetch + merge + push) is the right
+recovery for this scenario, but only triggers if dulwich raises
+that specific exception — which it doesn't for body-NAKs.
+
+### Fix
+
+After ``porcelain.push`` returns without exception, re-ls-remote
+the peer and compare ``refs/heads/main`` to our local HEAD. If
+they differ, the push was silently rejected — fall through to
+``_merge_then_push``. Costs one extra ls-remote round-trip per
+successful push attempt (negligible compared to the receive-
+pack work that just ran).
+
+### Convergence after the fix (sequential record test)
+
+1. Tablet records → commits → fans out to phone.
+2. Tablet's push body-NAKs because phone has its own divergent
+   commit. Post-flight ls-remote sees phone still at its prior
+   SHA. Tablet falls through to ``_merge_then_push``.
+3. Tablet fetches phone's commit, runs ``_merge_diverged``
+   (lift-aware three-way), creates a merge commit on tablet
+   with both peers' HEADs as parents, pushes the merge to
+   phone. By construction this push is FF on phone (peer's
+   HEAD is one of the parents). Phone's main → tablet's
+   merge.
+4. Phone records → commits on top of the merge → fans out to
+   tablet. FF; tablet's main → phone's new commit. Both
+   peers converged.
+
+Worst case for true-simultaneous merges (both phones merge in
+the same drain): both pushes succeed-and-NAK each other once
+more; second drain cycle re-merges; convergence in ~2 drain
+cycles instead of one. Self-correcting.
+
+### What this means for 0.45.44
+
+The 0.45.44 ``[post-receive-merge]`` path was the correct fix
+for "incoming push lands while I have an unstaged working-tree
+edit" — a different axis. The current bug is "incoming push
+gets silently NAKed because we already have our own commit."
+Both paths now exist; together they cover the matrix of
+contended-edit scenarios.
+
+### Files
+
+- ``azt_collabd/lan_push.py`` —
+  ``_push_to_peer``: post-flight ls-remote after
+  ``porcelain.push``; on SHA-mismatch fall through to
+  ``_merge_then_push``.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.45.45 — `ProjectStatus.head_sha` + peer content-refresh obligation
+
+### Why
+
+After 0.45.44 made the working tree actually reflect incoming
+LAN content (via merge-on-receive instead of deferred-reset),
+peers still have no documented way to detect that HEAD moved.
+``project_status.last_commit`` only bumps on *local* commits;
+``commits_ahead`` is github-relative; ``unshared_commits`` is
+peer-relative — none change reliably on a receive-pack from
+a paired peer. The peer's recorder kept rendering the pre-
+receive LIFT until the user manually re-entered the project.
+
+### Daemon-side
+
+``ProjectStatus.head_sha`` (new field; additive) — SHA hex of
+``refs/HEAD``. Bumps on every HEAD advance: local commit,
+incoming LAN receive-pack, post-receive merge. Empty string for
+projects with no commits yet (pre-init / pre-first-commit).
+
+``_h_project_status`` reads HEAD once per poll (in-memory ref
+lookup; no full status walk). Cost is negligible — same
+poll cadence works.
+
+### Client-side
+
+``azt_collab_client.projects.ProjectStatus`` decodes the new
+field with empty-string default for forward-compat with
+pre-0.45.45 daemons.
+
+### Contract update
+
+``CLIENT_INTEGRATION.md § 17b`` generalized from
+"Badge refresh obligation" to "Background refresh obligation."
+Now mandates:
+
+- Peers MUST poll ``project_status`` on a 5–15 s background
+  tick (unchanged).
+- Peers MUST track the last-seen ``head_sha`` and, when it
+  changes between polls, call ``_refresh_in_place`` (from § 14)
+  to re-read the LIFT and re-render the current view.
+- Empty ``head_sha`` (legacy daemon or pre-first-commit project)
+  disables the content-reload branch without breaking badge
+  correctness.
+
+Recipe and rationale in § 17b. § 14's "external mutation"
+catch-all stays as the generic principle; this is the explicit
+LAN-driven instance.
+
+### Field flow this closes
+
+Phone A records → commits → fans out to phone B → phone B's
+post-receive merges (0.45.44) → phone B's ``head_sha`` advances
+→ phone B's next background poll detects the change → recorder
+reloads in place → user sees phone A's entry without re-entering
+the project or tapping Sync. Round-trip latency is bounded by
+phone B's poll cadence (typically <10 s).
+
+### Also: `ui/fonts.py` package-name coupling fix
+
+Per NOTES_TO_DAEMON 2026-05-26 (recorder peer team): the
+hard-coded Android candidate
+``/data/user/0/org.atoznback.azt_recorder/files/app/fonts/``
+referenced an Android package name that **never existed** —
+the recorder ships as ``org.atoznback.aztrecorder`` (no
+underscore). Pure dead code; would also have failed
+cross-UID even if the package name had been right. The
+documented "Android peer's app dir" fallback was a no-op on
+every device, ever. Field symptom: all Android peers silently
+fell back to Roboto, producing boxes for Lingala ``ɛ`` /
+``ɔ`` + combining tone marks.
+
+Fix: new Candidate #1 ``<client_dir>/../fonts/<filename>``
+resolves to ``<files>/app/fonts/<filename>`` on Android
+regardless of peer package name (p4a packs source flat under
+``<files>/app/``) AND to ``<recorder>/fonts/<filename>`` on
+desktop with the recorder/symlink layout. The dead hard-coded
+``org.atoznback.azt_recorder`` candidate is removed entirely.
+Also: single-line stderr diagnostic on the ``Roboto``
+fallback path so a future silent miss surfaces in field logs
+without inferring from glyph behaviour.
+
+Once on 0.45.45+, the recorder can drop its peer-side workaround
+(search for "Workaround for an upstream bug in
+azt_collab_client/ui/fonts.py" in recorder ``main.py``).
+NOTES entry deleted per the file's "live queue only" rule.
+
+### Files
+
+- ``azt_collabd/server.py`` — ``_h_project_status`` reads HEAD,
+  emits ``head_sha`` in the response.
+- ``azt_collab_client/projects.py`` — ``ProjectStatus.head_sha``
+  field + ``from_dict`` decode.
+- ``azt_collab_client/CLIENT_INTEGRATION.md`` — § 17b
+  generalized to cover content refresh.
+- ``azt_collab_client/ui/fonts.py`` — source-tree-relative
+  Candidate #1; fallback diagnostic on Roboto path.
+- ``azt_collab_client/NOTES_TO_DAEMON.md`` — fonts entry
+  removed (resolved here).
+
+### Wire format
+
+Additive only — new key on ``project_status`` response. Pre-
+0.45.45 peers ignore the key; their content-reload branch
+no-ops (no head_sha to compare). Pre-0.45.45 daemons return no
+``head_sha``; 0.45.45+ peers see empty string and don't fire
+the reload — degrades to "only refresh on gesture / on_resume"
+which is the pre-this-release behaviour.
+
+## 0.45.44 — Post-receive: merge HEAD into working tree, don't just defer
+
+### Field-reported bug
+
+User's flow: two phones recording into the same LAN-shared
+project. Sequential record-then-sync should let the second
+phone see the first's data without a manual sync gesture.
+
+Logs from 10:47–10:48 showed the surface signals working —
+commits propagating both ways, ``[lan-push] advanced … →`` lines
+landing on the peer — but a structural correctness gap when
+both phones happened to be editing while a peer push arrived.
+
+### Cause
+
+After 0.45.39's deferred post-receive reset:
+
+1. Phone B pushes commit ``B1`` to phone A.
+2. dulwich's receive-pack handler advances HEAD to ``B1`` —
+   but does **not** touch phone A's index or working tree
+   (refs-only update).
+3. Phone A has unstaged edits, so the 0.45.39 guard defers
+   ``porcelain.reset(--hard)``. Working tree keeps phone A's
+   edits; index stays at phone A's prior HEAD; HEAD now points
+   at ``B1`` (which contains phone B's content X that's neither
+   in phone A's index nor working tree).
+4. Phone A's next ``commit_project`` runs ``_stage_all`` →
+   index now reflects working tree (phone A's edits, no X) →
+   ``porcelain.commit`` creates a commit with parent=``B1`` and
+   tree=(phone A's content only). The new commit's diff vs ``B1``
+   is ``-X + Y`` — i.e. it **silently reverts X** while adding
+   phone A's own change Y.
+5. Fan-out fast-forwards phone B from ``B1`` to phone A's new
+   commit. Phone B's working tree, after its own post-receive
+   reset, no longer has X.
+
+Net: phone B's recording is preserved in git history (the
+``B1`` commit is still reachable) but absent from HEAD and from
+phone B's working tree. The user perceives this as data loss.
+
+### Fix
+
+Replace the deferred-reset path with a real three-way merge.
+
+New helper ``repo.integrate_head_into_working_tree(repo,
+project_dir)``. Walks HEAD's tree and the base tree
+(``HEAD.parents[0]`` — the pre-pack HEAD on a fast-forward),
+and for each path:
+
+- **Unchanged in HEAD vs base** → working tree untouched.
+- **Working tree already matches HEAD** → no-op (both phones
+  produced the same content, e.g. both recorded the same
+  CAWL row's audio).
+- **Working tree == base** (no local edit on this file) →
+  take theirs: write HEAD's blob to working tree.
+- **Both sides changed**:
+  * ``.lift`` paths use ``lift_merge.three_way_merge``
+    (entry-aware, conflict-annotated); merged bytes land in
+    working tree.
+  * Other paths (binary audio, images) — keep ours and log
+    loudly. Audio filenames carry guid + timestamp so
+    cross-peer collisions are rare; if they do collide, the
+    safer choice is to preserve what the local user just
+    produced.
+- **Deleted in HEAD vs base, working tree == base** → honor
+  the deletion.
+- **Deleted in HEAD vs base, working tree edited** → keep
+  ours (preserve user's mid-edit work).
+
+Leaves the index untouched. The next ``commit_project`` stages
+the merged working tree on top of HEAD; the resulting commit
+preserves both sides. The fan-out push that follows is then
+correct — phone B fast-forwards to a tree containing both
+phone A's and phone B's recordings.
+
+``_reset_working_tree_after_receive``'s deferred branch (the
+``unstaged_mod`` path) now calls
+``integrate_head_into_working_tree`` instead of returning. On
+merge bailout (e.g. first commit, no parent to compute base
+from) or exception, falls through to the legacy deferred
+behaviour as a conservative backstop.
+
+The idle-receiver path (no unstaged mods) continues to use
+``porcelain.reset(mode='hard')`` — unchanged. That's the common
+case (one phone records, the other is idle) and the reset is
+correct there.
+
+### What the user gets
+
+The "one user records, the other sees it without a manual sync"
+UX works in both the common case (idle receiver) and the
+contended case (both phones editing). Phone A's recordings
+propagate to phone B's working tree on receive-pack, with
+phone B's in-flight edits preserved via entry-level LIFT merge.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  ``integrate_head_into_working_tree(repo, project_dir)``: new
+  three-way file merge helper.
+- ``azt_collabd/lan_listener.py`` —
+  ``_reset_working_tree_after_receive``: deferred-on-unstaged
+  branch now calls ``integrate_head_into_working_tree`` and
+  reports merge counts in stderr.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix.
+
+## 0.45.43 — Picker emits LAN-cloned project to host immediately
+
+### Field-reported UX bug
+
+After accepting a LAN share-offer (or scanning a pair+share QR)
+in the picker, the clone succeeded but the popup just dismissed,
+leaving the user on the picker with the project list still
+showing the pre-clone snapshot. The new project was only visible
+after backing out of the picker and re-entering. From the user's
+perspective: "I tapped Accept, the popup closed, and nothing
+happened."
+
+### Cause
+
+``picker.py``'s KV invoked the popup as
+``on_release: LAN_POPUPS.pending_offers_popup()`` with no
+``on_done``. The popup itself supports a callback (the daemon's
+``_h_lan_accept_offer`` stamps ``last_project`` server-side on
+success, and the popup hands a typed ``Result`` to ``on_done``)
+but nothing was wired to consume it. The clone happened, daemon
+state updated, popup dismissed — and the picker's project list
+remained whatever it was on entry, never re-populated.
+
+### Fix
+
+New screen method ``ProjectPickerScreen.receive_from_phone()``
+wraps ``pending_offers_popup`` with an ``on_done`` that:
+
+1. Filters for ``LAN_PROJECT_CLONED`` / ``LAN_PROJECT_REOPENED``
+   on the result (other branches just refresh the picker list).
+2. Extracts the cloned project's ``langcode`` from the Status
+   params.
+3. Resolves the project's ``lift_path`` via
+   ``open_project(langcode)`` (the same registry the existing
+   buttons populate from).
+4. Calls ``app.load_lift(path, langcode)`` — the same exit gesture
+   the existing project-list buttons use. The host's
+   ``load_lift`` routes to ``_emit_and_quit`` on the server APK
+   (Activity result → peer), or to whatever the host wants on a
+   non-external launch.
+
+Same wiring covers the QR-scan path (``pending_offers_popup``'s
+"Scan QR code" fall-through bubbles its result back through the
+same ``on_done``).
+
+Net effect: the user lands inside the freshly-cloned project the
+moment the clone completes, without an extra "exit then re-enter
+picker" gesture.
+
+### Files
+
+- ``azt_collab_client/ui/picker.py`` —
+  KV's "Receive a project from another phone" button now calls
+  ``root.receive_from_phone()`` instead of
+  ``LAN_POPUPS.pending_offers_popup()`` directly;
+  ``ProjectPickerScreen.receive_from_phone`` is the new method.
+
+### Wire format
+
+None. Pure client-side UI wiring; daemon state was already
+correct (last_project stamped, project registered).
+
+## 0.45.42 — Auto-init git at project creation + NOT_A_REPO recovery
+
+### Root cause for the field report
+
+A user reported:
+- Started a new project on phone A via "Start a new project."
+- Shared it to phone B over LAN.
+- Phone B saw the offer, accepted, and got nothing — project never
+  appeared, no error message.
+- Phone A's daemon log: ``[commit] 'en-001-x-kent' done:
+  codes=['NOT_A_REPO']`` on every commit attempt.
+
+The recordings were landing on disk (atomic-finalize wrote audio +
+LIFT bytes successfully) but **every commit was failing silently**
+because the project had no ``.git/`` directory.
+
+``projects.create_from_template`` (the "Start a new project"
+backend) downloaded the template LIFT, wrote it to disk, and
+called ``register`` — but **never ran ``porcelain.init``**. The
+working_dir existed; the LIFT existed; the registry entry
+existed; but ``.git/`` did not. Every subsequent
+``commit_project`` saw ``_get_repo`` return None and returned
+``NOT_A_REPO`` to the peer, which was filtered by the auto-sync
+silence contract (§ 17 routing). The peer never knew.
+
+Knock-on consequences:
+- No git history of recordings. Crashes lose work.
+- LAN listener returns 404 for the project (no ``.git/`` to
+  serve refs from). Share-offers from this phone are
+  un-cloneable.
+- Publish-to-GitHub eventually masks the bug (``init_repo`` does
+  the init at that point), but a user who never publishes never
+  enters git history.
+
+This has been latent since ``create_from_template`` shipped.
+
+### Fix, two layers
+
+1. **Create-time init.** ``projects.create_from_template`` now
+   calls a new helper ``repo.ensure_initial_commit(project_dir,
+   contributor_name='AZT')`` after writing the template + registering.
+   The helper runs ``porcelain.init`` (idempotent — re-init is
+   safe), seeds ``.gitignore`` if missing, and reuses
+   ``_commit_step_locked`` so the first commit captures the
+   template LIFT and any other files in the working_dir. After
+   this, every new project has a born HEAD and is immediately
+   usable by ``commit_project`` and the LAN listener. Best-effort
+   from ``create_from_template``'s perspective — a failure here
+   doesn't fail the project create (the auto-init-on-commit
+   recovery branch below is the safety net).
+
+2. **Commit-time auto-init recovery.** ``_commit_repo_locked``
+   now detects the legacy state where ``_get_repo`` returns None
+   but ``project_dir`` is a valid directory, and runs
+   ``porcelain.init`` inline before continuing to
+   ``_commit_step_locked``. Holds ``project_lock`` for the
+   duration, so no race with other writers. Recovers any project
+   in the field that's currently stuck in the NOT_A_REPO state —
+   user records into it, debounced commit fires, the auto-init
+   path creates ``.git/`` + commits the accumulated content as
+   the first commit. No user gesture required; next commit
+   surfaces ``COMMITTED_LOCAL`` instead of ``NOT_A_REPO``, and
+   the LAN listener can serve from the freshly-initialised repo.
+
+### Files
+
+- ``azt_collabd/repo.py`` —
+  - ``ensure_initial_commit`` / ``_ensure_initial_commit_locked``
+    (new) — idempotent init + initial commit helper.
+  - ``_commit_repo_locked`` — auto-init recovery branch when
+    ``_get_repo`` returns None on a valid project_dir.
+- ``azt_collabd/projects.py`` —
+  ``create_from_template`` calls ``ensure_initial_commit`` after
+  ``register``. Best-effort; failure logged but doesn't fail the
+  create.
+
+### Wire format
+
+None. Pure daemon-internal correctness fix. Existing peers see
+``COMMITTED_LOCAL`` instead of ``NOT_A_REPO`` on the recovered
+project's next commit — strictly an improvement; no peer change
+required.
+
+### Recovery for users already stuck
+
+Affected users open the broken project and record one entry.
+The debounce fires within 500 ms; ``_commit_repo_locked`` runs
+the auto-init recovery; the project's accumulated audio +
+LIFT enter git history as the first commit; future commits
+work normally. LAN sharing then works.
+
+## 0.45.41 — Share LAN-only projects + pre-flight share state + retryable accept-offer
+
+Field-reported bug cluster: user shared an unpublished project to
+a peer via LAN, peer accepted the offer, project never appeared,
+and the daemon UI's Share button disappeared after the share so
+they couldn't retry / re-show the QR / share to a third phone.
+Root causes were two separate-but-aligned bugs in the share flow.
+
+### Bug 1: Share button gated on GitHub publish
+
+The daemon settings UI's "Share [{langcode}] project" button (and
+the whole project-actions row containing it) was hidden when the
+project had no ``remote_url`` set. That gate dated to when this
+row carried the github-only "Grant collaborator access" button;
+collapsing the three sharing modes into one popup (0.45.0) made
+the gate wrong — LAN-only sharing doesn't need a github remote.
+
+**Fix.** Drop the ``if not live_remote_url: return`` gate in
+``SyncSettingsScreen._refresh_project_actions_row``. The row is
+now shown whenever a project is selected; the info label says
+"(not published to GitHub — share over local network only)"
+when there's no remote.
+
+Inside ``share_project_popup``, the github-invite section
+(section 3) now only renders when the project HAS a github
+remote — tapping it without one would have NO_REMOTE-errored
+anyway. Section 1 (paired phones) and section 2 (QR) work
+without a remote and always render.
+
+### Bug 2: Owner-side accept-offer silently fails on uninitialised project
+
+When the owner shared a project that lacked a usable
+``.git/HEAD`` (typical for a freshly-created project the user
+hadn't recorded into yet), the share-offer queued on the
+receiver's side fine — but the receiver's accept-offer LAN
+clone hit the owner's listener and got a generic 404 because
+dulwich couldn't open a repo with no commits. The receiver's
+accept-offer handler then removed the pending decision so the
+user had no path to retry.
+
+**Fix, two halves:**
+
+1. **Owner-side pre-flight in ``_h_lan_send_share_offer``.**
+   Refuses the share with a typed error when the project's
+   working_dir is missing a ``.git/`` directory or HEAD ref is
+   unborn. Error key ``project_not_initialised`` /
+   ``project_unborn`` / ``project_unreadable``; ``detail``
+   explains "record at least one entry first" so the user
+   sees an actionable message immediately rather than silent
+   failure on the recipient minutes later.
+
+2. **Receiver-side retainment in ``_h_lan_accept_offer``.**
+   Removes the pending decision only when the LAN clone
+   actually delivered (``LAN_PROJECT_CLONED`` /
+   ``LAN_PROJECT_REOPENED``). On failure the decision stays
+   addressable so the user can retry once the owner-side issue
+   clears, without re-asking the owner to re-share. The retained
+   decision shows up on the next ``lan_pending()`` poll.
+
+### Files
+
+- ``azt_collabd/ui/app.py`` —
+  ``_refresh_project_actions_row`` no longer hides the row when
+  ``remote_url`` is empty; info label adapts text.
+- ``azt_collab_client/ui/lan_popups.py`` —
+  ``share_project_popup`` gates section 3 on
+  ``project_status(langcode).remote_url``.
+- ``azt_collabd/server.py`` —
+  ``_h_lan_send_share_offer`` adds the working-dir / HEAD
+  pre-flight (typed errors); ``_h_lan_accept_offer`` retains the
+  pending decision when the clone didn't deliver.
+
+### Wire format
+
+Additive — new error string values from ``_h_lan_send_share_offer``
+(``project_not_initialised`` / ``project_unborn`` /
+``project_unreadable``). Old clients reading the legacy `error`
+strings fall through to a generic failure path; new clients
+(0.45.41+) can route to a "record something first" message.
+
+## 0.45.39 — LAN-sync hardening sweep + doc refresh
+
+Audit-driven follow-up to the 0.45.0–0.45.38 LAN-sync iteration.
+Five tightenings to data paths the audit flagged as racy or
+under-scoped; one security gate (QR-display binds auto-share);
+dead code removed; the peer contract documentation catches up
+with what shipped.
+
+### Code
+
+1. **LAN merge path holds ``project_lock``.**
+   ``lan_push._merge_then_push`` was performing fetch + lift-
+   aware three-way merge + push (working-tree writes, HEAD
+   advance) without acquiring the per-project lock. Could
+   interleave with a concurrent ``commit_project``,
+   ``atomic_finalize``, or the post-receive working-tree reset
+   (all of which already hold the lock). Wrap the whole
+   sequence in ``project_lock`` with a 5 s timeout — LAN
+   delivery is opportunistic, defer to the next drain pass if
+   the project is busy.
+
+2. **``.git/config`` writes serialized via ``project_lock``.**
+   The 0.45.37 retroactive ``strip_lan_origin_if_present`` ran
+   on every ``_h_project_status`` poll (picker fires it every
+   few seconds) without locking; concurrent ``init_repo`` /
+   Publish / ``_h_lan_adopt_origin`` was the race. Add a pre-
+   check (lock-free read of the origin url) so we only acquire
+   the lock when we'd actually mutate. New 2 s timeout; defer
+   to the next poll if busy.
+
+3. **``strip_lan_origin_if_present`` no longer wipes legitimate
+   private-IP origins.** Previously stripped any
+   ``192.168.x.y`` / ``10.x.y.z`` origin — including a user
+   who deliberately pointed Publish at a self-hosted Gitea on
+   a private IP. Added ``scope_to_paired_peers=True`` (the
+   default for the retroactive ``_h_project_status`` path): only
+   strip origin URLs whose host appears in a paired peer's
+   ``endpoints`` / ``static_endpoints`` list. The fresh-clone
+   ``lan_clone`` path passes ``scope_to_paired_peers=False``
+   because it's by-construction operating on a LAN-cloned URL.
+
+4. **Post-receive reset defers when working-tree edits are
+   in flight.** 0.45.38 added a 60 s pending-age guard catching
+   Phase 1 of ``atomic_open_write`` (scratch tokens under
+   ``.azt_atomic_pending/``). Gap: between Phase 2
+   (``os.replace`` lands bytes at the final path) and the next
+   ``commit_project``, the tracked file is on disk as
+   unstaged_mod with new content but old SHA in index — and
+   ``reset --hard HEAD`` would silently revert that to old-HEAD
+   content. New guard: if ``porcelain.status.unstaged`` lists
+   any non-pending path, defer the reset; the next
+   ``commit_project`` absorbs the index/HEAD mismatch the
+   pre-0.45.36 way. Worst case is briefly inflated ``n_changes``
+   until the next commit — strictly no worse than pre-0.45.36
+   and recoverable; the alternative was silent LIFT-edit data
+   loss in the Phase 2 ↔ receive-pack race window.
+
+5. **Auto-share on hello requires a recent QR-display
+   gesture.** Listener has ``CERT_NONE`` deliberately
+   (stdlib ssl can't request a client cert without validating
+   its CA chain, see ``_build_server``), so the body's
+   ``peer_id`` / ``fp`` / ``langcode`` claims aren't TLS-bound.
+   Pre-fix, an attacker on the LAN could POST
+   ``/v1/lan/hello`` with any peer_id + any langcode and our
+   daemon would (a) record them as paired and (b) add their
+   claimed langcode to their ``shared_projects`` allowlist —
+   at which point the dulwich smart-protocol handler accepts
+   ``GET /<lang>.git/info/refs`` from them and the project
+   exfiltrates over the LAN. New gate: ``_h_lan_pair_qr``
+   records a 10-minute single-use QR-offer for the displayed
+   langcode in ``lan_listener._pending_qr_offers``; the hello
+   handler's auto-share branch calls ``consume_qr_offer`` and
+   only fires ``add_shared_project`` when an active offer
+   exists. Without a recent QR display, the hello still
+   records the pair (legitimate symmetric-pairing path) but
+   refuses the auto-share — user can still tap Share manually.
+
+6. **LAN_TOGGLE_OFF wired into outbound endpoints.**
+   ``_h_lan_clone`` and ``_h_lan_send_share_offer`` now refuse
+   with the typed code when ``lan.allow_sync`` is off, instead
+   of silently failing at connect-time with the misleading
+   ``LAN_PEER_UNREACHABLE``. Peer UIs can route the user to the
+   toggle.
+
+7. **Dead ``/v1/lan/share_project`` endpoint removed.** The
+   bookkeeping-only ``_h_lan_share_project`` was reachable via
+   raw RPC but the client wrapper ``lan_share_project()`` calls
+   the strictly-more-complete ``/v1/lan/send_share_offer``
+   (which both updates the allowlist AND fires the courtesy
+   notification). Removing the duplicate clears one source of
+   future drift.
+
+8. **"Restart server" button on the server-too-old popup.**
+   Previously the popup offered only Update (download + install
+   a fresh APK) and Quit. Common field case the new button
+   handles: user already installed the new server APK from a
+   side channel (file manager, browser sideload, shared APK),
+   so the bytes on disk already satisfy the floor — but the
+   old ``:provider`` process is still serving the old version
+   because Android kept it alive across the replace. Tap →
+   cooperative ``POST /v1/admin/restart`` → daemon exits →
+   ContentProvider auto-spawn revives at the on-disk version →
+   compat probe re-runs. On refuse / pre-0.43.20 daemon that
+   doesn't know the endpoint, popup re-opens so the user can
+   tap Update instead. ``install_server_apk_popup`` gains an
+   ``on_restart_server`` optional callback; bootstrap's
+   ``_prompt_server_update`` wires it via
+   ``_restart_server_from_popup``.
+
+### Docs
+
+- **``azt-collab/CLAUDE.md``**: three new architecture
+  invariants — LAN sync (peer-to-peer, opportunistic, github
+  authoritative), ``.git/config`` writes hold ``project_lock``,
+  LIFT merge truncation guards. New runtime-config table rows
+  (``sync.work_offline``, ``sync.commit_pack_byte_budget``,
+  ``lan.allow_sync``). New Android-specifics paragraph on the
+  LAN foreground service.
+- **``azt_collab_client/CLIENT_INTEGRATION.md``**: brand-new
+  § 17d routing table for LAN status codes (all 14 of them);
+  brand-new § 20 on the LAN peer surface (hard rules, public
+  API, reference UI, migration checklist, security model);
+  § 17 routing table extended with the five non-LAN codes that
+  shipped earlier without making it into the contract
+  (``DNS_RESOLUTION_FAILED``, ``SYNC_GIVING_UP_TRANSIENT``,
+  ``TOPIC_BRANCH_CONFLICT``, ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET``,
+  ``LARGE_AUDIO_FILE_DETECTED``).
+
+### Wire format
+
+Additive only — no new wire endpoints. New status emission
+points for ``LAN_TOGGLE_OFF``. Old peers that don't route
+``LAN_TOGGLE_OFF`` fall through to the "everything else
+(translate to status line)" branch, which still surfaces the
+translated message ("Local-network sync is off"); only the
+"route to the toggle" affordance is missing.
+
+### Files
+
+- ``azt_collabd/lan_push.py`` — locks/import + split
+  ``_merge_then_push`` into outer (lock-acquire) + inner
+  (``_merge_then_push_locked``).
+- ``azt_collabd/repo.py`` — ``_host_matches_known_lan_peer``
+  helper; ``strip_lan_origin_if_present`` gains
+  ``scope_to_paired_peers`` + ``project_lock`` wrap.
+- ``azt_collabd/lan_clone.py`` — pass
+  ``scope_to_paired_peers=False`` from the fresh-clone path.
+- ``azt_collabd/lan_listener.py`` — new
+  ``_pending_qr_offers`` tracker + ``record_qr_offered`` /
+  ``consume_qr_offer``; ``_handle_hello_bodyauth`` consults
+  the gate; ``_reset_working_tree_after_receive`` adds the
+  Phase-2 unstaged-mod guard.
+- ``azt_collabd/server.py`` — ``_h_lan_pair_qr`` calls
+  ``record_qr_offered``; ``_h_lan_clone`` /
+  ``_h_lan_send_share_offer`` gate on
+  ``settings.lan_allow_sync()``; remove ``_h_lan_share_project``
+  + its dispatch entry.
+- ``azt_collab_client/ui/popups.py`` —
+  ``install_server_apk_popup`` gains ``on_restart_server`` kwarg
+  + optional "Restart server" button.
+- ``azt_collab_client/ui/bootstrap.py`` —
+  ``_prompt_server_update`` passes ``on_restart_server``;
+  ``_restart_server_from_popup`` is the cooperative-restart
+  handler (re-probes on accept, re-opens popup on refuse).
+- ``CLAUDE.md`` — three new invariants + runtime-config + LAN
+  FGS paragraph.
+- ``azt_collab_client/CLIENT_INTEGRATION.md`` — § 17 extended;
+  new § 17d + § 20.
+
+## 0.45.38 — Defer post-receive reset while atomic_open_write is in flight
+
+### Bug
+
+The 0.45.36 post-receive-pack working-tree-reset middleware
+races with the peer's two-phase ``atomic_open_write`` protocol:
+
+1. Peer Phase 1: opens ``.azt_atomic_pending/<token>`` via
+   ContentProvider FD, writes bytes, closes FD. **No
+   ``project_lock`` held during the write itself** — the FD
+   path bypasses the daemon's per-project lock.
+2. **Concurrent incoming push**: daemon's
+   ``_post_receive_pack_middleware`` runs after a successful
+   ``POST /git-receive-pack``. It acquires ``project_lock``,
+   runs ``porcelain.reset(repo, mode='hard', treeish=HEAD)``,
+   releases.
+3. Peer Phase 2: ``atomic_finalize_pending(token, rel_path)``
+   RPC. Daemon acquires ``project_lock``, looks for
+   ``.azt_atomic_pending/<token>`` → not found.
+
+Field surfaced as ``OSError: atomic_commit(...) failed:
+['SERVER_ERROR'] (SERVER_ERROR: pending_not_found)`` inside
+the recorder's ``stop_recording`` flow. The LIFT save aborted,
+the post-stop state transition never completed, and the
+recorder UI hung in "still recording." That UI-wedge is a
+recorder-side bug (a save failure shouldn't lock the UI); the
+``pending_not_found`` itself is this daemon-side race.
+
+### Fix
+
+``_reset_working_tree_after_receive`` consults
+``.azt_atomic_pending/`` *before* taking the lock. If any file
+in there is younger than ``atomic_recovery._MIN_AGE_S`` (60 s)
+— the same threshold ``atomic_recovery`` already uses for
+exactly this reason — the reset is deferred. The next push
+(or the next ``commit_project``) absorbs the index/HEAD
+mismatch the old way; worst case is the pre-0.45.36
+``n_changes`` behavior, strictly no worse than before.
+
+### Files
+
+- `azt_collabd/lan_listener.py` —
+  ``_reset_working_tree_after_receive`` adds a young-pending
+  guard at the top; new ``import time as _time``.
+
+## 0.45.37 — Strip LAN origin after clone + adopt-origin recovery via Publish + per-row Unpair
+
+### Why
+
+After ``lan_clone`` from a peer, the cloned project's
+``.git/config`` had ``remote.origin.url`` set to the peer's
+LAN listener URL (``https://192.168.x.y:port/<langcode>.git``).
+The publish-row's "hide Publish if remote_url present" gate
+treated this as a github remote and hid Publish — leaving the
+user with no path to back up to github. Re-cloning didn't help
+(the existing-project branch of ``lan_clone`` doesn't re-pop
+the in-flow adopt-origin popup). User-reported field symptom:
+"Publish isn't there, and not at all clear how to recover."
+
+### Change
+
+Four pieces:
+
+1. **Strip private-IP origin in ``lan_clone``'s fresh-clone
+   path.** New helper ``repo.strip_lan_origin_if_present``
+   detects an origin URL pointing at a private/loopback IP
+   (RFC 1918, ``localhost``, etc.) and removes the entire
+   ``[remote "origin"]`` section. Falls back to clearing just
+   the ``url`` key on older dulwich.
+
+2. **Auto-migrate on every ``_h_project_status``.**
+   Retroactive-fix for projects cloned before 0.45.37 —
+   strip runs on the next status poll, Publish appears
+   immediately afterward. Idempotent on healthy
+   github/gitlab origins.
+
+3. **Publish adopts a pending ``adopt_origin`` URL.**
+   ``_do_publish`` consults ``lan_pending()`` first; if a
+   pending ``adopt_origin`` decision exists for the current
+   langcode, its URL is used as the publish target (so the
+   user picks up the peer's existing github repo) rather than
+   inferring ``<user>/<langcode>``. Recovery for users who
+   missed the in-flow adopt-origin popup at scan time —
+   Publish becomes the unified entry point.
+
+4. **Per-row Unpair in ``paired_phones_popup``.** A direct
+   Unpair button alongside Manage. Same destructive
+   confirmation as the existing Manage→Unpair path. Surfaces
+   the common case (re-paired phone has a stale entry under
+   the old ``peer_id``) without making the user drill into
+   Manage.
+
+### Why "Publish adopts existing repo" works without an explicit prompt
+
+Publish's underlying ``_ensure_remote_repo`` already catches
+``HTTP 422 / 400 already exists`` from the create-repo API and
+treats it as success. ``init_repo`` then sets the local
+``origin`` to that URL and pushes. For the user's case (LAN-
+cloned from a tablet that's been working offline, so local
+HEAD is ahead of github HEAD), the push fast-forwards
+cleanly. The only edge case that wouldn't auto-resolve is a
+non-fast-forward push (a third device published while the
+tablet was offline) — rare enough to handle when it comes up.
+
+### Files
+
+- `azt_collabd/repo.py` — ``_is_private_ip_url``,
+  ``strip_lan_origin_if_present``.
+- `azt_collabd/lan_clone.py` — call strip in fresh-clone path
+  after ``_do_lan_clone``.
+- `azt_collabd/server.py` — call strip from ``_h_project_status``
+  as the retroactive-fix entry point.
+- `azt_collabd/ui/app.py` — ``_pending_adopt_origin_url``;
+  ``_do_publish`` consults it before falling back to inferred
+  URL.
+- `azt_collab_client/ui/lan_popups.py` — ``_build_peer_row``
+  adds Unpair button; ``paired_phones_popup`` adds
+  ``_confirm_unpair`` + confirmation dialog.
+
+### Build-system
+
+- ``android.numeric_version`` bumped to ``1260522001`` (same
+  day, second release). ``__version__`` 3-part as required:
+  ``0.45.37``.
+
+## 0.45.36 — Batch: working-tree reset, atomic-pending self-heal, mDNS fixes
+
+### Build-system note: explicit ``android.numeric_version`` (now required)
+
+The ``0.45.34.1`` hotfix accidentally locked the suite into
+4-part versions on Android: buildozer's default encoding gave
+``0.45.34.1`` a 10-digit versionCode (``1026453401``), while
+any subsequent 3-part version (``0.45.35``, ``0.45.36``, …)
+encodes to 8 digits (``10264536``). Android refuses the
+"upgrade" as ``INSTALL_FAILED_VERSION_DOWNGRADE``, and
+``adb uninstall`` wipes user data (``$AZT_HOME``: projects +
+credentials + jobs). Releasing 4-part versions to users is the
+wrong long-term answer (semver hygiene + UI clutter).
+
+Fix: override ``android.numeric_version`` in
+``server_apk/buildozer.spec.tmpl`` explicitly. Format
+``1_YYMMDD_NNN`` (date-based, monotonic). Current release uses
+``1260522000``. **Bump for every release** — there's no
+auto-computation from the version string. See the comment block
+in the spec for rationale.
+
+### Code changes (unchanged from the would-be 0.45.35)
+
+Six independent fixes bundled into one release. Each piece is
+narrowly-scoped; rollback story is per-file.
+
+### 1. Working-tree reset after incoming receive-pack
+
+Bug: dulwich's receive-pack handler advances refs without
+updating the working tree. After a peer pushes commits to us
+(fast-forward), our index still reflects the old HEAD, so every
+file the incoming commits touched shows as ``staged_mod``.
+Field n_changes spikes of 1409 → 1424 came directly from this.
+
+Fix: WSGI middleware around the listener's HTTPGitApplication
+catches successful ``POST /<lang>.git/git-receive-pack`` and
+runs ``porcelain.reset(repo, mode='hard', treeish=HEAD)`` under
+``project_lock`` (5 s timeout — defer if busy). Idempotent and
+safe: a receive-pack only lands as fast-forward, so HEAD's tree
+*is* what the working tree should now hold.
+
+### 2. ``.azt_atomic_pending/`` self-heal migration
+
+Bug: ``_stage_all`` filtered the scratch directory out of new
+stagings, but pre-existing repos had scratch tokens tracked by
+earlier code paths. They persisted as ``unstaged_mod`` forever,
+contributing ~3.36 MB each to every commit.
+
+Fix: ``_ensure_atomic_pending_self_heal`` runs from
+``_stage_all`` on every commit. Two parts:
+
+- Append ``.azt_atomic_pending/`` and ``.azt_atomic_orphans/``
+  to the project's ``.gitignore`` if missing.
+- ``del index[path]`` for any tracked file under
+  ``.azt_atomic_pending/``. Files remain on disk for
+  ``atomic_recovery`` to process; the index just stops carrying
+  them.
+
+Idempotent — a no-op once the state is correct. Init-time
+``.gitignore`` content updated to include both dirs by default
+for new projects.
+
+### 3. ``[atomic-recovery]`` directory-scan trace
+
+Field log baf 2026-05-22 showed n_changes stuck with atomic-
+pending tokens visible on disk but no ``[atomic-recovery]``
+lines mentioning them — couldn't tell whether the sweep had
+even considered them.
+
+``recover_project_orphans`` now emits one line per call when
+the pending dir is non-empty:
+
+```
+[atomic-recovery] scanning '/…/.azt_atomic_pending': 8 entries
+    (min_age=60s): [<token>@7200s, <token>@7150s, …]
+```
+
+Shows count + per-token ages so a tester can answer "did the
+sweep see X?" without rebuilding.
+
+### 4. Discovery restart after consecutive ``refused / unreachable``
+
+Bug: when a peer rebinds to a new port, our cached endpoint
+points at the dead old port. ``invalidate_endpoint`` clears
+*our* cache, but NsdManager's internal cache still has the
+stale advertisement and ``resolveService`` returns the old port
+(or nothing). Field workaround was manually toggling LAN
+off+on, which restarted ``discoverServices``.
+
+Fix: ``lan_push`` tracks consecutive ``refused / unreachable``
+counts per peer. After ``_RESTART_DISCOVERY_THRESHOLD = 3``
+failures, it calls ``lan_discovery.restart_browse()`` —
+``stopServiceDiscovery`` + clear endpoint cache +
+``discoverServices`` again, the mechanical equivalent of the
+manual toggle. Counter resets on success or after restart so we
+don't loop.
+
+### 5. Persist resolved endpoints into ``static_endpoints``
+
+Bug: ``peers.json::static_endpoints`` was set at pair time and
+never refreshed. After a peer rebind + daemon respawn (mDNS
+state empty), we fell back to the pair-time port, which is now
+ancient.
+
+Fix: ``_persist_resolved_endpoint`` runs from
+``onServiceResolved`` — writes the freshly-resolved
+``host:port`` to the head of ``static_endpoints`` so the static
+fallback drifts forward to track the peer's current location.
+Idempotent: skips the write if the head entry already matches.
+
+### Files
+
+- `azt_collabd/lan_listener.py` —
+  ``_reset_working_tree_after_receive``,
+  ``_post_receive_pack_middleware``, wired into
+  ``_build_server``.
+- `azt_collabd/repo.py` —
+  ``_ensure_atomic_pending_self_heal``; default ``.gitignore``
+  content updated.
+- `azt_collabd/atomic_recovery.py` —
+  ``recover_project_orphans`` directory-scan trace.
+- `azt_collabd/lan_push.py` — per-peer
+  ``_consec_failures`` counter; ``restart_browse`` on
+  threshold; reset on success.
+- `azt_collabd/lan_discovery.py` — ``restart_browse``;
+  ``_persist_resolved_endpoint`` called from
+  ``onServiceResolved``.
+
+## 0.45.34.1 — Recovery-commit LIFT delta trace (verify the merge fix)
+
+### Why
+
+`git diff HEAD~ baf.lift` isn't accessible on the device —
+working_dir lives in the server APK's private filesDir, release-
+signed APKs forbid ``adb run-as``, and we don't ship a ``git``
+binary. Without a way to inspect each recovery commit's effect
+on the LIFT, the tester can't tell whether the 0.45.34 merge fix
+is actually shrinking the spurious annotation pollution.
+
+### Change
+
+``_recover_under_lock`` now emits a single per-merge line:
+
+```
+[atomic-recovery] '<token>' merge delta:
+    lift_bytes 26,001,840 → 24,150,330 (-1,851,510),
+    conflict_annotations 1700 → 1218 (-482)
+```
+
+Tester reads it via the Share daemon-log button. With 0.45.34
+in place, post-merge annotation counts should *decrease*
+(canon-equal stripping) on a polluted LIFT; pre-0.45.34 they
+*increased* every cycle. The byte delta tracks the same trend
+indirectly. Counts are via substring-match on
+``b'azt-lift-conflict'`` — well-formed LIFT only contains that
+token in the annotation attribute, so the heuristic is exact in
+practice.
+
+### Files
+
+- `azt_collabd/atomic_recovery.py` — ``_recover_under_lock``
+  inserts the delta print between the merge call and the
+  ``_atomic_write_bytes`` call.
+
+## 0.45.34 — Self-healing LIFT merge (strip false-positive conflict markers)
+
+### Bug
+
+Field baf 2026-05-22 showed entries accumulating
+``<annotation name="azt-lift-conflict">`` markers (4 → 5 → 6 …
+on the same `<form>`) across recovery cycles, and duplicate
+``<form>`` blocks inserted between identical existing forms.
+``git diff`` example::
+
+  <form lang="en">
+      <text>body</text>
+  -    <annotation azt-lift-conflict="ours" /> × 4
+  +    <annotation azt-lift-conflict="ours" /> × 5
+  </form>
+  +<form lang="en">                  ← duplicate of next form
+  +    <text>body</text>
+  +    <annotation azt-lift-conflict="theirs" />
+  +</form>
+  <form lang="en">
+      <text>body</text>
+      <annotation azt-lift-conflict="theirs" />
+  </form>
+
+User: "there was never any conflict in the first place — we are
+not editing this field." Both forms have ``<text>body</text>``.
+Semantically identical. The merge was flagging them as
+conflicting anyway.
+
+### Root cause
+
+``_merge_pair`` compared elements with raw ``ET.tostring`` bytes
+(``_canon``). Stale ``azt-lift-conflict`` annotations from
+previous merges, plus whitespace/indentation differences between
+the orphan's LIFT and the current LIFT, made byte-equal
+semantically-identical content compare unequal → spurious
+conflict → fresh annotations appended → next merge sees even
+*more* unequal-looking content → more annotations. A vicious
+cycle that grew the LIFT by 1700+ markers per recovery on truly
+identical content.
+
+### Fix
+
+Two helpers added to ``lift_merge.py``:
+
+- ``_strip_conflict_annotations(elem)`` — recursively removes
+  every ``<annotation name="azt-lift-conflict" ...>`` child in
+  place.
+- ``_strip_indent_whitespace(elem)`` — normalizes inter-element
+  whitespace (text/tail are cleared when they contain only
+  whitespace and the element has children).
+- ``_canon_clean(elem)`` — canonical bytes for *detection*:
+  strips conflict annotations + normalizes whitespace, then
+  ``ET.tostring``. Used by ``_merge_pair`` instead of raw
+  ``_canon`` for the ``o vs t`` and ``base vs t``/``base vs o``
+  equality checks.
+
+When ``_canon_clean(o) == _canon_clean(t)`` the merge emits a
+*stripped* clone — annotations vanish on the canon-equal path.
+This makes the merge **self-healing**: every pass over a
+polluted LIFT collapses the spurious annotations on identical
+content back to nothing, leaving only markers on genuinely-
+divergent content. Real conflicts (where the underlying content
+actually differs) are still expressed with fresh
+``azt-lift-conflict`` markers as before.
+
+### Files
+
+- `azt_collabd/lift_merge.py` —
+  - new helpers ``_strip_conflict_annotations``,
+    ``_strip_indent_whitespace``, ``_canon_clean``.
+  - ``_merge_pair`` uses ``_canon_clean`` for detection, emits
+    annotation-stripped clones on canon-equality, including the
+    base-comparison "only-one-side-changed" paths.
+
+### Deferred to 0.45.35
+
+The four other 0.45.34 candidates remain pending — landing the
+merge fix alone keeps the rollback story clean if anything
+sideways surfaces:
+
+1. Working-tree reset on incoming push (ghost ``n_changes``
+   spikes after fast-forward).
+2. Exclude ``.azt_atomic_pending/`` from ``_commit_repo``
+   staging (27 MB-per-commit bloat from scratch tokens).
+3. One-time untrack the currently-tracked atomic-pending
+   tokens.
+4. ``[atomic-recovery]`` directory-scan trace.
+
+## 0.45.33 — Rendering contract: LANOK is independent of uncommitted changes
+
+### Why
+
+The §17b recipe pre-0.45.33 produced a single string and gated
+``LANOK`` on ``commits_ahead > 0``, conflating two orthogonal
+dimensions:
+
+- ``n_changes`` — uncommitted working-tree changes (the red
+  ``+N`` badge).
+- ``unshared_commits`` / ``commits_ahead`` — committed-work
+  replication status (the ``OK`` / ``LANOK`` / ``+u/a`` badge).
+
+Existing peer behavior already showed ``OK`` alongside red
+``+N`` (clean commit state, dirty working tree). ``LANOK``
+should behave the same way: it's about whether COMMITTED work
+is replicated, independent of whether new uncommitted edits
+are queued.
+
+### Change
+
+CLIENT_INTEGRATION.md § 17b now describes a two-element render:
+a sync-status string (OK / LANOK / +u/a + mode suffix) and a
+separate red ``+N`` uncommitted-changes badge that's visible
+whenever ``n_changes > 0``, regardless of the sync-status
+string. Both can be shown together.
+
+This is a peer-side contract update; no daemon code changes.
+Peers rendering the old recipe still work — they just won't
+surface LANOK during sustained editing.
+
+### Files
+
+- `azt_collab_client/CLIENT_INTEGRATION.md` § 17b — rewrite the
+  Python rendering snippet to split status string from
+  uncommitted badge.
+
+## 0.45.32 — Fan out to LAN peers immediately after each commit (LANOK latency)
+
+### Why
+
+The peer-side ``LANOK`` indicator requires
+``unshared_commits == 0`` — i.e., every local commit must be an
+ancestor of ``last_lan_pushed_sha`` (or ``origin/main``).
+``last_lan_pushed_sha`` only advanced on the watcher loop's
+30-second drain tick. Any commit landing between ticks left
+``unshared_commits > 0`` until the next tick, so LANOK never
+surfaced under sustained editing (typical field cadence: several
+commits per minute, > 30 s cycle).
+
+Other phone was actively fetching us and reaching our HEAD
+within seconds, but our daemon didn't know until the next
+outbound fanout ran ``_peek_peer_main`` and recorded the SHA.
+
+### Change
+
+``_run_commit`` (scheduler) now calls ``lan_push.fan_out`` after
+each ``COMMITTED_LOCAL`` when ``lan.allow_sync`` is on.
+``fan_out`` is idempotent (peeks each peer's ``main`` first, no-
+ops if already at our HEAD), so the cost is one ls-remote
+round-trip per paired peer per commit. The latency from
+``COMMITTED_LOCAL`` to ``last_lan_pushed_sha`` updated drops
+from up to 30 s to single-digit ms on a healthy LAN — LANOK
+surfaces on the next peer ``project_status`` poll.
+
+### Files
+
+- `azt_collabd/scheduler.py` —
+  ``_run_commit``: after the ``set_last_commit`` call on
+  ``COMMITTED_LOCAL``, conditionally fire
+  ``lan_push.fan_out(p)``.
+
+## 0.45.31 — Dump untracked/unstaged paths when n_changes is large
+
+### Why
+
+Field symptom: ``n_changes`` jumps from 1 to 71 across a few
+seconds with no peer-side write activity visible in the daemon
+log (no ``[commit-rpc]`` from the recorder, no ``mode='w'``
+``openFileDescriptor``). Can't tell whether the count is real
+files (and which ones) or a dulwich counting quirk; rebuilding
+to add a one-off trace is a multi-minute cycle.
+
+### Change
+
+``repo_status_summary`` now emits a single ``[repo-status]``
+line when ``n_changes >= 5``, dumping a head-listing of the
+``unstaged`` and ``untracked`` buckets with byte-safe decode.
+Threshold avoids noise on healthy projects (the typical
+single-file finalize-in-flight transient is 1–2).
+
+### Format
+
+```
+[repo-status] n=71 staged_add=0 staged_mod=0 staged_del=0
+  unstaged=1 untracked=70
+  untracked_head=['.azt_atomic_pending/abcd…', ...]
+  unstaged_head=['sw-US-x-kent.lift']
+```
+
+If the untracked head shows ``.azt_atomic_pending/<token>``
+entries piling up, atomic-recovery is leaving orphans behind
+(despite ``atomic_finalize``'s ``os.replace``). Other patterns
+(e.g., 70 audio files) point to a different write source.
+
+### Files
+
+- `azt_collabd/repo.py` — ``repo_status_summary`` adds the
+  ``[repo-status]`` diagnostic emit guarded by ``n >= 5``.
+
+## 0.45.30 — Sync-indicator rendering: single source of truth in CLIENT_INTEGRATION.md § 17b
+
+### Why
+
+The sync-indicator semantics (the ``LANOK +5`` vs
+``+unshared/ahead`` split, the four-cell ``work_offline ×
+lan_allow_sync`` suffix matrix) were duplicated across the
+peer contract in ``CLIENT_INTEGRATION.md § 17b`` and the
+field-level docstrings on ``ProjectStatus.work_offline`` /
+``lan_allow_sync`` / ``unshared_commits`` in
+``azt_collab_client/projects.py``. Consistent today because
+both were written in the same 0.45.0 pass, but they'd drift if
+the rendering recipe evolved and only one side was updated.
+
+### Change
+
+``projects.py`` field docstrings shortened to "what is this
+field" — they still describe the *semantic* (e.g.
+``unshared_commits == 0`` means "shared somewhere", drives the
+``LANOK`` split), but the rendering recipe (the full Python
+``if/elif`` cascade with suffix construction) lives only in
+``CLIENT_INTEGRATION.md § 17b`` now. Each field's docstring
+ends with a forward-pointer there.
+
+### Files
+
+- `azt_collab_client/projects.py` — trim docstrings on
+  ``work_offline``, ``lan_allow_sync``, ``unshared_commits``,
+  ``lan_pushed_sha``; add "Rendering recipe:
+  CLIENT_INTEGRATION.md § 17b" pointer.
+
+## 0.45.29 — Stuck-commit triage line in project_status
+
+### Why
+
+Field-triaging a "red +N" sync indicator (uncommitted file
+changes piling up) needs three numbers visible at once:
+``n_changes``, ``commit_failure_count``, ``last_commit_error``.
+On Android the daemon's only addressable from on-device peer
+processes, so without a daemon-log emit a tester has no way to
+read those fields unless the host app has already plumbed them
+into a banner.
+
+### Change
+
+``_h_project_status`` now logs one short trace line per call
+when *any* of ``n_changes``, ``commit_failure_count``, or
+``last_commit_error`` is non-zero. Quiet on a healthy project
+(picker polls every few seconds; we don't want to drown the
+log on the happy path). Format:
+
+```
+[project_status] 'baf' n_changes=1424 commits_ahead=0 commit_fail=0 last_err=''
+```
+
+Reading: ``n_changes`` climbs while ``commit_fail`` stays 0 →
+peer isn't calling ``commit_project``. ``commit_fail`` climbs →
+real commit failures, ``last_err`` carries the dulwich message.
+
+### Files
+
+- `azt_collabd/server.py` —
+  ``_h_project_status``: trace emit before the response dict.
+
+## 0.45.28 — LAN listener: decode bytes path in dulwich smart-protocol POST
+
+### Bug
+
+With both listeners up at boot (0.45.25), pairs reached each
+other for the GET ``/info/refs`` half of git smart-protocol but
+the subsequent POST to ``/<repo>.git/git-upload-pack`` /
+``/git-receive-pack`` died inside the receiver's
+``_DynamicBackend.open_repository`` with ``TypeError: a bytes-
+like object is required, not 'str'``. The receiver returned
+HTTP 500; pusher logged ``[lan-merge] fetch from '<peer>'
+failed: GitProtocolError('unexpected http resp 500 for
+.../git-upload-pack')``.
+
+Root cause: ``dulwich.web``'s GET handler passes the repo path
+to ``backend.open_repository`` as ``str`` (sliced from
+``mat.string[:mat.start()]``), but the smart-protocol POST
+handler in ``dulwich.server`` (UploadPackHandler /
+ReceivePackHandler ``__init__``) passes it as ``bytes`` from
+the wire parser. Our backend's ``.lstrip('/')`` is a str method.
+
+### Fix
+
+``_DynamicBackend.open_repository`` decodes ``bytes`` to str via
+``utf-8`` at entry before the existing normalization runs.
+Comment expanded to capture the two-axis variance (encoding and
+shape) so the next reader doesn't re-discover it.
+
+### Files
+
+- `azt_collabd/lan_listener.py` —
+  ``_DynamicBackend.open_repository``: ``isinstance(raw, bytes)``
+  → decode.
+
+## 0.45.27 — Peer-id tag in shared-log filename
+
+### Why
+
+0.45.26 tagged the on-disk log filename
+(``daemon-07c089f2.log``) but the Share button's display name —
+the filename the tester sees when the OS save dialog opens —
+was still ``azt_log_<stamp>.log`` regardless of device. Two
+phones' shared logs landed in the tester's Downloads folder
+with names that differed only by timestamp, defeating the
+collision-avoidance the on-disk rename solved.
+
+### Change
+
+``share_log_file`` in ``azt_collab_client/ui/share.py`` now
+calls ``lan_peer_id()`` and appends the short tag to the
+display name: ``azt_log_<stamp>_07c089f2.log``. Falls back to
+the un-tagged form if the daemon can't return a peer_id (e.g.
+cryptography unavailable on the peer's build).
+
+### Files
+
+- `azt_collab_client/ui/share.py` —
+  ``share_log_file`` resolves the tag once per call and appends
+  it to ``display_name`` when one wasn't explicitly passed.
+
+## 0.45.26 — Per-device peer-id tag in daemon log
+
+### Why
+
+Diagnosing LAN sync needs both phones' logs side by side, and
+both arrive at the tester as identically-named ``daemon.log``
+with identically-formatted ``[14:01:01]`` stamps — one phone's
+log clobbers the other on save, and a paragraph quoted from
+either is indistinguishable at a glance.
+
+### Change
+
+The stdio-tee now stamps every log line with the first 8 hex
+chars of the daemon's ed25519 peer-id, e.g.
+``[14:01:01 07c089f2] [scheduler] drain pushes: ['baf']`` — the
+same short id the user already sees in ``[lan-push] '07c089f2'
+...`` lines, so no new vocabulary. The on-disk filename gets
+the same suffix: ``$AZT_HOME/daemon-07c089f2.log``, so two
+phones' logs can sit in one folder without colliding. Both
+fall back to the un-tagged form if the peer-id isn't readable
+(fresh-install bootstrap, cryptography import failure).
+
+Tag is computed once per process and cached, so log writes pay
+nothing after the first call.
+
+### Files
+
+- `azt_collabd/server.py` —
+  - `_log_peer_tag_str()` lazy resolver + module-level cache.
+  - `daemon_log_path()` splices the tag into the filename.
+  - `_StdioTee._write_to_file` uses the tagged stamp.
+
+## 0.45.25 — Android service startup applies the LAN toggle
+
+### Bug
+
+A daemon respawn on Android left the daemon in a "toggle says yes,
+listener says no" split-brain: persisted `lan.allow_sync=on` drove
+the scheduler's LAN fan-out every 30 s (which then hammered each
+paired peer's last-known endpoint with `Connection refused`), but
+the listener thread, WifiLock, MulticastLock, FGS promotion, and
+mDNS service-info were never re-armed — inbound bound nothing,
+outbound advertised nothing. Field log baf 2026-05-22 caught it:
+54 consecutive minutes of `[lan-push] ... refused / unreachable —
+invalidated mDNS cache for re-resolve` with no
+`[lan-listener] started` / `[lan-fgs] acquired` / `[lan-discovery]
+nsd registered` until the user manually toggled LAN off→on.
+
+### Fix
+
+`server_apk/service.py:main()` now calls
+`lan_listener.apply_toggle()` after `scheduler.start_watcher()`,
+with the same try/except guard the desktop `server.run()` entry
+path uses (line 3274). Idempotent — a no-op when the listener's
+already up. Same class of bug as the pre-0.43.29 connectivity-
+watcher omission (desktop wired it, Android `:provider` forgot
+it); fixed now for the LAN listener.
+
+### Files
+
+- `server_apk/service.py` — added `before_lan_listener` /
+  `after_lan_listener` boot-trace phases and the
+  `apply_toggle()` call between `start_watcher()` and the idle
+  loop.
+
 ## 0.45.0 — LAN sync transport (full implementation)
 
 ### Why

@@ -1967,8 +1967,55 @@ def _prompt_server_update(ctx, current_version, min_required=''):
         install_label=_tr('Update'),
         title=_tr('Update AZT Collaboration?'),
         on_install_complete=lambda: _post_install_continuation(ctx),
+        on_restart_server=lambda: _restart_server_from_popup(
+            ctx, running_version=current_version or ''),
         repo=ctx.server_repo,
     )
+
+
+def _restart_server_from_popup(ctx, running_version=''):
+    """Cooperative-restart entry point wired into the server-too-
+    old popup's "Restart server" button. The common case this
+    handles: user already installed the new server APK from
+    another channel (browser sideload, file-manager tap on a
+    shared APK), so the bytes on disk satisfy the floor but the
+    old :provider process is still alive and serving the old
+    version.
+
+    Sends ``POST /v1/admin/restart`` (cooperative). On accept,
+    re-runs the compat probe via ``_post_install_continuation``
+    after a brief warm-up so the next user-visible state reflects
+    the freshly-spawned daemon. On refuse / unreachable / old-
+    daemon-doesn't-know-the-endpoint, re-opens the same popup so
+    the user can tap Update instead — the only way out for
+    pre-0.43.20 daemons that don't know ``/v1/admin/restart``.
+
+    No kill-by-PID fallback — the peer's UID can't kill the
+    daemon's process (the :provider service runs under the server
+    APK's UID). The cooperative endpoint is the only seam across
+    the UID boundary. If cooperative restart isn't available
+    (e.g. pre-0.43.20 daemon), the user's recourse is reboot or
+    reinstall, surfaced by reopening the popup.
+    """
+    _on_ui(_ui_status, ctx, _tr('Restarting the sync service…'))
+    try:
+        from .. import restart_server as _restart
+        res = _restart()
+    except Exception as ex:
+        print(f'[bootstrap] cooperative restart raised: {ex!r}; '
+              f'reopening popup', file=sys.stderr, flush=True)
+        _on_ui(_prompt_server_update, ctx, running_version)
+        return
+    if res.has(S.RESTARTING):
+        print(f'[bootstrap] manual cooperative restart accepted '
+              f'(running={running_version!r}); re-probing compat',
+              file=sys.stderr, flush=True)
+        _on_ui(_post_install_continuation, ctx)
+        return
+    print(f'[bootstrap] manual cooperative restart declined: '
+          f'codes={res.codes()!r}; reopening popup',
+          file=sys.stderr, flush=True)
+    _on_ui(_prompt_server_update, ctx, running_version)
 
 
 def _prompt_self_update(ctx, latest_version, mandatory=False,

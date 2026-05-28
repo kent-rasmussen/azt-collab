@@ -140,11 +140,15 @@ _KV_TEMPLATE = '''
                         # share offers waiting from already-paired
                         # phones AND a "Scan QR code" fallthrough
                         # for first-time pair-with-a-new-phone.
-                        # Calls the free function directly so every
-                        # picker host (recorder, viewer, server APK)
-                        # gets the affordance without needing an
-                        # App-method contract.
-                        on_release: LAN_POPUPS.pending_offers_popup()
+                        # ``root.receive_from_phone()`` wraps the
+                        # popup with an ``on_done`` that emits the
+                        # freshly-cloned project to the host App so
+                        # the user lands inside it immediately (same
+                        # behaviour as tapping an existing project
+                        # button below), instead of being dropped
+                        # back onto the picker with no visible new
+                        # project until they exit and re-enter.
+                        on_release: root.receive_from_phone()
                     RecBtn:
                         text: _('Start New')
                         normal_color: T.BTN_INACTIVE
@@ -295,3 +299,80 @@ class ProjectPickerScreen(Screen):
                   flush=True)
             btn.bind(on_release=_on_release)
             box.add_widget(btn)
+
+    def receive_from_phone(self):
+        """Open the pending-offers popup with an ``on_done`` that
+        emits the freshly-cloned project to the host App as if the
+        user had tapped its button in the projects list.
+
+        Without the ``on_done`` wiring (pre-0.45.43 behaviour was
+        ``LAN_POPUPS.pending_offers_popup()`` with no callback) the
+        popup just dismissed after a successful clone and the user
+        was left on the picker with the project list still showing
+        the pre-clone snapshot — they had to back out of the picker
+        and come back in for the new project's button to appear.
+        Both ``accept_offer`` and ``scan_to_pair`` route through
+        this popup, so this wiring covers both paths.
+        """
+        from .lan_popups import pending_offers_popup
+        from .. import S as _S
+
+        def _on_done(result):
+            # Only the cloned / re-opened branches deliver a
+            # project we can pick. Anything else (decline, scan-
+            # only-pair, transport failure) just dismisses the
+            # popup without picking.
+            if not result.has_any(
+                    _S.LAN_PROJECT_CLONED,
+                    _S.LAN_PROJECT_REOPENED):
+                # Re-populate in case the user accepted-and-decline
+                # mixed gestures changed the pending list shape.
+                Clock.schedule_once(
+                    lambda *_: self._populate_projects(), 0)
+                return
+            # Pull the langcode off the Status params (lan_clone
+            # stamps both LAN_PROJECT_CLONED and LAN_PROJECT_REOPENED
+            # with ``langcode=``).
+            langcode = ''
+            for s in result.statuses:
+                if s.code in (_S.LAN_PROJECT_CLONED,
+                              _S.LAN_PROJECT_REOPENED):
+                    langcode = str(
+                        (s.params or {}).get('langcode', '') or '')
+                    if langcode:
+                        break
+            if not langcode:
+                # Belt-and-braces: server-side ``_h_lan_accept_offer``
+                # also stamps last_project on success. Fall through
+                # to a refresh so the new project at least shows in
+                # the list rather than dropping the user on a stale
+                # snapshot.
+                Clock.schedule_once(
+                    lambda *_: self._populate_projects(), 0)
+                return
+            # Resolve the cloned project's lift_path via the
+            # registry. The daemon registered it during the LAN
+            # clone, so ``open_project(langcode)`` carries the path
+            # in the same shape as the list-projects rows.
+            from .. import open_project
+            try:
+                project = open_project(langcode)
+            except Exception:
+                project = None
+            path = (getattr(project, 'lift_path', '')
+                    or getattr(project, 'working_dir', '')) \
+                if project is not None else ''
+            app = App.get_running_app()
+            if not path or not hasattr(app, 'load_lift'):
+                # Host can't or won't emit — at least refresh so the
+                # new project's button is visible.
+                Clock.schedule_once(
+                    lambda *_: self._populate_projects(), 0)
+                return
+            print(f"[picker] LAN clone delivered "
+                  f"langcode={langcode!r} path={path!r} — "
+                  f"emitting to host",
+                  flush=True)
+            app.load_lift(path, langcode)
+
+        pending_offers_popup(on_done=_on_done)

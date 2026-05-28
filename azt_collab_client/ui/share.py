@@ -232,7 +232,28 @@ def share_log_file(log_path, prev_path=None, on_error=None,
     if not display_name:
         import datetime as _dt
         stamp = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-        display_name = f'azt_log_{stamp}.log'
+        # Splice the daemon's short peer-id tag into the display
+        # name so a tester collecting two phones' logs into one
+        # folder gets distinct filenames (e.g.
+        # ``azt_log_20260522_140101_07c089f2.log`` vs ...
+        # ``_a1b00d64.log``). Same 8-char tag the on-disk log file
+        # carries (``daemon-07c089f2.log``) and that already shows
+        # up in ``[lan-push] '07c089f2'`` lines. Falls back to the
+        # un-tagged form if ``lan_peer_id`` is unavailable (peer
+        # didn't ship cryptography, server transient, etc.) so the
+        # share still works.
+        tag = ''
+        try:
+            import azt_collab_client as _client
+            info = _client.lan_peer_id() or {}
+            hex_str = (info.get('peer_id') or '')
+            tag = hex_str[:8]
+        except Exception:
+            tag = ''
+        if tag:
+            display_name = f'azt_log_{stamp}_{tag}.log'
+        else:
+            display_name = f'azt_log_{stamp}.log'
     try:
         from jnius import autoclass, cast
         PythonActivity = autoclass('org.kivy.android.PythonActivity')

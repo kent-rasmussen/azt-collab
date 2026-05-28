@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.45.22"
+__version__ = "0.47.2"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -156,7 +156,16 @@ __version__ = "0.45.22"
 # ``sync.work_offline`` toggle and ``S.WORK_OFFLINE_ENABLED``
 # status code; a 0.43 client paired with an older daemon would
 # render the work-offline UI but the toggle would have no effect.
-MIN_SERVER_VERSION = "0.44.0"
+# 0.47.0 floor: wire-format break (same reason as the daemon's
+# matching ``MIN_CLIENT_VERSION`` bump). The ``project_status``
+# response replaces ``commits_ahead`` + ``unshared_commits`` with
+# ``wan_unshared`` / ``lan_unshared`` / ``at_risk``. A client at
+# v0.47 paired with a pre-v0.47 daemon would read missing fields
+# as zero and render every project as state A "OK," masking real
+# WAN-behind / LAN-behind / at-risk states. Force the floor so
+# the bootstrap popup prompts a daemon rebuild before that misread
+# happens.
+MIN_SERVER_VERSION = "0.47.0"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``
@@ -198,6 +207,9 @@ from .lift_io import (
 )
 from .recent import last_project, set_last_project
 from .peer_prefs import peer_pref, set_peer_pref
+from .notify import (
+    subscribe_project_changes, subscribe_global_changes, unsubscribe,
+)
 
 
 def configure(app_id: str):
@@ -1624,8 +1636,9 @@ def sync_project(langcode):
     pass returns.
 
     Sync button surface: peers usually display a status badge
-    (commits_ahead, work_offline) from ``project_status`` and call
-    this only when the user taps the badge. Per-edit commits go
+    (``wan_unshared`` / ``lan_unshared`` / ``at_risk`` /
+    ``work_offline``) from ``project_status`` and call this only
+    when the user taps the badge. Per-edit commits go
     through ``commit_project`` instead, which doesn't block on the
     network.
 
@@ -2222,6 +2235,8 @@ __all__ = [
     'audio_uri_for', 'image_uri_for', 'is_content_uri',
     'last_project', 'set_last_project',
     'peer_pref', 'set_peer_pref',
+    'subscribe_project_changes', 'subscribe_global_changes',
+    'unsubscribe',
     'Status', 'Result', 'S', 'Project', 'ProjectStatus',
     'translate_status', 'translate_result', 'set_translator',
     'ServerUnavailable',

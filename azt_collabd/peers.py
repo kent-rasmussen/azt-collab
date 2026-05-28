@@ -96,6 +96,12 @@ def _normalize_entry(entry):
     shouldn't crash the daemon)."""
     if not isinstance(entry, dict):
         entry = {}
+    raw_lsm = entry.get('last_seen_main') or {}
+    last_seen_main = {}
+    if isinstance(raw_lsm, dict):
+        for k, v in raw_lsm.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                last_seen_main[k] = v
     return {
         'device_name': str(entry.get('device_name', '') or ''),
         'fp': str(entry.get('fp', '') or ''),
@@ -109,6 +115,18 @@ def _normalize_entry(entry):
             if isinstance(s, str)],
         'paired_at': str(entry.get('paired_at', '') or ''),
         'last_seen_at': str(entry.get('last_seen_at', '') or ''),
+        # Per-project SHA of this peer's main as last observed via
+        # ls-remote / verified push. Keyed by langcode. Drives the
+        # honest ``lan_unshared`` / ``at_risk`` computation (was
+        # the conflated ``unshared_commits`` in 0.46.x) — walks
+        # HEAD excluding the union of all paired peers' observed-
+        # current-main SHAs. ``lan_unshared=0`` only when at least
+        # one paired peer is actually at our HEAD or descended from
+        # it. Replaces the project-wide ``last_lan_pushed_sha``
+        # field that recorded what *we* shipped rather than what
+        # the peer *has*, producing false-positive LANOK on
+        # diverged histories.
+        'last_seen_main': last_seen_main,
     }
 
 
@@ -238,6 +256,57 @@ def set_static_endpoints(peer_id, endpoints):
         _save_raw(data)
     out = dict(entry)
     out['peer_id'] = str(peer_id)
+    return out
+
+
+def set_peer_last_seen_main(peer_id, langcode, sha):
+    """Record a paired peer's ``refs/heads/main`` SHA for a given
+    project, as last observed via ls-remote or verified push.
+    Drives ``repo._lan_unshared`` and ``repo._at_risk`` (v0.47.0;
+    were combined as ``server._unshared_commit_count`` in 0.46.x) —
+    walks HEAD excluding the union of every paired peer's most-
+    recent observed-main SHA for this project. Updates monotonic
+    in spirit: callers call this only on actual observations.
+
+    Returns True if the peer existed (and the value was written),
+    False otherwise. Empty / falsy ``langcode`` or ``sha`` are
+    no-ops.
+    """
+    if not peer_id or not langcode or not sha:
+        return False
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if peer_id not in peers:
+            return False
+        entry = _normalize_entry(peers[peer_id])
+        last_seen_main = dict(entry.get('last_seen_main') or {})
+        last_seen_main[str(langcode)] = str(sha)
+        entry['last_seen_main'] = last_seen_main
+        peers[peer_id] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    return True
+
+
+def peer_main_shas_for(langcode):
+    """Return the list of paired peers' last-observed main SHAs
+    for *langcode*. Used by ``_lan_unshared`` and ``_at_risk`` to
+    compute the exclude set: a commit reachable from any of these
+    SHAs is proven-present on at least one paired peer. Empty list
+    when nothing observed yet (initial state, or pre-migration
+    data).
+    """
+    if not langcode:
+        return []
+    with _LOCK:
+        data = _load_raw()
+    out = []
+    for entry in (data.get('peers') or {}).values():
+        norm = _normalize_entry(entry)
+        sha = (norm.get('last_seen_main') or {}).get(langcode, '')
+        if sha:
+            out.append(sha)
     return out
 
 

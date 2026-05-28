@@ -144,8 +144,11 @@ def _print_current_project():
     _kv('— project_status —', '')
     _kv('branch', status.branch or '(none)')
     _kv('n_changes', status.n_changes)
-    _kv('commits_ahead', status.commits_ahead)
+    _kv('wan_unshared', status.wan_unshared)
+    _kv('lan_unshared', status.lan_unshared)
+    _kv('at_risk', status.at_risk)
     _kv('work_offline', _yes_no(status.work_offline))
+    _kv('lan_allow_sync', _yes_no(status.lan_allow_sync))
     _kv('commit_failure_count', status.commit_failure_count)
     if status.commit_failure_count:
         _kv('last_commit_failure_at', status.last_commit_failure_at)

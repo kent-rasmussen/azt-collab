@@ -213,6 +213,64 @@ def _canon(elem):
     return ET.tostring(elem, encoding='utf-8')
 
 
+def _strip_conflict_annotations(elem):
+    """Recursively remove every ``<annotation name="azt-lift-conflict"
+    ...>`` child from *elem* in place. Used by both the canonical-
+    comparison path (so stale annotations from previous merges don't
+    cause false-positive conflict detection) and by the canon-equal
+    output path (so semantically-identical elements emerge clean,
+    without inherited cruft).
+
+    Field log baf 2026-05-22 showed entries accumulating up to 1700+
+    ``azt-lift-conflict`` markers across recovery cycles, even on
+    forms whose `<text>` content was byte-identical on both sides.
+    Each merge saw the prior round's annotations as "ours has them,
+    theirs doesn't" → fresh conflict → more annotations. This strip
+    breaks that cycle: the merge sees the underlying content and
+    recognizes the equality."""
+    for child in list(elem):
+        if (child.tag == 'annotation'
+                and child.attrib.get('name') == CONFLICT_ANNOTATION_NAME):
+            elem.remove(child)
+        else:
+            _strip_conflict_annotations(child)
+
+
+def _strip_indent_whitespace(elem):
+    """Normalize inter-element whitespace by clearing text/tail
+    when they contain only whitespace and the element has
+    children. Two elements that differ only in indentation (e.g.,
+    one parsed from a pretty-printed file, one from a compact
+    source) then compare equal under ``_canon_clean`` below."""
+    if list(elem):
+        if elem.text is not None and not elem.text.strip():
+            elem.text = None
+    if elem.tail is not None and not elem.tail.strip():
+        elem.tail = None
+    for child in elem:
+        _strip_indent_whitespace(child)
+
+
+def _canon_clean(elem):
+    """Canonical bytes for *elem* with all ``azt-lift-conflict``
+    annotation children removed and inter-element whitespace
+    normalized. The version of ``_canon`` to use for conflict
+    *detection* — answers "do these two elements represent the
+    same semantic content?" rather than "are these two elements
+    byte-identical XML?".
+
+    Used by ``_merge_pair`` instead of bare ``_canon`` so that
+    stale conflict markers (left over from previous merges that
+    mistakenly flagged identical content) don't perpetuate fresh
+    conflicts every time the merge runs. See
+    ``_strip_conflict_annotations`` docstring for the field
+    incident this fixes."""
+    copy = ET.fromstring(_canon(elem))
+    _strip_conflict_annotations(copy)
+    _strip_indent_whitespace(copy)
+    return ET.tostring(copy, encoding='utf-8')
+
+
 def _strip_entries(root):
     """Return a copy of *root* with all <entry> children removed."""
     copy = ET.fromstring(_canon(root))
@@ -338,18 +396,42 @@ def _merge_pair(b, o, t, parent_allows_multi):
         return [_clone(t)]
     if t is None:
         return [_clone(o)]
-    if _canon(o) == _canon(t):
-        return [_clone(o)]
 
-    # Both present and differ. Check the base — only-one-side-changed
-    # cleanly takes the changed side without any conflict marker.
+    # Use ``_canon_clean`` for *detection* — strips stale
+    # ``azt-lift-conflict`` annotations and inter-element
+    # whitespace before comparing. Pre-0.45.34 the comparison was
+    # raw ``_canon``, which treated semantically-identical
+    # elements as conflicting whenever one side carried left-over
+    # annotations from a previous merge. That fed a vicious cycle:
+    # every recovery added more spurious annotations, which made
+    # the next recovery generate even more, ballooning to 1700+
+    # markers on truly-identical content in the field.
+    oc_clean = _canon_clean(o)
+    tc_clean = _canon_clean(t)
+    if oc_clean == tc_clean:
+        # Canon-equal ⇒ any existing ``azt-lift-conflict``
+        # annotations on either side are by definition
+        # false-positives (the underlying content matches), so
+        # we emit a *stripped* clone. The merge thereby
+        # self-heals previously-polluted LIFTs as it walks them:
+        # one pass over a 1700-marker entry collapses all the
+        # spurious annotations back to nothing, leaving only
+        # markers on genuinely-divergent content.
+        cleaned = _clone(o)
+        _strip_conflict_annotations(cleaned)
+        return [cleaned]
+
+    # Both present and differ semantically. Check the base —
+    # only-one-side-changed cleanly takes the changed side
+    # without any conflict marker. Base comparison also uses
+    # ``_canon_clean`` so a peer whose LIFT carries stale
+    # annotations relative to its own committed base doesn't
+    # synthesize a phantom "I changed something" signal.
     if b is not None:
-        bc = _canon(b)
-        oc = _canon(o)
-        tc = _canon(t)
-        if oc == bc:
+        bc_clean = _canon_clean(b)
+        if oc_clean == bc_clean:
             return [_clone(t)]   # only theirs changed
-        if tc == bc:
+        if tc_clean == bc_clean:
             return [_clone(o)]   # only ours changed
 
     # Both changed differently (or no shared base). Try to recurse

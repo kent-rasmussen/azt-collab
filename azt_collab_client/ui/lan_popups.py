@@ -408,17 +408,21 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                                'other phone.'))
 
 
-def _build_peer_row(peer, on_manage, font_name):
-    """One row in the paired-peers list."""
+def _build_peer_row(peer, on_manage, on_unpair, font_name):
+    """One row in the paired-peers list. Per-row Unpair surfaced
+    directly alongside Manage (0.45.37) so users can clean up
+    stale paired-peer entries (e.g., after the peer wiped + re-
+    paired and got a new ``peer_id``) without first drilling
+    into Manage."""
     row = BoxLayout(orientation='horizontal', size_hint_y=None,
-                    height=dp(56), spacing=dp(8), padding=dp(4))
+                    height=dp(56), spacing=dp(6), padding=dp(4))
     label_box = BoxLayout(orientation='vertical')
     name = peer.get('device_name') or _tr('Unnamed device')
     label_box.add_widget(Label(
         text=name, halign='left', valign='middle',
         size_hint_y=None, height=dp(28),
         font_size=sp(13), bold=True, font_name=font_name,
-        text_size=(dp(220), dp(28))))
+        text_size=(dp(190), dp(28))))
     pid = peer.get('peer_id', '')
     shared = ', '.join(peer.get('shared_projects') or []) or \
         _tr('(no projects shared)')
@@ -427,14 +431,19 @@ def _build_peer_row(peer, on_manage, font_name):
         halign='left', valign='middle',
         size_hint_y=None, height=dp(22),
         font_size=sp(10), color=theme.TEXT_DIM,
-        text_size=(dp(220), dp(22)),
+        text_size=(dp(190), dp(22)),
         font_name=font_name))
     row.add_widget(label_box)
     manage_btn = Button(text=_tr('Manage'), size_hint=(None, None),
-                        width=dp(96), height=dp(40),
-                        font_size=sp(13), font_name=font_name)
+                        width=dp(76), height=dp(40),
+                        font_size=sp(12), font_name=font_name)
     manage_btn.bind(on_release=lambda *_: on_manage(peer))
     row.add_widget(manage_btn)
+    unpair_btn = Button(text=_tr('Unpair'), size_hint=(None, None),
+                        width=dp(76), height=dp(40),
+                        font_size=sp(12), font_name=font_name)
+    unpair_btn.bind(on_release=lambda *_: on_unpair(peer))
+    row.add_widget(unpair_btn)
     return row
 
 
@@ -584,6 +593,54 @@ def paired_phones_popup(font_name='Roboto'):
                   content=container, size_hint=(0.95, 0.9),
                   auto_dismiss=False)
 
+    def _confirm_unpair(peer):
+        """Confirm dialog before calling ``lan_unpair``.
+        Destructive: removes the peer from ``peers.json``, drops
+        cached endpoint, drops any shared-project allowlist
+        entries for them. Re-pairing requires scanning a fresh
+        QR."""
+        from .. import lan_unpair  # local import — same shape
+        # as ``_manage_peer_popup``, keeps the module-level
+        # imports lean.
+        pid = peer.get('peer_id', '') or ''
+        name = peer.get('device_name') or _tr('Unnamed device')
+        body = BoxLayout(orientation='vertical', spacing=dp(8),
+                         padding=dp(12))
+        body.add_widget(Label(
+            text=_tr('Unpair "{name}"?\n\n'
+                     'This phone will no longer auto-share with '
+                     'that device. Re-pair by scanning a new QR.'
+                     ).format(name=name),
+            font_size=sp(13), font_name=font_name,
+            halign='center', valign='middle',
+            text_size=(dp(280), None)))
+        btn_row = BoxLayout(orientation='horizontal',
+                            spacing=dp(8),
+                            size_hint_y=None, height=dp(44))
+        cancel_btn = Button(text=_tr('Cancel'), font_name=font_name)
+        do_btn = Button(text=_tr('Unpair'), font_name=font_name)
+        btn_row.add_widget(cancel_btn)
+        btn_row.add_widget(do_btn)
+        body.add_widget(btn_row)
+        confirm_popup = Popup(
+            title=_tr('Confirm unpair'),
+            content=body, size_hint=(0.85, None), height=dp(240),
+            auto_dismiss=False)
+
+        def _do_it(*_):
+            confirm_popup.dismiss()
+            try:
+                lan_unpair(pid)
+            except Exception as ex:
+                import sys
+                print(f'[lan-unpair] {pid[:8]!r} failed: {ex!r}',
+                      file=sys.stderr, flush=True)
+            _refresh()
+
+        cancel_btn.bind(on_release=lambda *_: confirm_popup.dismiss())
+        do_btn.bind(on_release=_do_it)
+        confirm_popup.open()
+
     def _refresh():
         list_box.clear_widgets()
         peers = lan_list_peers()
@@ -602,6 +659,7 @@ def paired_phones_popup(font_name='Roboto'):
                 lambda p=peer: _manage_peer_popup(
                     p, on_refresh=_refresh,
                     font_name=font_name),
+                _confirm_unpair,
                 font_name=font_name))
 
     _refresh()
@@ -764,20 +822,37 @@ def share_project_popup(langcode='', font_name='Roboto'):
                 font_name=font_name))
 
     # --- Section 3: add github collaborator ---------------------
-    container.add_widget(Label(
-        text=_tr('— Add permission by github username —'),
-        size_hint_y=None, height=dp(24),
-        font_size=sp(11), color=theme.TEXT_DIM,
-        halign='center', valign='middle', font_name=font_name,
-        text_size=(dp(320), dp(24))))
-    invite_btn = Button(
-        text=_tr('Invite someone who isn\'t here'),
-        size_hint_y=None, height=dp(44),
-        font_size=sp(13), font_name=font_name)
-    invite_btn.bind(
-        on_release=lambda *_: grant_collaborator_popup(
-            langcode, font_name=font_name))
-    container.add_widget(invite_btn)
+    # Only shown when the project has a github remote — otherwise
+    # the invite would NO_REMOTE-error on tap. A user with an
+    # unpublished project should Publish first; the daemon settings
+    # UI's separate Publish button is the right entry point for
+    # that. Suppressing this section keeps the popup focused on
+    # LAN-only sharing when github isn't an option yet.
+    _project_has_remote = False
+    if langcode:
+        try:
+            from .. import project_status as _project_status
+            _ps = _project_status(langcode)
+            if _ps is not None:
+                _project_has_remote = bool(
+                    (getattr(_ps, 'remote_url', '') or '').strip())
+        except Exception:
+            _project_has_remote = False
+    if _project_has_remote:
+        container.add_widget(Label(
+            text=_tr('— Add permission by github username —'),
+            size_hint_y=None, height=dp(24),
+            font_size=sp(11), color=theme.TEXT_DIM,
+            halign='center', valign='middle', font_name=font_name,
+            text_size=(dp(320), dp(24))))
+        invite_btn = Button(
+            text=_tr('Invite someone who isn\'t here'),
+            size_hint_y=None, height=dp(44),
+            font_size=sp(13), font_name=font_name)
+        invite_btn.bind(
+            on_release=lambda *_: grant_collaborator_popup(
+                langcode, font_name=font_name))
+        container.add_widget(invite_btn)
 
     close_btn = Button(
         text=_tr('Close'), size_hint_y=None, height=dp(44),

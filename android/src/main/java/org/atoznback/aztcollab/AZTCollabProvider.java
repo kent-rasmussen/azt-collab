@@ -46,11 +46,54 @@ public class AZTCollabProvider extends ContentProvider {
 
     private static volatile DispatchCallback sDispatch;
     private static volatile OpenFileCallback sOpenFile;
+    /** Reference to the running Provider's context, captured in
+     *  onCreate so static methods (notifyStatusChanged) can access
+     *  the ContentResolver without an instance handle. Volatile
+     *  read on call paths is fine — set once, never overwritten,
+     *  null only before onCreate runs. */
+    private static volatile Context sContext;
 
     public static void registerCallbacks(DispatchCallback dispatch,
                                          OpenFileCallback openFile) {
         sDispatch = dispatch;
         sOpenFile = openFile;
+    }
+
+    /**
+     * Push-notify any peer that registered a ContentObserver on the
+     * status URI for *langcode*. Peers can register on either:
+     *
+     *   content://org.atoznback.aztcollab/status/&lt;langcode&gt;
+     *      → fired for that one project; observer registered with
+     *        notifyForDescendants=false catches only this URI.
+     *
+     *   content://org.atoznback.aztcollab/status
+     *      → fired by passing langcode = empty/null (daemon-wide
+     *        events: toggle flips, peer-list mutations). An
+     *        observer registered with notifyForDescendants=true
+     *        ALSO catches the per-project notifications above —
+     *        same registration receives both, so a project-list
+     *        UI subscribes once and gets every wakeup.
+     *
+     * Called from Python via jnius (notify.py). Safe from any
+     * thread — ContentResolver.notifyChange dispatches
+     * asynchronously to registered observers.
+     */
+    public static void notifyStatusChanged(String langcode) {
+        Context ctx = sContext;
+        if (ctx == null) return;
+        Uri uri;
+        if (langcode == null || langcode.isEmpty()) {
+            uri = Uri.parse("content://org.atoznback.aztcollab/status");
+        } else {
+            uri = Uri.parse(
+                "content://org.atoznback.aztcollab/status/" + langcode);
+        }
+        try {
+            ctx.getContentResolver().notifyChange(uri, null);
+        } catch (Throwable t) {
+            Log.e(TAG, "notifyChange failed for " + uri, t);
+        }
     }
 
     @Override
@@ -75,6 +118,10 @@ public class AZTCollabProvider extends ContentProvider {
         // second attempt sees the populated callbacks.
         Context ctx = getContext();
         if (ctx != null) {
+            // Capture for notifyStatusChanged's static call path.
+            // Set before start() — the Service might fire notify
+            // calls during its own startup.
+            sContext = ctx.getApplicationContext();
             try {
                 AZTServiceProviderhost.start(ctx, "");
             } catch (Throwable t) {

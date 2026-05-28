@@ -463,6 +463,27 @@ def create_from_template(template_url, vernlang, dest_dir,
         set_vernlang(vernlang, vernlang)
     except Exception:
         pass
+    # Initialize git immediately so every project has a usable .git/
+    # from day one. Pre-0.45.42 this step was deferred to the user's
+    # eventual Publish gesture (init_repo, which needs a remote_url),
+    # which meant projects that lived their whole life without github
+    # publishing accumulated audio + LIFT writes on disk while every
+    # commit_project call NOT_A_REPO'd silently — no git history, no
+    # LAN sharing (listener returns 404 with no .git/), no recovery
+    # path for crash protection. Initializing here gives the project
+    # a HEAD before the user's first record fires. Best-effort: a
+    # failure here is logged but doesn't fail the create — the
+    # auto-init recovery branch in ``repo._commit_repo_locked`` is
+    # the safety net for any case this misses.
+    try:
+        from . import repo as _repo
+        _repo.ensure_initial_commit(
+            project_dir, contributor_name='AZT')
+    except Exception as ex:
+        print(f'[create_from_template] initial-commit on '
+              f'{project_dir!r} failed (project still usable; '
+              f'next commit_project will retry): {ex!r}',
+              file=sys.stderr, flush=True)
     return p
 
 

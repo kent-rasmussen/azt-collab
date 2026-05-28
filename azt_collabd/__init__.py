@@ -100,7 +100,15 @@ from azt_collab_client import __version__  # noqa: F401
 # split. Also lifts the always-skip-commit-when-offline bug filed
 # in NOTES_TO_DAEMON.md (2026-05-15) — pre-0.43 daemons skip the
 # commit step entirely on offline ``request_sync``.
-MIN_CLIENT_VERSION = "0.45.0"
+#
+# 0.47.0 floor: wire-format break. ``project_status`` removes
+# ``commits_ahead`` and ``unshared_commits`` in favor of the
+# three independent counts ``wan_unshared`` / ``lan_unshared`` /
+# ``at_risk`` (per CLIENT_INTEGRATION.md § 17b). Old peers still
+# decoding the removed names would silently render zero for the
+# new sync indicator; force the floor so peers rebuild against
+# the v0.47 ProjectStatus shape.
+MIN_CLIENT_VERSION = "0.47.0"
 
 from . import config
 from . import net

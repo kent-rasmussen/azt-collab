@@ -101,6 +101,29 @@ def invalidate_endpoint(peer_id_hex):
         _endpoints.pop(peer_id_hex, None)
 
 
+def _persist_resolved_endpoint(peer_id_hex, host, port):
+    """Write a freshly-resolved ``host:port`` into the paired-peer
+    record's ``static_endpoints`` (a no-op if the peer isn't
+    paired). Called from ``onServiceResolved`` so the static
+    fallback drifts forward to track the peer's current location
+    instead of staying frozen at pair-time. Idempotent: if the
+    value is already at the head of the list, we skip the
+    ``set_static_endpoints`` write entirely."""
+    from . import peers as _peers
+    entry = _peers.get_peer(peer_id_hex)
+    if entry is None:
+        return  # not paired — discovery may surface non-paired peers
+    new_endpoint = f'{host}:{port}'
+    current = list(entry.get('static_endpoints') or [])
+    if current and current[0] == new_endpoint:
+        return  # already-current; no write needed
+    # Put the resolved one at the head; preserve any other entries
+    # the user may have manually added (e.g., a hotspot-host
+    # fallback) but dedupe.
+    updated = [new_endpoint] + [e for e in current if e != new_endpoint]
+    _peers.set_static_endpoints(peer_id_hex, updated)
+
+
 def _zc_props(peer_id_hex, fp_hex):
     return {
         b'peer_id': peer_id_hex.encode('ascii'),
@@ -336,6 +359,29 @@ def _build_resolve_listener_class():
                 print(f'[lan-discovery] nsd resolved '
                       f'{peer_id[:8]!r} → {host}:{port}',
                       file=sys.stderr, flush=True)
+                # Persist the freshly-resolved endpoint into the
+                # paired-peer record's ``static_endpoints``. Without
+                # this, ``static_endpoints`` stays frozen at
+                # pair-time forever — and after a daemon respawn
+                # (mDNS state empty) we'd fall back to the
+                # pair-time port, which is invariably stale because
+                # the peer rebinds ``0.0.0.0:0`` each start. The
+                # field log baf 2026-05-22 showed exactly this:
+                # cached static endpoint pointed at ``46553`` from
+                # an earlier session, peer was actually at
+                # ``42539``, fanout hammered the dead port for
+                # ages. Persisting on every successful resolve
+                # makes the static drift forward to track the
+                # peer's current location. Idempotent — the
+                # underlying ``set_static_endpoints`` is a no-op
+                # if the value is unchanged.
+                try:
+                    _persist_resolved_endpoint(peer_id, host, port)
+                except Exception as ex:
+                    print(f'[lan-discovery] persist resolved '
+                          f'endpoint {peer_id[:8]!r} failed: '
+                          f'{ex!r}',
+                          file=sys.stderr, flush=True)
             except Exception as ex:
                 print(f'[lan-discovery] resolve callback raised: '
                       f'{ex!r}', file=sys.stderr, flush=True)
@@ -565,3 +611,24 @@ def stop_browse():
         elif mode == 'nsd':
             _stop_browse_nsd()
         _STATE['browse'] = None
+
+
+def restart_browse():
+    """Stop and re-start discovery. Clears NsdManager's internal
+    state cache so the next ``onServiceFound`` event surfaces the
+    peer's *current* mDNS advertisement, not whatever it had
+    buffered before the peer rebound to a new port. Equivalent to
+    the user manually flipping the LAN toggle off+on — observed
+    in the field (baf 2026-05-22) to recover from "cached endpoint
+    refuses, mDNS doesn't re-resolve" without re-pairing.
+
+    Idempotent and safe to call when not already browsing.
+    Clears the in-memory endpoint cache so callers can't use the
+    stale value while resolution is in flight."""
+    print(f'[lan-discovery] restart_browse: '
+          f'clearing endpoint cache + restarting discovery',
+          file=sys.stderr, flush=True)
+    stop_browse()
+    with _LOCK:
+        _endpoints.clear()
+    start_browse()

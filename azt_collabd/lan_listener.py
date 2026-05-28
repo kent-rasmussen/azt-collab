@@ -41,11 +41,13 @@ Android-side, not yet wired) and is a no-op on desktop.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import ssl
 import sys
 import threading
+import time as _time
 
 from . import lan_discovery as _lan_discovery
 from . import paths as _paths
@@ -64,6 +66,64 @@ _STATE = {
 }
 
 
+# In-memory tracker for "user just displayed a QR offering this
+# langcode" gestures. Indexed by langcode → unix timestamp of the
+# most-recent display. ``_handle_hello_bodyauth`` consults this
+# before auto-sharing a langcode that arrives in an unpaired peer's
+# hello.
+#
+# Why: without this gate, an attacker on the LAN can POST
+# ``/v1/lan/hello`` with peer_id=any, fp=any, langcode=X and our
+# daemon would (a) record them as paired and (b) add X to their
+# shared_projects allowlist — at which point the dulwich smart-
+# protocol handler accepts ``GET /X.git/info/refs`` from them and
+# they can exfiltrate the project. The CERT_NONE TLS design
+# intentionally can't pin client certs (stdlib ssl limitation, see
+# ``_build_server``), so the only binding we have is "the user
+# gestured by showing a QR for X within the last few minutes."
+# The QR display is the user-consent signal; if no recent QR for
+# this langcode exists, the hello records the pair but refuses
+# auto-share.
+#
+# TTL deliberately wide enough for cross-device flows
+# (user shows QR, walks across the room, asks B to scan, B
+# scans + connects) — 10 minutes covers the common case;
+# anything stale is treated as "the user moved on, this isn't
+# the active gesture."
+_QR_OFFER_TTL_S = 600.0
+_pending_qr_offers = {}   # langcode (str) → unix timestamp (float)
+
+
+def record_qr_offered(langcode):
+    """Note that the user just displayed a pair-share-clone QR for
+    *langcode*. Consulted by the hello handler to gate auto-share.
+    Empty / falsy langcode is a no-op (legacy pair-only QR)."""
+    if not langcode:
+        return
+    _pending_qr_offers[str(langcode)] = _time.time()
+
+
+def consume_qr_offer(langcode):
+    """If a recent QR-offer for *langcode* exists, clear and return
+    True. Else return False. Single-use — once a peer's hello
+    consumes the offer, a second auto-share for the same langcode
+    requires the user to re-display the QR. Limits damage if a
+    legitimate scan happens but is followed by an attacker hello
+    racing in for the same langcode."""
+    if not langcode:
+        return False
+    key = str(langcode)
+    ts = _pending_qr_offers.get(key)
+    if ts is None:
+        return False
+    if _time.time() - ts > _QR_OFFER_TTL_S:
+        # Stale; clean up.
+        _pending_qr_offers.pop(key, None)
+        return False
+    _pending_qr_offers.pop(key, None)
+    return True
+
+
 def is_running():
     with _LOCK:
         return _STATE['server'] is not None
@@ -77,39 +137,87 @@ def bound_endpoint():
         return _STATE['bound']
 
 
-def _build_dict_backend():
-    """Build a ``dulwich.server.DictBackend`` exposing one
-    ``/{lang}.git`` mount per project that's shared with at least
-    one paired peer. Per-request the middleware further restricts
-    the exposed set to projects shared with the specific peer making
-    the request, so a paired phone can't fetch a project that's
-    only shared with someone else.
+class _DynamicBackend:
+    """dulwich Backend that resolves ``open_repository`` against
+    the *current* state of ``projects.json`` and ``peers.json`` —
+    not a snapshot taken at listener-start. New share_offer arrivals
+    (which mutate ``shared_projects``) immediately show up in the
+    serving set without a listener restart; rolled-back shares
+    immediately stop serving. Tradeoff is one ``peers.json`` read
+    per request; the file is tiny and cached at the OS level so
+    the cost is negligible vs the network/git work that follows.
+    """
 
-    Rebuilt on demand — every fresh handler creation reads the
-    current state of ``peers.json``, so changes to share lists take
-    effect on the next request without a listener restart."""
-    from dulwich.repo import Repo
-    from dulwich.server import DictBackend
-
-    shared_anywhere = set()
-    for peer in _peers.list_peers():
-        shared_anywhere.update(peer.get('shared_projects') or [])
-
-    mapping = {}
-    for project in _projects.list_all():
-        if project.langcode not in shared_anywhere:
-            continue
-        if not project.working_dir:
-            continue
-        try:
-            repo = Repo(project.working_dir)
-        except Exception as ex:
-            print(f'[lan-listener] skipping {project.langcode!r}: '
-                  f'Repo open failed: {ex!r}',
+    def open_repository(self, path):
+        from dulwich.errors import NotGitRepository
+        from dulwich.repo import Repo
+        # ``path`` shape varies across dulwich call sites in two
+        # axes:
+        #   - encoding: the GET ``/info/refs`` handler in
+        #     ``dulwich.web`` passes str (sliced from the URL
+        #     string); the smart-protocol POST handler in
+        #     ``dulwich.server`` (UploadPackHandler /
+        #     ReceivePackHandler init) passes bytes from the
+        #     wire-protocol parser.
+        #   - shape: some sites pass the repo prefix
+        #     (``/baf.git`` or ``baf.git``), others pass the full
+        #     URL path (``/baf.git/info/refs``).
+        # Pre-0.45.28 we only handled str; the POST path raised
+        # ``TypeError: a bytes-like object is required, not 'str'``
+        # at the ``lstrip('/')`` below, dulwich returned 500, and
+        # the pusher logged ``[lan-merge] fetch from '<peer>'
+        # failed: GitProtocolError('unexpected http resp 500 ...')``.
+        raw = path or ''
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='replace')
+        norm = raw.lstrip('/')
+        if '.git' in norm:
+            langcode = norm.split('.git', 1)[0]
+        else:
+            langcode = norm.split('/', 1)[0]
+        print(f'[lan-listener] open_repository: raw={raw!r} → '
+              f'langcode={langcode!r}',
+              file=sys.stderr, flush=True)
+        # Gate: project must appear in at least one paired peer's
+        # shared_projects allowlist. This IS the access control on
+        # the listener (TLS layer is CERT_NONE since stdlib ssl
+        # can't pin self-signed client certs). Future-harden with
+        # signed-message body auth to gate per-peer rather than
+        # union-of-all-peers.
+        shared_anywhere = set()
+        for peer in _peers.list_peers():
+            shared_anywhere.update(peer.get('shared_projects') or [])
+        if langcode not in shared_anywhere:
+            print(f'[lan-listener] reject {langcode!r}: not in any '
+                  f'peer\'s shared_projects '
+                  f'(shared_anywhere={sorted(shared_anywhere)!r})',
                   file=sys.stderr, flush=True)
-            continue
-        mapping[f'/{project.langcode}.git'] = repo
-    return DictBackend(mapping)
+            raise NotGitRepository(
+                f'project {langcode!r} is not shared with any peer')
+        project = _projects.get(langcode)
+        if project is None or not project.working_dir:
+            print(f'[lan-listener] reject {langcode!r}: not '
+                  f'registered (project={project!r})',
+                  file=sys.stderr, flush=True)
+            raise NotGitRepository(
+                f'project {langcode!r} not registered')
+        try:
+            return Repo(project.working_dir)
+        except Exception as ex:
+            print(f'[lan-listener] open repo {langcode!r} failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+            raise NotGitRepository(
+                f'project {langcode!r} repo failed to open') from ex
+
+
+def _build_dict_backend():
+    """Return the dynamic backend. Kept under the old name so the
+    rest of ``_build_server`` reads identically; switched from a
+    static ``DictBackend(mapping)`` (snapshot at listener-start)
+    to ``_DynamicBackend`` (re-reads ``peers.json`` on each
+    request) so new share_offer arrivals work without a listener
+    restart."""
+    return _DynamicBackend()
 
 
 def _peer_id_from_cert_der(cert_der):
@@ -195,14 +303,35 @@ def _handle_hello_bodyauth(environ, start_response):
     # shared_projects allowlist for them too. Saves the owner a
     # second tap on Share after the QR scan; the underlying share
     # was the QR-show gesture itself.
+    #
+    # SECURITY: only fire if the user actually displayed a QR
+    # offering this langcode within the last few minutes
+    # (``consume_qr_offer``). Without this gate, anyone on the
+    # LAN can POST ``/v1/lan/hello`` claiming any langcode and we
+    # would auto-grant them read access to that project (the git
+    # smart-protocol handler accepts requests for any project in
+    # the union of all paired peers' shared_projects). The QR-
+    # display gesture is the user-consent signal that pins
+    # langcode auto-share to a real intent. If no recent QR for
+    # this langcode is on file, we still record the pair (the
+    # caller went out of their way to claim an identity) but
+    # refuse the auto-share — the user can still tap Share
+    # manually if they meant to allow this peer.
     langcode_offered = str(payload.get('langcode', '') or '')
     if langcode_offered:
-        try:
-            _peers.add_shared_project(
-                actual_peer_id, langcode_offered)
-        except Exception as ex:
-            print(f'[lan-listener] hello auto-share for '
-                  f'{langcode_offered!r} raised: {ex!r}',
+        if consume_qr_offer(langcode_offered):
+            try:
+                _peers.add_shared_project(
+                    actual_peer_id, langcode_offered)
+            except Exception as ex:
+                print(f'[lan-listener] hello auto-share for '
+                      f'{langcode_offered!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+        else:
+            print(f'[lan-listener] hello from {actual_peer_id[:8]!r} '
+                  f'claimed langcode={langcode_offered!r} but no '
+                  f'recent QR offer for it; pair recorded, '
+                  f'auto-share refused',
                   file=sys.stderr, flush=True)
     resp = _json.dumps({'ok': True, 'peer_id': actual_peer_id})
     body_bytes = resp.encode('utf-8')
@@ -428,6 +557,457 @@ def _build_handler_class():
     return _CertCapturingHandler
 
 
+# Per-project deferred-reset queue. When the post-receive reset
+# below times out trying to acquire ``project_lock`` (the tablet's
+# own outgoing ``_merge_then_push`` workflow can hold it for >5 s,
+# longer than the receive-pack handler's tolerance), we add the
+# langcode to this set. The scheduler watcher's tick drains the
+# set by retrying ``_reset_working_tree_after_receive``; on
+# success, the function removes its own entry. ``_commit_repo_locked``
+# (in repo.py) also drains its own langcode at the top of every
+# commit attempt, so the next commit_project absorbs the pending
+# reset BEFORE staging — otherwise ``_stage_all`` sees the files
+# that the merge brought in as "missing from working tree" and
+# commits a *delete* for them, erasing the merge. Persisted to
+# ``$AZT_HOME/pending_resets.json`` so a daemon restart while
+# there's still a deferred reset on the queue doesn't lose track.
+# Loaded back in ``scheduler.reconcile_on_startup``.
+_PENDING_RESETS_FILENAME = 'pending_resets.json'
+_pending_post_receive_resets = set()
+_pending_resets_lock = threading.Lock()
+
+
+def _pending_resets_path():
+    from .paths import azt_home
+    return os.path.join(azt_home(), _PENDING_RESETS_FILENAME)
+
+
+def _save_pending_resets_locked():
+    """Atomic-write the pending-resets set. Caller holds
+    ``_pending_resets_lock``."""
+    p = _pending_resets_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f'{p}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(sorted(_pending_post_receive_resets), f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, p)
+    except Exception as ex:
+        print(f'[lan-listener] pending-resets save failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
+def _add_pending_reset(langcode):
+    """Mark *langcode* as needing a deferred post-receive reset."""
+    with _pending_resets_lock:
+        if langcode in _pending_post_receive_resets:
+            return
+        _pending_post_receive_resets.add(langcode)
+        _save_pending_resets_locked()
+
+
+def _remove_pending_reset(langcode):
+    """Clear *langcode* from the deferred-reset queue."""
+    with _pending_resets_lock:
+        if langcode not in _pending_post_receive_resets:
+            return
+        _pending_post_receive_resets.discard(langcode)
+        _save_pending_resets_locked()
+
+
+def has_pending_reset(langcode):
+    """Public predicate — used by ``repo._commit_repo_locked`` to
+    decide whether to absorb a pending reset before staging."""
+    with _pending_resets_lock:
+        return langcode in _pending_post_receive_resets
+
+
+def load_pending_resets_from_disk():
+    """Re-populate the in-memory set from
+    ``$AZT_HOME/pending_resets.json`` after a daemon restart. Called
+    from ``scheduler.reconcile_on_startup``. Idempotent."""
+    p = _pending_resets_path()
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as ex:
+        print(f'[lan-listener] pending-resets load failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    if not isinstance(data, list):
+        return
+    with _pending_resets_lock:
+        for entry in data:
+            if isinstance(entry, str):
+                _pending_post_receive_resets.add(entry)
+    if data:
+        print(f'[lan-listener] pending-resets loaded from disk: '
+              f'{sorted(_pending_post_receive_resets)!r}',
+              file=sys.stderr, flush=True)
+
+
+def drain_pending_resets():
+    """Retry each langcode in the deferred-reset queue. Called from
+    the scheduler watcher tick. Each retry goes through
+    ``_reset_working_tree_after_receive`` again; on success the
+    function removes its own queue entry, on continued LockTimeout
+    it re-adds it (no-op in that case). Other exceptions are logged
+    and the entry stays on the queue for the next tick."""
+    with _pending_resets_lock:
+        pending = list(_pending_post_receive_resets)
+    if not pending:
+        return
+    for langcode in pending:
+        try:
+            _reset_working_tree_after_receive(langcode)
+        except Exception as ex:
+            print(f'[lan-listener] drain_pending_resets '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+
+
+def _reset_working_tree_after_receive(langcode):
+    """After an incoming receive-pack advances HEAD via a push
+    from a peer, sync this peer's working tree + index to the
+    new HEAD. Without this, dulwich's receive-pack updates refs
+    without touching the working tree, and every file in the
+    incoming commits shows as ``staged_mod`` indefinitely (index
+    matches old state, HEAD points at new tree). Field symptom
+    (baf 2026-05-22): ``n_changes`` jumps by hundreds-to-
+    thousands after each fast-forward push, never clears until
+    a subsequent ``commit_project`` happens to absorb the
+    mismatch into a commit.
+
+    Hard reset is the right semantic here: a successful
+    receive-pack means the incoming changes are now canonically
+    HEAD; the working tree should reflect that. The
+    ``project_lock`` serializes us against any concurrent
+    ``commit_project`` / ``atomic_finalize`` (those acquire the
+    same lock), so a concurrent local edit can't land at the
+    moment we reset. Short timeout (5 s): if the lock is busy
+    longer than that, defer rather than block the WSGI worker;
+    the next ``commit_project`` will absorb the mismatch the
+    old (pre-0.45.35) way. 0.45.35."""
+    from . import projects as _projects
+    from .locks import project_lock, LockTimeout
+    from dulwich import porcelain
+    from dulwich.repo import Repo
+
+    project = _projects.get(langcode)
+    if project is None or not project.working_dir:
+        return
+    # Atomic-pending in-flight guard. Phase 1 of the peer's
+    # ``atomic_open_write`` writes bytes to
+    # ``.azt_atomic_pending/<token>`` via a raw ContentProvider FD
+    # — no project_lock held during the write itself. Phase 2 (the
+    # ``atomic_finalize`` RPC) DOES take the lock. Between those
+    # two steps, this post-receive reset can race in: it acquires
+    # the lock, runs ``porcelain.reset(mode='hard')``, releases.
+    # If dulwich's reset clobbers the in-flight ``<token>`` file
+    # (observed in the field as ``SERVER_ERROR: pending_not_found``
+    # surfacing in the peer's ``stop_recording`` path, baf
+    # 2026-05-22), the peer's Phase 2 fails — and worse, the
+    # recorder UI hangs in "still recording" because its post-
+    # stop state transition aborted on the save error.
+    #
+    # The guard: defer the reset if any
+    # ``.azt_atomic_pending/<token>`` is younger than the
+    # ``atomic_recovery._MIN_AGE_S`` threshold (60 s) — i.e., a
+    # Phase 1 write that might still be mid-flight. The next
+    # incoming push (or the next ``commit_project``) will absorb
+    # the index/HEAD mismatch the old way. Worst case: ``n_changes``
+    # stays inflated until the next push, which is the pre-0.45.36
+    # behavior — strictly no worse than before. 0.45.38.
+    pending_dir = os.path.join(project.working_dir,
+                               '.azt_atomic_pending')
+    if os.path.isdir(pending_dir):
+        try:
+            from . import atomic_recovery as _ar
+            min_age = _ar._MIN_AGE_S
+            now = _time.time()
+            youngest_age = None
+            for name in os.listdir(pending_dir):
+                p = os.path.join(pending_dir, name)
+                try:
+                    age = now - os.stat(p).st_mtime
+                except OSError:
+                    continue
+                if youngest_age is None or age < youngest_age:
+                    youngest_age = age
+            if youngest_age is not None and youngest_age < min_age:
+                print(f'[lan-listener] post-receive reset '
+                      f'{langcode!r}: deferred — pending-write in '
+                      f'flight (youngest {youngest_age:.1f}s, '
+                      f'threshold {min_age:.0f}s)',
+                      file=sys.stderr, flush=True)
+                return
+        except Exception as ex:
+            print(f'[lan-listener] pending-age guard raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+            # Fall through — better to do the reset than skip
+            # silently when the guard itself broke.
+    try:
+        with project_lock(project.working_dir, timeout=5):
+            repo = Repo(project.working_dir)
+            try:
+                # 0.45.39 Phase-2 guard: defer if the working tree
+                # has any non-pending unstaged modifications. The
+                # 0.45.38 guard above only covers Phase 1 (scratch
+                # tokens under .azt_atomic_pending/). Once a peer's
+                # atomic_finalize completes — os.replace moves the
+                # token to the final path — the scratch is gone, so
+                # the age-guard misses it, but the final file is now
+                # on disk with new bytes that ``commit_project``
+                # hasn't yet picked up. A ``reset --hard HEAD`` here
+                # would silently revert the just-landed LIFT (or
+                # audio) edit to its old HEAD content — silent data
+                # loss. Defer instead; the next ``commit_project``
+                # absorbs the index/HEAD mismatch the old (pre-
+                # 0.45.36) way. Worst case is the ghost ``n_changes``
+                # spike persists until the next commit — strictly no
+                # worse than pre-0.45.36 and recoverable.
+                try:
+                    st = porcelain.status(repo, untracked_files='no')
+                    unstaged_paths = list(st.unstaged or [])
+                except Exception as ex:
+                    print(f'[lan-listener] status-guard raised: '
+                          f'{ex!r}', file=sys.stderr, flush=True)
+                    unstaged_paths = []
+                if unstaged_paths:
+                    pending_prefix = b'.azt_atomic_pending/'
+                    orphan_prefix = b'.azt_atomic_orphans/'
+                    real_mods = [
+                        p for p in unstaged_paths
+                        if not (p.startswith(pending_prefix)
+                                or p.startswith(orphan_prefix))]
+                    if real_mods:
+                        # 0.45.44: instead of deferring (which left
+                        # the next commit_project to silently revert
+                        # the incoming peer's content), three-way
+                        # merge HEAD's tree into the working tree.
+                        # Working tree ends up with both sides'
+                        # edits; next commit creates a proper merge
+                        # commit on top of HEAD. See
+                        # ``repo.integrate_head_into_working_tree``.
+                        head = []
+                        for p in real_mods[:3]:
+                            try:
+                                head.append(
+                                    p.decode('utf-8', 'replace'))
+                            except Exception:
+                                head.append(repr(p))
+                        print(f'[lan-listener] post-receive '
+                              f'{langcode!r}: {len(real_mods)} '
+                              f'unstaged mod(s) — merging HEAD into '
+                              f'working tree (head={head!r})',
+                              file=sys.stderr, flush=True)
+                        try:
+                            from . import repo as _repo_mod
+                            applied, n_conflicts = (
+                                _repo_mod.integrate_head_into_working_tree(
+                                    repo, project.working_dir))
+                            if applied:
+                                print(f'[lan-listener] post-receive '
+                                      f'{langcode!r}: merge applied '
+                                      f'(conflicts={n_conflicts}); '
+                                      f'next commit_project will '
+                                      f'land the merged result',
+                                      file=sys.stderr, flush=True)
+                                return
+                            # Fell through (first commit etc.); fall
+                            # back to the deferred path so the next
+                            # commit at least preserves working tree.
+                            print(f'[lan-listener] post-receive '
+                                  f'{langcode!r}: merge bailed; '
+                                  f'deferring to next commit_project',
+                                  file=sys.stderr, flush=True)
+                            return
+                        except Exception as ex:
+                            # Merge raised: safer to defer than to
+                            # leave the working tree in a half-merged
+                            # state.
+                            print(f'[lan-listener] post-receive '
+                                  f'{langcode!r}: integrate raised '
+                                  f'{ex!r}; deferring',
+                                  file=sys.stderr, flush=True)
+                            return
+                # Re-attach HEAD as symref to refs/heads/main if
+                # they've decoupled (since 0.46.5). Field-observed
+                # merge-loop:
+                #   - ``_merge_diverged`` on the LOCAL side calls
+                #     ``worktree.commit(merge_heads=[...])`` which
+                #     advances HEAD's pointer (symref or detached).
+                #     On some flows HEAD ends up detached at our
+                #     last merge SHA.
+                #   - Incoming receive-pack updates ONLY
+                #     ``refs/heads/main`` via ``set_if_equals``;
+                #     HEAD's detached value is untouched.
+                #   - Result: HEAD = our last merge, main = peer's
+                #     last push. Each drain we see "peer at <main>",
+                #     local HEAD at <our merge>, FF check fails,
+                #     produce another degenerate merge, push,
+                #     repeat. Loop never terminates because neither
+                #     side's HEAD ever realigns with the converged
+                #     main.
+                # Fix: when HEAD is detached and main descends from
+                # (or equals) HEAD's value, re-attach HEAD as
+                # symref to refs/heads/main. HEAD's content is then
+                # a subset of main's, no data loss. After the
+                # re-attach, the next drain on this side sees
+                # local_head == peer's HEAD (both equal to main),
+                # no-op short-circuits, loop ends.
+                main_ref = b'refs/heads/main'
+                try:
+                    symrefs = repo.refs.get_symrefs()
+                    head_target = symrefs.get(b'HEAD')
+                except Exception:
+                    head_target = None
+                if head_target != main_ref:
+                    try:
+                        main_sha = repo.refs[main_ref]
+                        head_sha_raw = repo.refs[b'HEAD']
+                    except KeyError:
+                        main_sha = None
+                        head_sha_raw = None
+                    if main_sha and head_sha_raw \
+                            and main_sha != head_sha_raw:
+                        # Check ancestry: HEAD's value reachable
+                        # from main's history (main = HEAD's
+                        # descendant). Walk main's ancestry looking
+                        # for HEAD's SHA.
+                        head_is_ancestor = False
+                        try:
+                            for entry in repo.get_walker(
+                                    include=[main_sha]):
+                                if entry.commit.id == head_sha_raw:
+                                    head_is_ancestor = True
+                                    break
+                        except Exception:
+                            head_is_ancestor = False
+                        if head_is_ancestor:
+                            try:
+                                repo.refs.set_symbolic_ref(
+                                    b'HEAD', main_ref)
+                                print(f'[lan-listener] '
+                                      f'{langcode!r}: re-attached '
+                                      f'HEAD as symref to '
+                                      f'refs/heads/main '
+                                      f'(was detached at '
+                                      f'{head_sha_raw[:12].decode()}'
+                                      f'; main at '
+                                      f'{main_sha[:12].decode()})',
+                                      file=sys.stderr, flush=True)
+                            except Exception as ex:
+                                print(f'[lan-listener] '
+                                      f'{langcode!r}: re-attach '
+                                      f'failed: {ex!r}',
+                                      file=sys.stderr, flush=True)
+                head_sha = repo.refs[b'HEAD']
+                porcelain.reset(repo, mode='hard', treeish=head_sha)
+                print(f'[lan-listener] post-receive reset '
+                      f'{langcode!r} → HEAD '
+                      f'({head_sha[:12].decode()})',
+                      file=sys.stderr, flush=True)
+                # Success: clear any prior deferred-reset entry for
+                # this langcode. (Idempotent — no-op if not queued.)
+                _remove_pending_reset(langcode)
+                # HEAD advanced + working tree changed; push-notify
+                # observers so they re-poll project_status without
+                # waiting for the next background tick.
+                try:
+                    from .android_cp import notify as _notify
+                    _notify.notify_project_changed(langcode)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    repo.close()
+                except Exception:
+                    pass
+    except LockTimeout:
+        # Lock holder is someone else's project_lock (typically this
+        # device's own outgoing ``_merge_then_push`` workflow, which
+        # holds the lock through the entire merge — often >5 s).
+        # Queue the langcode so the scheduler's watcher tick can
+        # retry, and so ``_commit_repo_locked`` can absorb it before
+        # staging on the next commit_project. Without this, the
+        # working tree stays out of sync with HEAD indefinitely,
+        # showing as ghost ``n_changes`` (the merge files appear as
+        # "deleted" in working-tree status); worse, the next
+        # commit_project would stage that "delete" and erase the
+        # merge. See repo._commit_repo_locked for the absorbing
+        # half of this fix.
+        _add_pending_reset(langcode)
+        print(f'[lan-listener] post-receive reset {langcode!r}: '
+              f'lock busy (5s timeout) — queued for retry on next '
+              f'scheduler tick + absorb on next commit_project',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-listener] post-receive reset {langcode!r} '
+              f'failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
+_POST_RECEIVE_PATH_RE = None
+
+
+def _post_receive_pack_middleware(inner_app):
+    """WSGI middleware: catch successful receive-pack POSTs and
+    schedule a working-tree reset for the affected project. See
+    ``_reset_working_tree_after_receive`` for the why."""
+    import re
+    global _POST_RECEIVE_PATH_RE
+    if _POST_RECEIVE_PATH_RE is None:
+        _POST_RECEIVE_PATH_RE = re.compile(
+            r'^/([^/]+)\.git/git-receive-pack$')
+
+    def _wrapped(environ, start_response):
+        method = environ.get('REQUEST_METHOD', '')
+        path = environ.get('PATH_INFO', '')
+        m = (_POST_RECEIVE_PATH_RE.match(path)
+             if method == 'POST' else None)
+        if m is None:
+            return inner_app(environ, start_response)
+
+        langcode = m.group(1)
+        status_holder = [None]
+
+        def _capture_start(status, headers, exc_info=None):
+            status_holder[0] = status
+            return start_response(status, headers, exc_info)
+
+        result = inner_app(environ, _capture_start)
+
+        def _generator():
+            try:
+                for chunk in result:
+                    yield chunk
+            finally:
+                try:
+                    s = status_holder[0] or ''
+                    if s.startswith('200'):
+                        _reset_working_tree_after_receive(langcode)
+                except Exception as ex:
+                    print(f'[lan-listener] post-receive '
+                          f'middleware raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+                if hasattr(result, 'close'):
+                    try:
+                        result.close()
+                    except Exception:
+                        pass
+        return _generator()
+
+    return _wrapped
+
+
 def _build_server(port):
     from socketserver import ThreadingMixIn
     from wsgiref.simple_server import WSGIServer
@@ -439,7 +1019,12 @@ def _build_server(port):
     # already-built HTTPGitApplication or we double-wrap and
     # ``backend.open_repository`` resolves to the inner
     # HTTPGitApplication instead of the DictBackend.
-    app = _peer_acl_middleware(make_wsgi_chain(backend))
+    # Outer ``_post_receive_pack_middleware`` triggers the
+    # working-tree reset after successful receive-pack POSTs;
+    # inner ``_peer_acl_middleware`` gates access by paired-peer
+    # shared_projects.
+    app = _peer_acl_middleware(
+        _post_receive_pack_middleware(make_wsgi_chain(backend)))
 
     # Use the stdlib WSGI server rather than dulwich's
     # ``HTTPGitServer`` — the latter was removed (or renamed) in
@@ -555,16 +1140,36 @@ def apply_toggle():
     available before any NsdManager browse fires later in phase 5),
     then promote the :provider service to FGS (so the OS can't
     kill us mid-handshake), then start the listener thread.
-    Reverse on OFF."""
+    Reverse on OFF.
+
+    Per-step failure attribution: each phase logs its own
+    ``[lan-listener] {step} failed`` line so a field log immediately
+    identifies whether WifiLock, FGS promotion, or socket bind is
+    the failing seam. Pre-0.46.x the three steps shared one
+    try/except and the message lost which step actually raised.
+    Idempotent: when called from the watcher's reconcile tick on a
+    healthy daemon, the ``not is_running()`` / ``is_running()``
+    guards short-circuit so no work is done."""
     from .android_cp import lan_fgs as _lan_fgs
     desired = _settings.lan_allow_sync()
     if desired and not is_running():
         try:
             _lan_fgs.acquire_wifi_locks()
+        except Exception as ex:
+            print(f'[lan-listener] acquire_wifi_locks failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+            return
+        try:
             _lan_fgs.start_fgs()
+        except Exception as ex:
+            print(f'[lan-listener] start_fgs failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+            _lan_fgs.release_wifi_locks()
+            return
+        try:
             bound = start()
         except Exception as ex:
-            print(f'[lan-listener] start failed: {ex!r}',
+            print(f'[lan-listener] listener bind failed: {ex!r}',
                   file=sys.stderr, flush=True)
             _lan_fgs.stop_fgs()
             _lan_fgs.release_wifi_locks()

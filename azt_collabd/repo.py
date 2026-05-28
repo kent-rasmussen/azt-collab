@@ -713,6 +713,348 @@ def _get_repo(project_dir):
         return None
 
 
+def _is_private_ip_url(url):
+    """Return True if *url* points to a private/local IP host
+    (RFC 1918, loopback, link-local). Used to detect a peer-LAN
+    origin URL that should be stripped — those endpoints are
+    ephemeral (the peer's daemon binds a new port every start)
+    and aren't meaningful as a persistent ``origin``."""
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        host = (urlparse(url).hostname or '').strip()
+        if not host:
+            return False
+        if host in ('localhost',):
+            return True
+        try:
+            addr = ipaddress.ip_address(host)
+            return (addr.is_private or addr.is_loopback
+                    or addr.is_link_local)
+        except ValueError:
+            # hostname (DNS name) — not a numeric IP, can't be
+            # a private-IP URL by our definition. github.com and
+            # gitlab.com fall here and stay untouched.
+            return False
+    except Exception:
+        return False
+
+
+def _host_matches_known_lan_peer(host):
+    """Return True if *host* appears in any paired peer's
+    ``endpoints`` or ``static_endpoints`` list. Used to scope the
+    retroactive ``strip_lan_origin_if_present`` fix to URLs that
+    were genuinely set by ``lan_clone`` — without this check, a
+    user pointing publish at ``https://192.168.0.5/gitea/repo.git``
+    (legitimate self-hosted Gitea on a private IP) would have
+    their origin silently wiped on every ``project_status`` poll.
+
+    Empty / None host returns False.
+    """
+    if not host:
+        return False
+    host = host.strip().lower()
+    try:
+        from . import peers as _peers
+    except Exception:
+        return False
+    try:
+        all_peers = _peers.list_peers()
+    except Exception:
+        return False
+    for entry in all_peers or []:
+        for source in ('endpoints', 'static_endpoints'):
+            for raw in (entry.get(source) or []):
+                try:
+                    h = raw.rsplit(':', 1)[0].strip().lower()
+                except (AttributeError, ValueError):
+                    continue
+                if h and h == host:
+                    return True
+    return False
+
+
+def strip_lan_origin_if_present(working_dir,
+                                scope_to_paired_peers=True):
+    """If ``<working_dir>/.git/config`` has
+    ``remote.origin.url`` pointing at a paired-LAN-peer's listener
+    URL, remove the entire ``[remote "origin"]`` section. Returns
+    True iff a strip occurred (idempotent).
+
+    Why: ``lan_clone`` sets ``origin`` to whatever URL we
+    cloned FROM, which on LAN is
+    ``https://192.168.x.y:port/<langcode>.git`` — the peer's
+    listener. That URL is useless as a persistent origin (port
+    changes per peer restart, and fan-out uses live mDNS rather
+    than this URL). Worse, ``project_status`` reads it as
+    ``remote_url`` and the publish-row gate ("hide Publish iff
+    remote_url is non-empty") treats the LAN URL as "this
+    project has been backed up." Stripping is the fix.
+
+    *scope_to_paired_peers* (default True): only strip URLs whose
+    host matches a paired peer's known endpoint host. Protects
+    users who deliberately set origin to a private-IP URL (e.g.
+    self-hosted Gitea on 192.168.0.5). The ``lan_clone`` forward-
+    fix path passes ``False`` — at that point we KNOW the origin
+    came from a LAN clone we just did. The ``_h_project_status``
+    retroactive-fix path keeps the default ``True`` so it can
+    only nuke URLs we can trace back to a paired peer.
+
+    Runs under ``project_lock`` because ``config.write_to_path``
+    rewrites ``.git/config`` on disk and the retroactive caller
+    fires on every status poll — a concurrent ``init_repo`` /
+    Publish / ``adopt_origin`` is the race. Bounded 2 s timeout
+    so the picker-poll hot path doesn't stall; defer to next
+    poll if busy.
+
+    Called by ``lan_clone.clone_from_peer`` on fresh-clone
+    (forward-fix, ``scope_to_paired_peers=False``) and by
+    ``_h_project_status`` on every status poll (retroactive-fix
+    for projects cloned before 0.45.37, ``scope_to_paired_peers=True``).
+    """
+    try:
+        repo = _get_repo(working_dir)
+        if repo is None:
+            return False
+        # Pre-check (lock-free): decide whether to bother taking
+        # the lock. Two reasons to proceed:
+        #   1. There's a paired-peer LAN-origin URL in
+        #      ``.git/config`` that needs removing.
+        #   2. There are orphan ``refs/remotes/origin/*`` tracking
+        #      refs left over from a prior strip (config-section
+        #      removed by an earlier release but refs not — pre-
+        #      0.46.2 the strip only touched config). These
+        #      produce the asymmetric ``commits_ahead`` rendering
+        #      between originator and LAN-cloned peers.
+        # Picker polls status every few seconds; steady-state has
+        # neither, so most calls return False here without locking.
+        try:
+            config = repo.get_config()
+            url_needs_strip = False
+            try:
+                origin_url = config.get(
+                    (b'remote', b'origin'), b'url').decode(
+                    'utf-8', errors='replace')
+                if _is_private_ip_url(origin_url):
+                    if scope_to_paired_peers:
+                        from urllib.parse import urlparse
+                        host = (
+                            urlparse(origin_url).hostname or '').strip()
+                        if _host_matches_known_lan_peer(host):
+                            url_needs_strip = True
+                    else:
+                        url_needs_strip = True
+            except KeyError:
+                # No URL — possibly stripped by earlier release.
+                pass
+            orphan_refs_present = False
+            if not url_needs_strip:
+                # Only bother walking refs when we wouldn't already
+                # be taking the lock. (When we ARE stripping the
+                # URL, the locked path walks refs anyway.)
+                prefix = b'refs/remotes/origin/'
+                try:
+                    for ref_name in repo.refs.allkeys():
+                        if isinstance(ref_name, bytes) \
+                                and ref_name.startswith(prefix):
+                            orphan_refs_present = True
+                            break
+                except Exception:
+                    pass
+            if not url_needs_strip and not orphan_refs_present:
+                return False
+        finally:
+            try:
+                repo.close()
+            except Exception:
+                pass
+    except Exception as ex:
+        print(f'[lan-origin-strip] {working_dir!r} pre-check '
+              f'failed: {ex!r}', file=sys.stderr, flush=True)
+        return False
+    # Pre-check said "yes, strip this." Now take the lock and
+    # re-read defensively before mutating — another writer could
+    # have changed origin between our pre-check and lock
+    # acquisition.
+    try:
+        with project_lock(working_dir, timeout=2.0):
+            return _strip_lan_origin_locked(
+                working_dir, scope_to_paired_peers)
+    except LockTimeout:
+        # Hot path — defer to next status poll.
+        return False
+    except Exception as ex:
+        print(f'[lan-origin-strip] {working_dir!r} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _strip_lan_origin_locked(working_dir, scope_to_paired_peers):
+    repo = _get_repo(working_dir)
+    if repo is None:
+        return False
+    try:
+        did_strip = False
+        config = repo.get_config()
+        try:
+            origin_url = config.get(
+                (b'remote', b'origin'), b'url').decode(
+                'utf-8', errors='replace')
+        except KeyError:
+            origin_url = ''
+        # Strip URL pass: only when a private-IP URL is present and
+        # (when scoped) traces to a paired peer.
+        if origin_url and _is_private_ip_url(origin_url):
+            host_ok = True
+            if scope_to_paired_peers:
+                from urllib.parse import urlparse
+                host = (urlparse(origin_url).hostname or '').strip()
+                host_ok = _host_matches_known_lan_peer(host)
+            if host_ok:
+                try:
+                    config.remove_section((b'remote', b'origin'))
+                except (KeyError, AttributeError):
+                    # Older dulwich: no remove_section. Best-
+                    # effort by clearing the url key — leaves an
+                    # empty section, but project_status.remote_url
+                    # will read empty (which is what the UI gate
+                    # cares about).
+                    try:
+                        config.set(
+                            (b'remote', b'origin'), b'url', b'')
+                    except Exception:
+                        return False
+                config.write_to_path()
+                print(f'[lan-origin-strip] {working_dir!r}: '
+                      f'removed paired-peer origin '
+                      f'url={origin_url!r}',
+                      file=sys.stderr, flush=True)
+                did_strip = True
+        # Strip tracking-ref pass: ``porcelain.clone`` writes
+        # ``refs/remotes/origin/<branch>`` at clone time; the URL
+        # strip above (or a prior version of it) doesn't touch
+        # those refs, so they linger at clone-time SHA forever
+        # with nothing maintaining them. ``_count_commits_ahead``
+        # then walks against a stale phantom, producing the
+        # asymmetric LANOK rendering the recorder team reported.
+        # Strip whenever URL has just been removed OR (config
+        # already URL-less + tracking refs orphaned). The orphan
+        # check covers projects stripped by earlier daemon
+        # versions that left the refs behind.
+        try:
+            try:
+                config.get((b'remote', b'origin'), b'url')
+                has_url_now = True
+            except KeyError:
+                has_url_now = False
+        except Exception:
+            has_url_now = False
+        # If we just stripped, URL is gone. If URL was already
+        # absent, this is an orphan-cleanup pass. In either case
+        # tracking refs under ``refs/remotes/origin/`` shouldn't
+        # exist on a properly-cleaned LAN-cloned project.
+        if not has_url_now:
+            prefix = b'refs/remotes/origin/'
+            removed = []
+            try:
+                ref_keys = list(repo.refs.allkeys())
+            except Exception as ex:
+                ref_keys = []
+                print(f'[lan-origin-strip] {working_dir!r}: '
+                      f'allkeys raised {ex!r}', file=sys.stderr,
+                      flush=True)
+            for ref_name in ref_keys:
+                if not isinstance(ref_name, bytes):
+                    continue
+                if not ref_name.startswith(prefix):
+                    continue
+                try:
+                    del repo.refs[ref_name]
+                    removed.append(
+                        ref_name.decode('utf-8', 'replace'))
+                except Exception as ex:
+                    print(f'[lan-origin-strip] {working_dir!r}: '
+                          f'del {ref_name!r} raised {ex!r}',
+                          file=sys.stderr, flush=True)
+            if removed:
+                print(f'[lan-origin-strip] {working_dir!r}: '
+                      f'removed orphan tracking refs '
+                      f'{removed!r}', file=sys.stderr, flush=True)
+                did_strip = True
+        return did_strip
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
+
+
+def _ensure_atomic_pending_self_heal(repo, project_dir):
+    """Self-healing migration for pre-0.45.35 projects whose
+    ``.gitignore`` didn't list ``.azt_atomic_pending/`` and where
+    earlier code paths had already tracked scratch tokens into
+    the repo. Two pieces:
+
+    1. Append ``.azt_atomic_pending/`` and ``.azt_atomic_orphans/``
+       to ``.gitignore`` if missing.
+    2. ``git rm --cached`` any tracked file under
+       ``.azt_atomic_pending/`` — leaves the file on disk so
+       ``atomic_recovery`` can still process it on its next scan,
+       but removes it from the index so it stops showing up as
+       ``staged_mod`` and bloating every subsequent commit.
+
+    Field log baf 2026-05-22: a tester had 8 tokens tracked,
+    each ~3.36 MB, contributing 27 MB of scratch content to
+    every commit and persisting as ``n_changes >= 8`` even when
+    no edits happened. Recovery couldn't help because by the
+    time it scanned the directory the files were already
+    tracked-as-modified rather than untracked orphans.
+
+    Idempotent: a no-op once the state is correct."""
+    # Part 1: .gitignore append.
+    gitignore = os.path.join(project_dir, '.gitignore')
+    needed = ('.azt_atomic_pending/', '.azt_atomic_orphans/')
+    have = ''
+    try:
+        with open(gitignore) as fh:
+            have = fh.read()
+    except (IOError, OSError):
+        pass
+    to_add = [n for n in needed if n not in have]
+    if to_add:
+        try:
+            with open(gitignore, 'a') as fh:
+                if have and not have.endswith('\n'):
+                    fh.write('\n')
+                for n in to_add:
+                    fh.write(n + '\n')
+            print(f'[gitignore-migrate] {project_dir!r}: appended '
+                  f'{to_add!r}',
+                  file=sys.stderr, flush=True)
+        except (IOError, OSError) as ex:
+            print(f'[gitignore-migrate] {project_dir!r}: append '
+                  f'failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+
+    # Part 2: untrack any currently-indexed atomic-pending tokens.
+    try:
+        index = repo.open_index()
+        prefix = b'.azt_atomic_pending/'
+        to_remove = [p for p in list(index) if p.startswith(prefix)]
+        if to_remove:
+            for path in to_remove:
+                del index[path]
+            index.write()
+            print(f'[gitignore-migrate] {project_dir!r}: untracked '
+                  f'{len(to_remove)} stale atomic-pending token(s) '
+                  f'(files preserved on disk for recovery to process)',
+                  file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[gitignore-migrate] {project_dir!r}: index '
+              f'cleanup failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
 def _stage_all(repo, project_dir):
     """Stage all modified and untracked files (equivalent to git add -A),
     EXCEPT the daemon-internal scratch dir ``.azt_atomic_pending/``.
@@ -725,7 +1067,13 @@ def _stage_all(repo, project_dir):
     landing in the GitHub repo instead of the audio/LIFT files they
     were supposed to become. Filtering them here is the
     belt-and-braces alongside the ``.gitignore`` entry on repo init.
+
+    Pre-staging migration runs each call: see
+    ``_ensure_atomic_pending_self_heal``. It self-heals any project
+    whose .gitignore predates the ``.azt_atomic_pending/`` rule and/or
+    whose index contains tracked scratch tokens from earlier code paths.
     """
+    _ensure_atomic_pending_self_heal(repo, project_dir)
     from dulwich import porcelain
     status = porcelain.status(repo)
     paths = []
@@ -909,27 +1257,35 @@ def _ensure_remote_repo(remote_url, username, token):
 
 def repo_status_summary(project_dir):
     """
-    Return (branch, remote_url, n_changes, commits_ahead) describing
+    Return (branch, remote_url, n_changes, wan_unshared) describing
     the project directory, or None if it is not a git repository.
     (Not a Result — this is a raw accessor for UI status indicators.)
 
-    ``commits_ahead`` is the number of commits on the current branch
-    not yet pushed to ``refs/remotes/origin/<branch>``. Computed from
-    the *local* cache of the remote ref (no network round-trip) so
-    the value is whatever is true given the last fetch / push:
+    ``wan_unshared`` is the number of commits on the current branch
+    not yet on ``refs/remotes/origin/<branch>``. Computed from the
+    *local* cache of the remote ref (no network round-trip) so the
+    value is whatever is true given the last fetch / push:
 
-    - No origin remote configured → 0 (publish hasn't happened)
+    - No origin remote configured → walk-from-HEAD (every commit
+      is unpublished by definition; LAN-only project case since
+      0.46.1, signals "no github backup")
     - Origin configured but never pushed → 0 (no remote ref to
       compare against; the indicator should read OK rather than
       double-counting the unpushed initial commit as "behind")
-    - Local commits since last push → N>0 (the case peers display
-      as ``(+n)``)
+    - Local commits since last push → N>0 (peer-rendered as the
+      ``WAN-N`` count per CLIENT_INTEGRATION.md § 17b)
 
     A stale cache (peer was offline since last commit, didn't fetch)
     can under-report; that's acceptable per the recorder's UX
     contract — the indicator falls back to OK rather than guessing
     against unobserved remote state. Filed by azt_recorder 1.37.6 in
     ``azt_collab_client/NOTES_TO_DAEMON.md``.
+
+    Pre-0.47.0 this field was named ``commits_ahead``; renamed
+    in lockstep with the wire-format split (wan_unshared,
+    lan_unshared, at_risk). ``lan_unshared`` and ``at_risk`` are
+    computed separately via ``_lan_unshared`` and ``_at_risk``
+    (they need the langcode for peer lookup; this function does not).
     """
     try:
         from dulwich import porcelain
@@ -958,38 +1314,320 @@ def repo_status_summary(project_dir):
                  len(st.staged.get('delete', [])) +
                  len(st.unstaged) +
                  len(st.untracked))
+            # Diagnostic: when n is large enough to be interesting,
+            # dump the actual file paths each bucket contains. Field
+            # symptom (0.45.x) was ``n_changes`` jumping from 1 to
+            # 71 with no peer-side write activity in the daemon log
+            # — we couldn't tell whether the count was real
+            # untracked files (and which ones) or a counting quirk.
+            # One line per call lets a tester sharing the daemon log
+            # answer "what are those 70 files?" without rebuilding.
+            # Threshold of 5 keeps the line out of healthy-project
+            # noise. 0.45.30.
+            if n >= 5:
+                def _names(items, k=8):
+                    out = []
+                    for it in items[:k]:
+                        if isinstance(it, bytes):
+                            out.append(it.decode('utf-8', errors='replace'))
+                        else:
+                            out.append(str(it))
+                    if len(items) > k:
+                        out.append(f'… +{len(items) - k} more')
+                    return out
+                print(
+                    f'[repo-status] n={n} '
+                    f'staged_add={len(st.staged.get("add", []))} '
+                    f'staged_mod={len(st.staged.get("modify", []))} '
+                    f'staged_del={len(st.staged.get("delete", []))} '
+                    f'unstaged={len(st.unstaged)} '
+                    f'untracked={len(st.untracked)} '
+                    f'untracked_head={_names(list(st.untracked))!r} '
+                    f'unstaged_head={_names(list(st.unstaged))!r}',
+                    file=sys.stderr, flush=True)
         except Exception:
             n = 0
 
-        commits_ahead = _count_commits_ahead(repo, branch)
+        wan_unshared = _wan_unshared(repo, branch)
 
-        return branch, remote_url, n, commits_ahead
+        return branch, remote_url, n, wan_unshared
     except Exception:
         return None
 
 
-def _count_commits_ahead(repo, branch):
+_walk_count_last_logged = {}
+
+
+def _walk_count_log(repo, tag, msg):
+    """Rate-limited diagnostic emit for the three sync-status walker
+    helpers (``_wan_unshared``, ``_lan_unshared``, ``_at_risk``).
+    Picker polls status every few seconds; without rate-limiting
+    we'd log a dozen lines per minute per project at steady state.
+    Cache last-emitted text per (working_dir, tag); print only on
+    change. The ``tag`` argument distinguishes the three callers
+    (``wan-unshared`` / ``lan-unshared`` / ``at-risk``).
+    """
+    try:
+        key = (repo.path, tag)
+    except Exception:
+        key = ('', tag)
+    if _walk_count_last_logged.get(key) == msg:
+        return
+    _walk_count_last_logged[key] = msg
+    print(f'[{tag}] {key[0]!r}: {msg}',
+          file=sys.stderr, flush=True)
+
+
+def _wan_unshared(repo, branch):
     """Count commits on ``refs/heads/<branch>`` not yet on
     ``refs/remotes/origin/<branch>`` using the local ref cache. Any
     failure (detached HEAD, no remote ref cached, walker error)
-    returns 0 — the indicator's contract is "OK on uncertainty."""
+    returns 0 — the indicator's contract is "OK on uncertainty."
+
+    Special case for LAN-only projects (since 0.46.1): when there
+    is NO ``origin`` remote configured at all (vs. "configured but
+    never pushed"), count all commits reachable from HEAD. Every
+    local commit IS unpublished by definition when github isn't a
+    backup target. Powers the ``WAN-N`` rendering for LAN-only
+    projects per ``CLIENT_INTEGRATION.md`` § 17b — without this,
+    ``wan_unshared`` stayed 0 forever and the friction signal for
+    "no github backup" never appeared.
+
+    The "no origin remote" branch is distinguishable from "origin
+    configured but never pushed" by reading ``.git/config``: if
+    ``remote.origin.url`` is absent (or empty), we know there's
+    nowhere to push, so HEAD ancestry IS the count. If the url
+    exists but the tracking ref doesn't (never-pushed-but-publish-
+    configured), we still return 0 to avoid double-counting the
+    unpushed initial commit as "behind."
+
+    Renamed from ``_count_commits_ahead`` in v0.47.0 to match the
+    new wire field name. Semantics unchanged.
+
+    Each call emits one rate-limited ``[wan-unshared]`` line
+    showing which branch fired and the SHAs involved; the line
+    only prints when the output changes from the last value.
+    """
     try:
         local_ref = b'refs/heads/' + branch.encode()
         remote_ref = b'refs/remotes/origin/' + branch.encode()
         try:
             local_sha = repo.refs[local_ref]
         except KeyError:
+            _walk_count_log(repo, 'wan-unshared',
+                f'branch={branch!r}: no local ref → 0')
             return 0
         try:
             remote_sha = repo.refs[remote_ref]
         except KeyError:
-            return 0
+            # No tracking ref. Two possibilities:
+            #   (a) origin configured + url set, but no push yet
+            #       → stick with "OK on uncertainty"; return 0.
+            #   (b) no origin remote at all (LAN-only project)
+            #       → count every commit reachable from HEAD;
+            #         each IS unpublished by definition.
+            # Treat empty URL value as case (b): older dulwich's
+            # ``strip_lan_origin_if_present`` fallback leaves the
+            # ``[remote "origin"]`` section with ``url = ``
+            # (empty string) when ``config.remove_section`` raises.
+            # An empty URL is semantically the same as no URL —
+            # there's nowhere to push to. Pre-0.46.8 we treated
+            # this as (a), masking the LAN-only walk and producing
+            # the asymmetric badge the field surfaced 2026-05-26.
+            url_str = ''
+            try:
+                url = repo.get_config().get(
+                    (b'remote', b'origin'), b'url')
+                try:
+                    url_str = url.decode('utf-8', 'replace').strip()
+                except Exception:
+                    url_str = ''
+            except KeyError:
+                url_str = ''
+            if url_str:
+                # Case (a): origin actually configured.
+                _walk_count_log(repo, 'wan-unshared',
+                    f'branch={branch!r} local={local_sha[:12]!r}: '
+                    f'no tracking ref + origin URL configured '
+                    f'({url_str[:48]}…) → 0 (OK-on-uncertainty)')
+                return 0
+            # Case (b): no origin (or empty URL = "half-stripped",
+            # treat the same). Count from HEAD.
+            try:
+                walker = repo.get_walker(include=[local_sha])
+                n = sum(1 for _ in walker)
+                _walk_count_log(repo, 'wan-unshared',
+                    f'branch={branch!r} '
+                    f'local={local_sha[:12]!r}: '
+                    f'no tracking ref + no origin URL '
+                    f'(LAN-only) → walk-from-HEAD = {n}')
+                return n
+            except Exception as ex:
+                _walk_count_log(repo, 'wan-unshared',
+                    f'branch={branch!r} '
+                    f'local={local_sha[:12]!r}: '
+                    f'walk-from-HEAD raised {ex!r} → 0')
+                return 0
         if local_sha == remote_sha:
+            _walk_count_log(repo, 'wan-unshared',
+                f'branch={branch!r} local={local_sha[:12]!r}: '
+                f'tracking ref equals local → 0')
             return 0
-        walker = repo.get_walker(
-            include=[local_sha], exclude=[remote_sha])
-        return sum(1 for _ in walker)
-    except Exception:
+        try:
+            walker = repo.get_walker(
+                include=[local_sha], exclude=[remote_sha])
+            n = sum(1 for _ in walker)
+            _walk_count_log(repo, 'wan-unshared',
+                f'branch={branch!r} local={local_sha[:12]!r} '
+                f'remote={remote_sha[:12]!r}: '
+                f'walk excluding tracking → {n}')
+            return n
+        except Exception as ex:
+            _walk_count_log(repo, 'wan-unshared',
+                f'branch={branch!r}: tracking-walk raised '
+                f'{ex!r} → 0')
+            return 0
+    except Exception as ex:
+        try:
+            _walk_count_log(repo, 'wan-unshared',
+                f'outer raised {ex!r} → 0')
+        except Exception:
+            pass
+        return 0
+
+
+def _lan_unshared(repo, branch, langcode):
+    """Count commits reachable from ``refs/heads/<branch>`` that
+    are NOT reachable from any paired-and-sharing peer's
+    ``last_seen_main`` for *langcode*. Returns 0 when no peers
+    are paired ("nothing to be behind on" — see
+    [[sync-status-state-frequencies]] for the convention).
+
+    Added in v0.47.0 as the LAN-side counterpart to ``_wan_unshared``.
+    Together with ``_at_risk`` they drive the 5-state sync
+    indicator per CLIENT_INTEGRATION.md § 17b.
+
+    Failure modes return 0 (OK-on-uncertainty), matching the
+    sibling helpers."""
+    try:
+        local_ref = b'refs/heads/' + branch.encode()
+        try:
+            local_sha = repo.refs[local_ref]
+        except KeyError:
+            _walk_count_log(repo, 'lan-unshared',
+                f'branch={branch!r}: no local ref → 0')
+            return 0
+        peer_shas = []
+        try:
+            from . import peers as _peers
+            for sha_hex in _peers.peer_main_shas_for(langcode):
+                try:
+                    peer_shas.append(sha_hex.encode('ascii'))
+                except Exception:
+                    continue
+        except Exception as ex:
+            _walk_count_log(repo, 'lan-unshared',
+                f'branch={branch!r}: peer_main_shas raised '
+                f'{ex!r} → 0')
+            return 0
+        if not peer_shas:
+            # No paired peers paired for this project — the LAN
+            # channel has no "expected destination" to be behind
+            # on. Convention: 0, so the renderer doesn't show
+            # "LAN-N" for a user who hasn't paired anyone yet.
+            _walk_count_log(repo, 'lan-unshared',
+                f'branch={branch!r} local={local_sha[:12]!r}: '
+                f'no paired peers → 0')
+            return 0
+        try:
+            walker = repo.get_walker(
+                include=[local_sha], exclude=peer_shas)
+            n = sum(1 for _ in walker)
+            _walk_count_log(repo, 'lan-unshared',
+                f'branch={branch!r} local={local_sha[:12]!r} '
+                f'peers={len(peer_shas)}: walk excluding peers '
+                f'→ {n}')
+            return n
+        except Exception as ex:
+            _walk_count_log(repo, 'lan-unshared',
+                f'branch={branch!r}: walk raised {ex!r} → 0')
+            return 0
+    except Exception as ex:
+        try:
+            _walk_count_log(repo, 'lan-unshared',
+                f'outer raised {ex!r} → 0')
+        except Exception:
+            pass
+        return 0
+
+
+def _at_risk(repo, branch, langcode):
+    """Count commits reachable from ``refs/heads/<branch>`` that
+    are NOT reachable from EITHER origin tracking refs OR any
+    paired peer's ``last_seen_main`` — i.e., the set-intersection
+    of ``_wan_unshared`` and ``_lan_unshared`` as commit sets.
+
+    Returns 0 when no peers are paired (matches the
+    ``_lan_unshared`` convention: at_risk ≤ lan_unshared, so
+    lan=0 forces at_risk=0). This prevents projects with no
+    paired peers from rendering in state E (both behind, at-risk)
+    just because they have no LAN destinations to be behind on.
+
+    Added in v0.47.0. Zero in all states except state E (both
+    channels behind on the same commits). See
+    CLIENT_INTEGRATION.md § 17b."""
+    try:
+        local_ref = b'refs/heads/' + branch.encode()
+        try:
+            local_sha = repo.refs[local_ref]
+        except KeyError:
+            return 0
+        # Peer check first: if no peers, at_risk = 0 by convention.
+        peer_shas = []
+        try:
+            from . import peers as _peers
+            for sha_hex in _peers.peer_main_shas_for(langcode):
+                try:
+                    peer_shas.append(sha_hex.encode('ascii'))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not peer_shas:
+            _walk_count_log(repo, 'at-risk',
+                f'branch={branch!r} local={local_sha[:12]!r}: '
+                f'no paired peers → 0 (lan_unshared convention)')
+            return 0
+        # Combine peer SHAs and origin tracking refs into one
+        # exclude set. The walker counts commits not reachable
+        # from ANY of them.
+        excludes = list(peer_shas)
+        for ref in (b'refs/remotes/origin/main',
+                    b'refs/remotes/origin/master'):
+            try:
+                excludes.append(repo.refs[ref])
+            except KeyError:
+                continue
+        try:
+            walker = repo.get_walker(
+                include=[local_sha], exclude=excludes)
+            n = sum(1 for _ in walker)
+            _walk_count_log(repo, 'at-risk',
+                f'branch={branch!r} local={local_sha[:12]!r} '
+                f'excludes={len(excludes)} '
+                f'(peers={len(peer_shas)}): '
+                f'walk excluding union → {n}')
+            return n
+        except Exception as ex:
+            _walk_count_log(repo, 'at-risk',
+                f'branch={branch!r}: walk raised {ex!r} → 0')
+            return 0
+    except Exception as ex:
+        try:
+            _walk_count_log(repo, 'at-risk',
+                f'outer raised {ex!r} → 0')
+        except Exception:
+            pass
         return 0
 
 
@@ -1029,7 +1667,9 @@ def _init_repo_locked(project_dir, remote_url, username, token,
     gitignore = os.path.join(project_dir, '.gitignore')
     if not os.path.exists(gitignore):
         with open(gitignore, 'w') as fh:
-            fh.write('__pycache__/\n*.pyc\n.buildozer/\nenv/\n.DS_Store\nimage_cache/\n')
+            fh.write('__pycache__/\n*.pyc\n.buildozer/\nenv/\n.DS_Store\n'
+                     'image_cache/\n.azt_atomic_pending/\n'
+                     '.azt_atomic_orphans/\n')
         result.add(S.GITIGNORE_CREATED)
 
     _stage_all(repo, project_dir)
@@ -1308,8 +1948,435 @@ def _commit_repo_locked(project_dir, contributor_name):
     result = Result()
     repo = _get_repo(project_dir)
     if repo is None:
+        # Auto-init recovery: ``create_from_template`` /
+        # ``register_project`` pre-0.45.42 created the working_dir
+        # without ever running ``porcelain.init``, so every commit
+        # NOT_A_REPO'd silently and the user's audio + LIFT writes
+        # never entered git history. Detect that state here and
+        # initialize on the fly so the next commit succeeds. We hold
+        # ``project_lock`` (caller acquired it), so the init can't
+        # race with another writer. Safe even on a working_dir that
+        # has files: ``porcelain.init`` only creates ``.git/`` next
+        # to whatever's there, then ``_stage_all`` below picks up
+        # the existing content and commits it as the initial commit.
+        if not project_dir or not os.path.isdir(project_dir):
+            result.add(S.NOT_A_REPO)
+            return result
+        try:
+            repo = porcelain.init(project_dir)
+            result.add(S.INITIALIZED)
+            print(f'[commit] {project_dir!r}: auto-init recovery — '
+                  f'project had no .git/, created one',
+                  file=sys.stderr, flush=True)
+        except Exception as ex:
+            result.add(S.NOT_A_REPO)
+            print(f'[commit] {project_dir!r}: auto-init failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+            return result
+    # Pre-commit absorb of any pending post-receive reset for this
+    # project. The lan_listener's reset path queues the langcode if
+    # it couldn't acquire ``project_lock`` within 5 s (typically
+    # because our own outgoing merge was holding the lock). Without
+    # this absorb, ``_stage_all`` below would see the merge files
+    # as "missing from working tree" (they're in HEAD but the reset
+    # never wrote them to disk) and produce a commit that DELETES
+    # them — silently undoing the incoming merge. We hold
+    # ``project_lock`` here (reentrant flock — caller acquired it),
+    # so we can safely run the same hard-reset-to-HEAD the lan
+    # listener would have. See ``lan_listener.has_pending_reset``
+    # + ``_add_pending_reset`` / ``_remove_pending_reset`` for the
+    # queue mechanics.
+    try:
+        from . import projects as _projects_mod
+        from . import lan_listener as _lan_listener
+        langcode = _projects_mod.find_langcode_by_working_dir(
+            project_dir)
+        if langcode and _lan_listener.has_pending_reset(langcode):
+            try:
+                head_sha = repo.refs[b'HEAD']
+                porcelain.reset(repo, mode='hard',
+                                treeish=head_sha)
+                _lan_listener._remove_pending_reset(langcode)
+                print(f'[commit] {langcode!r}: absorbed pending '
+                      f'post-receive reset → HEAD '
+                      f'({head_sha[:12].decode()}) before staging',
+                      file=sys.stderr, flush=True)
+            except Exception as ex:
+                # Don't fail the commit on absorb error — log and
+                # proceed. Worst case is the ``n_changes`` mismatch
+                # surfaces in the commit, which is no worse than
+                # the pre-absorb behavior.
+                print(f'[commit] {langcode!r}: pending-reset absorb '
+                      f'raised {ex!r} — proceeding to stage anyway',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[commit] pending-reset absorb check raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    _commit_step_locked(repo, project_dir, contributor_name, result)
+    return result
+
+
+def integrate_head_into_working_tree(repo, project_dir):
+    """Three-way file-level merge after an incoming receive-pack
+    moved HEAD past our pre-pack base, while our working_tree
+    holds pending local edits.
+
+    Inputs:
+      - base  = HEAD's parent tree  (what we were sitting on top
+                of before the receive-pack)
+      - ours  = working_tree
+      - theirs= HEAD's tree (the just-arrived peer commit)
+
+    Per file:
+      - Unchanged in HEAD vs base → leave working_tree alone.
+      - Working_tree already matches HEAD → no-op (already
+        integrated, e.g. both phones recorded the same audio).
+      - Working_tree == base (no local edit) → take HEAD's
+        version: write the blob to working_tree.
+      - Both sides changed:
+        * ``.lift`` paths → ``lift_merge.three_way_merge``;
+          merged bytes land in working_tree.
+        * Other paths (binary audio, images) → keep ours, log
+          loudly. In normal use audio filenames carry a guid +
+          timestamp so two phones' recordings don't collide; if
+          they DO collide on the same path the safer choice is
+          to keep what the local user just produced and let the
+          peer re-pull.
+
+    Deletions:
+      - Path in base + working_tree but absent in HEAD AND
+        working_tree == base → honor the deletion.
+      - Path in base + working_tree but absent in HEAD AND
+        working_tree != base → keep ours (we modified it after
+        theirs deleted; the safe play is to preserve user work).
+
+    Leaves the index untouched. The next ``commit_project``
+    stages the merged working_tree on top of HEAD; the resulting
+    commit preserves both sides' changes.
+
+    Holds no additional lock — caller (post-receive middleware
+    or the commit path) already holds ``project_lock``. Returns
+    ``(applied: bool, n_conflicts: int)``. ``applied=False`` means
+    the merge bailed (e.g., HEAD has no parent — first commit
+    case); caller should fall back to the original behaviour
+    (defer or reset-hard).
+    """
+    from dulwich.object_store import iter_tree_contents
+    head_sha = repo.refs[b'HEAD']
+    head_commit = repo[head_sha]
+    head_tree_sha = head_commit.tree
+    if not head_commit.parents:
+        # First commit on the branch — nothing to merge against.
+        # Caller should fall through to its non-merge branch.
+        return False, 0
+    base_tree_sha = repo[head_commit.parents[0]].tree
+    head_files = {}
+    for entry in iter_tree_contents(repo.object_store, head_tree_sha):
+        head_files[entry.path] = entry
+    base_files = {}
+    for entry in iter_tree_contents(repo.object_store, base_tree_sha):
+        base_files[entry.path] = entry
+    n_conflicts = 0
+    n_taken_theirs = 0
+    n_merged_lift = 0
+    n_kept_ours = 0
+    n_deleted_honored = 0
+    n_deleted_overridden = 0
+    for path, head_entry in head_files.items():
+        base_entry = base_files.get(path)
+        if base_entry is not None \
+                and head_entry.sha == base_entry.sha:
+            # Unchanged in HEAD vs base; nothing to integrate.
+            continue
+        try:
+            wt_path = os.path.join(
+                project_dir, path.decode('utf-8'))
+        except UnicodeDecodeError:
+            continue
+        try:
+            with open(wt_path, 'rb') as fh:
+                wt_bytes = fh.read()
+            wt_exists = True
+        except (FileNotFoundError, IsADirectoryError):
+            wt_bytes = b''
+            wt_exists = False
+        try:
+            head_bytes = repo.object_store[head_entry.sha].data
+        except KeyError:
+            # Pack inconsistency; skip the file rather than
+            # crash the merge.
+            continue
+        base_bytes = b''
+        if base_entry is not None:
+            try:
+                base_bytes = repo.object_store[
+                    base_entry.sha].data
+            except KeyError:
+                base_bytes = b''
+        if wt_exists and wt_bytes == head_bytes:
+            # Working_tree already matches HEAD; no-op.
+            continue
+        if not wt_exists or wt_bytes == base_bytes:
+            # Local has no edits on this file (or working_tree
+            # absent); take theirs.
+            try:
+                os.makedirs(os.path.dirname(wt_path) or '.',
+                            exist_ok=True)
+                with open(wt_path, 'wb') as fh:
+                    fh.write(head_bytes)
+                n_taken_theirs += 1
+            except OSError as ex:
+                print(f'[post-receive-merge] write {wt_path!r} '
+                      f'failed: {ex!r}',
+                      file=sys.stderr, flush=True)
+            continue
+        # Both sides changed.
+        if path.endswith(b'.lift'):
+            try:
+                mr = lift_merge.three_way_merge(
+                    base_bytes, wt_bytes, head_bytes,
+                    path=path.decode('utf-8', 'replace'))
+                with open(wt_path, 'wb') as fh:
+                    fh.write(mr.merged_bytes)
+                n_merged_lift += 1
+                n_conflicts += len(mr.conflicts)
+            except Exception as ex:
+                print(f'[post-receive-merge] lift_merge on '
+                      f'{path!r} raised {ex!r}; keeping ours',
+                      file=sys.stderr, flush=True)
+                n_kept_ours += 1
+        else:
+            print(f'[post-receive-merge] both sides changed '
+                  f'{path!r} (non-LIFT); keeping ours',
+                  file=sys.stderr, flush=True)
+            n_kept_ours += 1
+    # Deletions: in base+wt but not in HEAD.
+    for path, base_entry in base_files.items():
+        if path in head_files:
+            continue
+        try:
+            wt_path = os.path.join(
+                project_dir, path.decode('utf-8'))
+        except UnicodeDecodeError:
+            continue
+        try:
+            with open(wt_path, 'rb') as fh:
+                wt_bytes = fh.read()
+        except (FileNotFoundError, IsADirectoryError):
+            continue
+        try:
+            base_bytes = repo.object_store[base_entry.sha].data
+        except KeyError:
+            base_bytes = b''
+        if wt_bytes == base_bytes:
+            try:
+                os.remove(wt_path)
+                n_deleted_honored += 1
+            except OSError:
+                pass
+        else:
+            n_deleted_overridden += 1
+    print(f'[post-receive-merge] {project_dir!r}: '
+          f'taken_theirs={n_taken_theirs} '
+          f'merged_lift={n_merged_lift} (conflicts={n_conflicts}) '
+          f'kept_ours={n_kept_ours} '
+          f'deleted_honored={n_deleted_honored} '
+          f'deleted_overridden={n_deleted_overridden}',
+          file=sys.stderr, flush=True)
+    return True, n_conflicts
+
+
+def snapshot_unstaged_paths(repo, project_dir):
+    """Read working-tree bytes for every unstaged-mod path (except
+    daemon-internal scratch dirs) into an in-memory dict. Used by
+    ``lan_push._merge_then_push_locked`` as a recovery snapshot
+    before pre-commit + merge — if the pre-commit silently
+    fails to stage (porcelain.add no-op edge cases observed in
+    the field as "red +N hanging around after a swipe"),
+    ``_merge_diverged`` would otherwise overwrite the working
+    tree with committed state and lose the user's edits.
+
+    Returns ``dict[path_bytes, bytes]``. Empty on a clean
+    working tree or transient failure (caller handles empty
+    same as "no snapshot needed").
+    """
+    from dulwich import porcelain
+    pending_prefix = b'.azt_atomic_pending/'
+    orphan_prefix = b'.azt_atomic_orphans/'
+    snapshot = {}
+    try:
+        st = porcelain.status(repo, untracked_files='no')
+    except Exception as ex:
+        print(f'[snapshot] status raised {ex!r}; returning empty',
+              file=sys.stderr, flush=True)
+        return snapshot
+    for rel in (st.unstaged or []):
+        if rel.startswith(pending_prefix) \
+                or rel.startswith(orphan_prefix):
+            continue
+        try:
+            rel_str = rel.decode('utf-8', 'replace')
+        except Exception:
+            continue
+        full = os.path.join(project_dir, rel_str)
+        try:
+            with open(full, 'rb') as fh:
+                snapshot[rel] = fh.read()
+        except OSError:
+            pass
+    return snapshot
+
+
+def reapply_snapshot_after_merge(repo, project_dir, snapshot,
+                                  base_sha):
+    """Reapply a working-tree snapshot after ``_merge_diverged``
+    has overwritten paths. For ``.lift`` files, three-way merge
+    via ``lift_merge.three_way_merge`` with base = the snapshot's
+    pre-merge HEAD blob, ours = snapshot, theirs = current working
+    tree (the merge result). For non-LIFT paths, overwrite with
+    the snapshot (user's edit wins — same policy
+    ``_merge_diverged`` itself uses for non-LIFT modify/modify).
+
+    Caller (``_merge_then_push_locked``) holds ``project_lock``;
+    no inner lock acquisition.
+
+    *base_sha*: the local HEAD SHA at the time the snapshot was
+    taken (i.e. before the merge ran). May be empty/None if the
+    repo had no commits then; lift_merge handles empty base.
+
+    Returns ``(applied_paths, conflicts)`` — the count of paths
+    reapplied and the total lift_merge conflicts across all
+    reapplied LIFTs.
+    """
+    if not snapshot:
+        return 0, 0
+    base_blobs = {}
+    if base_sha:
+        try:
+            base_commit = repo[base_sha]
+            base_blobs = _walk_tree(repo, base_commit.tree)
+        except Exception:
+            base_blobs = {}
+    applied = 0
+    total_conflicts = 0
+    for path_bytes, snap_bytes in snapshot.items():
+        try:
+            rel = path_bytes.decode('utf-8', 'replace')
+        except Exception:
+            continue
+        full = os.path.join(project_dir, rel)
+        try:
+            with open(full, 'rb') as fh:
+                post_merge_bytes = fh.read()
+        except OSError:
+            post_merge_bytes = b''
+        if snap_bytes == post_merge_bytes:
+            continue
+        if path_bytes.endswith(b'.lift'):
+            base_sha_blob = base_blobs.get(path_bytes)
+            base_bytes = b''
+            if base_sha_blob:
+                try:
+                    base_bytes = _blob_bytes(
+                        repo, base_sha_blob) or b''
+                except Exception:
+                    base_bytes = b''
+            try:
+                mr = lift_merge.three_way_merge(
+                    base_bytes, snap_bytes, post_merge_bytes,
+                    path=rel)
+                with open(full, 'wb') as fh:
+                    fh.write(mr.merged_bytes)
+                applied += 1
+                total_conflicts += len(mr.conflicts)
+                print(f'[lan-merge-reapply] lift_merge {rel!r}: '
+                      f'merged ({len(mr.conflicts)} conflicts)',
+                      file=sys.stderr, flush=True)
+            except Exception as ex:
+                # Merge raised — restore snapshot to preserve
+                # user data (last-resort: keep ours).
+                try:
+                    with open(full, 'wb') as fh:
+                        fh.write(snap_bytes)
+                    applied += 1
+                    print(f'[lan-merge-reapply] lift_merge raised '
+                          f'{ex!r}; restored snapshot for {rel!r}',
+                          file=sys.stderr, flush=True)
+                except OSError as wex:
+                    print(f'[lan-merge-reapply] restore for '
+                          f'{rel!r} failed: {wex!r}',
+                          file=sys.stderr, flush=True)
+        else:
+            try:
+                with open(full, 'wb') as fh:
+                    fh.write(snap_bytes)
+                applied += 1
+                print(f'[lan-merge-reapply] restored snapshot for '
+                      f'{rel!r} ({len(snap_bytes)} bytes)',
+                      file=sys.stderr, flush=True)
+            except OSError as ex:
+                print(f'[lan-merge-reapply] write {full!r} failed: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+    return applied, total_conflicts
+
+
+def ensure_initial_commit(project_dir, contributor_name='AZT'):
+    """Idempotent ``porcelain.init`` + initial commit of whatever's
+    on disk in *project_dir*. Called from ``projects.create_from_template``
+    so a freshly-created project has a usable git state (``.git/``
+    plus a born HEAD) before the user's first record fires. Without
+    this, every ``commit_project`` would NOT_A_REPO until the user
+    eventually tapped Publish, and the project couldn't be shared
+    over LAN (listener returns 404 with no refs to serve).
+
+    Returns a ``Result`` carrying ``INITIALIZED`` /
+    ``ALREADY_INITIALIZED`` / ``COMMITTED_LOCAL`` /
+    ``NOTHING_TO_COMMIT``. Holds ``project_lock`` (so concurrent
+    callers serialize). On lock contention returns a busy result;
+    the caller treats this as transient.
+    """
+    _ensure_ssl()
+    try:
+        with project_lock(project_dir):
+            return _ensure_initial_commit_locked(
+                project_dir, contributor_name)
+    except LockTimeout:
+        return _busy_result(project_dir)
+
+
+def _ensure_initial_commit_locked(project_dir, contributor_name):
+    from dulwich import porcelain
+    result = Result()
+    if not project_dir or not os.path.isdir(project_dir):
         result.add(S.NOT_A_REPO)
         return result
+    repo = _get_repo(project_dir)
+    if repo is None:
+        try:
+            repo = porcelain.init(project_dir)
+            result.add(S.INITIALIZED)
+        except Exception as ex:
+            result.add(S.NOT_A_REPO)
+            print(f'[ensure-initial] {project_dir!r}: '
+                  f'porcelain.init failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+            return result
+    else:
+        result.add(S.ALREADY_INITIALIZED)
+    gitignore = os.path.join(project_dir, '.gitignore')
+    if not os.path.exists(gitignore):
+        try:
+            with open(gitignore, 'w') as fh:
+                fh.write('__pycache__/\n*.pyc\n.buildozer/\nenv/\n'
+                         '.DS_Store\nimage_cache/\n'
+                         '.azt_atomic_pending/\n'
+                         '.azt_atomic_orphans/\n')
+        except OSError:
+            pass
+    # Re-use the normal commit step so we get the same DATA_LOSS_RISK
+    # / large-file diagnostics / debounce-counter clearing as a
+    # regular commit. Adds COMMITTED_LOCAL or NOTHING_TO_COMMIT
+    # depending on whether the working tree has any content.
     _commit_step_locked(repo, project_dir, contributor_name, result)
     return result
 
@@ -1346,6 +2413,18 @@ def _commit_step_locked(repo, project_dir, contributor_name, result):
             )
             result.add(S.COMMITTED_LOCAL)
             _clear_commit_failure_count(project_dir)
+            # Push-notify any peer observing this project's status URI.
+            # HEAD just advanced; subscribed peers wake up + re-poll.
+            # No-op off Android (peers fall back to polling there).
+            try:
+                from . import projects as _projects_mod
+                from .android_cp import notify as _notify
+                langcode = _projects_mod.find_langcode_by_working_dir(
+                    project_dir)
+                if langcode:
+                    _notify.notify_project_changed(langcode)
+            except Exception:
+                pass
             # Data-quality flag: oversize files in the just-made
             # commit. Recorder is for word-list elicitation; multi-MB
             # files probably mean someone recorded a phrase/text by
@@ -1407,8 +2486,17 @@ def _push_repo_locked(project_dir, username, token):
     try:
         remote_url = repo.get_config().get(
             (b'remote', b'origin'), b'url'
-        ).decode('utf-8')
+        ).decode('utf-8').strip()
     except KeyError:
+        result.add(S.NO_REMOTE)
+        return result
+    # Half-stripped origin (``[remote "origin"]`` with ``url = ``
+    # empty) is semantically the same as no origin: there's nowhere
+    # to push. Pre-this-fix the empty URL flowed into
+    # ``_push_step_locked`` and dulwich raised ``NotGitRepository``
+    # on every drain tick, ~4 times per cycle. Same shape as the
+    # 0.46.8 fix in ``_count_commits_ahead`` for the same root cause.
+    if not remote_url:
         result.add(S.NO_REMOTE)
         return result
     _push_step_locked(repo, project_dir, username, token, remote_url, result)
@@ -1443,8 +2531,13 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     try:
         remote_url = repo.get_config().get(
             (b'remote', b'origin'), b'url'
-        ).decode('utf-8')
+        ).decode('utf-8').strip()
     except KeyError:
+        result.add(S.NO_REMOTE)
+        return result
+    # Half-stripped origin (url="") = no remote. Same fix shape as
+    # ``_push_repo_locked`` and ``_count_commits_ahead`` (0.46.8).
+    if not remote_url:
         result.add(S.NO_REMOTE)
         return result
 

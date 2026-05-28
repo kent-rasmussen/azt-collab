@@ -618,6 +618,7 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
                              on_retry=None,
                              on_open_app=None,
                              open_app_label=None,
+                             on_restart_server=None,
                              repo=None):
     """Single canonical popup for "the suite needs the server APK
     (or a newer one) before this app can do anything useful". Used
@@ -715,6 +716,18 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         closes the popup, peer keeps running. Right for self-
         update where declining means "stick with the current
         version".
+    on_restart_server : callable() | None
+        When set, render an extra "Restart server" button that
+        invokes the callback. Used by the server-too-old branch
+        so the user can ask the daemon to exit (cooperative
+        ``/v1/admin/restart``) without downloading a fresh APK —
+        Android's ContentProvider auto-spawn revives the daemon
+        on the next peer call, which on the typical "I already
+        installed the new APK but the old :provider process is
+        still alive" case results in the newer code loading.
+        Callback is responsible for showing progress and re-
+        running the compat check; the popup just dismisses on
+        invocation.
 
     Returns the Popup so callers can hold a ref. ``auto_dismiss``
     is False — the user must explicitly choose Quit / Open page /
@@ -805,6 +818,7 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         open_page_url=open_page_url,
         dismiss_label=dismiss_label,
         dismiss_action=dismiss_action,
+        on_restart_server=on_restart_server,
     )
 
     if len(available) > 1:
@@ -939,6 +953,20 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
             halign='center', valign='middle',
         )
 
+    # Optional "Restart server" button — server-too-old workflow.
+    # When the user has already installed the new server APK but
+    # Android kept the old daemon process alive, cooperative
+    # /v1/admin/restart lets it exit so the next ContentProvider
+    # call lazy-spawns the new code. Cheaper than re-downloading
+    # the APK.
+    restart_btn = None
+    if on_restart_server is not None:
+        restart_btn = Button(
+            text=_tr('Restart server'),
+            font_size=sp(13), font_name=font_name,
+            halign='center', valign='middle',
+        )
+
     # Bind text_size to size so labels wrap inside their button
     # bounds rather than spilling / clipping.
     def _bind_wrap(b):
@@ -949,12 +977,16 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
         _bind_wrap(retry_btn)
     if open_app_btn is not None:
         _bind_wrap(open_app_btn)
+    if restart_btn is not None:
+        _bind_wrap(restart_btn)
 
     btn_row.add_widget(quit_btn)
     if retry_btn is not None:
         btn_row.add_widget(retry_btn)
     if open_app_btn is not None:
         btn_row.add_widget(open_app_btn)
+    if restart_btn is not None:
+        btn_row.add_widget(restart_btn)
     btn_row.add_widget(install_btn)
     btn_row.add_widget(open_page_btn)
     content.add_widget(btn_row)
@@ -1119,5 +1151,14 @@ def install_server_apk_popup(on_status=None, font_name='Roboto',
             except Exception as ex:
                 print(f'[install_popup] on_open_app raised: {ex}')
         open_app_btn.bind(on_release=_open_app)
+    if restart_btn is not None:
+        def _restart(*_):
+            popup.dismiss()
+            try:
+                on_restart_server()
+            except Exception as ex:
+                print(f'[install_popup] on_restart_server raised: '
+                      f'{ex}')
+        restart_btn.bind(on_release=_restart)
     popup.open()
     return popup

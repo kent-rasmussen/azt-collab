@@ -1470,14 +1470,28 @@ class SettingsScreen(Screen):
             ps = None
         if ps is not None and (ps.remote_url or '').strip():
             live_remote_url = ps.remote_url.strip()
-        if not live_remote_url:
-            return
-        # Gate passed — show row and seed info.
+        # Pre-0.45.0 this row was gated on ``live_remote_url`` being
+        # non-empty because the button it carried was a github
+        # collaborator-invite. 0.45.0 collapsed the row's button into
+        # the consolidated "Share project" popup, which carries
+        # paired-phones LAN-share + pair-QR + github-invite sections.
+        # The first two work fine without a github remote — a user
+        # who wants to share an unpublished project over LAN should
+        # not have to Publish to GitHub first just to see the Share
+        # button. So the gate is gone; the popup adapts internally
+        # (hides the github-invite section when remote_url is empty).
         if info is not None:
-            info.text = _tr(
-                'Project: {langcode}\nRemote: {remote_url}').format(
-                    langcode=project.langcode,
-                    remote_url=live_remote_url)
+            if live_remote_url:
+                info.text = _tr(
+                    'Project: {langcode}\nRemote: {remote_url}'
+                ).format(langcode=project.langcode,
+                         remote_url=live_remote_url)
+            else:
+                info.text = _tr(
+                    'Project: {langcode}\n'
+                    '(not published to GitHub — '
+                    'share over local network only)'
+                ).format(langcode=project.langcode)
         # Heights (0.45.0): section label (dp 32) + info (~dp 40) +
         # share-project button (dp 52) + msg (dp 20) + 3× spacing
         # (dp 8 each). The separate grant_collab button is gone in
@@ -2327,6 +2341,39 @@ class SettingsScreen(Screen):
         for c in kids:
             row.add_widget(c)
 
+    def _pending_adopt_origin_url(self, langcode):
+        """Return the URL from a pending ``adopt_origin`` decision
+        for *langcode*, or ``''`` if none exists. Lets Publish
+        adopt a peer's existing github repo instead of inferring
+        a new ``<user>/<langcode>`` path — see ``_do_publish``
+        for context. 0.45.37."""
+        try:
+            from .. import lan_pending  # type: ignore
+        except (ImportError, ValueError):
+            try:
+                from azt_collab_client import lan_pending
+            except Exception:
+                return ''
+        try:
+            decisions = lan_pending() or []
+        except Exception:
+            return ''
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            if d.get('kind') != 'adopt_origin':
+                continue
+            payload = d.get('payload') or {}
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get('langcode') or '') != langcode:
+                continue
+            url = str(payload.get('url') or '').strip()
+            if url:
+                return url
+        return ''
+
+
     def _pick_publish_candidate(self):
         """Return the Project the daemon last touched, or ``None`` if
         there isn't one (no project ever opened on this device, server
@@ -2531,6 +2578,21 @@ class SettingsScreen(Screen):
             return
         domain = 'gitlab.com' if host == 'gitlab' else 'github.com'
         remote_url = f'https://{domain}/{user}/{langcode}.git'
+        # If a ``LAN_ADOPT_ORIGIN_NEEDED`` pending decision exists
+        # for this langcode (stashed by ``lan_clone`` when the peer
+        # shared a project that already had a github origin), use
+        # ITS URL instead of the inferred ``<user>/<langcode>``.
+        # This is the recovery path for a user who missed (or
+        # never saw) the in-flow adopt-origin popup at scan time
+        # — Publish becomes the unified entry point: existing
+        # peer-repo gets adopted; otherwise a new repo gets
+        # created at the inferred path. 0.45.37.
+        adopt_url = self._pending_adopt_origin_url(langcode)
+        if adopt_url:
+            remote_url = adopt_url
+            print(f'[publish] using pending adopt_origin URL for '
+                  f'{langcode!r}: {remote_url!r}',
+                  file=sys.stderr, flush=True)
         # 0.40.0: contributor is daemon-owned; we don't pass it on the
         # wire any more. ``init_project`` reads from ``store.get_contributor()``
         # itself; if unset, it returns ``Result(CONTRIBUTOR_UNSET)`` and

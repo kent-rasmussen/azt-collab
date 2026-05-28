@@ -70,11 +70,29 @@ class ProjectStatus:
     last_sync: float
     working_dir: str
     lift_path: str
-    # Number of local commits on the current branch not yet pushed
-    # to the remote — the count peers display as "(+n)" alongside
-    # last_sync. Defaults to 0 for forward-compat with daemons that
-    # don't yet emit it (see NOTES_TO_DAEMON.md).
-    commits_ahead: int = 0
+    # Sync-status counts (v0.47.0). Three independent walks over the
+    # local commit graph; render via the 5-state recipe in
+    # CLIENT_INTEGRATION.md § 17b. Pre-0.47 daemons emitted
+    # ``commits_ahead`` + ``unshared_commits``; those fields are
+    # gone (MIN_SERVER_VERSION enforces). Defaults of 0 here are
+    # for *missing fields on stub responses*, not for old-daemon
+    # tolerance.
+    #
+    #   wan_unshared — commits not on github (was commits_ahead).
+    #     Special-cased for LAN-only projects: walks from HEAD
+    #     when no origin URL is configured, surfacing the whole
+    #     history as a friction signal for "no github backup."
+    #   lan_unshared — commits not on any paired peer's
+    #     ``last_seen_main``. Returns 0 when no peers are paired
+    #     (the "nothing to be behind on" convention).
+    #   at_risk      — commits on neither channel (set intersection
+    #     of wan_unshared and lan_unshared as commit sets). Zero
+    #     except in state E ("both behind on the same commits"),
+    #     which is the routine transient state right after a
+    #     fresh commit.
+    wan_unshared: int = 0
+    lan_unshared: int = 0
+    at_risk: int = 0
     # Per-project metadata mirrored from the project record so
     # peers can read status + identity in one round-trip. Empty
     # for forward-compat with pre-0.39 daemons.
@@ -102,47 +120,35 @@ class ProjectStatus:
     # ``<annotation name="azt-lift-conflict">`` the same way as
     # cross-peer merge conflicts).
     n_recovered_today: int = 0
-    # Daemon-wide work-offline toggle (since daemon 0.43.0). True
-    # means automatic push is suppressed: the connectivity
-    # watcher's drain is a no-op and the user-gestured Sync
-    # button returns ``S.WORK_OFFLINE_ENABLED``. Commits via
-    # ``commit_project`` are unaffected. Peers render a badge
-    # alongside ``commits_ahead`` so the user sees "5 commits
-    # waiting · offline mode" rather than misreading the count as
-    # a sync failure. Carried on every ``project_status`` even
-    # though it's daemon-wide (not per-project) so peers can
-    # render the badge without a second RPC.
+    # Daemon-wide work-offline toggle. True means automatic push
+    # is suppressed (the watcher's drain is a no-op,
+    # ``sync_project`` returns ``S.WORK_OFFLINE_ENABLED``);
+    # ``commit_project`` is unaffected. Carried on every
+    # ``project_status`` even though it's daemon-wide so peers
+    # don't need a second RPC to render the badge. Since 0.43.0.
+    # Rendering recipe: CLIENT_INTEGRATION.md § 17b.
     work_offline: bool = False
-    # Daemon-wide LAN-sync toggle (since daemon 0.45.0). Carried
-    # alongside ``work_offline`` so peers can render the joint
-    # state — github push and LAN fan-out are independent gates,
-    # so the four-cell matrix (work_offline × lan_allow_sync) maps
-    # to four user-visible sync states:
-    #
-    #   work_offline=off, lan=off → "github only"            (no suffix)
-    #   work_offline=off, lan=on  → "github + LAN"           (no suffix today)
-    #   work_offline=on,  lan=off → "offline"                (suffix == "offline")
-    #   work_offline=on,  lan=on  → "LAN-only"               (suffix == "LAN-only")
-    #
-    # The peer-side sync-indicator should swap "offline" for
-    # "LAN-only" when both bits are set — paired phones still
-    # receive commits, github push is the only thing suspended.
+    # Daemon-wide LAN-sync toggle (independent of ``work_offline``).
+    # Combines with ``work_offline`` into the four-cell matrix the
+    # sync indicator renders as suffix ``''`` / ``offline`` /
+    # ``LAN-only``. Since 0.45.0. Rendering recipe:
+    # CLIENT_INTEGRATION.md § 17b.
     lan_allow_sync: bool = False
-    # Count of local commits reachable from HEAD that are NOT yet on
-    # any remote (neither github's last-fetched ``main`` nor any LAN
-    # peer's last-known ``main``). Zero = "shared somewhere":
-    # every local commit exists on at least one other device, so
-    # this phone could be wiped without losing data. Peer-side
-    # sync indicator uses this together with ``commits_ahead`` to
-    # render ``LANOK +5`` (5 ahead of github, all shared) vs
-    # ``+1/5`` (5 ahead, 1 not shared with anyone). Since 0.45.0.
-    unshared_commits: int = 0
     # SHA hex of the most recent commit successfully LAN-delivered
     # to at least one paired peer. Empty when nothing has been
-    # LAN-delivered yet. The daemon uses this as part of the
-    # "shared somewhere" computation above; peers can read it for
-    # diagnostic display. Since 0.45.0.
+    # LAN-delivered yet. Diagnostic only — ``lan_unshared`` and
+    # ``at_risk`` are what drive the indicator (was the conflated
+    # ``unshared_commits`` pre-0.47.0). Since 0.45.0.
     lan_pushed_sha: str = ''
+    # SHA hex of the project's current HEAD. Changes on every HEAD
+    # advance — local commit, incoming LAN receive-pack,
+    # post-receive merge — so peers polling ``project_status`` can
+    # use a change here as a uniform "the daemon's view of this
+    # project moved; re-read content" signal, independent of which
+    # event caused the move. Empty string when no commits exist
+    # yet (pre-init, or pre-first-commit project). Since 0.45.45.
+    # See CLIENT_INTEGRATION.md § 17b Background refresh obligation.
+    head_sha: str = ''
 
     @classmethod
     def from_dict(cls, d):
@@ -156,7 +162,9 @@ class ProjectStatus:
             last_sync=float(d.get('last_sync', 0.0)),
             working_dir=d.get('working_dir', ''),
             lift_path=d.get('lift_path', ''),
-            commits_ahead=int(d.get('commits_ahead', 0)),
+            wan_unshared=int(d.get('wan_unshared', 0) or 0),
+            lan_unshared=int(d.get('lan_unshared', 0) or 0),
+            at_risk=int(d.get('at_risk', 0) or 0),
             repo_slug=d.get('repo_slug', '') or '',
             cawl_image_repo=d.get('cawl_image_repo', '') or '',
             commit_failure_count=int(
@@ -168,6 +176,6 @@ class ProjectStatus:
                 d.get('n_recovered_today', 0) or 0),
             work_offline=bool(d.get('work_offline', False)),
             lan_allow_sync=bool(d.get('lan_allow_sync', False)),
-            unshared_commits=int(d.get('unshared_commits', 0) or 0),
             lan_pushed_sha=str(d.get('lan_pushed_sha', '') or ''),
+            head_sha=str(d.get('head_sha', '') or ''),
         )

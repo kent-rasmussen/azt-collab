@@ -652,6 +652,26 @@ def main():
     # restores parity with the desktop daemon.
     scheduler.start_watcher()
 
+    # Auto-start the LAN listener if the persisted toggle is on.
+    # ``lan.allow_sync`` survives a daemon restart in config.json
+    # but the listener thread + WifiLock + FGS state don't, so
+    # without this reconciliation a service respawn leaves the
+    # daemon in a "toggle says yes, listener says no" split-brain:
+    # outbound LAN fan-out fires every scheduler tick (and hammers
+    # peers' stale endpoints with Connection refused), while
+    # inbound binds nothing and mDNS advertises nothing, so paired
+    # peers can't reach us either. Same fix as ``server.run`` does
+    # on the desktop entry path — the Android :provider entry
+    # path was missing it. Idempotent (no-op if already up).
+    _boot_trace('before_lan_listener')
+    try:
+        from azt_collabd import lan_listener as _lan_listener
+        _lan_listener.apply_toggle()
+    except Exception as ex:
+        print(f'[service] lan_listener startup apply failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+    _boot_trace('after_lan_listener')
+
     _boot_trace('entering_idle_loop')
     # Idle-stop loop. Stays alive while peers are bound or the
     # provider is in active use; stops the service when both

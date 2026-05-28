@@ -311,6 +311,27 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
                    detail=err)
         return result
+    # Strip the LAN listener URL from ``.git/config``'s origin.
+    # ``_do_lan_clone`` runs dulwich's clone which sets origin to
+    # ``https://<peer-host>:<peer-port>/<langcode>.git`` — a
+    # private-IP URL that's useless as a persistent origin (peer
+    # port changes per restart, and we don't fetch by URL after
+    # the initial clone — fan-out uses live mDNS). Worse, the
+    # publish-row "hide if remote_url present" gate treated this
+    # as a github remote, so Publish never appeared and users
+    # were stuck without a clear path to back up. 0.45.37.
+    try:
+        from . import repo as _repo
+        # scope_to_paired_peers=False — we just cloned from a peer,
+        # the origin URL is by construction a LAN listener URL, no
+        # need to gate on the paired-peers list (which the peer is
+        # likely already in via add_shared_project, but the check
+        # is unnecessary here).
+        _repo.strip_lan_origin_if_present(
+            dest_dir, scope_to_paired_peers=False)
+    except Exception as ex:
+        print(f'[lan-clone] strip_lan_origin {dest_dir!r} failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
     try:
         _projects.register(langcode, dest_dir,
                            lift_path=lift_path,

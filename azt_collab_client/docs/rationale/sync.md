@@ -51,8 +51,9 @@ and (2) MB-burning eager push on every brief cellular tether.
   don't trigger a push storm), "metered?"
   (`sync.work_offline`, daemon-wide bool — metered state is
   device-scoped, not per-project). Peers read
-  `project_status.commits_ahead` + `.work_offline` for the
-  badge.
+  `project_status.wan_unshared` + `.lan_unshared` + `.at_risk`
+  + `.work_offline` for the badge (renamed from
+  `commits_ahead` + `unshared_commits` in v0.47.0).
 
 **Sync button keeps commit+push.** `commit_project` is the
 primary commit path; `sync_project` is the user-gestured

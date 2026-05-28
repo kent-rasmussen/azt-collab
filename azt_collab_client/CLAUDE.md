@@ -63,8 +63,8 @@ into here; this package owns:
    $AZT_HOME and the local check happens to work — easy to merge
    without noticing. Go through `project_status(langcode)` instead;
    it carries `remote_url`, `last_commit`, `last_sync`,
-   `commits_ahead`, and the daemon touches the project as recent
-   on every call.
+   `wan_unshared` / `lan_unshared` / `at_risk`, and the daemon
+   touches the project as recent on every call.
 
 3. **No `azt_collabd` import.** This package must keep working when
    the daemon is running in a separate process or a different APK.

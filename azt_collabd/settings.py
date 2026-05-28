@@ -70,28 +70,65 @@ _ENV_MAP = {
 
 _lock = threading.Lock()
 
+# Sentinel for "config.json is unreadable" (truncated JSON, corrupt
+# bytes). Distinct from "file missing" (empty dict) so callers don't
+# clobber the file with a defaults-only payload after a failed read.
+class _LoadFailed:
+    __slots__ = ('error',)
+
+    def __init__(self, error):
+        self.error = error
+
 
 def _path():
     return os.path.join(azt_home(), _FILENAME)
 
 
 def _load_raw():
+    """Return the parsed config dict, ``{}`` if the file is missing,
+    or ``_LoadFailed(error)`` if the file exists but can't be parsed.
+    Callers MUST distinguish the third case — overwriting a corrupt
+    file with a dict built from defaults silently wipes every other
+    persisted key (see the APK-update-killed-mid-write failure mode
+    that surfaced 2026-05-26)."""
     try:
         with open(_path()) as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
     except Exception as ex:
-        print(f'[collab.settings] load failed: {ex}')
-        return {}
+        # Loud — this is the kind of failure that silently reverts
+        # user toggles unless we surface it. The on-disk file is
+        # preserved (no clobber) and callers refuse to write until
+        # the user repairs / removes it.
+        print(f'[collab.settings] load failed (config.json '
+              f'unreadable; preserving on disk, refusing writes '
+              f'until repaired): {ex!r}', flush=True)
+        return _LoadFailed(ex)
 
 
 def _save_raw(data):
+    """Atomically persist *data* to config.json. Write to a tmp file
+    in the same directory, ``fsync``, then ``os.replace`` — so an
+    interrupted write (APK update kill, OOM) never leaves a truncated
+    config.json that the next boot reads as ``{}`` and resolves every
+    key to its default."""
     p = _path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f'{p}.tmp.{os.getpid()}'
     with _lock:
-        with open(p, 'w') as f:
+        with open(tmp, 'w') as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # Some filesystems (notably tmpfs on older Android)
+                # reject fsync. Atomic-replace still works there;
+                # we just lose the durability guarantee on power
+                # loss, which is the smaller of the two risks.
+                pass
+        os.replace(tmp, p)
 
 
 def get(key, default=None):
@@ -105,14 +142,27 @@ def get(key, default=None):
         except (TypeError, ValueError):
             pass
     data = _load_raw()
+    if isinstance(data, _LoadFailed):
+        # Treat unreadable as "use defaults for the read", but DON'T
+        # let set_() write through this state — that's enforced in
+        # set_() itself.
+        return _DEFAULTS.get(key, default)
     if key in data:
         return _coerce(key, data[key])
     return _DEFAULTS.get(key, default)
 
 
 def set_(key, value):
-    """Persist a value for *key* in config.json."""
+    """Persist a value for *key* in config.json. Refuses to write
+    when the existing config.json is unreadable, so a corrupt file
+    isn't replaced with a one-key dict that silently reverts every
+    other persisted setting."""
     data = _load_raw()
+    if isinstance(data, _LoadFailed):
+        print(f'[collab.settings] refusing to set {key!r}: '
+              f'config.json is unreadable ({data.error!r}). '
+              f'Repair or remove it and retry.', flush=True)
+        return
     data[key] = value
     _save_raw(data)
 

@@ -237,6 +237,17 @@ def reconcile_on_startup():
     # Run outside the scheduler lock — touches the filesystem, not
     # the jobs registry. Best-effort; never raises.
     _sweep_legacy_orphans()
+    # Re-populate the deferred post-receive-reset queue from disk so
+    # a daemon restart while a reset was pending doesn't lose track.
+    # The next watcher tick will drain whatever was queued; in the
+    # meantime ``_commit_repo_locked`` absorbs entries on commit too.
+    try:
+        from . import lan_listener as _lan_listener
+        _lan_listener.load_pending_resets_from_disk()
+    except Exception as ex:
+        print(f'[scheduler] reconcile_on_startup: '
+              f'lan_listener.load_pending_resets_from_disk raised '
+              f'{ex!r}', file=sys.stderr, flush=True)
 
 
 # ── legacy-orphan sweeps ────────────────────────────────────────────────────
@@ -402,7 +413,7 @@ def _fire(langcode):
     # there's now (or already was) a local commit waiting for the
     # drain loop to push. NOTHING_TO_COMMIT means the index was
     # clean — leave pending_push as-is (a prior commit may still
-    # be waiting; the drain loop already knows from commits_ahead).
+    # be waiting; the drain loop already knows from wan_unshared).
     if 'COMMITTED_LOCAL' in codes:
         _set_pending_push(langcode, True)
 
@@ -434,6 +445,31 @@ def _run_commit(langcode):
           file=sys.stderr, flush=True)
     if 'COMMITTED_LOCAL' in codes:
         projects.set_last_commit(langcode)
+        # Eagerly fan-out to paired LAN peers when the LAN toggle
+        # is on. Without this, ``last_lan_pushed_sha`` only
+        # advances on the watcher loop's drain tick (every
+        # ``sync.connectivity_poll_s``, default 30 s) — so any
+        # commit landing between ticks isn't recorded as "shared
+        # somewhere" until the next tick, and the peer-side LANOK
+        # indicator stays dark because ``lan_unshared`` is
+        # almost never 0 under any sustained editing pace (typical
+        # field cadence is several commits per minute, > 30 s
+        # cycle). Firing here makes the latency from
+        # ``COMMITTED_LOCAL`` to ``last_lan_pushed_sha`` ≈ one
+        # listener round-trip on the LAN (single-digit ms when
+        # both phones are up) instead of up to 30 s, so LANOK
+        # surfaces on the next peer poll. Idempotent: fan_out
+        # internally peeks each peer's main first and no-ops if
+        # they're already at our HEAD. 0.45.32.
+        try:
+            from . import settings as _settings
+            if _settings.lan_allow_sync():
+                from . import lan_push as _lan_push
+                _lan_push.fan_out(p)
+        except Exception as ex:
+            print(f'[commit] {langcode!r} post-commit LAN fan-out '
+                  f'raised: {ex!r}',
+                  file=sys.stderr, flush=True)
     return res
 
 
@@ -544,6 +580,41 @@ def _watcher_loop():
                            and _online_since is not None
                            and (now - _online_since) >= grace)
         lan_eligible = _settings.lan_allow_sync()
+        # LAN-listener split-brain reconcile. The persisted toggle and
+        # the listener thread can drift apart in three ways:
+        #   * APK update / kill -9 killed the host while
+        #     ``apply_toggle`` was mid-write to config.json — next
+        #     boot reads the persisted bit fine but the listener
+        #     thread/FGS/WifiLock state is fresh (= empty);
+        #   * ``apply_toggle`` raised on FGS or WifiLock acquisition
+        #     during boot and aborted; persisted=True, listener=down;
+        #   * an inbound socket failure tore the listener down but the
+        #     toggle wasn't flipped (paranoia case).
+        # In all three the symptom is the same: peers fan-out to a
+        # listener that isn't listening, get "Connection refused" in
+        # a loop, and the user has to open the pair flow (which calls
+        # ``_auto_enable_lan`` and force-re-applies) to recover. Doing
+        # the reconcile here heals it without a user gesture. The call
+        # is idempotent — apply_toggle no-ops when state matches.
+        try:
+            from . import lan_listener as _lan_listener
+            _lan_listener.apply_toggle()
+        except Exception as ex:
+            print(f'[scheduler] lan_listener.apply_toggle failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+        # Drain the deferred post-receive-reset queue. Entries land
+        # here when ``_reset_working_tree_after_receive`` hit a
+        # LockTimeout (typically because the local outgoing merge
+        # held the project_lock past 5 s). Each retry goes through
+        # the full reset path; success removes the entry, continued
+        # LockTimeout re-queues. See lan_listener.drain_pending_resets
+        # + the matching absorb in repo._commit_repo_locked. The
+        # call is a fast no-op when the queue is empty.
+        try:
+            _lan_listener.drain_pending_resets()
+        except Exception as ex:
+            print(f'[scheduler] lan_listener.drain_pending_resets '
+                  f'failed: {ex!r}', file=sys.stderr, flush=True)
         if github_eligible or lan_eligible:
             try:
                 _drain_pending_push()

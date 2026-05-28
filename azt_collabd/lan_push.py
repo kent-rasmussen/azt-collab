@@ -33,6 +33,19 @@ from . import lan_discovery as _lan_discovery
 from . import peer_id as _peer_id
 from . import peers as _peers
 from . import status as S
+from .locks import LockTimeout, project_lock
+
+
+# Per-peer consecutive "refused / unreachable" failure counter.
+# Reset on every successful contact (push, no-op confirmation, or
+# share-offer round-trip). After ``_RESTART_DISCOVERY_THRESHOLD``
+# consecutive failures we call ``lan_discovery.restart_browse()``
+# — equivalent to the user manually flipping LAN off+on, which
+# was observed in the field to recover stale NsdManager state.
+# Counter goes back to 0 after restart so we don't restart in a
+# tight loop.
+_consec_failures = {}   # peer_id_hex → int
+_RESTART_DISCOVERY_THRESHOLD = 3
 
 
 def _resolve_endpoint(peer_entry):
@@ -158,6 +171,17 @@ def _push_to_peer(project, peer_entry):
     # "success" line is ambiguous between real delivery and no-op.
     local_head = _local_head_sha(project)
     pre_peer_head = _peek_peer_main(url, pm, pid)
+    # Honest per-peer observation: any time ls-remote returns a
+    # peer's main SHA we record it. Drives the honest
+    # ``lan_unshared`` and ``at_risk`` counts (since 0.47.0; was
+    # the conflated ``unshared_commits`` pre-0.47) — see
+    # ``repo._lan_unshared`` and ``peers.peer_main_shas_for``.
+    if pre_peer_head:
+        try:
+            _peers.set_peer_last_seen_main(
+                pid, project.langcode, pre_peer_head)
+        except Exception:
+            pass
     if pre_peer_head is None:
         # Couldn't ls-remote; proceed with the push attempt anyway.
         # The log below will say "in-sync? unknown" — we still get
@@ -167,17 +191,52 @@ def _push_to_peer(project, peer_entry):
         print(f'[lan-push] {pid[:8]!r} already at '
               f'{local_head[:12]!r} — no-op',
               file=sys.stderr, flush=True)
-        # Even the no-op confirms the peer has this SHA — refresh
-        # the "shared somewhere" record so the LANOK indicator
-        # reflects current reality if the field was previously
-        # missing or stale.
+        # The no-op confirms the peer has our SHA. Both the
+        # legacy project-wide field (back-compat) and the new
+        # per-peer record get the observation.
         try:
             from . import projects as _projects
             _projects.set_last_lan_pushed_sha(
                 project.langcode, local_head)
         except Exception:
             pass
+        _consec_failures.pop(pid, None)  # success: reset counter
         return True
+
+    # Pre-flight fast-forward check (since 0.46.4). dulwich's
+    # smart-protocol receive-pack on the listener side uses
+    # ``set_if_equals(ref, expected_old, new)`` — a stale-write
+    # guard, NOT a fast-forward check. If our ``expected_old``
+    # matches the peer's current main (which it does because we
+    # just read it via ls-remote), dulwich happily ACCEPTS a non-
+    # FF push as a silent force-overwrite. The peer's
+    # ``refs/heads/main`` gets reset to our HEAD; the peer's own
+    # commits stay in the object store but the ref no longer
+    # points at them. Field-observed result: each phone pushed
+    # to the other and each phone's local commits silently fell
+    # off the ref while still being shown locally because HEAD
+    # was decoupled from main on the receive side. Both phones
+    # rendered LANOK on diverged histories (the recorder team's
+    # 2026-05-26 report).
+    #
+    # Defend client-side: if the peer's current main is NOT an
+    # ancestor of our local HEAD, that's a divergence — go
+    # through ``_merge_then_push`` (lift-aware three-way fetch
+    # + merge + push) rather than letting porcelain.push do the
+    # force-overwrite. This is the pre-flight complement to the
+    # 0.45.46 post-flight verify, which detected silent NAKs
+    # (HTTP-level success, protocol-level rejection). The
+    # silent-overwrite case here is the opposite shape: protocol-
+    # level success that we shouldn't have asked for.
+    if pre_peer_head and pre_peer_head != local_head:
+        if not _peer_is_ancestor_of_local(project, pre_peer_head):
+            print(f'[lan-push] {pid[:8]!r}: peer at '
+                  f'{pre_peer_head[:12]!r} is NOT ancestor of '
+                  f'local {local_head[:12]!r} — would be force-'
+                  f'overwrite; routing through merge instead',
+                  file=sys.stderr, flush=True)
+            return _merge_then_push(
+                project, url, pm, pid, host, port)
 
     try:
         porcelain.push(
@@ -211,10 +270,59 @@ def _push_to_peer(project, peer_entry):
                 or 'Errno 111' in msg
                 or 'NewConnectionError' in msg):
             _lan_discovery.invalidate_endpoint(pid)
+            # Distinguish "this device has no network at all"
+            # (errno 101 ENETUNREACH — no default route on any
+            # interface) from "peer specifically unreachable on
+            # this network" (errno 113 EHOSTUNREACH — we have a
+            # network but can't reach this IP) from generic
+            # connection refused (errno 111 ECONNREFUSED — IP
+            # reachable but the listener isn't accepting on the
+            # port we tried; usually means peer process / listener
+            # is down or rebound). The three errnos point at very
+            # different field problems and the previous lumped log
+            # line forced a back-and-forth of "is this phone
+            # online?" before diagnosis could even start.
+            if 'Errno 101' in msg or 'Network is unreachable' in msg:
+                cause = ('this device has no network route '
+                         '(ENETUNREACH) — check WiFi / airplane '
+                         'mode on THIS device')
+            elif ('Errno 113' in msg
+                  or 'No route to host' in msg):
+                cause = (f'no route to {host} on this network '
+                         f'(EHOSTUNREACH) — peer device is likely '
+                         f'offline or on a different network')
+            elif 'Errno 111' in msg or 'Connection refused' in msg:
+                cause = (f'{host}:{port} refused the connection '
+                         f'(ECONNREFUSED) — peer daemon / listener '
+                         f'is down or rebound to a different port')
+            else:
+                cause = 'unspecified connection failure'
             print(f'[lan-push] {pid[:8]!r} at {host}:{port} '
-                  f'refused / unreachable — invalidated mDNS cache '
-                  f'for re-resolve',
+                  f'refused / unreachable: {cause} — invalidated '
+                  f'mDNS cache for re-resolve',
                   file=sys.stderr, flush=True)
+            # Track consecutive failures; after the threshold, do
+            # what manually toggling LAN off+on would do — restart
+            # discovery to clear NsdManager's internal stale-
+            # advertisement state. Just clearing our cache isn't
+            # enough when the peer rebound to a new port and
+            # NsdManager hasn't surfaced an update event for the
+            # rebind. Reset counter after the restart so we don't
+            # restart again on the very next failure.
+            n = _consec_failures.get(pid, 0) + 1
+            _consec_failures[pid] = n
+            if n >= _RESTART_DISCOVERY_THRESHOLD:
+                print(f'[lan-push] {pid[:8]!r}: {n} consecutive '
+                      f'refused — restarting discovery to clear '
+                      f'stale NsdManager state',
+                      file=sys.stderr, flush=True)
+                try:
+                    _lan_discovery.restart_browse()
+                except Exception as restart_ex:
+                    print(f'[lan-push] restart_browse raised: '
+                          f'{restart_ex!r}',
+                          file=sys.stderr, flush=True)
+                _consec_failures[pid] = 0
             return False
         if cls == 'DivergedBranches':
             # Try the lift-aware three-way merge path: fetch peer's
@@ -231,13 +339,43 @@ def _push_to_peer(project, peer_entry):
         print(f'[lan-push] push to {pid[:8]!r} at {host}:{port} '
               f'failed: {ex!r}', file=sys.stderr, flush=True)
         return False
-    # Post-flight: did we actually advance the peer? Compare what
-    # we just pushed (local_head) against what the peer had before.
-    # ``in-sync`` when pre_peer_head was already equal (we already
-    # short-circuit above for that, so this only fires when the
-    # ls-remote pre-check itself was unreachable). ``advanced``
-    # gives the user a clear before/after they can correlate with
-    # their commit history.
+    # Post-flight verify: dulwich's smart-protocol receive-pack
+    # NAKs a non-FF push via the protocol body — porcelain.push
+    # returns WITHOUT raising in that case (HTTP layer succeeded;
+    # only the per-ref update was rejected). Field repro
+    # (2026-05-26): two phones recorded concurrently and ended up
+    # at divergent SHAs; both phones logged ``advanced ...`` per
+    # the absence of an exception, neither actually delivered
+    # anything, and the peers stayed diverged across multiple
+    # drain ticks. The fix: re-ls-remote and compare. If the
+    # peer's main isn't at our local HEAD after the push, treat
+    # it as a silent non-FF and fall through to
+    # ``_merge_then_push`` (lift-aware three-way fetch + merge +
+    # push — same code path the ``DivergedBranches`` exception
+    # already triggers above).
+    if local_head:
+        try:
+            post_peer_head = _peek_peer_main(url, pm, pid)
+        except Exception as ex:
+            post_peer_head = None
+            print(f'[lan-push] post-flight ls-remote raised: '
+                  f'{ex!r}; assuming push landed',
+                  file=sys.stderr, flush=True)
+        if post_peer_head and post_peer_head != local_head:
+            print(f'[lan-push] {pid[:8]!r}: push returned 200 but '
+                  f'peer main still at {post_peer_head[:12]!r} '
+                  f'(expected {local_head[:12]!r}) — silent non-FF '
+                  f'rejection; falling through to merge',
+                  file=sys.stderr, flush=True)
+            return _merge_then_push(
+                project, url, pm, pid, host, port)
+    # Push really did land. Compare what we pushed (local_head)
+    # against what the peer had before. ``in-sync`` when
+    # pre_peer_head was already equal (we already short-circuit
+    # above for that, so this only fires when the ls-remote pre-
+    # check itself was unreachable). ``advanced`` gives the user
+    # a clear before/after they can correlate with their commit
+    # history.
     if pre_peer_head is None:
         print(f'[lan-push] pushed {project.langcode!r} → '
               f'{pid[:8]!r} at {host}:{port} (pre-state unknown)',
@@ -248,9 +386,15 @@ def _push_to_peer(project, peer_entry):
               f'{(local_head or "?")[:12]!r}',
               file=sys.stderr, flush=True)
     # Record the SHA we delivered so ``project_status`` can compute
-    # the "shared somewhere" count (LANOK indicator). We update on
-    # every successful push, not just the "advanced" case, because
-    # a no-op confirms the peer has at least this SHA.
+    # ``lan_unshared`` and ``at_risk`` (the LAN/intersection axes
+    # of the 5-state sync indicator). Two bookkeeping fields:
+    #   - ``last_lan_pushed_sha`` (project-wide): kept for back-
+    #     compat with anything still reading it.
+    #   - per-peer ``last_seen_main`` in peers.json: the post-flight
+    #     verify just confirmed the peer is at local_head, so this
+    #     is a verified observation. ``repo._lan_unshared`` and
+    #     ``repo._at_risk`` (v0.47.0; was ``server._unshared_commit_count``
+    #     in 0.46.x) walk against this.
     if local_head:
         try:
             from . import projects as _projects
@@ -259,6 +403,22 @@ def _push_to_peer(project, peer_entry):
         except Exception as ex:
             print(f'[lan-push] set_last_lan_pushed_sha raised: '
                   f'{ex!r}', file=sys.stderr, flush=True)
+        try:
+            _peers.set_peer_last_seen_main(
+                pid, project.langcode, local_head)
+        except Exception as ex:
+            print(f'[lan-push] set_peer_last_seen_main raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+        # peer_main_shas changed → lan_unshared / at_risk on our side
+        # just dropped (and the peer's project_status also changed,
+        # but that's the peer's daemon to broadcast). Push-notify
+        # observers on this device.
+        try:
+            from .android_cp import notify as _notify
+            _notify.notify_project_changed(project.langcode)
+        except Exception:
+            pass
+    _consec_failures.pop(pid, None)  # success: reset counter
     return True
 
 
@@ -279,13 +439,81 @@ def _local_head_sha(project):
         return ''
 
 
+def _peer_is_ancestor_of_local(project, peer_sha_hex):
+    """Is *peer_sha_hex* an ancestor of our local HEAD?
+
+    Returns True if yes — meaning a normal ``porcelain.push`` to
+    update peer's main to our HEAD is a fast-forward and safe.
+    False otherwise: peer has commits we don't (or histories
+    diverged); the push would be a force-overwrite under dulwich's
+    smart-protocol receive-pack (which uses ``set_if_equals``, a
+    stale-write guard, NOT an FF check) and would silently clobber
+    the peer's local progress. In that case the caller should
+    route to ``_merge_then_push`` (lift-aware three-way merge).
+
+    Walks local HEAD's ancestry looking for the peer's commit.
+    For typical AZT field projects (~hundreds of commits) this is
+    fast even on phones; we cap at 10k commits as a safety net so
+    a pathological history never hangs the drain.
+
+    Returns False on any exception or when the peer's commit
+    isn't in our object store at all.
+    """
+    if not peer_sha_hex:
+        return False
+    try:
+        from dulwich.repo import Repo
+        repo = Repo(project.working_dir)
+        try:
+            peer_sha = peer_sha_hex.encode('ascii')
+            try:
+                local_head = repo.refs[b'HEAD']
+            except KeyError:
+                return False
+            # Object-store membership is a cheap pre-filter — if
+            # peer's commit isn't even in our store, it can't be
+            # an ancestor.
+            if peer_sha not in repo.object_store:
+                return False
+            try:
+                walker = repo.get_walker(include=[local_head])
+                for i, entry in enumerate(walker):
+                    if entry.commit.id == peer_sha:
+                        return True
+                    if i > 10000:
+                        # Safety cap; let merge path take over on
+                        # implausibly-long histories.
+                        return False
+            except Exception:
+                return False
+            return False
+        finally:
+            try:
+                repo.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
 def _peek_peer_main(url, pm, pid):
-    """ls-remote the peer's listener for ``refs/heads/main``.
-    Returns the SHA (hex string) or ``None`` if we couldn't
-    reach the peer / parse the response. Cheap — protocol
-    round-trip only, no packfile transfer. Used by
-    ``_push_to_peer`` to decide whether to actually push or
-    short-circuit as a no-op."""
+    """ls-remote the peer's listener for the peer's current
+    canonical commit. Returns the SHA (hex string) or ``None``
+    if we couldn't reach the peer / parse the response. Cheap —
+    protocol round-trip only, no packfile transfer.
+
+    **Prefers ``HEAD`` over ``refs/heads/main``** (since 0.46.4).
+    Reason: dulwich's smart-protocol receive-pack uses
+    ``set_if_equals`` and ACCEPTS non-FF pushes as silent force-
+    overwrites. After a force-overwrite, the peer's
+    ``refs/heads/main`` reflects what *we* pushed, not what the
+    peer actually has locally. The peer's own latest commits
+    live at their ``HEAD`` (which is detached from main once
+    main has been clobbered). Reading ``HEAD`` first gives us
+    the peer's actual current state — which is what the FF
+    check and merge logic need. Falls back to ``refs/heads/main``
+    when ``HEAD`` is absent (rare; bare-mode or odd setups).
+    """
     try:
         from dulwich.client import HttpGitClient
         from urllib.parse import urlparse
@@ -298,7 +526,7 @@ def _peek_peer_main(url, pm, pid):
         # or a wrapper with ``.refs``. Handle both.
         if hasattr(refs, 'refs'):
             refs = refs.refs
-        main = refs.get(b'refs/heads/main') or refs.get(b'HEAD')
+        main = refs.get(b'HEAD') or refs.get(b'refs/heads/main')
         if isinstance(main, bytes):
             return main.decode('ascii')
         return main
@@ -321,7 +549,31 @@ def _merge_then_push(project, url, pm, pid, host, port):
     the standard ``<azt-lift-conflict>`` annotation and a
     forensic diagnostic dump under
     ``<working_dir>/.azt-collab/diagnostics/``. The merge commit
-    has both parents (our HEAD + peer HEAD), bot author."""
+    has both parents (our HEAD + peer HEAD), bot author.
+
+    Runs entirely under ``project_lock``: fetch writes packs to
+    the local object store, ``_merge_diverged`` mutates the
+    working tree + index + HEAD, and the post-merge push reads
+    the freshly-committed merge SHA. Without the lock, any of
+    these can interleave with a concurrent ``commit_project``,
+    ``atomic_finalize``, or post-receive reset — same hazards
+    the github sync path locks against (see
+    ``_sync_repo_locked`` in repo.py). LAN delivery is
+    opportunistic; a 5 s timeout means we skip this round if the
+    project is busy and the next drain pass retries.
+    """
+    try:
+        with project_lock(project.working_dir, timeout=5.0):
+            return _merge_then_push_locked(
+                project, url, pm, pid, host, port)
+    except LockTimeout:
+        print(f'[lan-merge] {pid[:8]!r}: project busy — deferring '
+              f'merge; next drain pass will retry',
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _merge_then_push_locked(project, url, pm, pid, host, port):
     from dulwich import porcelain
     from dulwich.repo import Repo
     from . import repo as _repo_mod
@@ -333,6 +585,86 @@ def _merge_then_push(project, url, pm, pid, host, port):
               file=sys.stderr, flush=True)
         return False
     try:
+        # Stash-and-reapply pattern for pending working-tree edits.
+        #
+        # ``_merge_diverged`` walks committed trees and overwrites
+        # the working tree with the merged committed state — so an
+        # unstaged edit on this peer would silently get clobbered.
+        # Field-observed symptom: red ``+N`` lingering after a
+        # swipe means the user has edits we haven't committed yet
+        # (porcelain.add occasionally no-ops in edge cases the
+        # field has seen but we haven't fully diagnosed).
+        #
+        # Three-step protection:
+        #   1. Snapshot working-tree bytes for every unstaged-mod
+        #      path BEFORE anything runs.
+        #   2. Try the pre-commit. If it succeeds (COMMITTED_LOCAL)
+        #      or there's nothing to commit (NOTHING_TO_COMMIT),
+        #      drop the snapshot — the edits are either captured
+        #      as a real commit (one of the merge's parents) or
+        #      didn't exist.
+        #   3. If the pre-commit failed (or raised), keep the
+        #      snapshot. After ``_merge_diverged`` writes the merge
+        #      result, ``reapply_snapshot_after_merge`` writes the
+        #      snapshot back — lift-aware for ``.lift`` paths
+        #      (lift_merge three-way), keep-ours for other paths.
+        snapshot = _repo_mod.snapshot_unstaged_paths(
+            repo, project.working_dir)
+        pre_merge_head_sha = None
+        try:
+            pre_merge_head_sha = repo.refs[b'HEAD']
+        except Exception:
+            pass
+        try:
+            from . import store as _store_mod
+            contributor = _store_mod.get_contributor() or 'AZT'
+            pre_result = _repo_mod.Result()
+            _repo_mod._commit_step_locked(
+                repo, project.working_dir, contributor, pre_result)
+            if pre_result.has(_repo_mod.S.COMMITTED_LOCAL):
+                # Edits are now in a real commit; the merge will
+                # include them as a parent. Snapshot no longer
+                # needed.
+                snapshot = {}
+                try:
+                    new_head = repo.refs[b'HEAD']
+                    print(f'[lan-merge] {pid[:8]!r}: auto-committed '
+                          f'pending working-tree edits before merge '
+                          f'→ {new_head[:12].decode()}',
+                          file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+            elif pre_result.has(_repo_mod.S.NOTHING_TO_COMMIT):
+                # Clean working tree. Snapshot would be empty
+                # anyway, but be explicit.
+                snapshot = {}
+            else:
+                # COMMIT_FAILED, COMMIT_REPEATEDLY_FAILED, or
+                # similar. Snapshot stays held for post-merge
+                # reapply. Don't lose user data even when the
+                # committer is mis-behaving.
+                if snapshot:
+                    print(f'[lan-merge] {pid[:8]!r}: pre-merge '
+                          f'commit returned '
+                          f'codes={pre_result.codes()!r}; will '
+                          f'reapply {len(snapshot)} working-tree '
+                          f'path(s) after merge',
+                          file=sys.stderr, flush=True)
+        except Exception as ex:
+            # Pre-commit raised. Keep snapshot for post-merge
+            # reapply.
+            if snapshot:
+                print(f'[lan-merge] {pid[:8]!r}: pre-merge commit '
+                      f'raised {ex!r}; will reapply '
+                      f'{len(snapshot)} working-tree path(s) '
+                      f'after merge',
+                      file=sys.stderr, flush=True)
+            else:
+                print(f'[lan-merge] {pid[:8]!r}: pre-merge commit '
+                      f'raised {ex!r}; no working-tree edits to '
+                      f'preserve, proceeding',
+                      file=sys.stderr, flush=True)
+
         # The bundled dulwich's ``porcelain.fetch`` doesn't accept
         # ``pool_manager=`` even though ``porcelain.push`` does.
         # Go one level lower: build an ``HttpGitClient`` directly
@@ -353,11 +685,15 @@ def _merge_then_push(project, url, pm, pid, host, port):
                   f'{ex!r}', file=sys.stderr, flush=True)
             return False
 
-        # Resolve peer's main-branch tip. dulwich returns refs
-        # via the FetchPackResult's ``refs`` attr.
+        # Resolve peer's canonical current commit. dulwich
+        # returns refs via the FetchPackResult's ``refs`` attr.
+        # Prefer ``HEAD`` over ``refs/heads/main`` for the same
+        # reason ``_peek_peer_main`` does (since 0.46.4): a peer
+        # whose main was force-overwritten still has its real
+        # state at HEAD.
         peer_refs = getattr(fetch_result, 'refs', None) or {}
-        peer_head = peer_refs.get(b'refs/heads/main') \
-            or peer_refs.get(b'HEAD')
+        peer_head = peer_refs.get(b'HEAD') \
+            or peer_refs.get(b'refs/heads/main')
         if peer_head is None:
             print(f'[lan-merge] {pid[:8]!r}: no main / HEAD ref in '
                   f'fetch result; refs={list(peer_refs.keys())!r}',
@@ -407,6 +743,57 @@ def _merge_then_push(project, url, pm, pid, host, port):
         print(f'[lan-merge] merged → {merged_sha[:12]!r} '
               f'(conflicts={len(conflicts)})',
               file=sys.stderr, flush=True)
+
+        # Snapshot reapply path: pre-commit failed (or raised),
+        # so the snapshot still holds the user's unstaged edits.
+        # ``_merge_diverged`` just overwrote them; restore now
+        # with lift-aware merging so the user's work survives.
+        # After the reapply, attempt a second commit so the
+        # reapplied content lands on top of the merge commit and
+        # is what we push to the peer.
+        if snapshot:
+            try:
+                applied, conflicts_n = (
+                    _repo_mod.reapply_snapshot_after_merge(
+                        repo, project.working_dir, snapshot,
+                        pre_merge_head_sha))
+                if applied:
+                    print(f'[lan-merge] {pid[:8]!r}: reapplied '
+                          f'{applied} working-tree path(s) after '
+                          f'merge (conflicts={conflicts_n})',
+                          file=sys.stderr, flush=True)
+                # Second commit pass — bundles the reapplied
+                # working-tree edits on top of the merge commit.
+                # If this ALSO fails to commit, the snapshot is
+                # at least on disk in working_tree; the next
+                # drain's commit_project will retry. User data
+                # is preserved either way.
+                post_result = _repo_mod.Result()
+                _repo_mod._commit_step_locked(
+                    repo, project.working_dir, contributor,
+                    post_result)
+                if post_result.has(_repo_mod.S.COMMITTED_LOCAL):
+                    try:
+                        new_head = repo.refs[b'HEAD']
+                        print(f'[lan-merge] {pid[:8]!r}: '
+                              f'reapplied snapshot committed on '
+                              f'top of merge → '
+                              f'{new_head[:12].decode()}',
+                              file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
+                else:
+                    print(f'[lan-merge] {pid[:8]!r}: post-merge '
+                          f'commit returned '
+                          f'codes={post_result.codes()!r}; '
+                          f'snapshot stays in working tree, next '
+                          f'drain retries',
+                          file=sys.stderr, flush=True)
+            except Exception as ex:
+                print(f'[lan-merge] {pid[:8]!r}: snapshot reapply '
+                      f'raised {ex!r}; user edits may be in '
+                      f'working tree, not in HEAD',
+                      file=sys.stderr, flush=True)
     finally:
         try:
             repo.close()
@@ -644,6 +1031,52 @@ def fan_out(project):
           f'paired={len(all_peers)} '
           f'sharing_this={len(candidates)}',
           file=sys.stderr, flush=True)
+    # 0.46.7 diagnostic surface (renamed in 0.47.0): fire
+    # ``_wan_unshared`` once per drain so the ``[wan-unshared]``
+    # trace is visible regardless of whether a peer app is
+    # foregrounded and polling status. Picker / recorder normally
+    # drive ``_h_project_status`` (which calls the three walker
+    # helpers), but on devices where the server APK is the only
+    # thing open (e.g., right after a Restart server tap), no peer
+    # polls, so the diagnostic never fired. Rate-limit (output-
+    # change-only) still applies — steady-state drains emit nothing.
+    try:
+        from dulwich.repo import Repo
+        from . import repo as _repo_mod
+        try:
+            _diag_repo = Repo(project.working_dir)
+        except Exception:
+            _diag_repo = None
+        if _diag_repo is not None:
+            # Use the project's actual HEAD branch — not a hardcoded
+            # 'main'. A project that ended up on ``refs/heads/master``
+            # (LAN clone from a peer whose source git config defaulted
+            # to master, or any user-renamed branch) was emitting a
+            # ``[count-ahead]`` line for the orphan ``refs/heads/main``
+            # ref while ``_h_project_status`` reported the master
+            # walk — two unrelated numbers in the log per drain tick
+            # for the same project. Pre-fix value 'main' was the
+            # assumption from the 0.46.7 diagnostic patch; revisit if
+            # LAN-cloned projects ever standardize on a single branch.
+            try:
+                head_ref = _diag_repo.refs.read_ref(b'HEAD')
+                if head_ref and head_ref.startswith(b'refs/heads/'):
+                    branch = head_ref[len(b'refs/heads/'):].decode(
+                        'utf-8', 'replace')
+                else:
+                    branch = 'main'
+            except Exception:
+                branch = 'main'
+            try:
+                _repo_mod._wan_unshared(_diag_repo, branch)
+            except Exception:
+                pass
+            try:
+                _diag_repo.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
     out = {}
     for entry in candidates:
         out[entry['peer_id']] = _push_to_peer(project, entry)

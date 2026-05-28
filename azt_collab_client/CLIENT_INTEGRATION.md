@@ -1411,7 +1411,7 @@ behaviours drift.
 > on this path is now incorrect — ``commit_project`` never
 > emits ``PUSHED``. Peers MUST migrate their post-commit logic
 > off "did we push?" and onto the daemon's drain state via
-> ``project_status.commits_ahead`` / ``project_status.work_offline``.
+> ``project_status.wan_unshared`` / ``project_status.work_offline``.
 
 > **For the rationale** (what each code *means*, why
 > auto-sync must be silent, the pre-0.34.1 anti-pattern this
@@ -1453,6 +1453,11 @@ the sync settings screen anchored on the work-offline toggle
 | ``S.JOB_INTERRUPTED`` | Retry once silently; if still failing, log and move on. | Retry; surface a transient-error toast if retry also fails. |
 | ``S.INSUFFICIENT_MEMORY_FOR_MERGE`` | **Silent.** Daemon refused the merge because device free memory was below ``sync.min_free_mem_mb_for_merge`` (default 200 MB). Next drain cycle re-checks and proceeds when memory recovers — nothing the user can do mid-recording, and toasting "not enough memory" while they're working is just noise. Params: ``mem_available_mb`` (int), ``min_required_mb`` (int). 0.44.4+. | Translated toast naming the numeric headroom — the user explicitly asked, so they get the "close other apps, I'll retry" message. Translation already covers the wording. DO NOT route to settings — no per-project knob fixes RAM pressure. |
 | ``S.SERVER_UNAVAILABLE`` / ``S.SERVER_ERROR`` | **Silent.** Log; daemon will be reachable next time. | Transient-error toast. DO NOT route to settings — no user-fixable config here. |
+| ``S.DNS_RESOLUTION_FAILED`` | **Silent.** Network class — same envelope as ``SERVER_UNAVAILABLE``; daemon will resolve next time when DNS is back. (0.44.6+.) | Transient-error toast. DO NOT route to settings. |
+| ``S.SYNC_GIVING_UP_TRANSIENT`` | **Silent.** Daemon exhausted its in-process retries for now; the scheduler will pick it back up. (0.44.6+.) | Transient-error toast. |
+| ``S.TOPIC_BRANCH_CONFLICT`` | **Silent.** Topic-branch path collided with concurrent state; next drain retries. (0.44.9+.) | Transient-error toast naming the topic-branch dance; no user action. |
+| ``S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` | **Silent.** Daemon gave up after the per-attempt budget kept tripping. User can't act mid-flight; next drain re-tries on a different network. (0.44.12+.) | Surface the translated toast (carries reason=oversize/exhausted and a hint about retrying on a different network). |
+| ``S.LARGE_AUDIO_FILE_DETECTED`` | **SURFACE (informational).** Daemon flagged a >threshold audio file during commit. Render a banner: "A multi-MB file was committed — was a phrase recorded by mistake?" Doesn't block the commit; purely an audit nudge. Params: ``path``, ``size``, ``threshold``. (0.44.12+.) | Same as auto. |
 | ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
 | ``S.DATA_LOSS_RISK`` | **SURFACE (not silenced).** This is a data-loss-class signal — files written by a peer aren't reaching git. The auto/user distinction does NOT apply: ALWAYS render the translated toast / banner with the maintainer-contact wording. Params: ``count`` (int), ``sample`` (up to 5 paths). | Same surface as auto-sync. |
 | ``S.COMMIT_REPEATEDLY_FAILED`` | **SURFACE (not silenced).** Two-or-more successive ``COMMIT_FAILED`` for this project. Same data-loss-class severity as ``DATA_LOSS_RISK``: recordings are accumulating on the device but not entering git history. The catchup-commit pattern (one fat commit landing N stranded recordings after a long failure streak) is exactly what this catches — each prior failed attempt bumps the counter, and a second-or-later failure surfaces the loud status so the user is told to investigate before more files pile up uncommitted. Params: ``count`` (int, running streak), ``error`` (str, last dulwich message). Counter clears on the next successful commit. (The daemon also retries stuck commits in the background with exponential backoff, so the running ``count`` and the ``COMMIT_REPEATEDLY_FAILED`` your peer sees on the next sync attempt may reflect failures the peer never directly triggered. Peers don't need to do anything different — the existing result-iteration handles it.) | Same surface as auto-sync. |
@@ -1604,7 +1609,7 @@ from azt_collab_client import (
   ``NO_REPO``. **Never carries ``PUSHED``** — push happens on
   the daemon's drain loop. Pre-0.43 peer code that polls for
   ``PUSHED`` after ``request_sync`` will sit waiting forever;
-  migrate that logic onto ``project_status.commits_ahead``.
+  migrate that logic onto ``project_status.wan_unshared``.
 - ``sync_project(langcode)`` — the user-gestured "push pending
   commits now" RPC, bound to the Sync button. Does commit +
   push under one project lock. Returns ``Result``
@@ -1619,7 +1624,7 @@ The scheduler's connectivity watcher tracks
 60 s) AND ``sync.work_offline`` is off, projects with
 ``pending_push`` get pushed. Peers don't poll this — the
 ``project_status`` response carries the state peers need
-(``commits_ahead``, ``work_offline``).
+(``wan_unshared``, ``lan_unshared``, ``at_risk``, ``work_offline``).
 
 ### Work-offline toggle
 
@@ -1636,79 +1641,347 @@ settings UI) fires an immediate push-drain pass so the user
 doesn't wait a full ``connectivity_poll_s`` tick.
 
 ```python
-# Render the badge from project_status without a second RPC.
-# Since 0.45.0 the indicator encodes two orthogonal axes:
+# v0.47.0 RENDERING MODEL — please read this whole comment block
+# before changing anything; the rules are interrelated.
 #
-#   - commits_ahead vs github (existing axis since 0.43)
-#   - unshared_commits vs ANY remote (github OR any LAN peer)
+# project_status carries five ProjectStatus fields that drive
+# the sync indicator. Three are independent count axes (each
+# is its own walk over the local commit graph); two are the
+# settings toggles that gate auto-resolution.
 #
-# unshared_commits=0 + commits_ahead>0 means "5 ahead of github
-# but all 5 exist on at least one paired phone" → render as
-# ``LANOK +5``: the user can't lose data even if this phone dies.
+#   1. wan_unshared  — commits not on github (the "remote
+#                       tracking ref" channel). Special case:
+#                       LAN-only projects with no origin URL
+#                       walk from HEAD, so wan_unshared equals
+#                       the whole history. Intentional friction
+#                       signal for "no github backup."
+#   2. lan_unshared  — commits not on any paired-and-sharing
+#                       peer's last_seen_main. Returns 0 when
+#                       no peers are paired (nothing to be
+#                       behind on).
+#   3. at_risk        — commits on neither channel (intersection
+#                       of wan_unshared and lan_unshared as
+#                       commit sets). Zero except in state E.
+#   4. n_changes      — uncommitted working-tree changes.
+#                       Drives the always-red R(+n) badge.
+#   5. work_offline   — daemon-wide toggle. When on, scheduler
+#                       drain does not push to github.
+#   6. lan_allow_sync — daemon-wide toggle. When on, LAN
+#                       listener / fan-out is armed.
 #
-# unshared_commits>0 means at least one local commit lives nowhere
-# else → render as ``+{unshared}/{ahead}``: data-loss-risk that
-# count of commits are wholly local. The slash is the read: 1 of 5.
+# Five sync-status labels fall out of the three count axes:
 #
-# work_offline + lan_allow_sync combos still affect the suffix:
+#   wan=0, lan=0                          → "OK"
+#   wan>0, lan=0                          → "WAN-{wan}"
+#   wan=0, lan>0                          → "LAN-{lan}"
+#   wan>0, lan>0, at_risk=0  (rare)       → "WAN-{wan}_LAN-{lan}"
+#                                           (split-brain — different
+#                                            commits on each channel
+#                                            with no overlap; requires
+#                                            divergent history)
+#   wan>0, lan>0, at_risk>0  (routine)    → "WAN-{wan} LAN-{lan}"
+#                                           (both behind on the same
+#                                            commits, normal transient
+#                                            state right after a fresh
+#                                            commit; underscore vs
+#                                            space distinguishes from
+#                                            the rare split-brain case)
 #
-#   work_offline=off, lan=off  → no suffix (github-mediated)
-#   work_offline=off, lan=on   → no suffix (github + LAN both push)
-#   work_offline=on,  lan=off  → "offline"
-#   work_offline=on,  lan=on   → "LAN-only"
+# Frequency in normal workflow: OK > WAN-N / LAN-N > WAN+LAN both
+# behind > split-brain. State E (both-behind-routine) is the
+# transient that drops to LAN-N or WAN-N as one channel catches
+# up. See [[sync-status-state-frequencies]].
+#
+# RED COLOUR RULE — "settings allow this to be stored, but it
+# isn't stored yet." Transient red = normal automation; persistent
+# red = something's broken; black = "settings preclude this
+# resolution; you accepted it by design (phone in the forest)."
+#
+#   WAN-{wan}    red iff work_offline is OFF
+#   LAN-{lan}    red iff lan_allow_sync is ON
+#   R(+n)        always red (auto-commit always runs)
+#
+# Each part of the WAN-x_LAN-y / WAN-x LAN-y compound labels gets
+# its own red treatment per the rule above. The separator
+# (underscore or space) stays black.
+#
+# SUFFIX TABLE — only "· offline" actually surfaces; the other
+# two toggle states are implied (the user can see them elsewhere
+# in the UI; no need to call them out alongside every sync
+# status).
+#
+#   work_offline=off, lan=off → no suffix (default state)
+#   work_offline=off, lan=on  → no suffix ("· LAN" is implied)
+#   work_offline=on,  lan=off → " · offline"
+#   work_offline=on,  lan=on  → no suffix ("· LAN-only" is implied)
+#
+# OK · LAN BAN — the only label/suffix combo that's explicitly
+# disallowed: an "OK" label with "· LAN" suffix is collapsed
+# to bare "OK". The label asserts a clean-state claim and "·
+# LAN" is a mode tag; composing them reads ambiguously. Only
+# applies to bare "OK" — "LANOK · LAN-only" etc. are fine.
 ps = project_status(langcode)
+wan = ps.wan_unshared
+lan = ps.lan_unshared
+ar  = ps.at_risk
+n   = ps.n_changes
+wo  = ps.work_offline
+lt  = ps.lan_allow_sync
 
-if ps.work_offline and ps.lan_allow_sync:
-    mode_suffix = " · LAN-only"
-elif ps.work_offline:
-    mode_suffix = " · offline"
-else:
-    mode_suffix = ""
+# Per-channel red rule.
+def red(text):  return mark_red(text)        # peer-specific colouring
+def plain(text):return text
 
-if ps.commits_ahead == 0:
-    sync_indicator.text = ""  # all up to date with github
-elif ps.unshared_commits == 0:
-    # Every local commit is on github OR a paired phone.
-    sync_indicator.text = f"LANOK +{ps.commits_ahead}{mode_suffix}"
+wan_part = red(f"WAN-{wan}") if not wo else plain(f"WAN-{wan}")
+lan_part = red(f"LAN-{lan}") if lt        else plain(f"LAN-{lan}")
+
+# State label.
+if wan == 0 and lan == 0:
+    label = "OK"
+elif wan == 0:
+    label = lan_part
+elif lan == 0:
+    label = wan_part
+elif ar == 0:
+    # State D (rare): split-brain — underscore separator.
+    label = wan_part + "_" + lan_part
 else:
-    # ``+unshared/ahead`` — N commits live nowhere else.
-    sync_indicator.text = (
-        f"+{ps.unshared_commits}/{ps.commits_ahead}{mode_suffix}")
+    # State E (routine): both behind on the same commits — space.
+    label = wan_part + " " + lan_part
+
+# Uncommitted-changes badge — literal text is just ``+N``, drawn
+# in red as a separate visual element next to the label. (Earlier
+# design notes used the shorthand ``R(+N)`` to denote "the red
+# uncommitted badge with value N" — that's notation, not output.
+# Peers render ``+1`` / ``+3`` etc., not the literal string "R(+1)".)
+badge = red(f"+{n}") if n > 0 else ""
+
+# Suffix (only · offline surfaces; · LAN / · LAN-only are implied).
+suffix = " · offline" if (wo and not lt) else ""
+
+# OK · LAN ban (no longer reachable since · LAN is implied to "",
+# but kept as documentation): bare "OK" never composes with a
+# "· LAN" suffix.
+if label == "OK" and suffix == " · LAN":
+    suffix = ""
+
+sync_status.text = (label + (" " + badge if badge else "") +
+                    suffix).strip()
 ```
 
-### Badge refresh obligation — peer MUST re-poll after every sync gesture
+The compound labels (`WAN-x_LAN-y`, `WAN-x LAN-y`) are best
+rendered with adjacent inline elements so the per-part red rule
+can colour `WAN-x` and `LAN-y` independently. Most Kivy/Toolkit
+peers do this with two `Label` widgets in a `BoxLayout` (or one
+`Label` with `markup=True` colour tags); the recipe above is
+illustrative pseudocode, not a single-widget literal.
+
+### Background refresh obligation — peer MUST re-poll AND re-read content on HEAD advance
 
 The daemon has no channel to push state changes into a running
 peer; ``project_status`` is the only surface, and it's pull-only.
-That means every gesture that mutates ``commits_ahead`` /
-``work_offline`` on the daemon side leaves the peer's last-
-seen ``ProjectStatus`` snapshot stale until the peer re-fetches.
-Peers MUST re-call ``project_status(langcode)`` and re-bind the
-badge:
+That covers two distinct things peers must keep in sync:
+
+- **Badge state** — ``wan_unshared`` / ``lan_unshared`` /
+  ``at_risk`` / ``work_offline`` etc. (see § 17b rendering
+  recipe). Drives the sync-status indicator.
+- **Content state** — the LIFT (and audio / image) bytes
+  rendered in the peer's UI. Changes when the daemon's HEAD
+  advances: local commit, **incoming LAN receive-pack from a
+  paired peer**, post-receive merge commit, scheduler-driven
+  github pull (future ``MERGED_REMOTE``).
+
+Peers MUST re-call ``project_status(langcode)`` and act on
+**both** dimensions:
 
 1. **In the result handler of every sync gesture.** Whether
    the gesture was the user-pressed Sync button
    (``sync_project``), a debounced background commit
    (``commit_project`` + ``poll_job``), or a peer-side
    work-offline toggle (``set_work_offline``). Don't read the
-   gesture's own ``Result`` for the new ``commits_ahead`` —
+   gesture's own ``Result`` for the new ``wan_unshared`` —
    ``Result`` carries status codes, not state. Always re-poll
    ``project_status``.
 2. **On a low-rate background tick.** Daemon-driven push
    happens on the scheduler's drain loop without a peer
-   gesture; without a background poll the badge would stay at
-   the last-gesture-time value indefinitely. 5-15 s is the
-   right range — fast enough that the user sees the
-   ``commits_ahead`` drop after a background push, slow enough
-   that the RPC cost stays trivial.
+   gesture; LAN-incoming receive-packs from a paired peer
+   land entirely outside the peer's loop. Without a background
+   poll the badge would stay at the last-gesture-time value
+   indefinitely AND the LIFT view would stay frozen at the
+   pre-receive content. 5-15 s is the right range — fast enough
+   that the user sees the badge drop after a background push
+   AND sees a paired peer's recording within ~10 s, slow
+   enough that the RPC cost stays trivial.
 3. **On ``on_resume`` / activity-foreground.** Same hook used
    for project-switch reconciliation (§ 14a). The daemon may
-   have drained while the peer was backgrounded.
+   have drained — or absorbed a peer's LAN push — while the
+   peer was backgrounded.
 
-Field symptom this section closes (2026-05-18): UI badge
-sticky at ``(+160)`` while daemon log showed successive
-``[sync-rpc] 'baf' done: codes=['NOTHING_TO_COMMIT', 'PUSHED']``
-— daemon was at zero commits_ahead, peer never re-polled.
+#### The signal — ``ProjectStatus.head_sha``
+
+Track the daemon's current HEAD across polls. Since 0.45.45,
+``project_status`` carries ``head_sha`` — the SHA hex of
+``refs/HEAD`` on the daemon side. It bumps on every event that
+moves HEAD: local commits the peer initiated, local commits
+the daemon's scheduler ran (stuck-commit retry), and (the case
+this section exists for) **incoming receive-pack from a paired
+peer over LAN**.
+
+The recipe:
+
+```python
+def _on_status_poll(self, ps):
+    # Badge dimension: redraw regardless. Cheap.
+    self._refresh_sync_indicator(ps)
+    self._refresh_uncommitted_badge(ps)
+    # Content dimension: only fire the expensive in-place
+    # reload when HEAD actually moved underneath us. First
+    # poll establishes the baseline; subsequent polls compare.
+    last = getattr(self, '_last_head_sha', None)
+    if ps.head_sha and ps.head_sha != last:
+        if last is not None:
+            # Not the first poll — HEAD really did advance.
+            # Re-read the LIFT and re-render with the user's
+            # anchor preserved per § 14.
+            self._refresh_in_place()
+        self._last_head_sha = ps.head_sha
+```
+
+Empty ``head_sha`` (legacy daemon or pre-first-commit project)
+disables the content-reload branch — peers fall back to the
+pre-0.45.45 behaviour of "only refresh on user-initiated sync"
+without losing badge correctness.
+
+The peer's ``_refresh_in_place`` implementation lives in
+§ 14 (the LIFT-aware "anchor stays, content under it
+refreshes" recipe).
+
+#### Polling cadence and content-reload cost
+
+The background poll is light (in-memory dict lookups +
+HEAD-SHA read on the daemon side). The content reload is
+heavier — re-parse the LIFT, rebuild any derived indices, re-
+render the current view. That's why the recipe gates the
+reload on ``head_sha`` change rather than firing every tick.
+
+If your peer has a slow LIFT parse (large project), consider:
+- Cache the last-rendered HEAD locally per loaded view so a
+  back-tap doesn't re-parse needlessly.
+- Don't reload the LIFT model on tick if the user's currently
+  recording an entry. Stash the new ``head_sha`` as
+  ``_pending_head_sha`` and apply on next idle / save
+  boundary. The merge-on-receive (since 0.45.44) means the
+  daemon already preserved your in-flight edit, so deferring
+  the reload is just polish-pass UX.
+
+#### Push notifications — ContentObserver subscription (v0.47.0+)
+
+The "no addressable channel into a peer's UI thread" rationale
+above held through 0.46.x. **v0.47.0 adds one** via Android's
+standard ``ContentResolver.notifyChange`` /
+``registerContentObserver`` pair, scoped to the existing
+``AZTCollabProvider`` authority. Peers can now subscribe to
+per-project status URIs and get sub-second wakeups instead of
+waiting for the next polling tick.
+
+The polling cadence drops correspondingly:
+
+- **Subscribed peer (Android, has the suite-signature permission)**:
+  Background tick at 60-120 s (sanity backstop for missed
+  notifications, observer churn, etc.). Otherwise, re-poll
+  on every observer fire + on ``on_resume``. ~10× less RPC
+  traffic than the polling-only model.
+- **Non-Android peer (desktop / loopback / unsigned)**:
+  Subscription API returns ``None`` → peer falls back to the
+  5-15 s polling tick described above. The subscribe / unsubscribe
+  calls are silent no-ops; peer code is the same shape either
+  way.
+
+**API**:
+
+```python
+from azt_collab_client import (
+    subscribe_project_changes, subscribe_global_changes, unsubscribe,
+)
+
+# Subscribe to one project (active in the recorder, viewer, etc.)
+def _on_status_change(uri):
+    # Don't fetch state here directly — debounce + dispatch to
+    # the UI thread. Multiple rapid wakeups during a sync cascade
+    # collapse to one re-poll.
+    Clock.schedule_once(lambda dt: self._refresh_badge(), 0)
+
+self._sub_token = subscribe_project_changes(langcode, _on_status_change)
+# self._sub_token is None on non-Android or if registration failed —
+# the peer's polling fallback handles that case.
+
+# Tear down (on project switch, on_pause, app exit):
+unsubscribe(self._sub_token)
+self._sub_token = None
+```
+
+**For project-list / picker UIs** that render multiple projects,
+use ``subscribe_global_changes`` instead — one subscription on
+the parent URI catches per-project notifications across every
+project (Android's ``notifyForDescendants=True`` semantics):
+
+```python
+self._global_token = subscribe_global_changes(_on_any_change)
+```
+
+**Daemon-side firing**: ``notify_project_changed`` is called by
+the daemon at every state-change site:
+
+- After successful local commit (HEAD advance)
+- After successful incoming receive-pack + working-tree reset
+- After successful LAN push + peer-observation record update
+- After commit-time post-receive absorb
+- For toggle flips (``work_offline``, ``lan_allow_sync``) — fires
+  the global URI, which descendants-mode observers also receive
+
+The observer callback fires on the binder thread that delivered
+the notification (no Handler passed to ``ContentObserver``).
+Peers needing UI-thread access (Kivy widget mutation, etc.)
+should marshal in the callback — ``Clock.schedule_once`` on
+Kivy is the standard idiom.
+
+**Lifetime + threading**: pyjnius proxies must survive Python
+GC between events; the client library holds them strong-ref'd
+in module state, keyed by the token. Pass that token to
+``unsubscribe`` to release. Failing to unsubscribe leaks the
+observer for the lifetime of the Python process — not catastrophic
+(observers are cheap) but undisciplined. The token is opaque to
+the peer; treat it as a handle.
+
+#### Why peer-side polling is still the floor
+
+Even with notifications wired, polling remains the contract
+floor for three reasons:
+
+- Non-Android peers / desktop transport have no ContentProvider.
+- Observer wakeups can be missed (process killed and re-spawned,
+  registration churn, binder thread saturation).
+- ``on_resume`` always re-polls once — the process may have
+  been backgrounded long enough that wakeups landed and went
+  un-handled if the peer didn't subscribe before pausing.
+
+So the recipe is "subscribe when foregrounded, poll as a
+heartbeat, re-poll on every wakeup and on resume."
+
+#### Field symptoms this section closes
+
+- 2026-05-18: UI badge sticky at ``(+160)`` while daemon log
+  showed ``[sync-rpc] 'baf' done: codes=['NOTHING_TO_COMMIT',
+  'PUSHED']`` — daemon was at zero wan_unshared, peer never
+  re-polled.
+- 2026-05-26: two phones LAN-paired and sharing one project,
+  phone A's recording landed on phone B's working tree via
+  ``[lan-push] advanced ... → ...`` but phone B's recorder
+  kept rendering the pre-receive LIFT until the user manually
+  re-entered the project. Closed by the ``head_sha`` signal
+  here AND the merge-on-receive in 0.45.44 (which makes the
+  working tree actually reflect the merge result rather than
+  the deferred-reset stale state).
 
 ### Migration checklist (from pre-0.43 peer)
 
@@ -1718,7 +1991,7 @@ sticky at ``(+160)`` while daemon log showed successive
 2. Strip any post-RPC code that polls for ``PUSHED`` /
    ``COMMITTED_AND_PUSHED`` on the ``request_sync`` result.
    Replace with periodic ``project_status`` reads of
-   ``commits_ahead``.
+   ``wan_unshared`` / ``lan_unshared`` / ``at_risk``.
 3. Add ``S.WORK_OFFLINE_ENABLED`` to the user-initiated sync
    routing table — toast + route to ``open_server_ui()``.
 4. Render the work-offline badge from
@@ -1793,7 +2066,7 @@ absorb a peer that fires N parallel RPCs per gesture. When a
 peer skips the obligations below, the **daemon stays fine** but
 the **peer pays in user-visible noise**: stacks of toasts for
 ``S.BUSY``, redundant ``project_status`` polls that move the
-badge nowhere, and (worst) flapping ``commits_ahead`` numbers
+badge nowhere, and (worst) flapping ``wan_unshared`` numbers
 because two in-flight syncs see different snapshots of the
 project tree.
 
@@ -1898,7 +2171,7 @@ DO NOT:
 
 Wire sync / commit gestures to **user-events** (edit saved,
 button pressed, screen left) — never to **state observations**
-(``commits_ahead > 0`` watcher firing a sync). State-based
+(``wan_unshared > 0`` watcher firing a sync). State-based
 triggers create feedback loops where the daemon's own state
 update kicks off the next round of RPCs.
 
@@ -1926,6 +2199,41 @@ If a "smart" peer-side feature you're considering overlaps
 with any of the above, default to NOT adding it. The daemon
 is the single source of truth; peer cleverness that duplicates
 its work loses every disagreement.
+
+## 17d. Routing on LAN-sync status codes
+
+The LAN sync surface (0.45.0+) returns ``Result``s carrying
+LAN-specific status codes from ``lan_clone`` /
+``lan_pair_accept`` / ``lan_pending`` / the settings-side
+share gestures. Routing rules:
+
+| Status code | When emitted | Peer response |
+|---|---|---|
+| ``S.LAN_PAIRED`` | ``lan_pair_accept`` succeeded. | Toast / log; show updated paired-devices list. |
+| ``S.LAN_UNPAIRED`` | ``lan_unpair`` succeeded. | Same. |
+| ``S.LAN_PEER_UNREACHABLE`` | ``lan_clone`` / fan-out couldn't resolve an endpoint or the connection failed at TLS / TCP. Params: ``peer_id``, optional ``detail``. | Translated toast ("Couldn't reach <device> over local network — make sure they're both on the same Wi-Fi"). |
+| ``S.LAN_FP_MISMATCH`` | A paired peer's TLS-cert fingerprint differs from the value recorded in ``peers.json`` — possible MITM or device re-pair. Currently logged daemon-side; emitted as a typed Result code in a future tightening pass (CHANGELOG 0.45.0 § Known gaps). | When peers see it surface in a ``Result``: surface a SECURITY-FLAVOURED toast — "<device>'s identity changed; re-pair to confirm." Do NOT silently auto-rotate the stored fingerprint. |
+| ``S.LAN_TOGGLE_OFF`` | The user invoked a LAN op (``lan_clone``, ``send_share_offer``, …) with the daemon-wide LAN toggle off. (0.45.39+.) | Toast "Turn LAN sync on first" + ``open_server_ui()`` so the user lands on the toggle. |
+| ``S.LAN_PROJECT_CLONED`` | ``lan_clone`` performed a fresh clone from a peer. Params: ``langcode``, ``peer_id``, ``device_name``. | Translate to status line; pickup follows — the daemon stamps ``last_project`` so the peer's next picker resume lands in the new project. |
+| ``S.LAN_PROJECT_REOPENED`` | ``lan_clone`` found a related local copy already; bookkeeping recorded the LAN pair without re-cloning. | Translate to status line. |
+| ``S.LAN_PROJECT_COLLISION_UNRELATED`` | Local project with this langcode exists but shares no commits with the peer's — refuse rather than overwrite. Params: ``langcode``. | Surface translated toast naming the langcode + "rename or remove first" instruction. |
+| ``S.LAN_ADOPT_ORIGIN_NEEDED`` | A LAN-clone delivered a project whose ``origin`` is unset; the peer's QR included a ``remote_url`` we'd like to adopt. Stashed as a pending decision (kind=``adopt_origin``). | Open ``adopt_origin_popup`` (``azt_collab_client.ui.lan_popups``) to confirm; or wait for the user to discover it via the "Decisions waiting (N)" surface. |
+| ``S.LAN_REMOTE_CONFLICT`` | Local project has one ``origin``, the peer is offering a different one. Stashed as a pending decision (kind=``remote_conflict``). | Open ``adopt_origin_popup`` with three options (use theirs / keep mine / dual-publish). |
+| ``S.LAN_PROJECT_ADOPTED_REMOTE`` | The user accepted an adopt-origin decision; ``origin`` was set. | Translate to status line; refresh ``project_status`` so Publish disappears (now has a remote). |
+| ``S.LAN_SHARE_OFFER`` / ``S.LAN_SHARE_DECLINED`` / ``S.LAN_OFFER_ACCEPTED`` | Reserved for future direct emission. The current code path uses the typed ``pending_decisions`` ``kind`` strings (``share_offer`` / ``adopt_origin`` / ``remote_conflict``) returned by ``lan_pending()``; peer UIs dispatch on ``kind``. If your peer wants to render translated text per decision, run ``translate_status(Status(<S.LAN_SHARE_OFFER...>, params))`` keyed off the kind. | Peers driving the pending-decisions surface should iterate ``lan_pending()`` directly and dispatch on ``kind``; the typed codes are wired forward for future-strict ``Result`` emission. |
+
+### Constants — LAN
+
+```python
+from azt_collab_client import S
+S.LAN_PAIRED / S.LAN_UNPAIRED
+S.LAN_PEER_UNREACHABLE / S.LAN_FP_MISMATCH / S.LAN_TOGGLE_OFF
+S.LAN_PROJECT_CLONED / S.LAN_PROJECT_REOPENED
+S.LAN_PROJECT_COLLISION_UNRELATED
+S.LAN_ADOPT_ORIGIN_NEEDED / S.LAN_PROJECT_ADOPTED_REMOTE
+S.LAN_REMOTE_CONFLICT
+S.LAN_SHARE_OFFER / S.LAN_SHARE_DECLINED / S.LAN_OFFER_ACCEPTED
+```
 
 ## 18. Low-power adaptive policy
 
@@ -2227,6 +2535,199 @@ popup for the usual download-and-install popup. Once every
 field daemon is at 0.42+ the comparison should never trigger
 (the receiver auto-reaps during install) and the helper is
 effectively dead code.
+
+## 20. LAN sync peer surface (since 0.45.0)
+
+The LAN sync transport lets two AZT-suite devices on the same
+Wi-Fi (or hotspot) push commits to each other without going
+through github. The peer's responsibility is small: render the
+toggle / pair / share / pending-decisions affordances, call
+the right wrappers, and route the typed Results.
+
+> **For the rationale** (why LAN is opportunistic redundancy,
+> not a github replacement; why identity is body-claimed
+> rather than TLS-pinned; why auto-share is gated on a QR
+> display) — see ``CLAUDE.md`` "LAN sync architecture
+> invariants" in the canonical repo. This section is the
+> contract.
+
+### Hard rules
+
+1. **LAN is opportunistic. github is authoritative.** A
+   successful LAN push does NOT clear ``pending_push``; the
+   daemon still pushes to github when network and toggles
+   allow. Peers MUST NOT treat LAN-only delivery as "synced."
+   The ``WAN-N`` / ``LAN-N`` / ``WAN-x LAN-y`` distinctions in
+   § 17b's rendering recipe are the user-visible expression of
+   this — never conflate them.
+2. **Don't poll ``lan_pending`` faster than 5 s.** The
+   pending-decisions list is for surfacing user-actionable
+   prompts, not telemetry. Pre-resume background polling
+   should be paused; resume on ``on_resume`` with one fresh
+   fetch.
+3. **Never store the peer's ed25519 key, fingerprint, or
+   endpoint outside ``peers.json``.** The daemon owns the
+   paired-peers registry. Peer-side caches drift — fingerprint
+   mismatches go undetected, endpoints stale-pin to a dead
+   port, ``shared_projects`` allowlist desyncs between two
+   peers reading the same daemon. Read via ``lan_list_peers``
+   each time.
+4. **A LAN-only project shows a ``WAN-N`` badge (red iff
+   work_offline=off) but Publish must still be available.**
+   ``lan_clone`` strips the peer's listener URL from local
+   ``.git/config`` (0.45.37+) so ``project_status.remote_url``
+   reads empty and the publish-row gate doesn't hide Publish.
+   Don't second-guess the empty ``remote_url`` — the project
+   IS unpublished (no github backup yet, hence the ``WAN-N``
+   walk-from-HEAD intentional-friction count grows with each
+   commit), even though it's reachable on the LAN.
+
+### Public API surface
+
+All wrappers are in ``azt_collab_client`` (re-exported from
+``__all__``). Wrappers translate transport failure into the
+empty / no-op shape (``[]`` / ``{}`` / ``Result(SERVER_UNAVAILABLE)``);
+peers don't raise.
+
+```python
+from azt_collab_client import (
+    # Identity (read-only)
+    lan_peer_id,
+    # Paired-peers registry
+    lan_list_peers, lan_pair_qr, lan_pair_accept, lan_unpair,
+    lan_set_static_endpoints,
+    # Per-peer share allowlist + outbound courtesy notify
+    lan_share_project, lan_unshare_project,
+    # Receiver-side LAN clone + pending decisions
+    lan_clone, lan_pending,
+    lan_accept_offer, lan_decline_offer,
+    lan_adopt_origin, lan_resolve_conflict,
+    # Daemon-wide toggle (hot-applied)
+    lan_toggle, lan_set_toggle,
+)
+```
+
+Field shapes worth knowing:
+
+- ``lan_peer_id()`` → ``{peer_id, fp, device_name}`` — your
+  daemon's identity. Empty dict on transport failure.
+- ``lan_list_peers()`` → list of ``{peer_id, fp, device_name,
+  endpoints, static_endpoints, shared_projects, paired_at,
+  last_seen_at}``. Empty list on transport failure.
+- ``lan_pair_qr(langcode='')`` → dict to render via ``segno``.
+  When ``langcode`` is non-empty, the QR carries the
+  project's ``remote_url`` + ``vernlang`` so a single scan
+  does pair + share + clone. Empty dict on transport failure.
+  **Side effect:** displaying a QR for ``langcode`` registers
+  a 10-minute single-use auto-share offer in the daemon so the
+  peer's hello back can auto-share that langcode (and only
+  that langcode). Without an active offer, a hello requesting
+  any langcode still records the pair but refuses auto-share —
+  user must tap Share manually.
+- ``lan_pair_accept({payload})`` → ``Result`` carrying
+  ``LAN_PAIRED`` + the recorded peer entry.
+- ``lan_clone(peer_id, langcode, remote_url='', vernlang='')``
+  → ``Result`` (see § 17d for codes).
+- ``lan_pending()`` → list of ``{id, kind, params, created_at}``.
+  ``kind`` is one of ``share_offer`` / ``adopt_origin`` /
+  ``remote_conflict``.
+- ``lan_toggle()`` → ``{on, endpoint}``; ``lan_set_toggle(on)``
+  → same. Hot-applied; listener thread + (Android) FGS + WifiLock
+  are re-armed atomically.
+
+### Reference UI
+
+``azt_collab_client.ui.lan_popups`` ships the canonical UI for
+this surface — peers SHOULD reuse it rather than reimplement:
+
+```python
+from azt_collab_client.ui.lan_popups import (
+    share_project_popup,        # owner-side: per-langcode share
+                                # (paired-phones list + QR
+                                # + github-invite)
+    paired_phones_popup,        # all-projects paired-phones list
+                                # with per-row Manage + Unpair
+    pending_offers_popup,       # receiver-side: pending share-
+                                # offers + Scan-QR fallback
+    scan_to_pair,               # picker-side scanner entry
+    adopt_origin_popup,         # confirm adopt-origin / resolve
+                                # remote-conflict
+)
+```
+
+All five honor the daemon's translated status codes via
+``translate_result``; peers don't need to repeat the
+translation.
+
+### Status-line rendering
+
+See § 17b — the WAN-N / LAN-N / R(+n) status elements are
+independent (each per-channel red rule applies separately).
+The recipe there is the single source of truth; don't re-
+derive the badge logic. Pre-0.47.0 peers worked from a
+conflated ``unshared_commits`` count that hid the "github
+fine but LAN behind" case entirely — the WANOK label and
+the per-channel red rule from § 17b are how this is now
+made visible.
+
+### Migration checklist — peer adopting LAN
+
+For a peer that wants to expose LAN sync (most peers should —
+the user-visible value is high):
+
+1. **Expose the toggle.** A "Local Wi-Fi sync" entry in
+   settings that reads ``lan_toggle()`` and writes via
+   ``lan_set_toggle``. Use ``open_server_ui()`` to delegate
+   to the daemon's settings page if your peer doesn't host
+   project-bound settings.
+2. **Wire the picker "Scan QR" entry.** The picker's "Pair
+   with another phone" / "Receive a project" entry calls
+   ``LAN_POPUPS.scan_to_pair()``; the popup handles the
+   pair + clone + adopt-origin flow inline.
+3. **Render the pending-decisions count on the picker.**
+   ``len(lan_pending())`` → "(N waiting)" suffix on the
+   receive-button label. Refresh on ``on_resume`` + after
+   any pending-decisions gesture.
+4. **Wire the share affordance.** A per-project "Share this
+   project" button in the project context menu calls
+   ``share_project_popup(langcode)``.
+5. **Honor the new routing codes.** See § 17d. Critical: LAN
+   codes are surfaced; don't drop them in the "everything
+   else" catch-all.
+6. **Re-poll ``project_status`` after pending-decisions
+   gestures.** Accepting a share-offer triggers a LAN clone
+   that changes ``last_project``; ``on_resume`` reconciliation
+   (§ 14a) handles the resulting project switch, but only if
+   the peer polls.
+
+A peer that ships none of these still works — LAN sync runs
+daemon-side and is observable through the existing
+``project_status`` fields. The peer just won't be able to
+PAIR / SHARE / CLONE without the daemon's settings UI.
+
+### Security model
+
+The LAN listener uses TLS with ``CERT_NONE`` deliberately
+(stdlib ssl can't request a client cert without validating its
+CA chain; peers' certs are self-signed and pinned by
+fingerprint via ``peers.json``). Identity is body-claimed
+under encrypted transport plus bound to user gesture (QR
+display) for any auto-share. Practical implications:
+
+- **Trust your LAN.** The threat model presumes the user
+  controls the Wi-Fi they're on. A public-AP-shared LAN with
+  attackers is *not* the design target; TLS still encrypts
+  the transfer but identity can't be verified to the level a
+  real PKI would give.
+- **Don't expose the LAN listener over a tunnel / port-forward.**
+  The auto-share gating is local-network-only safe; bridging
+  it through an SSH tunnel or a VPN exit opens the surface to
+  anyone who can reach the listener port.
+- **Fingerprint mismatches are SECURITY events, not bugs.**
+  ``LAN_FP_MISMATCH`` means a paired peer's cert changed
+  out from under you — could be a legitimate re-pair, could
+  be MITM. Surface, don't auto-rotate. Re-scan their QR to
+  re-pair with the new fingerprint after verbal confirm.
 
 ## What the suite does *for* you (keep code shareable)
 

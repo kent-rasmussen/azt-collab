@@ -233,6 +233,36 @@ def recover_project_orphans(project_dir, lift_path, langcode=''):
         return summary
     now = time.time()
 
+    # Directory-scan trace. Field log baf 2026-05-22 showed
+    # n_changes stuck at 1424 with 8 atomic-pending tokens on
+    # disk while no ``[atomic-recovery]`` lines appeared for
+    # those specific tokens — couldn't tell whether the sweep
+    # had even considered them. This line fires once per
+    # ``recover_project_orphans`` call when the directory is
+    # non-empty, dumping the names + ages so the tester reading
+    # the daemon log can answer "did the sweep see X?" without
+    # rebuilding.
+    try:
+        ages = []
+        for n in names:
+            p = os.path.join(pending_dir, n)
+            try:
+                ages.append((n, int(now - os.stat(p).st_mtime)))
+            except OSError:
+                ages.append((n, -1))
+        head = ages[:6]
+        tail_count = max(0, len(ages) - len(head))
+        head_str = ', '.join(f'{n}@{a}s' for (n, a) in head)
+        if tail_count:
+            head_str += f', … +{tail_count} more'
+        print(f'[atomic-recovery] scanning {pending_dir!r}: '
+              f'{len(names)} entr{"y" if len(names) == 1 else "ies"} '
+              f'(min_age={_MIN_AGE_S:.0f}s): [{head_str}]',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[atomic-recovery] scan trace failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
     # Read current LIFT bytes once; we'll diff every orphan against
     # this snapshot. Missing lift_path is rare but possible (project
     # registered without a LIFT yet) — treat orphan as straight
@@ -387,6 +417,32 @@ def _recover_under_lock(project_dir, lift_path, langcode,
             _stash_unmergeable(project_dir, name, orphan_path)
             summary['unmergeable'] += 1
             continue
+
+        # LIFT delta trace — verifies the 0.45.34 merge fix in
+        # the field. After 0.45.34, recovery on a polluted LIFT
+        # should produce a *smaller* result with a *lower*
+        # ``azt-lift-conflict`` count, because the canon-equal
+        # path strips stale false-positive annotations from
+        # semantically-identical content. Pre-0.45.34 the trend
+        # was the opposite: every cycle added more spurious
+        # annotations. The tester reads this line from the
+        # daemon log via the Share button; no on-device git
+        # tooling needed (working_dir lives in the server APK's
+        # private filesDir, not adb-accessible on release
+        # builds). ``count(b'azt-lift-conflict')`` is a substring
+        # heuristic — each annotation contributes one occurrence
+        # in the ``name="azt-lift-conflict"`` attribute, and the
+        # token doesn't appear elsewhere in well-formed LIFT.
+        old_size = len(current_bytes)
+        new_size = len(mr.merged_bytes)
+        old_annot = current_bytes.count(b'azt-lift-conflict')
+        new_annot = mr.merged_bytes.count(b'azt-lift-conflict')
+        print(f'[atomic-recovery] {name!r} merge delta: '
+              f'lift_bytes {old_size:,} → {new_size:,} '
+              f'({new_size - old_size:+,}), '
+              f'conflict_annotations {old_annot} → {new_annot} '
+              f'({new_annot - old_annot:+})',
+              file=sys.stderr, flush=True)
 
         try:
             _atomic_write_bytes(lift_path, mr.merged_bytes)

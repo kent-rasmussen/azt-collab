@@ -427,6 +427,17 @@ def _h_lan_pair_qr(body):
         'repo_url': repo_url,
         'vernlang': vernlang,
     }
+    # Bind the user-gesture (displaying a QR for this langcode)
+    # to subsequent auto-share gating in ``lan_listener``. Without
+    # this, an attacker on the LAN can hello with any langcode and
+    # get auto-shared into the corresponding project. See
+    # ``lan_listener._pending_qr_offers`` for the rationale.
+    if langcode:
+        try:
+            _lan_listener.record_qr_offered(langcode)
+        except Exception as ex:
+            print(f'[server] record_qr_offered failed: {ex!r}',
+                  file=sys.stderr, flush=True)
     return 200, {"ok": True, "payload": payload}
 
 
@@ -495,34 +506,11 @@ def _h_lan_pair_accept(body):
                  "peer": entry}
 
 
-def _h_lan_share_project(body):
-    """Add a project to a paired peer's outbound share list. Phase 3
-    of the LAN sync transport.
-
-    Body: ``{langcode, peer_id}``. ``shared_projects`` in
-    ``peers.json`` becomes the set of langcodes this peer's listener
-    advertises to that paired phone (enforced in phase 4's listener
-    middleware). Bookkeeping-only at phase 3 — no listener exists
-    yet.
-
-    Response: ``{ok: True, peer: {...}}`` on success;
-    ``{ok: False, error: 'peer_unknown'}`` if the peer isn't paired."""
-    langcode = str((body or {}).get('langcode', '') or '')
-    peer_id = str((body or {}).get('peer_id', '') or '')
-    if not langcode or not peer_id:
-        return 200, {"ok": False, "error": "bad_request",
-                     "detail": "langcode + peer_id required"}
-    entry = _peers.add_shared_project(peer_id, langcode)
-    if entry is None:
-        return 200, {"ok": False, "error": "peer_unknown",
-                     "detail": f"peer_id {peer_id[:8]!r} not paired"}
-    return 200, {"ok": True, "peer": entry}
-
-
 def _h_lan_unshare_project(body):
     """Remove a project from a paired peer's outbound share list.
-    Symmetric counterpart to ``_h_lan_share_project``. Body /
-    response shapes match."""
+    Inverse of ``_h_lan_send_share_offer`` (which is the share-WITH-
+    notification path the client wrapper actually drives). Body /
+    response shapes match the inverse pattern."""
     langcode = str((body or {}).get('langcode', '') or '')
     peer_id = str((body or {}).get('peer_id', '') or '')
     if not langcode or not peer_id:
@@ -561,6 +549,14 @@ def _h_lan_set_toggle(body):
     on = _settings.lan_allow_sync()
     bound = _lan_listener.bound_endpoint()
     endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    # Daemon-wide change — push-notify all observers (every project's
+    # rendering may shift modes / suffix). Reaches only descendants-
+    # mode subscribers on the parent status URI.
+    try:
+        from .android_cp import notify as _notify
+        _notify.notify_global_changed()
+    except Exception:
+        pass
     return 200, {"ok": True, "on": on, "endpoint": endpoint}
 
 
@@ -584,6 +580,15 @@ def _h_lan_clone(body):
     if not peer_id or not langcode:
         return 200, {"ok": False, "error": "bad_request",
                      "detail": "peer_id + langcode required"}
+    # LAN-sync must be on for the outbound clone connection to
+    # have anywhere to land — without the listener up our pinned-
+    # TLS request fails at connect time and the user sees a
+    # generic LAN_PEER_UNREACHABLE. Surface the actual reason so
+    # peer UIs can route to the toggle.
+    if not _settings.lan_allow_sync():
+        r = Result()
+        r.add(S.LAN_TOGGLE_OFF)
+        return 200, {"ok": True, "result": r.to_dict()}
     result = _lan_clone_mod.clone_from_peer(
         peer_id, langcode, incoming_url=remote_url,
         incoming_vernlang=vernlang)
@@ -608,7 +613,11 @@ def _h_lan_pending(_body):
 
 def _h_lan_accept_offer(body):
     """Accept a pending share-offer: triggers the LAN clone for the
-    referenced peer + langcode, then removes the pending decision.
+    referenced peer + langcode. Removes the pending decision only
+    when the clone actually delivered a project (CLONED / REOPENED)
+    so a transient failure (peer offline, project not yet committed
+    owner-side, LAN race) leaves the offer in place for the user to
+    retry without re-asking the owner to re-share.
 
     Body: ``{decision_id}``."""
     from . import pending_decisions as _pending
@@ -624,13 +633,23 @@ def _h_lan_accept_offer(body):
         str(params.get('langcode', '') or ''),
         incoming_url=str(params.get('repo_url', '') or ''),
         incoming_vernlang=str(params.get('vernlang', '') or ''))
-    _pending.remove(decision_id)
-    if result.has_any(S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED):
+    delivered = result.has_any(
+        S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED)
+    if delivered:
+        _pending.remove(decision_id)
         try:
             store.set_last_langcode(
                 str(params.get('langcode', '') or ''))
         except Exception:
             pass
+    else:
+        # Keep the pending decision so the user can retry once the
+        # owner-side issue clears (project committed at least once,
+        # owner back on LAN, etc.). The decision_id stays addressable
+        # for the next accept_offer call.
+        print(f'[server] accept_offer {decision_id!r}: clone did '
+              f'not deliver (codes={result.codes()!r}); pending '
+              f'kept for retry', file=sys.stderr, flush=True)
     return 200, {"ok": True, "result": result.to_dict()}
 
 
@@ -729,6 +748,61 @@ def _h_lan_send_share_offer(body):
     langcode = str((body or {}).get('langcode', '') or '')
     if not peer_id or not langcode:
         return 200, {"ok": False, "error": "bad_request"}
+    # Gate on the daemon-wide LAN toggle: without it the courtesy
+    # POST below fails at connect time and the receiver never sees
+    # the offer. Bookkeeping the allowlist change in that case
+    # would silently desync the two sides' views of "what's shared
+    # with whom." Refuse with LAN_TOGGLE_OFF so the UI can route
+    # the user to the toggle before retrying.
+    if not _settings.lan_allow_sync():
+        return 200, {"ok": False, "error": "lan_toggle_off"}
+    # Pre-flight: the LAN clone on the receiving side will fail
+    # with a generic 404 if our project doesn't have a usable git
+    # state (working_dir exists + .git/ exists + HEAD ref is born).
+    # Refuse the share gesture here so the user sees a clear reason
+    # instead of "I tapped Share, the other phone got an offer,
+    # accepted, and nothing happened." Typical trip: fresh project
+    # the user created but never recorded into — no commits yet, so
+    # dulwich's smart-protocol returns no refs and the cloner sees
+    # 404. The fix is "record at least one entry first"; surface
+    # that here.
+    proj = projects.get(langcode)
+    if proj is None:
+        return 200, {"ok": False, "error": "project_unknown"}
+    project_wd = proj.working_dir or ''
+    if not project_wd or not os.path.isdir(
+            os.path.join(project_wd, '.git')):
+        return 200, {
+            "ok": False,
+            "error": "project_not_initialised",
+            "detail": (
+                "This project has no git repository yet. "
+                "Record at least one entry, then try sharing again."
+            ),
+        }
+    try:
+        from dulwich.repo import Repo
+        _r = Repo(project_wd)
+        try:
+            _r.refs[b'HEAD']
+        except (KeyError, Exception) as ex:
+            _r.close()
+            return 200, {
+                "ok": False,
+                "error": "project_unborn",
+                "detail": (
+                    f"This project has no commits yet ({ex!r}). "
+                    "Record at least one entry, then try sharing "
+                    "again."
+                ),
+            }
+        _r.close()
+    except Exception as ex:
+        return 200, {
+            "ok": False,
+            "error": "project_unreadable",
+            "detail": f'{ex!r}',
+        }
     entry = _peers.add_shared_project(peer_id, langcode)
     if entry is None:
         return 200, {"ok": False, "error": "peer_unknown"}
@@ -838,6 +912,12 @@ def _h_set_work_offline(body):
         except Exception as ex:
             print(f'[work_offline] drain_pushes_now failed: {ex}',
                   file=sys.stderr, flush=True)
+    # Daemon-wide change — push-notify all observers.
+    try:
+        from .android_cp import notify as _notify
+        _notify.notify_global_changed()
+    except Exception:
+        pass
     return 200, {"ok": True, "work_offline": enabled}
 
 
@@ -1920,11 +2000,79 @@ def _h_project_status(langcode, _body):
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
+    # Auto-migrate pre-0.45.37 LAN-cloned projects: if origin
+    # points at a private-IP URL (a peer's LAN listener), strip
+    # it so the publish-row gate sees an empty remote_url and
+    # Publish becomes visible. Idempotent — no-op on healthy
+    # github/gitlab origins.
+    try:
+        from .repo import strip_lan_origin_if_present as _strip_lan
+        _strip_lan(p.working_dir)
+    except Exception as ex:
+        print(f'[project_status] strip_lan_origin {langcode!r} '
+              f'failed: {ex!r}',
+              file=sys.stderr, flush=True)
     summary = _repo_status(p.working_dir)
-    branch, remote_url, n_changes, commits_ahead = ('', '', 0, 0)
+    branch, remote_url, n_changes, wan_unshared = ('', '', 0, 0)
     if summary is not None:
-        branch, remote_url, n_changes, commits_ahead = summary
+        branch, remote_url, n_changes, wan_unshared = summary
+    # ``lan_unshared`` and ``at_risk`` need the langcode for peer
+    # lookup, which ``repo_status_summary`` doesn't carry; open
+    # the project repo once more and compute them inline. Both
+    # return 0 on any failure (matching the OK-on-uncertainty
+    # contract of ``_wan_unshared``).
+    lan_unshared = 0
+    at_risk = 0
+    try:
+        from dulwich.repo import Repo as _Repo
+        from .repo import _lan_unshared as _calc_lan_unshared
+        from .repo import _at_risk as _calc_at_risk
+        _diag_repo = None
+        try:
+            _diag_repo = _Repo(p.working_dir)
+        except Exception:
+            _diag_repo = None
+        if _diag_repo is not None and branch:
+            try:
+                lan_unshared = _calc_lan_unshared(
+                    _diag_repo, branch, langcode)
+            except Exception:
+                lan_unshared = 0
+            try:
+                at_risk = _calc_at_risk(
+                    _diag_repo, branch, langcode)
+            except Exception:
+                at_risk = 0
+            try:
+                _diag_repo.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
     api = _project_for_api(p)
+    # HEAD SHA — uniform change signal for peers (CLIENT_INTEGRATION.md
+    # § 17b Background refresh obligation). Bumps on every HEAD
+    # advance: local commit, incoming receive-pack, merge commit.
+    # Empty when the project has no commits yet (pre-init, or
+    # pre-first-commit). Cheap to read; held off the dulwich
+    # ``refs`` lookup, no full status walk required.
+    head_sha = ''
+    try:
+        from dulwich.repo import Repo
+        _r = Repo(p.working_dir)
+        try:
+            _h = _r.refs[b'HEAD']
+            if isinstance(_h, bytes):
+                head_sha = _h.decode('ascii', 'replace')
+            else:
+                head_sha = str(_h)
+        finally:
+            try:
+                _r.close()
+            except Exception:
+                pass
+    except Exception:
+        head_sha = ''
     # Stuck-commit telemetry: peers polling status surface
     # COMMIT_REPEATEDLY_FAILED once count >= 2 (matches the
     # daemon's own threshold). The scheduler retries failed
@@ -1949,13 +2097,40 @@ def _h_project_status(langcode, _body):
     else:
         n_recovered_today = 0
     from . import settings as _settings
+    # Diagnostic trace: each picker poll emits one short line with
+    # the fields field-testers most need when triaging a stuck
+    # indicator (uncommitted-changes ``n_changes``, stuck-commit
+    # streak ``commit_failure_count``, and the dulwich error
+    # string from the latest failure). Lets a tester reading the
+    # daemon log see whether commits are *failing* (count climbs,
+    # err present) vs *not being requested* (count stays at 0
+    # while n_changes climbs). 0.45.29.
+    if n_changes or commit_failure_count or last_commit_error:
+        err_tail = last_commit_error[:120] if last_commit_error else ''
+        print(f'[project_status] {langcode!r} n_changes={n_changes} '
+              f'wan_unshared={wan_unshared} '
+              f'lan_unshared={lan_unshared} at_risk={at_risk} '
+              f'commit_fail={commit_failure_count} '
+              f'last_err={err_tail!r}',
+              file=sys.stderr, flush=True)
     return 200, {
         "ok": True,
         "langcode": langcode,
         "branch": branch,
         "remote_url": remote_url or p.remote_url,
         "n_changes": n_changes,
-        "commits_ahead": commits_ahead,
+        # Sync-status accounting (v0.47.0 — replaces the pre-0.47
+        # ``commits_ahead`` + ``unshared_commits`` pair). Three
+        # counts feed the 5-state indicator per § 17b:
+        #   wan_unshared — commits not on github (was commits_ahead)
+        #   lan_unshared — commits not on any paired peer
+        #   at_risk     — commits on neither channel (intersection)
+        # Clean rename + new field; old field names are gone. Old
+        # peers get a decode-time miss and refuse via the
+        # MIN_SERVER_VERSION check.
+        "wan_unshared": wan_unshared,
+        "lan_unshared": lan_unshared,
+        "at_risk": at_risk,
         "last_commit": p.last_commit,
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
@@ -1977,9 +2152,8 @@ def _h_project_status(langcode, _body):
         # writes were merged back in.
         "n_recovered_today": n_recovered_today,
         # Work-offline state (since 0.43.0). Daemon-wide bool, not
-        # per-project; carried here so peers can render a badge
-        # alongside the per-project commits_ahead count without a
-        # second RPC. Pre-0.43 callers ignore the unknown key.
+        # per-project; carried here so peers can render the
+        # offline / LAN-only suffix without a second RPC.
         "work_offline": _settings.work_offline(),
         # LAN-sync toggle (since 0.45.0). Carried alongside
         # work_offline so peers can render the joint state — the
@@ -1989,65 +2163,16 @@ def _h_project_status(langcode, _body):
         # peer sync-indicator. Same daemon-wide-bool-on-per-
         # project-response shape as work_offline.
         "lan_allow_sync": _settings.lan_allow_sync(),
-        # Sharing-status accounting (since 0.45.0). Powers the
-        # peer-side ``+unshared/+ahead`` and ``LANOK`` sync
-        # indicator: a local commit is "shared somewhere" if it's
-        # an ancestor of either ``refs/remotes/origin/main`` (last
-        # known github state) or ``last_lan_pushed_sha`` (latest
-        # SHA we've successfully LAN-delivered to a peer).
-        # ``unshared_commits`` counts commits in local HEAD's
-        # ancestry that are on NEITHER. Zero means LANOK — every
-        # commit exists somewhere besides this phone, so the user
-        # can't be wiped out by a phone loss.
-        "unshared_commits": _unshared_commit_count(p),
         "lan_pushed_sha": projects.get_last_lan_pushed_sha(langcode),
+        # Uniform HEAD-advance signal (since 0.45.45). Peers
+        # polling project_status use a change in this field as
+        # the trigger for ``_refresh_in_place`` per
+        # CLIENT_INTEGRATION.md § 17b. Bumps on local commit,
+        # incoming LAN receive-pack, and merge commits — the
+        # complete set of events that mutate the on-disk view of
+        # this project the peer is rendering.
+        "head_sha": head_sha,
     }
-
-
-def _unshared_commit_count(project):
-    """Count commits reachable from local HEAD that are ancestors
-    of neither ``refs/remotes/origin/main`` (github's last-fetched
-    state) nor ``last_lan_pushed_sha`` (latest LAN-delivered SHA).
-    Zero = every local commit lives somewhere besides this phone.
-
-    Walks the commit graph via dulwich's ``get_walker`` with the
-    union of both remote heads as the exclude set, so the walk
-    terminates at the first ancestor that's already replicated.
-    Cheap for typical project sizes (a few hundred commits)."""
-    try:
-        from dulwich.repo import Repo
-        repo = Repo(project.working_dir)
-    except Exception:
-        return 0
-    try:
-        try:
-            local_head = repo.refs[b'HEAD']
-        except KeyError:
-            return 0
-        excludes = []
-        for ref in (b'refs/remotes/origin/main',
-                    b'refs/remotes/origin/master'):
-            try:
-                excludes.append(repo.refs[ref])
-            except KeyError:
-                continue
-        lan_sha_hex = projects.get_last_lan_pushed_sha(project.langcode)
-        if lan_sha_hex:
-            try:
-                excludes.append(lan_sha_hex.encode('ascii'))
-            except Exception:
-                pass
-        try:
-            walker = repo.get_walker(
-                include=[local_head], exclude=excludes)
-            return sum(1 for _ in walker)
-        except Exception:
-            return 0
-    finally:
-        try:
-            repo.close()
-        except Exception:
-            pass
 
 
 def _h_set_project_last_sync(langcode, body):
@@ -2277,6 +2402,15 @@ def _h_project_atomic_commit(langcode, body):
         except Exception:
             pass
         return 500, {"ok": False, "error": str(ex)}
+    # Auto-fire a debounced commit. Same race + same fix as the
+    # sibling ``_h_project_atomic_finalize`` — see the comment
+    # there for the rationale.
+    try:
+        scheduler.commit_project(langcode)
+    except Exception as ex:
+        print(f'[atomic_commit] auto-commit schedule failed for '
+              f'{langcode!r}: {ex!r}',
+              file=sys.stderr, flush=True)
     res = Result().add(S.ATOMIC_COMMITTED,
                        bytes_written=len(data),
                        sha256=hashlib.sha256(data).hexdigest())
@@ -2620,6 +2754,31 @@ def _h_project_atomic_finalize(langcode, body):
         except OSError:
             pass
         return 500, {"ok": False, "error": str(ex)}
+    # Auto-fire a debounced commit so the just-finalized bytes
+    # always get absorbed into a git commit. Without this, a race
+    # window exists: peer fires commit_project after save N-1, the
+    # daemon's 500 ms debounce timer fires and starts the commit,
+    # then save N's atomic_finalize lands AFTER the commit's
+    # ``_stage_all`` but before the next peer-side commit_project
+    # fires. The result is n_changes > 0 forever — the bytes are
+    # on disk but no commit captures them. Field-observed
+    # 2026-05-27: phone showed sticky ``+1 red`` (n_changes=1) for
+    # the rest of the session after a recording cycle whose final
+    # atomic_finalize raced with the in-flight commit.
+    #
+    # ``scheduler.commit_project`` is debounced + idempotent — if
+    # the peer ALSO fires commit_project (the usual peer-side
+    # contract), bursts of finalize-driven schedules coalesce with
+    # the peer's call into a single commit run. Cheap (sets / resets
+    # a 500 ms timer) and side-effect-free if there's nothing to
+    # commit (the next ``_stage_all`` sees a clean index and the
+    # job returns ``NOTHING_TO_COMMIT``).
+    try:
+        scheduler.commit_project(langcode)
+    except Exception as ex:
+        print(f'[atomic_finalize] auto-commit schedule failed for '
+              f'{langcode!r}: {ex!r}',
+              file=sys.stderr, flush=True)
     res = Result().add(S.ATOMIC_COMMITTED,
                        bytes_written=bytes_written,
                        sha256=h.hexdigest())
@@ -2754,8 +2913,6 @@ def dispatch(method, path, body):
             return _h_lan_pair_qr(body)
         if path == '/v1/lan/pair/accept':
             return _h_lan_pair_accept(body)
-        if path == '/v1/lan/share_project':
-            return _h_lan_share_project(body)
         if path == '/v1/lan/unshare_project':
             return _h_lan_unshare_project(body)
         if path == '/v1/lan/unpair':
@@ -2965,8 +3122,56 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn,
 def daemon_log_path():
     """Absolute path to the daemon's persisted stderr log when the
     "Save daemon log to file" toggle is enabled. Used by the
-    settings-UI share button to attach / dump the log."""
-    return os.path.join(azt_home(), 'daemon.log')
+    settings-UI share button to attach / dump the log.
+
+    Filename includes the device's short peer-id tag (e.g.
+    ``daemon-07c089f2.log``) so a tester collecting logs from
+    several phones into one folder — email attachment, shared
+    drive — gets distinct filenames per device instead of one
+    ``daemon.log`` clobbering another. Falls back to plain
+    ``daemon.log`` if the peer-id isn't readable yet (bootstrap
+    on a fresh install where ed25519 cert generation hasn't
+    completed). The ``.prev`` rotation path appends the same
+    suffix uniformly."""
+    tag = _log_peer_tag_str()
+    name = f'daemon-{tag}.log' if tag else 'daemon.log'
+    return os.path.join(azt_home(), name)
+
+
+# Cache: the first 8 hex chars of the daemon's ed25519 peer_id,
+# spliced into every log line stamp so a tester comparing two
+# phones' logs can tell them apart at a glance. Same prefix the
+# user already sees on per-peer lines (``[lan-push] '07c089f2'
+# ...``), so no new vocabulary. Sentinel ``None`` = not yet
+# attempted; ``''`` = attempted and unavailable (peer_id couldn't
+# be read — log without a tag rather than retry on every write).
+_log_peer_tag = None
+
+
+def _log_peer_tag_str():
+    """Return the short peer-id tag to splice into log line stamps.
+
+    Lazily resolved on first call: reading the peer_id triggers
+    file I/O (and ed25519 cert generation on a fresh install),
+    neither of which we want to do at module import. After the
+    first call the result is cached for the life of the process,
+    so subsequent log writes pay nothing.
+
+    A read failure (cryptography missing during bootstrap, file
+    locked, etc.) caches the empty string so we don't retry on
+    every write — log lines then look unchanged from the pre-
+    0.45.25 format.
+    """
+    global _log_peer_tag
+    if _log_peer_tag is not None:
+        return _log_peer_tag
+    try:
+        from azt_collabd import peer_id as _peer_id
+        hex_str = _peer_id.peer_id_hex() or ''
+        _log_peer_tag = hex_str[:8] if hex_str else ''
+    except Exception:
+        _log_peer_tag = ''
+    return _log_peer_tag
 
 
 class _StdioTee:
@@ -3031,7 +3236,11 @@ class _StdioTee:
             self._file.write(data)
             self._file.flush()
             return
-        stamp = _time.strftime('[%H:%M:%S] ')
+        tag = _log_peer_tag_str()
+        if tag:
+            stamp = _time.strftime(f'[%H:%M:%S {tag}] ')
+        else:
+            stamp = _time.strftime('[%H:%M:%S] ')
         pieces = data.split('\n')
         at_sol = self._sol_state[0]
         out = []
