@@ -177,6 +177,15 @@ LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
 
+# Nearby-pair flow — see azt_collabd/status.py for the per-code
+# rationale. Sender's outbound request lives 5 min then times out;
+# receiver Accept/Decline routes through the shared decisions
+# watcher (kind=pair_request).
+LAN_PAIR_REQUEST_PENDING = 'LAN_PAIR_REQUEST_PENDING'
+LAN_PAIR_REQUEST_ACCEPTED = 'LAN_PAIR_REQUEST_ACCEPTED'
+LAN_PAIR_REQUEST_DECLINED = 'LAN_PAIR_REQUEST_DECLINED'
+LAN_PAIR_REQUEST_TIMEOUT = 'LAN_PAIR_REQUEST_TIMEOUT'
+
 # Transport-failure codes. The client wrappers' ``except
 # ServerUnavailable`` / non-``ok`` response branches (see
 # ``sync_project``, ``project_status``, etc. in ``__init__.py``)

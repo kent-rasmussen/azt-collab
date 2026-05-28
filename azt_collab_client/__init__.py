@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.47.6"
+__version__ = "0.48.0"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -165,7 +165,7 @@ __version__ = "0.47.6"
 # WAN-behind / LAN-behind / at-risk states. Force the floor so
 # the bootstrap popup prompts a daemon rebuild before that misread
 # happens.
-MIN_SERVER_VERSION = "0.47.0"
+MIN_SERVER_VERSION = "0.48.0"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``
@@ -1035,15 +1035,27 @@ def lan_share_project(langcode, peer_id):
     return resp.get('peer') or {}
 
 
-def lan_clone(peer_id, langcode, remote_url='', vernlang=''):
+def lan_clone(peer_id, langcode, remote_url='', vernlang='',
+              user_initiated=True):
     """LAN-clone *langcode* from *peer_id* (combined pair-share-
     clone flow). Synchronous. ``vernlang`` is the project's
     linguistic code (LIFT ``<form lang="…">`` value for new
     entries); separate from ``langcode`` (project key) — pass the
     value the owner sent in the QR / share-offer payload so the
     recipient registers it correctly even when the project name
-    isn't a real BCP-47 code (``MyEnglishProject``). Returns a
-    ``Result`` carrying one of ``LAN_PROJECT_CLONED`` /
+    isn't a real BCP-47 code (``MyEnglishProject``).
+
+    ``user_initiated`` controls whether ``last_project`` is moved
+    to the newly-cloned project on success. ``True`` (default) =
+    active gesture (QR scan, Nearby-pair completion, explicit
+    "Clone from peer" tap) — the picker resumes into the project.
+    ``False`` = passive accept of an incoming share-offer popup —
+    the project lands in the picker list without hijacking what
+    the user is currently working on. The shared decisions
+    watcher passes ``False`` on KIND_SHARE_OFFER accept; callers
+    initiating from QR/Nearby paths pass ``True``.
+
+    Returns a ``Result`` carrying one of ``LAN_PROJECT_CLONED`` /
     ``LAN_PROJECT_REOPENED`` / ``LAN_PROJECT_COLLISION_UNRELATED``
     / ``LAN_PEER_UNREACHABLE``, optionally overlaid with
     ``LAN_ADOPT_ORIGIN_NEEDED`` or ``LAN_REMOTE_CONFLICT``."""
@@ -1051,7 +1063,8 @@ def lan_clone(peer_id, langcode, remote_url='', vernlang=''):
         resp = call('POST', '/v1/lan/clone',
                     {'peer_id': peer_id, 'langcode': langcode,
                      'remote_url': remote_url,
-                     'vernlang': vernlang})
+                     'vernlang': vernlang,
+                     'user_initiated': bool(user_initiated)})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -1135,6 +1148,199 @@ def lan_resolve_conflict(decision_id, mode):
     except ServerUnavailable:
         return False
     return bool(resp.get('ok'))
+
+
+def project_kv_get(langcode, key, default=None):
+    """Read a scalar project-KV value (e.g. ``team_size``).
+
+    These values are stored as ``.azt/kv/<key>.txt`` in the
+    project's working tree and synced across paired phones
+    via the normal commit/push pipeline. Use for any value
+    every phone on the project must agree on (team size,
+    sort orders, project-wide UI preferences).
+
+    Returns the value as a string. ``default`` is returned
+    on transport failure, unknown project, or unset key —
+    so callers don't have to special-case "missing"."""
+    if not langcode or not key:
+        return default
+    try:
+        resp = call('GET',
+                    f'/v1/projects/{langcode}/kv/{key}')
+    except ServerUnavailable:
+        return default
+    if not resp.get('ok'):
+        return default
+    val = resp.get('value', '')
+    if val == '':
+        return default
+    return val
+
+
+def project_kv_set(langcode, key, value):
+    """Write a scalar project-KV value and fire a debounced
+    commit so it propagates to paired peers. ``value`` is
+    coerced to a string before storage; callers reading via
+    ``project_kv_get`` parse on the way out.
+
+    Returns the stored value on success, ``None`` on
+    transport failure or unknown project. Commit happens
+    asynchronously — caller doesn't need to wait."""
+    if not langcode or not key:
+        return None
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/kv/{key}',
+                    {'value': '' if value is None else str(value)})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    return resp.get('value', '')
+
+
+def project_kv_list(langcode):
+    """Return every KV entry for *langcode* as
+    ``{key: value}``. Empty dict on transport failure /
+    unknown project."""
+    if not langcode:
+        return {}
+    try:
+        resp = call('GET', f'/v1/projects/{langcode}/kv')
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    out = resp.get('kv') or {}
+    return out if isinstance(out, dict) else {}
+
+
+def list_slots(langcode):
+    """Return ``{slot: {peer_id, claimed_at, device_name}}``
+    for *langcode*. Drives the peer's "who's on which slot"
+    rendering. Empty dict if no slots are claimed."""
+    if not langcode:
+        return {}
+    try:
+        resp = call('GET', f'/v1/projects/{langcode}/slots')
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    out = resp.get('slots') or {}
+    return out if isinstance(out, dict) else {}
+
+
+def claim_slot(langcode, slot):
+    """Claim *slot* for this device on *langcode*. Atomic
+    locally (any prior claim by this device is dropped) and
+    convergent across phones (simultaneous claims of the
+    same slot resolve via the post-merge timestamp tiebreak;
+    the loser sees on next sync that they're no longer in
+    ``list_slots`` and is re-prompted).
+
+    Identity (peer_id + device_name) comes from the daemon —
+    callers don't pass it. Refuses with ``CONTRIBUTOR_UNSET``
+    if the daemon has no contributor name set.
+
+    Returns ``True`` on success, ``False`` on transport
+    failure / unknown project / refused claim."""
+    if not langcode or not slot:
+        return False
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/slots/claim',
+                    {'slot': str(slot)})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
+
+
+def release_slot(langcode):
+    """Release every slot held by this device on *langcode*.
+    Idempotent. Returns the list of slots that were released
+    (empty if we held nothing)."""
+    if not langcode:
+        return []
+    try:
+        resp = call('POST',
+                    f'/v1/projects/{langcode}/slots/release',
+                    {})
+    except ServerUnavailable:
+        return []
+    if not resp.get('ok'):
+        return []
+    out = resp.get('released') or []
+    return out if isinstance(out, list) else []
+
+
+def lan_pair_request_send(peer_id, langcode=''):
+    """Initiate a Nearby-pair request to *peer_id* (an mDNS-
+    discovered, currently-unpaired device). Carries our identity
+    + the sender's current project langcode as pair context — the
+    receiver uses it to decide whether to auto-share that project
+    on accept (matched langcode + related history) or open a
+    share screen for explicit selection.
+
+    Returns a ``Result`` carrying ``LAN_PAIR_REQUEST_PENDING`` on
+    success (the receiver's daemon stashed a pending decision).
+    The actual accept / decline lands later via the shared
+    decisions watcher — the receiver responds, their daemon
+    notifies us, and our daemon emits
+    ``LAN_PAIR_REQUEST_ACCEPTED`` / ``..._DECLINED`` /
+    ``..._TIMEOUT`` (5 min cap) via the next status poll."""
+    try:
+        resp = call('POST', '/v1/lan/pair_request_send',
+                    {'peer_id': peer_id,
+                     'langcode': str(langcode or '')})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_pair_request_resolve(decision_id, accept):
+    """Resolve an incoming KIND_PAIR_REQUEST pending decision.
+    ``accept=True`` records the pair + sends hello-back (same
+    path as ``lan_pair_accept`` from a QR scan); ``accept=False``
+    sends a nack to the sender and removes the decision. Returns
+    a ``Result``."""
+    try:
+        resp = call('POST', '/v1/lan/pair_request_resolve',
+                    {'decision_id': decision_id,
+                     'accept': bool(accept)})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})])
+    return Result.from_dict(resp.get('result') or {})
+
+
+def lan_nearby_unpaired():
+    """Return mDNS-discovered devices that are NOT in our
+    ``peers.json``. List of ``{peer_id, fp, device_name,
+    endpoint}`` dicts. Empty list on transport failure or when
+    LAN sharing is off / discovery hasn't surfaced anyone yet.
+
+    Used by the Nearby-pair UI to populate the
+    "Devices in this room" list with Pair buttons."""
+    try:
+        resp = call('GET', '/v1/lan/nearby_unpaired')
+    except ServerUnavailable:
+        return []
+    if not resp.get('ok'):
+        return []
+    out = resp.get('peers') or []
+    if not isinstance(out, list):
+        return []
+    return out
 
 
 def lan_unshare_project(langcode, peer_id):
@@ -2210,6 +2416,10 @@ __all__ = [
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
     'lan_clone', 'lan_pending', 'lan_accept_offer',
     'lan_decline_offer', 'lan_adopt_origin', 'lan_resolve_conflict',
+    'lan_pair_request_send', 'lan_pair_request_resolve',
+    'lan_nearby_unpaired',
+    'project_kv_get', 'project_kv_set', 'project_kv_list',
+    'list_slots', 'claim_slot', 'release_slot',
     'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',

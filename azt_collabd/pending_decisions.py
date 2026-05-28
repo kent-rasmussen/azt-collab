@@ -49,6 +49,10 @@ _LOCK = threading.Lock()
 KIND_SHARE_OFFER = 'share_offer'
 KIND_ADOPT_ORIGIN = 'adopt_origin'
 KIND_REMOTE_CONFLICT = 'remote_conflict'
+# Nearby-pair: a device discovered via mDNS posted a pair-request
+# to our listener. Params: ``peer_id``, ``fp``, ``device_name``,
+# ``endpoint``, ``langcode`` (sender's current project, may be '').
+KIND_PAIR_REQUEST = 'pair_request'
 
 
 def _path():

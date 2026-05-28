@@ -20,6 +20,7 @@ from .icons import icon_path
 from .share import share_running_apk
 from .update import check_for_update, default_asset_filename
 from .bootstrap import bootstrap
+from .decisions import install_decision_watcher
 
 __all__ = ['LangPickerScreen', 'register_langpicker_kv',
            'ProjectPickerScreen', 'register_picker_kv',
@@ -27,4 +28,5 @@ __all__ = ['LangPickerScreen', 'register_langpicker_kv',
            'install_server_apk_popup', 'grant_collaborator_popup',
            'register_charis', 'icon_path',
            'share_running_apk', 'check_for_update',
-           'default_asset_filename', 'bootstrap']
+           'default_asset_filename', 'bootstrap',
+           'install_decision_watcher']

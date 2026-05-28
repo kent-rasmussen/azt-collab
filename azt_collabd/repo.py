@@ -556,6 +556,41 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
             deletes.append(path)
             continue
 
+        # Slot claims (.azt/slots/<slot>.txt): two devices may
+        # have claimed the same slot simultaneously. Pick the
+        # one whose embedded claimed_at is later. Convergent
+        # atomicity per the project_kv contract (NOTES_TO_DAEMON.md
+        # amendment, 2026-05-28).
+        if (path.startswith('.azt/slots/') and path.endswith('.txt')
+                and o is not None and t is not None and o != t):
+            from . import project_kv as _pkv
+            o_bytes = _blob_bytes(repo, o) or b''
+            t_bytes = _blob_bytes(repo, t) or b''
+            ours = _pkv._parse_text(o_bytes.decode('utf-8', 'replace'))
+            theirs = _pkv._parse_text(t_bytes.decode('utf-8', 'replace'))
+            winner = _pkv._later_claim(ours, theirs) or ours
+            body = _pkv._format_slot_file(
+                winner.get('peer_id', ''),
+                winner.get('device_name', ''),
+                claimed_at=winner.get('claimed_at') or '',
+            )
+            merged_writes[path] = ('bytes', body.encode('utf-8'))
+            continue
+        # Scalar project KV (.azt/kv/<key>.txt): lexicographic
+        # winner (deterministic + cheap; rare conflicts since
+        # these are single-write-mostly settings like team_size).
+        if (path.startswith('.azt/kv/') and path.endswith('.txt')
+                and o is not None and t is not None and o != t):
+            o_bytes = _blob_bytes(repo, o) or b''
+            t_bytes = _blob_bytes(repo, t) or b''
+            o_text = o_bytes.decode('utf-8', 'replace')
+            t_text = t_bytes.decode('utf-8', 'replace')
+            winner_text = max(o_text, t_text)
+            if not winner_text.endswith('\n'):
+                winner_text += '\n'
+            merged_writes[path] = ('bytes',
+                                   winner_text.encode('utf-8'))
+            continue
         if path.endswith('.lift') and o is not None and t is not None and o != t:
             # Heavy path — load bytes only here. Free them as soon
             # as the merge call returns so the dict-of-bytes peak

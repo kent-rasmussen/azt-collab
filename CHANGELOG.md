@@ -9,6 +9,242 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.48.0 — Peer-interaction round: nearby pairing, shared decisions watcher, KV / slot claims
+
+End-to-end work driven by the 2026-05-28 architecture
+discussion on "peer interaction for 3+ devices on the same
+project." Consolidates what was iteratively built up as
+0.47.7 / 0.47.8 / 0.47.9 during the session.
+
+### Theme
+
+When the suite was two phones, every peer relationship
+fit into a QR scan. With three phones and an existing
+pair-mesh, the rough edges showed: opaque auto-generated
+peer labels, no way to find a peer who's in the room but
+unpaired, asymmetric shares ("I share with you, you don't
+share back"), no convergence guarantee when the same word-
+list slot is claimed twice. This release closes those gaps.
+
+### 1. Nearby-pair flow (KIND_PAIR_REQUEST)
+
+mDNS already surfaces unpaired devices on the LAN. New:
+
+- ``lan_nearby_unpaired()`` client wrapper returns the
+  discovered-but-not-yet-paired devices.
+- ``lan_pair_request_send(peer_id, langcode='')`` POSTs an
+  outbound pair request to a discovered peer with our
+  current-project langcode as pair context. Receiver sees
+  the shared decisions watcher popup (see #2).
+- ``lan_pair_request_resolve(decision_id, accept)`` on the
+  receiver's side. Accept records the pair + sends
+  hello-back (standard flow records the pair on sender
+  side); decline POSTs ``pair_response{accept:false}`` so
+  sender clears the spinner.
+- Sender-side outbound state lives in
+  ``azt_collabd/lan_pair_requests.py`` (in-memory, 5-min
+  timeout). Status codes
+  ``LAN_PAIR_REQUEST_PENDING|ACCEPTED|DECLINED|TIMEOUT``.
+- Listener endpoints ``/v1/lan/pair_request`` (receiver)
+  and ``/v1/lan/pair_response`` (sender) use the new
+  ``_https_post_signalling`` helper — TLS encrypted but
+  fp not pinnable yet (peer not paired). Same threat
+  model as ``hello_to_peer``.
+
+QR scanning still works; this is the *additional* path for
+"we're in the same room, both already running the suite,
+neither has a QR to scan."
+
+### 2. Shared decisions watcher (`ui.decisions`)
+
+Every pending decision the daemon stashes (share offers,
+pair requests, adopt-origin, remote-conflict) is now
+rendered by **a single shared client UI** —
+``azt_collab_client.ui.decisions``. Peers replace ad-hoc
+polling of ``lan_pending`` with one
+``install_decision_watcher()`` call in ``on_start``; the
+watcher renders the modal popups, calls the existing
+per-kind resolve RPCs, and fires an
+``on_resolved(kind, action, decision)`` callback so the
+peer can refresh its own state.
+
+- Wrap-friendly labels (long device names, langcodes, URLs
+  word-wrap instead of clipping).
+- "Internet" wording for origin URLs (the daemon supports
+  GitHub, GitLab, and self-hosted; no GitHub branding in
+  popups).
+- ``KIND_REMOTE_CONFLICT`` is three-way: Keep mine /
+  Switch to theirs / Use both. "Use both" appends to
+  ``Project.extra_remotes`` (see #4).
+- ``KIND_SHARE_OFFER`` accept is **passive**: the new
+  project lands in the registry but ``last_project`` is
+  not touched. Peer's ``on_resolved`` may refresh the
+  project list; must NOT auto-load. (The QR-scan and
+  Nearby-pair paths remain *active* — they DO move
+  ``last_project``.)
+
+Contract details + migration checklist in
+``CLIENT_INTEGRATION.md`` § 20a.
+
+### 3. Peer identity gated on ``contributor``
+
+``store.get_device_name()`` is now derived state:
+``f'{contributor} — {autodetect}'`` when contributor is
+set, empty when not. ``set_device_name`` becomes a no-op
+(kept callable for pre-0.48 client compat). User-facing
+setting is the contributor field — one input, two derived
+outputs (git author name + peer label).
+
+``CONTRIBUTOR_UNSET`` now gates pair-accept, pair-request-
+send, pair-request-resolve (accept), send-share-offer,
+slot-claim, and lan_set_toggle (turn-on). Peer UIs already
+route this status (the GH publish path uses it today), so
+existing handling does the right thing.
+
+Net effect: a user who hasn't set their contributor name
+can't accidentally advertise an anonymous ``moto g - 2025``
+to other peers; ``Kent — moto g - 2025`` shows up after
+they fill in the contributor field once.
+
+### 4. ``KIND_REMOTE_CONFLICT`` "Use both" — data model
+
+``projects.Project.extra_remotes`` (list of additional
+Internet-hosted remote URLs) with ``add_extra_remote`` /
+``remove_extra_remote`` setters.
+``_h_lan_resolve_conflict`` mode ``'dual_publish'`` now
+appends ``incoming_url`` to ``extra_remotes`` (was a
+no-op flag pre-0.48).
+
+**Gap, documented honestly**: the push iteration over
+``extra_remotes`` is NOT yet wired through the ~8
+``porcelain.push`` sites in ``repo.py``. The data model
+captures the user's "Use both" preference but only the
+primary ``remote_url`` is pushed today. Follow-up release
+will add the iteration. Acceptable interim because the
+user judged this case "infrequent" in the architecture
+discussion and the data model is the durable part.
+
+### 5. Project-shared KV + atomic slot claims
+
+Cross-phone agreement on per-project state that doesn't
+fit in the LIFT file (``team_size``, "who's on which
+recording slot", etc.). Files in the working tree under
+``.azt/kv/`` and ``.azt/slots/``, synced through the
+existing LIFT pipeline.
+
+- ``project_kv_get/set/list`` for scalars
+  (``.azt/kv/<key>.txt``).
+- ``list_slots`` / ``claim_slot`` / ``release_slot`` for
+  slot claims (``.azt/slots/<slot>.txt`` with content
+  ``<peer_id>\n<claimed_at_iso>\n<device_name>``).
+- ``slot_claim`` atomically (locally) displaces any prior
+  claim by this device on a different slot — the one-
+  slot-per-peer invariant.
+- Convergent across phones: two simultaneous claims of
+  the same slot both land; the daemon's merge driver
+  (extended ``repo._merge_diverged`` with path-prefix
+  branches for ``.azt/slots/*.txt`` and
+  ``.azt/kv/*.txt``) picks the version whose embedded
+  ``claimed_at`` is later. Loser sees on next sync that
+  they're not in ``list_slots`` and is re-prompted by the
+  peer UI.
+
+Peer contract + locked semantics + recommended flow in
+``CLIENT_INTEGRATION.md`` § 21. NOTES_TO_DAEMON.md item
+deleted (acted on).
+
+### 6. Mutuality contract for shares
+
+``KIND_SHARE_OFFER`` accept already auto-mirrors via the
+clone path (existing flow). New: receiver-side popup is
+the only place share offers surface — no more "I tapped
+Share, the other phone never sees it" because the
+watcher polls 1 s and the popup is near-instant on same
+LAN. The pre-0.48 § 20 hard rule 2 ("don't poll
+lan_pending faster than 5 s") is superseded — the
+watcher is the only poller now.
+
+### Files
+
+New modules:
+
+- ``azt_collab_client/ui/decisions.py``
+- ``azt_collabd/lan_pair_requests.py``
+- ``azt_collabd/project_kv.py``
+
+Touched:
+
+- ``azt_collab_client/__init__.py`` — 9 new wrappers
+  (``lan_pair_request_send`` / ``_resolve`` /
+  ``lan_nearby_unpaired`` / ``project_kv_get`` / ``_set`` /
+  ``_list`` / ``list_slots`` / ``claim_slot`` /
+  ``release_slot``), ``lan_clone`` gains
+  ``user_initiated`` kwarg, ``__all__`` updated,
+  ``__version__`` → ``0.48.0``,
+  ``MIN_SERVER_VERSION`` → ``0.48.0``.
+- ``azt_collab_client/ui/__init__.py`` — re-exports
+  ``install_decision_watcher``.
+- ``azt_collab_client/status.py`` — adds
+  ``LAN_PAIR_REQUEST_PENDING|ACCEPTED|DECLINED|TIMEOUT``.
+- ``azt_collab_client/translate.py`` — translations for
+  the four new status codes.
+- ``azt_collab_client/CLIENT_INTEGRATION.md`` — new
+  § 20a "Shared decisions watcher" and § 21 "Project-
+  shared KV and slot claims" with peer migration
+  checklists. § 20 hard rule 2 superseded.
+- ``azt_collab_client/NOTES_TO_DAEMON.md`` — KV item
+  deleted (acted on); LANOK item also deleted (resolved
+  in 0.47.0).
+- ``azt_collabd/__init__.py`` —
+  ``MIN_CLIENT_VERSION`` → ``0.48.0``.
+- ``azt_collabd/status.py`` — mirror of new pair-request
+  codes.
+- ``azt_collabd/pending_decisions.py`` — adds
+  ``KIND_PAIR_REQUEST`` constant.
+- ``azt_collabd/lan_listener.py`` — adds
+  ``_handle_pair_request`` + ``_handle_pair_response``
+  body-auth handlers + dispatch.
+- ``azt_collabd/lan_push.py`` — adds
+  ``_our_endpoint_str`` and
+  ``_https_post_signalling`` (unpaired-peer signalling).
+- ``azt_collabd/server.py`` — 10 new RPC handlers:
+  4 for the pair-request flow,
+  6 for KV/slot. ``_h_lan_clone`` reads
+  ``user_initiated``; ``_h_lan_accept_offer`` drops the
+  ``last_project`` set; ``_h_lan_resolve_conflict``'s
+  ``dual_publish`` mode writes ``extra_remotes``.
+  ``_refuse_if_contributor_unset`` helper gates 5 LAN
+  endpoints.
+- ``azt_collabd/projects.py`` —
+  ``Project.extra_remotes`` field +
+  ``add_extra_remote`` / ``remove_extra_remote``.
+- ``azt_collabd/repo.py`` — ``_merge_diverged`` gains
+  slot/KV merge branches.
+- ``azt_collabd/store.py`` — ``get_device_name`` derived
+  from contributor; ``set_device_name`` no-op.
+
+### Wire format
+
+Additive. New endpoints listed under each section above.
+``MIN_CLIENT_VERSION`` and ``MIN_SERVER_VERSION`` both
+bumped to ``0.48.0`` — peers that predate the new
+pending-decision kind mis-render incoming
+``KIND_PAIR_REQUEST`` entries, and old daemons can't
+emit them; the floor bump means cross-version mismatches
+show the upgrade popup instead of partial behavior.
+
+### Known follow-ups
+
+- Push iteration over ``extra_remotes`` (data-model-only
+  today; see § 4).
+- Migration that drops the legacy ``collab.device_name``
+  config field once existing installs have rolled past
+  one release with the derived-only ``get_device_name``
+  so the legacy-honour branch can go.
+- Peer-side UI work for the Nearby-unpaired list + slot
+  picker + ``team_size`` row — recorder team's pickup
+  per CLIENT_INTEGRATION.md §§ 20a, 21.
+
 ## 0.47.6 — LangPicker re-pick: restore region_scroll visibility
 
 ### Diagnosis

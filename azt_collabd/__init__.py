@@ -108,7 +108,15 @@ from azt_collab_client import __version__  # noqa: F401
 # decoding the removed names would silently render zero for the
 # new sync indicator; force the floor so peers rebuild against
 # the v0.47 ProjectStatus shape.
-MIN_CLIENT_VERSION = "0.47.0"
+#
+# 0.48.0 raises again for the peer-interaction work: shared
+# decisions watcher (§ 20a), Nearby-pair flow (KIND_PAIR_REQUEST
+# + sender outbound tracking), KV / slot-claim API (§ 21),
+# extra_remotes, derived device_name. New endpoints are additive
+# but the wire contract is meaningfully different — peers that
+# predate them mis-render the new pending-decision kind and
+# can't drive the slot picker.
+MIN_CLIENT_VERSION = "0.48.0"
 
 from . import config
 from . import net

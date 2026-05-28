@@ -290,6 +290,21 @@ def _h_credentials_status(_body):
     return 200, {"ok": True, **store.get_status()}
 
 
+def _refuse_if_contributor_unset():
+    """Return a 200 / non-ok refusal body when contributor is empty,
+    or None when set. LAN signalling endpoints call this to surface
+    CONTRIBUTOR_UNSET before doing anything that would advertise an
+    anonymous device on the LAN.
+
+    Same shape as the existing GH-publish refusal — peer routes via
+    the existing status-code dispatch."""
+    if store.get_contributor():
+        return None
+    return 200, {"ok": True,
+                 "result": Result().add(
+                     S.CONTRIBUTOR_UNSET).to_dict()}
+
+
 def _h_get_contributor(_body):
     return 200, {"ok": True, "contributor": store.get_contributor()}
 
@@ -457,6 +472,9 @@ def _h_lan_pair_accept(body):
     A v0 / unknown / missing-required-field payload returns
     ``{ok: False, error: 'bad_payload', detail: ...}`` so the picker
     UI can show a clear "QR data looked wrong" message."""
+    refusal = _refuse_if_contributor_unset()
+    if refusal is not None:
+        return refusal
     payload = (body or {}).get('payload') or {}
     if not isinstance(payload, dict):
         return 200, {"ok": False, "error": "bad_payload",
@@ -538,8 +556,17 @@ def _h_lan_set_toggle(body):
     listener lifecycle. Body: ``{on: bool}``. Hot-applied — listener
     + (later) NsdManager + FGS promotion happen synchronously.
 
-    Response: ``{ok: True, on, endpoint}`` after reconciliation."""
+    Response: ``{ok: True, on, endpoint}`` after reconciliation.
+    Turning on requires ``contributor`` set — without it the
+    advertised peer label would be anonymous (since 0.47.7
+    device_name derives from contributor + autodetect), so we
+    refuse with ``CONTRIBUTOR_UNSET`` and the peer UI routes the
+    user to the contributor field."""
     desired = bool((body or {}).get('on', False))
+    if desired:
+        refusal = _refuse_if_contributor_unset()
+        if refusal is not None:
+            return refusal
     _settings.set_lan_allow_sync(desired)
     try:
         _lan_listener.apply_toggle()
@@ -577,14 +604,17 @@ def _h_lan_clone(body):
     langcode = str((body or {}).get('langcode', '') or '')
     remote_url = str((body or {}).get('remote_url', '') or '')
     vernlang = str((body or {}).get('vernlang', '') or '')
+    # Active vs passive gesture. True (default, for back-compat
+    # with pre-0.47.7 callers that don't pass it) = QR scan /
+    # Nearby pair / explicit clone — move last_project to the
+    # newly-acquired project so the picker resumes into it.
+    # False = passive accept of an incoming share-offer popup —
+    # the project lands in the registry without hijacking what
+    # the user is working on. See CLIENT_INTEGRATION.md § 20a.
+    user_initiated = bool((body or {}).get('user_initiated', True))
     if not peer_id or not langcode:
         return 200, {"ok": False, "error": "bad_request",
                      "detail": "peer_id + langcode required"}
-    # LAN-sync must be on for the outbound clone connection to
-    # have anywhere to land — without the listener up our pinned-
-    # TLS request fails at connect time and the user sees a
-    # generic LAN_PEER_UNREACHABLE. Surface the actual reason so
-    # peer UIs can route to the toggle.
     if not _settings.lan_allow_sync():
         r = Result()
         r.add(S.LAN_TOGGLE_OFF)
@@ -592,9 +622,9 @@ def _h_lan_clone(body):
     result = _lan_clone_mod.clone_from_peer(
         peer_id, langcode, incoming_url=remote_url,
         incoming_vernlang=vernlang)
-    # Set last_project on a successful clone / reopen so the picker
-    # exits straight into the project the user just acquired.
-    if result.has_any(S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED):
+    if (user_initiated
+            and result.has_any(S.LAN_PROJECT_CLONED,
+                               S.LAN_PROJECT_REOPENED)):
         try:
             store.set_last_langcode(langcode)
         except Exception:
@@ -603,12 +633,208 @@ def _h_lan_clone(body):
 
 
 def _h_lan_pending(_body):
-    """List pending UI decisions (share offers, adopt-origin
-    prompts, remote conflicts). Powers the "Decisions waiting (N)"
-    surface in settings and the "Receive a project from another
-    phone (N waiting)" picker badge."""
+    """List pending UI decisions (share offers, pair requests,
+    adopt-origin prompts, remote conflicts). Powers the shared
+    decisions watcher (``azt_collab_client.ui.decisions``)."""
     from . import pending_decisions as _pending
     return 200, {"ok": True, "decisions": _pending.list_all()}
+
+
+def _h_lan_nearby_unpaired(_body):
+    """Return mDNS-discovered devices NOT in our peers.json.
+    Powers the peer-side "Nearby (unpaired)" list with Pair
+    buttons. Empty list if discovery hasn't surfaced anyone or
+    LAN sync is off.
+
+    For each discovered ``peer_id`` we know the endpoint (host,
+    port) from mDNS; the fingerprint and device_name come from
+    a cached snapshot the listener built on the last discovery
+    sweep. To stay safe against stale mDNS data (peer rebound a
+    new port, peer_id renamed), we surface only the
+    endpoint-resolvable subset.
+    """
+    from . import lan_discovery as _lan_discovery
+    from . import peers as _peers
+    paired_ids = {p['peer_id'] for p in _peers.list_peers()}
+    out = []
+    for peer_id, (host, port) in _lan_discovery.known_endpoints().items():
+        if peer_id in paired_ids:
+            continue
+        out.append({
+            'peer_id': peer_id,
+            # fp and device_name aren't carried in the mDNS
+            # endpoint cache today (resolve callback writes only
+            # endpoint). UI shows device_name on the popup AFTER
+            # the receiver accepts (which carries it in
+            # pair_response → lan_pair_requests). Pre-pair, the
+            # UI displays the peer_id prefix.
+            'fp': '',
+            'device_name': '',
+            'endpoint': f'{host}:{int(port)}',
+        })
+    return 200, {"ok": True, "peers": out}
+
+
+def _h_lan_pair_request_send(body):
+    """Initiate a Nearby-pair request to *peer_id*.
+
+    Body: ``{peer_id, langcode?}``. Looks up the peer's endpoint
+    in the mDNS cache, POSTs to their listener's
+    ``/v1/lan/pair_request``, and records an in-memory outbound
+    entry so the peer UI can poll the response state.
+    """
+    from . import lan_discovery as _lan_discovery
+    from . import lan_pair_requests as _lpr
+    from . import lan_push as _lan_push
+    from . import peer_id as _peer_id_mod
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    langcode = str((body or {}).get('langcode', '') or '')
+    if len(peer_id) != 64:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id wrong length"}
+    refusal = _refuse_if_contributor_unset()
+    if refusal is not None:
+        return refusal
+    if not _settings.lan_allow_sync():
+        r = Result()
+        r.add(S.LAN_TOGGLE_OFF)
+        return 200, {"ok": True, "result": r.to_dict()}
+    endpoint = _lan_discovery.get_endpoint(peer_id)
+    if endpoint is None:
+        r = Result()
+        r.add(S.LAN_PEER_UNREACHABLE, peer_id=peer_id)
+        return 200, {"ok": True, "result": r.to_dict()}
+    host, port = endpoint
+    try:
+        ident = _peer_id_mod.ensure()
+    except Exception as ex:
+        return 200, {"ok": False, "error": "no_lan_identity",
+                     "detail": repr(ex)}
+    # The receiver's listener uses CERT_NONE + body-claimed
+    # identity. The sender's outbound request goes through the
+    # same lan_push pinned-context machinery. Since we don't yet
+    # know the receiver's fp (mDNS didn't carry it forward into
+    # the endpoint cache), we use a non-pinned TLS context for
+    # this single signalling POST — same threat model as
+    # share_offer / hello_to_peer (assertion is in the body).
+    body_obj = {
+        'peer_id': ident['peer_id'],
+        'fp': ident['fp'],
+        'device_name': store.get_device_name(),
+        'endpoint': _lan_push._our_endpoint_str(),
+        'langcode': langcode,
+    }
+    status, _resp = _lan_push._https_post_signalling(
+        host, int(port), '/v1/lan/pair_request', body_obj)
+    if status != 200:
+        r = Result()
+        r.add(S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
+              detail=f'http_status={status}')
+        return 200, {"ok": True, "result": r.to_dict()}
+    _lpr.record_sent(peer_id, langcode=langcode)
+    r = Result()
+    r.add(S.LAN_PAIR_REQUEST_PENDING, peer_id=peer_id,
+          langcode=langcode)
+    return 200, {"ok": True, "result": r.to_dict()}
+
+
+def _h_lan_pair_request_resolve(body):
+    """Resolve an inbound KIND_PAIR_REQUEST.
+
+    Body: ``{decision_id, accept: bool}``.
+
+    Accept path: record the peer locally + send hello-back +
+    POST pair_response{accept:true} so the sender's spinner
+    clears. The hello-back records the pair on the sender side
+    via the standard hello flow.
+
+    Decline path: POST pair_response{accept:false} only; no
+    peer record on either side.
+
+    Either way, the pending decision is removed."""
+    from . import pending_decisions as _pending
+    from . import lan_push as _lan_push
+    from . import peer_id as _peer_id_mod
+    decision_id = str((body or {}).get('decision_id', '') or '')
+    accept = bool((body or {}).get('accept', False))
+    if accept:
+        refusal = _refuse_if_contributor_unset()
+        if refusal is not None:
+            return refusal
+    decision = _pending.get(decision_id) if decision_id else None
+    if (decision is None
+            or decision.get('kind') != _pending.KIND_PAIR_REQUEST):
+        return 200, {"ok": False, "error": "not_found"}
+    params = decision.get('params') or {}
+    peer_id = str(params.get('peer_id', '') or '')
+    fp = str(params.get('fp', '') or '')
+    device_name = str(params.get('device_name', '') or '')
+    endpoint = str(params.get('endpoint', '') or '')
+    # The sender's pair-context langcode is recorded for future
+    # use (per-pair auto-share when histories related) but not
+    # acted on at pair time today — share is its own gesture.
+    result = Result()
+    sender_host, sender_port = '', 0
+    if endpoint:
+        try:
+            sender_host, port_str = endpoint.rsplit(':', 1)
+            sender_port = int(port_str)
+        except (ValueError, TypeError):
+            sender_host, sender_port = '', 0
+    if accept:
+        _peers.record_pair(peer_id, fp, device_name, endpoint)
+        # Hello-back: standard flow records the pair on the
+        # sender side. langcode='' here — we don't auto-share
+        # at pair time (per the architecture-discussion
+        # decision; explicit per-project share comes later).
+        # The mutual-share contract for the QR/share-offer
+        # paths handles auto-sharing in their own gestures.
+        if sender_host:
+            try:
+                _lan_push.hello_to_peer(
+                    sender_host, sender_port, fp,
+                    store.get_device_name(), langcode='')
+            except Exception as ex:
+                print(f'[server] pair-accept hello-back to '
+                      f'{peer_id[:8]!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+        result.add(S.LAN_PAIR_REQUEST_ACCEPTED, peer_id=peer_id,
+                   device_name=device_name)
+    else:
+        result.add(S.LAN_PAIR_REQUEST_DECLINED, peer_id=peer_id)
+    # Best-effort pair_response → sender's listener. Non-fatal;
+    # the standard hello-back already informed the sender on
+    # accept, and decline still works (just no spinner update).
+    if sender_host:
+        try:
+            ident = _peer_id_mod.ensure()
+            _lan_push._https_post_signalling(
+                sender_host, sender_port, '/v1/lan/pair_response',
+                {'peer_id': ident['peer_id'], 'accept': accept})
+        except Exception as ex:
+            print(f'[server] pair-response to {peer_id[:8]!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+    _pending.remove(decision_id)
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _h_lan_pair_request_status(body):
+    """One-shot poll of the outbound pair-request state for a
+    peer. Body: ``{peer_id}``. Returns ``{ok, state}`` where
+    state is 'pending' | 'accepted' | 'declined' | 'timeout' |
+    'none'. Terminal states clear on read (see
+    ``lan_pair_requests.status_for``)."""
+    from . import lan_pair_requests as _lpr
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if len(peer_id) != 64:
+        return 200, {"ok": False, "error": "bad_request"}
+    status = _lpr.status_for(peer_id)
+    if status is None:
+        return 200, {"ok": True, "state": "none"}
+    return 200, {"ok": True,
+                 "state": status.get('state', 'pending'),
+                 "langcode": status.get('langcode', ''),
+                 "device_name": status.get('device_name', '')}
 
 
 def _h_lan_accept_offer(body):
@@ -637,11 +863,10 @@ def _h_lan_accept_offer(body):
         S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED)
     if delivered:
         _pending.remove(decision_id)
-        try:
-            store.set_last_langcode(
-                str(params.get('langcode', '') or ''))
-        except Exception:
-            pass
+        # Passive clone: do NOT touch last_project on share-offer
+        # accept. The project lands in the registry; the user
+        # explicitly opens it later via the picker. See
+        # CLIENT_INTEGRATION.md § 20a "passive clone" rule.
     else:
         # Keep the pending decision so the user can retry once the
         # owner-side issue clears (project committed at least once,
@@ -721,15 +946,27 @@ def _h_lan_resolve_conflict(body):
             or decision.get('kind') != _pending.KIND_REMOTE_CONFLICT):
         return 200, {"ok": False, "error": "not_found"}
     params = decision.get('params') or {}
+    langcode = str(params.get('langcode', '') or '')
+    incoming_url = str(params.get('incoming_url', '') or '')
     if mode == 'use_theirs':
-        langcode = str(params.get('langcode', '') or '')
-        incoming_url = str(params.get('incoming_url', '') or '')
         try:
             projects.set_remote_url(langcode, incoming_url)
         except Exception as ex:
             return 200, {"ok": False,
                          "error": f'set_remote_url failed: {ex!r}'}
-    elif mode not in ('keep_mine', 'dual_publish'):
+    elif mode == 'dual_publish':
+        # Record incoming as a secondary remote. The push path
+        # (repo._push_to_remote_url) iterates the primary plus
+        # extra_remotes after; secondaries are best-effort and a
+        # failure on one doesn't block the others. Per
+        # CLIENT_INTEGRATION.md § 20a "Use both" — user picked
+        # to publish to both Internet locations.
+        try:
+            projects.add_extra_remote(langcode, incoming_url)
+        except Exception as ex:
+            return 200, {"ok": False,
+                         "error": f'add_extra_remote failed: {ex!r}'}
+    elif mode != 'keep_mine':
         return 200, {"ok": False,
                      "error": f'unknown mode: {mode!r}'}
     _pending.remove(decision_id)
@@ -748,6 +985,9 @@ def _h_lan_send_share_offer(body):
     langcode = str((body or {}).get('langcode', '') or '')
     if not peer_id or not langcode:
         return 200, {"ok": False, "error": "bad_request"}
+    refusal = _refuse_if_contributor_unset()
+    if refusal is not None:
+        return refusal
     # Gate on the daemon-wide LAN toggle: without it the courtesy
     # POST below fails at connect time and the receiver never sees
     # the offer. Bookkeeping the allowlist change in that case
@@ -2262,6 +2502,135 @@ def _h_grant_collaborator(langcode, body):
     return 200, {"ok": True, "result": res.to_dict()}
 
 
+def _h_project_kv_get(langcode, key, _body):
+    """``GET /v1/projects/<lang>/kv/<key>`` — read a scalar
+    project-KV value (string). Returns ``{value}`` (empty
+    string for unset).
+
+    Storage is ``<working_dir>/.azt/kv/<key>.txt`` (per
+    ``project_kv`` module)."""
+    from . import project_kv as _pkv
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not _pkv._is_safe_name(key):
+        return 400, {"ok": False, "error": "bad_key"}
+    return 200, {"ok": True, "value": _pkv.kv_get(p.working_dir, key)}
+
+
+def _h_project_kv_set(langcode, key, body):
+    """``POST /v1/projects/<lang>/kv/<key>`` — write a scalar
+    project-KV value and fire a debounced commit so it
+    propagates to paired peers via the existing sync
+    pipeline. Body: ``{value: str}``."""
+    from . import project_kv as _pkv
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not _pkv._is_safe_name(key):
+        return 400, {"ok": False, "error": "bad_key"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    value = body.get('value', '')
+    if value is None:
+        value = ''
+    try:
+        _pkv.kv_set(p.working_dir, key, str(value))
+    except Exception as ex:
+        return 500, {"ok": False,
+                     "error": f'kv_set raised: {ex!r}'}
+    _touch_project(langcode)
+    job_id = scheduler.commit_project(langcode)
+    return 200, {"ok": True, "value": str(value), "job_id": job_id}
+
+
+def _h_project_kv_list(langcode, _body):
+    """``GET /v1/projects/<lang>/kv`` — return every KV entry
+    as ``{kv: {key: value, ...}}``."""
+    from . import project_kv as _pkv
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    return 200, {"ok": True, "kv": _pkv.kv_list(p.working_dir)}
+
+
+def _h_project_slots_list(langcode, _body):
+    """``GET /v1/projects/<lang>/slots`` — return current slot
+    claims as ``{slots: {slot: {peer_id, claimed_at, device_name}, ...}}``.
+
+    Slots are typically integers stringified (``"1"``, ``"2"``…)
+    but the storage layer permits any safe filename — peer UIs
+    decide the slot keyspace."""
+    from . import project_kv as _pkv
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    return 200, {"ok": True,
+                 "slots": _pkv.slot_list(p.working_dir)}
+
+
+def _h_project_slot_claim(langcode, body):
+    """``POST /v1/projects/<lang>/slots/claim`` — claim a slot.
+    Body: ``{slot: str}``. Atomically (locally) displaces any
+    prior claim by this peer on a different slot; convergent
+    against simultaneous claims of the same slot by other
+    peers (post-merge resolver picks the later ``claimed_at``).
+
+    Identity (``peer_id`` + ``device_name``) comes from the
+    daemon's own LAN identity / contributor — peers do not pass
+    these on the wire (same pattern as commit identity)."""
+    from . import project_kv as _pkv
+    from . import peer_id as _peer_id_mod
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    slot = body.get('slot')
+    if not isinstance(slot, (str, int)) or not str(slot):
+        return 400, {"ok": False, "error": "missing_slot"}
+    slot = str(slot)
+    if not _pkv._is_safe_name(slot):
+        return 400, {"ok": False, "error": "bad_slot"}
+    refusal = _refuse_if_contributor_unset()
+    if refusal is not None:
+        return refusal
+    try:
+        ident = _peer_id_mod.ensure()
+    except Exception as ex:
+        return 500, {"ok": False,
+                     "error": f'no_lan_identity: {ex!r}'}
+    ok = _pkv.slot_claim(p.working_dir, ident['peer_id'],
+                         store.get_device_name(), slot)
+    if not ok:
+        return 400, {"ok": False, "error": "claim_refused"}
+    _touch_project(langcode)
+    job_id = scheduler.commit_project(langcode)
+    return 200, {"ok": True, "slot": slot, "job_id": job_id}
+
+
+def _h_project_slot_release(langcode, _body):
+    """``POST /v1/projects/<lang>/slots/release`` — release
+    every slot held by this peer. Returns the list of slots
+    that were released so the UI can render "you released
+    slot N". Idempotent — empty list if we held nothing."""
+    from . import project_kv as _pkv
+    from . import peer_id as _peer_id_mod
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    try:
+        ident = _peer_id_mod.ensure()
+    except Exception as ex:
+        return 500, {"ok": False,
+                     "error": f'no_lan_identity: {ex!r}'}
+    released = _pkv.slot_release(p.working_dir, ident['peer_id'])
+    if released:
+        _touch_project(langcode)
+        scheduler.commit_project(langcode)
+    return 200, {"ok": True, "released": released}
+
+
 def _h_project_commit(langcode, _body):
     """``POST /v1/projects/<lang>/commit`` — schedule a debounced
     commit. As of 0.43.0 commit and push are split: this endpoint
@@ -2878,6 +3247,8 @@ def dispatch(method, path, body):
             return _h_lan_get_toggle(body)
         if path == '/v1/lan/pending':
             return _h_lan_pending(body)
+        if path == '/v1/lan/nearby_unpaired':
+            return _h_lan_nearby_unpaired(body)
         if path == '/v1/projects':
             return _h_list_projects(body)
         if path.startswith('/v1/projects/'):
@@ -2892,6 +3263,12 @@ def dispatch(method, path, body):
             if len(parts) == 6 and parts[4] == 'cawl' \
                     and parts[5] == 'cache_status':
                 return _h_cawl_cache_status(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'kv':
+                return _h_project_kv_list(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'kv':
+                return _h_project_kv_get(parts[3], parts[5], body)
+            if len(parts) == 5 and parts[4] == 'slots':
+                return _h_project_slots_list(parts[3], body)
         if path.startswith('/v1/jobs/'):
             parts = path.split('/')
             if len(parts) == 4 and parts[3]:
@@ -2933,6 +3310,12 @@ def dispatch(method, path, body):
             return _h_lan_resolve_conflict(body)
         if path == '/v1/lan/send_share_offer':
             return _h_lan_send_share_offer(body)
+        if path == '/v1/lan/pair_request_send':
+            return _h_lan_pair_request_send(body)
+        if path == '/v1/lan/pair_request_resolve':
+            return _h_lan_pair_request_resolve(body)
+        if path == '/v1/lan/pair_request_status':
+            return _h_lan_pair_request_status(body)
         if path == '/v1/credentials/github/device_flow/start':
             return _h_github_device_flow_start(body)
         if path == '/v1/credentials/github/tokens':
@@ -2999,6 +3382,14 @@ def dispatch(method, path, body):
                 return _h_set_cawl_image_repo(parts[3], body)
             if len(parts) == 5 and parts[4] == 'repo_slug':
                 return _h_set_repo_slug(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'kv':
+                return _h_project_kv_set(parts[3], parts[5], body)
+            if len(parts) == 6 and parts[4] == 'slots' \
+                    and parts[5] == 'claim':
+                return _h_project_slot_claim(parts[3], body)
+            if len(parts) == 6 and parts[4] == 'slots' \
+                    and parts[5] == 'release':
+                return _h_project_slot_release(parts[3], body)
         return 404, {"ok": False, "error": "not_found"}
 
     return 405, {"ok": False, "error": "method_not_allowed"}

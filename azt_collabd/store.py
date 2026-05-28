@@ -499,40 +499,52 @@ def _autodetect_device_name():
 
 
 def get_device_name():
-    """Stored device-name label. Auto-populates (and persists) on
-    first read if unset, so callers never see an empty string
-    after the first call. Empty input to ``set_device_name`` later
-    *also* triggers re-autodetection on next read.
+    """Composed peer label = ``<contributor> — <autodetect>``.
 
-    The auto-populated value is just a best-effort default — the
-    user can override via the settings UI for clarity / privacy
-    ("Marie's tablet" instead of "SM-T580")."""
-    stored = (_load_config_file().get('collab') or {}).get(
+    Since 0.47.7 device_name is **derived** from contributor +
+    OS-level device label rather than independently stored.
+    Returns the empty string when contributor is unset (peer
+    label is "not set"); LAN operations refuse with
+    ``CONTRIBUTOR_UNSET`` in that state so the user sets a name
+    once and both git commits + peer labels get a sensible value.
+
+    The autodetect half (``moto g - 2025`` / ``Marie's Tablet`` /
+    desktop hostname) is best-effort. Composed value is what
+    other paired devices see in their peer roster and what gets
+    stamped on the git author email slot.
+
+    The pre-0.47.7 ``device_name`` config field is still read
+    if present (legacy peers persisted it via an old set_device_name
+    path that no longer exists); a future migration will drop it.
+    """
+    contributor = get_contributor()
+    if not contributor:
+        # No contributor → no peer label. The composed form would
+        # read "— moto g - 2025" which is uselessly anonymous.
+        # Callers gate on CONTRIBUTOR_UNSET instead.
+        return ''
+    # Legacy stored override (pre-0.47.7). If present, honour it
+    # so existing pairings don't see a churn in peer labels on
+    # upgrade. Once the field migrates out we'll drop this branch.
+    legacy = (_load_config_file().get('collab') or {}).get(
         'device_name', '')
-    if stored:
-        return stored
+    if legacy:
+        return legacy
     detected = _autodetect_device_name()
-    # Persist so subsequent calls (and other peers on this device)
-    # see a stable value without re-running the autodetect probes.
-    cfg = _load_config_file()
-    cfg.setdefault('collab', {})['device_name'] = detected
-    try:
-        _save_config_file(cfg)
-    except OSError:
-        # Persist failure is not fatal — caller still gets the
-        # autodetected value; next call will re-detect. Logging
-        # would be noisy in tests.
-        pass
-    return detected
+    if not detected or detected == 'unknown-device':
+        return contributor
+    return f'{contributor} — {detected}'
 
 
 def set_device_name(name):
-    """Persist the user's device-name override. Strips whitespace;
-    empty string clears, causing ``get_device_name`` to re-detect
-    on next read."""
-    cfg = _load_config_file()
-    cfg.setdefault('collab', {})['device_name'] = (name or '').strip()
-    _save_config_file(cfg)
+    """No-op since 0.47.7. ``device_name`` is now derived from
+    ``contributor`` + autodetect (see ``get_device_name``); user-
+    facing setting is the contributor field. Kept callable for
+    back-compat with any client code that still calls it on
+    older daemons — the underlying config field is no longer
+    authoritative, so this just no-ops."""
+    # Intentional pass — see docstring.
+    return
 
 
 # ── recent project (server-canonical) ───────────────────────────────────────

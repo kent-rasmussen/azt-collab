@@ -222,6 +222,15 @@ _HANDLERS = {
         _tr('Share for {langcode} was declined.'), p),
     S.LAN_OFFER_ACCEPTED:     lambda p: _fmt(
         _tr('Accepted share offer for {langcode}.'), p),
+    S.LAN_PAIR_REQUEST_PENDING: lambda p: _fmt(
+        _tr('Waiting for {device_name} to accept the pair request…'),
+        p),
+    S.LAN_PAIR_REQUEST_ACCEPTED: lambda p: _fmt(
+        _tr('{device_name} accepted the pair request.'), p),
+    S.LAN_PAIR_REQUEST_DECLINED: lambda p: _fmt(
+        _tr('{device_name} declined the pair request.'), p),
+    S.LAN_PAIR_REQUEST_TIMEOUT: lambda p: _fmt(
+        _tr('Pair request to {device_name} timed out.'), p),
     S.APP_NOT_INSTALLED:      lambda p: _fmt(_tr('App not installed. Visit {url} and select "All repositories".'), p),
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),

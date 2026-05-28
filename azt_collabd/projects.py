@@ -83,6 +83,14 @@ class Project:
     # projects and LAN clones explicitly populate it from the
     # handshake / template input.
     vernlang: str = ''
+    # Additional Internet-hosted remotes for this project. Populated
+    # when the user picks "Use both" on a KIND_REMOTE_CONFLICT
+    # popup (LAN sync surfaces two divergent ``remote_url``\ s
+    # from paired devices). ``remote_url`` stays as primary; the
+    # push path attempts each ``extra_remotes`` entry after primary
+    # as best-effort secondaries. Empty list is the common case.
+    # 0.47.7+.
+    extra_remotes: list = field(default_factory=list)
 
     def to_dict(self):
         return {
@@ -96,10 +104,15 @@ class Project:
             'cawl_image_repo': self.cawl_image_repo,
             'repo_slug': self.repo_slug,
             'vernlang': self.vernlang,
+            'extra_remotes': list(self.extra_remotes or []),
         }
 
     @classmethod
     def from_entry(cls, langcode, d):
+        raw_extra = d.get('extra_remotes') or []
+        if not isinstance(raw_extra, list):
+            raw_extra = []
+        extra = [str(u) for u in raw_extra if isinstance(u, str) and u]
         return cls(
             langcode=langcode,
             working_dir=d.get('working_dir', ''),
@@ -111,6 +124,7 @@ class Project:
             cawl_image_repo=d.get('cawl_image_repo', ''),
             repo_slug=d.get('repo_slug', ''),
             vernlang=d.get('vernlang', ''),
+            extra_remotes=extra,
         )
 
     def effective_vernlang(self):
@@ -350,6 +364,39 @@ def set_remote_url(langcode, url):
     def mut(d):
         if langcode in d:
             d[langcode]['remote_url'] = url
+    _update(mut)
+
+
+def add_extra_remote(langcode, url):
+    """Append *url* to this project's ``extra_remotes`` list,
+    preserving order and deduping. No-op if *url* equals the
+    project's primary ``remote_url`` (the user picked
+    ``dual_publish`` but the two URLs are identical — possibly
+    a re-pair race) or if *url* is already in the list. Used by
+    KIND_REMOTE_CONFLICT mode ``dual_publish``."""
+    def mut(d):
+        if langcode not in d:
+            return
+        entry = d[langcode]
+        if str(entry.get('remote_url', '') or '') == url:
+            return
+        extras = list(entry.get('extra_remotes') or [])
+        if url in extras:
+            return
+        extras.append(url)
+        entry['extra_remotes'] = extras
+    _update(mut)
+
+
+def remove_extra_remote(langcode, url):
+    """Remove *url* from ``extra_remotes`` (no-op if absent).
+    Used when the user changes their mind via the settings UI."""
+    def mut(d):
+        if langcode not in d:
+            return
+        extras = [u for u in (d[langcode].get('extra_remotes') or [])
+                  if u != url]
+        d[langcode]['extra_remotes'] = extras
     _update(mut)
 
 

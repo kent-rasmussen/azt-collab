@@ -2560,11 +2560,14 @@ the right wrappers, and route the typed Results.
    The ``WAN-N`` / ``LAN-N`` / ``WAN-x LAN-y`` distinctions in
    § 17b's rendering recipe are the user-visible expression of
    this — never conflate them.
-2. **Don't poll ``lan_pending`` faster than 5 s.** The
-   pending-decisions list is for surfacing user-actionable
-   prompts, not telemetry. Pre-resume background polling
-   should be paused; resume on ``on_resume`` with one fresh
-   fetch.
+2. **Don't poll ``lan_pending`` from peer code at all.** Use
+   the shared decisions watcher (§ 20a) — it owns the poll.
+   The watcher polls at 1 s by default which is fine because
+   it's the *only* poller; an additional peer-side poll on
+   the same endpoint races the watcher and double-pops
+   decisions. (The old "≥5s" rule existed when each peer
+   polled independently; it's superseded by the watcher
+   contract.)
 3. **Never store the peer's ed25519 key, fingerprint, or
    endpoint outside ``peers.json``.** The daemon owns the
    paired-peers registry. Peer-side caches drift — fingerprint
@@ -2728,6 +2731,332 @@ display) for any auto-share. Practical implications:
   out from under you — could be a legitimate re-pair, could
   be MITM. Surface, don't auto-rotate. Re-scan their QR to
   re-pair with the new fingerprint after verbal confirm.
+
+## 20a. Shared decisions watcher (since 0.47.x)
+
+Every pending decision the daemon stashes (share offers,
+pair requests, adopt-origin / remote-conflict prompts) is
+rendered by **a single shared client UI** —
+``azt_collab_client.ui.decisions``. Peers must not reimplement
+these popups, must not poll ``lan_pending`` themselves, and
+must not own these surfaces.
+
+### Hard rules
+
+1. **Install the watcher exactly once at startup.** Call
+   ``install_decision_watcher()`` from your App's ``on_start``
+   (after ``bootstrap()`` returns). The watcher is a singleton;
+   a second call replaces the interval / callback without
+   spawning a second poll loop, but you should only need to
+   call it once per process.
+2. **Do not call ``lan_pending()`` from peer code.** The
+   watcher owns that endpoint. A second poller racing the
+   watcher will pop decisions twice (popup, accept, second
+   pop on stale data).
+3. **Do not render your own popups for the four kinds.** The
+   watcher owns ``KIND_SHARE_OFFER`` / ``KIND_PAIR_REQUEST``
+   / ``KIND_ADOPT_ORIGIN`` / ``KIND_REMOTE_CONFLICT``. Peer
+   code that previously called ``pending_offers_popup`` /
+   ``adopt_origin_popup`` directly should drop those calls —
+   the watcher surfaces them automatically.
+4. **Do not auto-load a newly-received project.** When the
+   user accepts a ``KIND_SHARE_OFFER``, the clone is
+   **passive** (``user_initiated=False``): the project lands
+   in your list but ``last_project`` is unchanged. Your
+   ``on_resolved`` callback may refresh the project list; it
+   must NOT switch the loaded project. The user explicitly
+   opens it later if they want.
+
+### Public surface
+
+```python
+from azt_collab_client.ui import install_decision_watcher
+
+class MyApp(App):
+    def on_start(self):
+        super().on_start()
+        bootstrap(...)
+        install_decision_watcher(
+            poll_interval_s=1.0,    # default; clamp [0.5, 5.0]
+            on_resolved=self._on_decision_resolved,
+        )
+
+    def _on_decision_resolved(self, kind, action, decision):
+        # kind: 'share_offer' | 'pair_request' |
+        #       'adopt_origin' | 'remote_conflict'
+        # action: 'accept' | 'decline' | 'keep_mine' |
+        #         'use_theirs' | 'both'
+        # decision: the original {id, kind, params, created_at}
+        if kind == 'share_offer' and action == 'accept':
+            self.refresh_project_list()
+        if kind == 'pair_request' and action == 'accept':
+            self.refresh_peer_roster()
+```
+
+### Decision kinds
+
+| Kind | Body params | Popup shows | Resolves via |
+|---|---|---|---|
+| ``share_offer`` | ``peer_id, device_name, langcode, repo_url, vernlang`` | "{device_name} wants to share project '{langcode}' with you." | ``lan_accept_offer`` (passive clone) / ``lan_decline_offer`` |
+| ``pair_request`` *(new in 0.47.x)* | ``peer_id, fp, device_name, endpoint, langcode`` | "{device_name} wants to pair with this device." | ``lan_pair_request_resolve`` |
+| ``adopt_origin`` | ``peer_id, device_name, langcode, url`` | "Back up project '{langcode}' to the Internet at {url}?" | ``lan_adopt_origin`` |
+| ``remote_conflict`` | ``peer_id, device_name, langcode, existing_url, incoming_url`` | "Two Internet locations for project '{langcode}'. Pick which to use." | ``lan_resolve_conflict`` (modes: ``keep_mine``, ``use_theirs``, ``dual_publish`` — peer chooses via three-button row) |
+
+Long ``device_name`` / ``langcode`` / URL values wrap inside
+the popup rather than clipping. Don't pass these through a
+shortener in your refresh hook; the watcher handles
+presentation.
+
+### Status codes routed through the watcher
+
+- ``S.LAN_SHARE_OFFER`` — daemon emits when a paired peer's
+  outbound share lands. Watcher renders.
+- ``S.LAN_PAIR_REQUEST_PENDING`` — sender-side ack after the
+  user taps Pair in the Nearby-unpaired list. Watcher does
+  NOT render this — it's an informational status the host
+  app may toast / spinner-render however it likes ("waiting
+  for {device_name}…"). Auto-clears on accept / decline /
+  timeout.
+- ``S.LAN_PAIR_REQUEST_ACCEPTED`` / ``..._DECLINED`` /
+  ``..._TIMEOUT`` — emitted by the sender's daemon when the
+  receiver responds (or 5-min cap fires). Surface as a toast
+  (translated via ``translate_status``).
+- ``S.LAN_ADOPT_ORIGIN_NEEDED`` — overlaid on a clone Result;
+  the receiver's pending-decisions list gains a corresponding
+  ``adopt_origin`` entry. Watcher renders.
+- ``S.LAN_REMOTE_CONFLICT`` — same pattern; watcher renders.
+
+### Sender-side Nearby-pair flow (peer responsibilities)
+
+The watcher handles the **receiver** side of pair requests.
+The **sender** side is the Nearby-unpaired list in the peer
+UI:
+
+1. Read ``lan_nearby_unpaired()`` → list of mDNS-discovered
+   devices not in our ``peers.json``. Each entry has
+   ``peer_id``, ``fp``, ``device_name``, ``endpoint``.
+2. Render with a "Pair…" button per row. On tap, call
+   ``lan_pair_request_send(peer_id, langcode=current_project)``.
+3. On the returned ``Result`` carrying
+   ``S.LAN_PAIR_REQUEST_PENDING``, render a non-modal
+   spinner / "waiting for {device_name}…" toast. The
+   sender's daemon polls the receiver and emits
+   ``S.LAN_PAIR_REQUEST_ACCEPTED`` / ``..._DECLINED`` /
+   ``..._TIMEOUT`` on the next status fetch.
+4. Refresh ``lan_list_peers()`` on accept; clear the spinner
+   on any of the three terminal statuses.
+
+### Migration checklist — pre-0.47 peers
+
+For a peer that already ships LAN sync (§ 20):
+
+1. Add the ``install_decision_watcher()`` call to
+   ``on_start``.
+2. Delete any peer-side polling of ``lan_pending``.
+3. Delete any peer-side direct calls to
+   ``pending_offers_popup`` / ``adopt_origin_popup`` (the
+   watcher surfaces them automatically). The "Receive a
+   project" picker button can stay for the
+   first-pair-via-QR fallthrough, but it should NOT poll
+   share-offers — those land via the watcher now.
+4. If your peer kept its own "what to do when a project
+   arrives" logic (e.g. auto-loading the new project), drop
+   it. Passive clone is the contract; the user explicitly
+   opens new projects.
+5. Add a Nearby-unpaired section to your peer roster /
+   settings screen that calls ``lan_nearby_unpaired`` and
+   ``lan_pair_request_send`` per the sender-flow checklist
+   above.
+
+### What the watcher does NOT do
+
+- It does not render the **outbound** "waiting for response"
+  state — that's the host's job (the surface depends on
+  whether it's a toast, a row spinner, or a modal). The
+  watcher only renders **inbound** decisions.
+- It does not handle QR-scan pairing — that path uses
+  ``ui.lan_popups.scan_to_pair`` and runs synchronously in-
+  flow. The watcher is for the asynchronous "someone else
+  initiated" case.
+- It does not surface ``S.CONTRIBUTOR_UNSET`` or other
+  gating statuses — those belong on the affected gestures'
+  return paths (toast + navigate to settings).
+
+## 21. Project-shared KV and slot claims (since 0.47.9)
+
+Cross-phone agreement on per-project state that doesn't fit
+in the LIFT file: ``team_size``, "who's on which recording
+slot", project-wide UI preferences, etc. Stored as plain
+files under the project's working tree (``.azt/kv/`` and
+``.azt/slots/``), committed and synced through the existing
+LIFT pipeline, with conflict resolution wired into the
+daemon's merge driver.
+
+### Public API surface
+
+```python
+from azt_collab_client import (
+    project_kv_get, project_kv_set, project_kv_list,
+    list_slots, claim_slot, release_slot,
+)
+
+# Scalar KV — every phone agrees on this value.
+project_kv_set(langcode, 'team_size', 4)
+team_size = project_kv_get(langcode, 'team_size', default=None)
+
+# Slot claim — who's recording which range of the wordlist.
+claim_slot(langcode, '2')           # claim slot 2 for this device
+slots = list_slots(langcode)         # {'2': {peer_id, claimed_at,
+                                     #        device_name}, ...}
+release_slot(langcode)               # drop every slot held by us
+```
+
+Notes on each:
+
+- **``project_kv_get(langcode, key, default=None)``** — reads
+  ``.azt/kv/<key>.txt``. Returns *default* on transport
+  failure, unknown project, or unset key — peer code can
+  treat empty / missing uniformly.
+- **``project_kv_set(langcode, key, value)``** — writes
+  ``.azt/kv/<key>.txt`` and fires a debounced
+  ``commit_project`` so the change propagates via the
+  existing sync pipeline. ``value`` is coerced to string;
+  callers parse on read.
+- **``list_slots(langcode)``** — returns
+  ``{slot: {peer_id, claimed_at, device_name}}`` — the
+  authoritative roster of who's on which slot. Empty dict
+  if no claims exist yet.
+- **``claim_slot(langcode, slot)``** — atomic (locally)
+  displace-on-claim: any prior claim by this device on a
+  *different* slot is dropped before the new file is
+  written. The "one device, one slot" invariant holds
+  per-device without coordination.
+- **``release_slot(langcode)``** — removes every slot held
+  by this device. Idempotent.
+
+### Locked semantics
+
+The four design decisions from the 2026-05-28 architecture
+discussion (anchored here so peer code can reason about
+behaviour without spelunking the CHANGELOG):
+
+1. **Convergent atomicity, not real-time.** Two phones can
+   simultaneously claim the same slot — both commits land,
+   both push, the merge driver picks one winner (per #4),
+   the loser sees on next ``list_slots`` that they're not
+   in the roster. Peer UI must re-prompt the user to pick
+   again when ``list_slots`` excludes this device. There is
+   no leader / quorum / coordinator; convergence happens at
+   sync time, in-room latency ~60 s.
+
+2. **Canonical key is ``peer_id``.** Slot records carry the
+   device's ed25519 pubkey hex (64 chars) as the key.
+   ``device_name`` is a display label only — it can change
+   without invalidating any claim (e.g. when the user
+   renames their contributor). Peer UI displays
+   ``device_name``; peer logic compares ``peer_id``.
+
+3. **One file per slot.** ``.azt/slots/<slot>.txt`` content:
+
+   ```
+   <peer_id>
+   <claimed_at_iso>
+   <device_name>
+   ```
+
+   Simultaneous claims produce a natural git merge conflict
+   that the daemon's merge driver resolves automatically
+   (per #4). Peer code does NOT see conflict markers — it
+   only sees the post-resolution state.
+
+4. **Tiebreak: later ``claimed_at`` wins.** Merge picks
+   the version whose embedded ISO timestamp is later
+   (lexicographic compare = chronological for UTC ISO
+   format). Ties on equal timestamps break by
+   alphabetic ``peer_id``. Reasoning: matches the user's
+   "I tapped first" mental model. Implementation detail —
+   if field data ever shows misbehaviour, the daemon can
+   switch tiebreak rules without changing the wire format.
+
+### Hard rules
+
+1. **Identity comes from the daemon, not the peer.** Don't
+   pass ``peer_id`` or ``device_name`` to ``claim_slot``;
+   the daemon uses its own. Same pattern as commit
+   identity — peers don't pass ``contributor`` over the
+   wire either.
+2. **Claim refuses with ``CONTRIBUTOR_UNSET`` when no
+   contributor name is set.** Route the user to the
+   contributor field before retrying — same routing as the
+   existing GH-publish path. Read paths
+   (``project_kv_get`` / ``list_slots``) work without a
+   contributor; only the claim gesture is gated.
+3. **Peer-side UI must re-detect displacement.** If a peer
+   was at slot 2 and a later ``list_slots`` doesn't include
+   the peer's ``peer_id`` anywhere, prompt the user to
+   pick again. There is no daemon-side notification for
+   displacement — the absence in ``list_slots`` is the
+   signal.
+4. **Slot keys are safe filenames.** ``[A-Za-z0-9_]`` start,
+   ``[A-Za-z0-9_.-]`` body, ≤64 chars. The daemon rejects
+   anything else (``bad_slot``). Use simple numeric strings
+   (``'1'``, ``'2'``, …) unless you have a specific reason.
+5. **One slot per device.** ``claim_slot('2')`` while
+   already holding slot 5 silently drops the prior claim.
+   This is the displace-on-claim invariant. Peer UI may
+   want to confirm before reclaiming if the user previously
+   tapped a different slot.
+
+### Recommended peer flow (word-list splitting use case)
+
+The motivating case is splitting a SILCAWL recording across
+a 3-person team. Each phone reads ``team_size`` + their
+slot number to compute a CAWL range filter:
+
+```python
+team_size = int(project_kv_get(langcode, 'team_size',
+                               default='0') or '0')
+my_peer_id = lan_peer_id().get('peer_id', '')
+slots = list_slots(langcode)
+my_slot = next((s for s, claim in slots.items()
+                if claim.get('peer_id') == my_peer_id),
+               None)
+
+if team_size and not my_slot:
+    show_pick_slot_dialog(team_size, taken=set(slots))
+
+if team_size and my_slot:
+    apply_cawl_filter(compute_range(team_size, int(my_slot)))
+```
+
+- Read ``team_size`` + ``list_slots`` at project-open and
+  on every sync completion.
+- ``show_pick_slot_dialog`` displays slot buttons; tapped
+  slot fires ``claim_slot(langcode, slot)``; the
+  ``list_slots`` roster updates on next sync.
+- ``apply_cawl_filter`` is the peer's existing per-range
+  filter (recorder's ``apply_cawl`` path).
+
+### Migration checklist — peer adopting the KV/slot feature
+
+1. **Read ``team_size`` at project-open.** If unset,
+   nothing to do (single-device project; existing manual
+   filter behavior). If set, fall into the slot flow.
+2. **Render a slot picker** when ``team_size`` is set AND
+   this device isn't in ``list_slots``. Show only unclaimed
+   slots by default with a "show all" override for the
+   dead-phone-replacement case.
+3. **Wire ``claim_slot`` to the picker tap.** Refresh
+   ``list_slots`` after the call to confirm the claim
+   landed.
+4. **Recompute the CAWL filter on every sync completion
+   when the source is "split".** Add a peer-side flag
+   (``cawl_filter_source`` ∈ ``{'split', 'manual', None}``)
+   so manual edits in the existing range textbox don't
+   get clobbered.
+5. **Route ``CONTRIBUTOR_UNSET`` from ``claim_slot``** to
+   the contributor field. Existing GH-publish handling does
+   the right thing here; route it the same way.
 
 ## What the suite does *for* you (keep code shareable)
 

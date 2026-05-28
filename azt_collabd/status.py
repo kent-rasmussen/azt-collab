@@ -300,6 +300,31 @@ LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
 
+# Nearby-pair flow (request from an unpaired device discovered via
+# mDNS). The sender posts to the receiver's listener; the receiver
+# stashes a pending decision (kind=pair_request) and the user
+# Accept/Decline resolves it via the same shared decisions watcher
+# UI as share-offer / adopt-origin.
+#   LAN_PAIR_REQUEST_PENDING:  sender ack — request posted, waiting
+#                              on the other side. Params: ``peer_id``,
+#                              ``device_name``, ``langcode`` (the
+#                              sender's current project, may be '').
+#   LAN_PAIR_REQUEST_ACCEPTED: receiver accepted; the sender's
+#                              outbound request resolves. Pair
+#                              record + hello-back follow the same
+#                              path as a QR-pair. Params:
+#                              ``peer_id``, ``device_name``.
+#   LAN_PAIR_REQUEST_DECLINED: receiver declined; sender clears the
+#                              in-flight request. Params:
+#                              ``peer_id``.
+#   LAN_PAIR_REQUEST_TIMEOUT:  5-min cap elapsed without a response;
+#                              the in-flight request is auto-
+#                              cleared. Params: ``peer_id``.
+LAN_PAIR_REQUEST_PENDING = 'LAN_PAIR_REQUEST_PENDING'
+LAN_PAIR_REQUEST_ACCEPTED = 'LAN_PAIR_REQUEST_ACCEPTED'
+LAN_PAIR_REQUEST_DECLINED = 'LAN_PAIR_REQUEST_DECLINED'
+LAN_PAIR_REQUEST_TIMEOUT = 'LAN_PAIR_REQUEST_TIMEOUT'
+
 # Transport-failure codes. Mirror of the client-side constants
 # (the daemon doesn't emit these — they're produced by the
 # client wrappers' transport-failure branches — but keeping the

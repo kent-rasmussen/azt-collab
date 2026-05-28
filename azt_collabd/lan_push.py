@@ -904,6 +904,76 @@ def hello_to_peer(host, port, expected_fp, device_name='',
     return True
 
 
+def _our_endpoint_str():
+    """Return our LAN listener's ``host:port`` as a string, or ''
+    if the listener isn't bound. Used by signalling payloads
+    (pair_request, hello) that need to advertise where the
+    remote side can reach us back."""
+    from . import lan_listener as _lan_listener
+    bound = _lan_listener.bound_endpoint()
+    return f'{bound[0]}:{bound[1]}' if bound else ''
+
+
+def _https_post_signalling(host, port, path, payload):
+    """Best-effort HTTPS POST to a discovered-but-not-yet-paired
+    peer's listener. Used for pair_request / pair_response which
+    can't pin the receiver's fp yet (we don't have it until the
+    pair is recorded).
+
+    Threat model same as ``hello_to_peer`` /
+    ``_handle_share_offer_bodyauth``: identity is body-claimed
+    under encrypted-but-unauthenticated transport, with the
+    user gesture (Pair tap) as the consent signal. The body
+    carries the sender's ed25519 pubkey which IS the peer_id.
+
+    Returns ``(status_code, body_bytes)`` on success,
+    ``(0, b'')`` on any failure (logged).
+    """
+    import json
+    import ssl
+    try:
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # Load our own cert so the peer can ID us via fp from the
+        # body (which references our peer_id = ed25519 pubkey).
+        from . import peer_id as _peer_id_mod
+        cert_path = _peer_id_mod.cert_path()
+        key_path = _peer_id_mod.key_path()
+        if cert_path and key_path:
+            ctx.load_cert_chain(certfile=cert_path,
+                                keyfile=key_path)
+    except Exception as ex:
+        print(f'[lan-push] signalling ctx build failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 0, b''
+    try:
+        import urllib3
+        pm = urllib3.PoolManager(
+            ssl_context=ctx,
+            assert_hostname=False,
+            cert_reqs='CERT_NONE',
+        )
+    except Exception as ex:
+        print(f'[lan-push] signalling pool manager failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+        return 0, b''
+    url = f'https://{host}:{int(port)}{path}'
+    try:
+        resp = pm.request(
+            'POST', url,
+            body=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            timeout=urllib3.Timeout(connect=5, read=10),
+            retries=False,
+        )
+    except Exception as ex:
+        print(f'[lan-push] signalling POST {url} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 0, b''
+    return resp.status, resp.data
+
+
 def _https_post_to_peer(peer_id, path, payload):
     """Generic best-effort HTTPS POST to a paired peer's LAN
     listener. Resolves the peer's endpoint via the standard

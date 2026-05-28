@@ -469,6 +469,70 @@ def _handle_share_declined(environ, start_response, peer_id,
     return _json_response(start_response, '200 OK', {'ok': True})
 
 
+def _handle_pair_request(environ, start_response):
+    """Inbound Nearby-pair request from an unpaired device.
+
+    Stashes a KIND_PAIR_REQUEST pending decision; the shared
+    decisions watcher renders the popup on next poll. Body:
+    ``{peer_id, fp, device_name, endpoint, langcode?}``.
+
+    Accepts unpaired callers (this IS the gesture by which they
+    become paired). Body must self-validate by carrying its own
+    peer_id + fp (the peer_id IS the ed25519 pubkey, so the
+    body claim is what TLS would have verified anyway under our
+    CERT_NONE setup — see lan_listener._build_server for why).
+    """
+    from . import pending_decisions as _pending
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    fp = str(payload.get('fp', '') or '')
+    device_name = str(payload.get('device_name', '') or '')
+    endpoint = str(payload.get('endpoint', '') or '')
+    langcode = str(payload.get('langcode', '') or '')
+    if len(peer_id) != 64 or len(fp) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id / fp wrong length'})
+    _pending.add(_pending.KIND_PAIR_REQUEST, {
+        'peer_id': peer_id, 'fp': fp,
+        'device_name': device_name, 'endpoint': endpoint,
+        'langcode': langcode,
+    })
+    print(f'[lan-listener] pair-request from {peer_id[:8]!r} '
+          f'({device_name!r}) stashed',
+          file=sys.stderr, flush=True)
+    return _json_response(start_response, '200 OK', {'ok': True})
+
+
+def _handle_pair_response(environ, start_response):
+    """Inbound response to an outbound pair-request we sent.
+
+    Body: ``{peer_id, accept: bool}``. Sender-side dispatch
+    only updates the in-memory outbound-requests state; the
+    actual peer record (if accept=True) is recorded when the
+    receiver's hello-back lands via the normal hello flow.
+    """
+    from . import lan_pair_requests as _lpr
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    accept = bool(payload.get('accept', False))
+    if len(peer_id) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id wrong length'})
+    _lpr.record_response(peer_id, accept)
+    print(f'[lan-listener] pair-response from {peer_id[:8]!r}: '
+          f'{"accept" if accept else "decline"}',
+          file=sys.stderr, flush=True)
+    return _json_response(start_response, '200 OK', {'ok': True})
+
+
 def _peer_acl_middleware(app):
     """WSGI middleware: extract peer-id from the verified client
     cert (captured into ``environ`` by ``_CertCapturingHandler``);
@@ -514,6 +578,10 @@ def _peer_acl_middleware(app):
         if method == 'POST' and path_info == '/v1/lan/share_declined':
             return _handle_share_declined_bodyauth(
                 environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/pair_request':
+            return _handle_pair_request(environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/pair_response':
+            return _handle_pair_response(environ, start_response)
         # Non-signalling fallthrough: dulwich.web's git smart-
         # protocol app. URL-level ACL is handled at backend-build
         # time — ``_build_dict_backend`` only mounts projects that
