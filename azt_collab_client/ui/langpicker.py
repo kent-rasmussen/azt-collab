@@ -76,12 +76,17 @@ _KV_TEMPLATE = '''
             height: 0
         ScrollView:
             id: results_scroll
+            size_hint_y: None
+            height: min(results_box.minimum_height, dp(416))
+            do_scroll_x: False
+            bar_width: dp(4)
             BoxLayout:
                 id: results_box
                 orientation: 'vertical'
                 size_hint_y: None
                 height: self.minimum_height
                 spacing: dp(4)
+        Widget:
 '''
 
 
@@ -112,12 +117,46 @@ BoxLayout:
         opacity: 0
         halign: 'left'
         text_size: self.width, None
-    BoxLayout:
-        id: region_box
-        orientation: 'vertical'
+    ScrollView:
+        id: region_scroll
         size_hint_y: None
-        height: self.minimum_height
-        spacing: dp(4)
+        height: min(region_box.minimum_height, dp(420))
+        do_scroll_x: False
+        bar_width: dp(4)
+        BoxLayout:
+            id: region_box
+            orientation: 'vertical'
+            size_hint_y: None
+            height: self.minimum_height
+            spacing: dp(4)
+    BoxLayout:
+        id: region_chosen
+        orientation: 'horizontal'
+        size_hint_y: None
+        height: 0
+        opacity: 0
+        disabled: True
+        spacing: dp(8)
+        Label:
+            id: region_chosen_label
+            text: ''
+            font_size: sp(14)
+            font_name: FONT
+            color: T.TEXT
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+            shorten: True
+        Button:
+            id: region_change_btn
+            text: _('Change')
+            size_hint_x: None
+            width: dp(96)
+            background_color: T.SURFACE_ALT
+            background_normal: ''
+            color: T.ACCENT
+            font_name: FONT
+            font_size: sp(13)
     BoxLayout:
         size_hint_y: None
         height: dp(40)
@@ -235,6 +274,11 @@ class LangPickerScreen(Screen):
         cls._search_index = idx
 
     def _on_search_text(self, text):
+        if self._selected and text:
+            self._selected = None
+            self._selected_region = ''
+            self._dialect_code = ''
+            self._hide_selection()
         if hasattr(self, '_search_ev') and self._search_ev:
             self._search_ev.cancel()
         self._search_ev = Clock.schedule_once(
@@ -302,6 +346,9 @@ class LangPickerScreen(Screen):
             cb = self._selection_box.ids.get('continue_btn')
             if cb:
                 cb.bind(on_release=lambda w: self._on_continue())
+            rcb = self._selection_box.ids.get('region_change_btn')
+            if rcb:
+                rcb.bind(on_release=lambda w: self._change_region())
         return self._selection_box
 
     def _show_selection(self):
@@ -348,12 +395,25 @@ class LangPickerScreen(Screen):
 
         region_box = ids.get('region_box')
         region_title = ids.get('region_title')
+        region_scroll = ids.get('region_scroll')
+        region_chosen = ids.get('region_chosen')
+        region_chosen_label = ids.get('region_chosen_label')
         if region_box:
             region_box.clear_widgets()
+        if region_chosen:
+            region_chosen.height = 0
+            region_chosen.opacity = 0
+            region_chosen.disabled = True
+        if region_chosen_label:
+            region_chosen_label.text = ''
+        if region_scroll:
+            region_scroll.opacity = 1
+            region_scroll.disabled = False
         if len(all_regions) > 1:
             if region_title:
                 region_title.height = dp(20)
                 region_title.opacity = 1
+                region_title.disabled = False
             rnames = self._region_names or {}
             btn = Button(
                 text=_tr('Multiple / all regions'),
@@ -393,15 +453,51 @@ class LangPickerScreen(Screen):
 
     def _select_region(self, region_code):
         self._selected_region = region_code
-        region_box = self._sel_ids.get('region_box')
-        if region_box:
-            for child in region_box.children:
-                if region_code and region_code in child.text:
-                    child.background_color = theme.ACCENT
-                elif not region_code and 'Multiple' in child.text:
-                    child.background_color = theme.ACCENT
-                else:
-                    child.background_color = theme.SURFACE_ALT
+        ids = self._sel_ids
+        if region_code:
+            rname = (self._region_names or {}).get(region_code, region_code)
+            display = f'{rname} ({region_code})'
+        else:
+            display = _tr('Multiple / all regions')
+        region_title = ids.get('region_title')
+        region_scroll = ids.get('region_scroll')
+        region_chosen = ids.get('region_chosen')
+        region_chosen_label = ids.get('region_chosen_label')
+        if region_title:
+            region_title.height = 0
+            region_title.opacity = 0
+            region_title.disabled = True
+        if region_scroll:
+            region_scroll.height = 0
+            region_scroll.opacity = 0
+            region_scroll.disabled = True
+        if region_chosen:
+            region_chosen.height = dp(40)
+            region_chosen.opacity = 1
+            region_chosen.disabled = False
+        if region_chosen_label:
+            region_chosen_label.text = display
+        self._update_code()
+
+    def _change_region(self):
+        ids = self._sel_ids
+        self._selected_region = ''
+        region_title = ids.get('region_title')
+        region_scroll = ids.get('region_scroll')
+        region_box = ids.get('region_box')
+        region_chosen = ids.get('region_chosen')
+        if region_title:
+            region_title.height = dp(20)
+            region_title.opacity = 1
+            region_title.disabled = False
+        if region_scroll and region_box:
+            region_scroll.height = min(region_box.minimum_height, dp(420))
+            region_scroll.opacity = 1
+            region_scroll.disabled = False
+        if region_chosen:
+            region_chosen.height = 0
+            region_chosen.opacity = 0
+            region_chosen.disabled = True
         self._update_code()
 
     def _toggle_dialect(self, active):
@@ -426,6 +522,14 @@ class LangPickerScreen(Screen):
         region_box = ids.get('region_box')
         if region_box:
             region_box.clear_widgets()
+        region_chosen = ids.get('region_chosen')
+        if region_chosen:
+            region_chosen.height = 0
+            region_chosen.opacity = 0
+            region_chosen.disabled = True
+        region_chosen_label = ids.get('region_chosen_label')
+        if region_chosen_label:
+            region_chosen_label.text = ''
         di = ids.get('dialect_input')
         if di:
             di.height = 0

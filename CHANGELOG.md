@@ -9,6 +9,132 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.47.6 — LangPicker re-pick: restore region_scroll visibility
+
+### Diagnosis
+
+After 0.47.5, picking a region collapsed the picker by setting
+`region_scroll.opacity = 0` and `disabled = True`. When the
+user then re-typed in the search field and picked a *different*
+language, `_select_language` rebuilt the buttons inside
+`region_box` but never reset `region_scroll`'s opacity/disabled
+back to visible/enabled. The KV-bound height followed
+`region_box.minimum_height` correctly (hence the
+"appropriately sized blank spot") but the contents stayed
+invisible.
+
+### Fix
+
+`_select_language` now resets `region_scroll.opacity = 1`,
+`region_scroll.disabled = False`, and (in the multi-region
+branch) `region_title.disabled = False` before populating the
+buttons. `_change_region` already did the equivalent on its
+path; this just brings the second entry point into line.
+
+### Files
+
+- ``azt_collab_client/ui/langpicker.py`` — restore
+  `region_scroll`/`region_title` visibility in `_select_language`.
+
+### Wire format
+
+None. UI-only.
+
+## 0.47.5 — LangPicker tightens results cap; region collapses after pick
+
+### Fix
+
+1. The results-list cap was `dp(520)` (≈ 10 rows), but the
+   soft-keyboard covers roughly the bottom half of the screen
+   when the search field has focus, so the last few matches
+   were hidden behind it. Cap is now `dp(416)` (8 rows of
+   `dp(48)` + spacing) so the visible list stays above the
+   keyboard on a standard phone.
+
+2. After the user picks a region, the picker (title +
+   ScrollView of region buttons) now collapses to a single
+   line — `<region name> (rc)` plus a small `Change` button.
+   Tapping `Change` re-expands the picker (and clears
+   `_selected_region`). State per step is now:
+   1. language name (`selected_label`)
+   2. region name + `Change` (collapsed picker)
+   3. dialect checkbox + optional variant input
+   4. assembled language code
+   5. Continue
+
+   When no region has been picked yet, the picker stays open
+   exactly as before. `_hide_selection` and `_select_language`
+   both reset the chosen-region one-liner so navigating away
+   and back lands on a clean state.
+
+### Files
+
+- ``azt_collab_client/ui/langpicker.py`` — `results_scroll`
+  cap `dp(520)` → `dp(416)`; new `region_chosen` BoxLayout
+  in `_SELECTION_KV` (Label + `Change` button); new
+  `_change_region` method; `_select_region` / `_hide_selection`
+  / `_select_language` toggle picker vs. chosen-one-liner
+  visibility.
+
+### Wire format
+
+None. UI-only.
+
+## 0.47.4 — LangPicker results list cap + reset on re-search
+
+### Fix
+
+Two related fixes to LangPickerScreen:
+
+1. The language-search results list (`results_box`) had
+   `size_hint_y: 1.0` default, so it grew to fill all remaining
+   vertical space even with only a handful of matches. Now
+   capped at `dp(520)` (≈ 10 buttons of `dp(48)` + spacing) and
+   only scrolls past that — same shape as the region list in
+   0.47.3.
+
+2. After the user picked a language, editing the search field
+   again populated `results_box` *below* the inserted selection
+   panel (so new matches appeared beneath the Continue button).
+   `_on_search_text` now treats any non-empty edit while a
+   language is already selected as "start over": clears
+   `_selected` / `_selected_region` / `_dialect_code` and tears
+   down the selection panel before scheduling the new search.
+
+### Files
+
+- ``azt_collab_client/ui/langpicker.py`` — cap `results_scroll`
+  at `dp(520)`; reset selection state in `_on_search_text` when
+  a language was already chosen and the search field is edited
+  to non-empty text.
+
+### Wire format
+
+None. UI-only.
+
+## 0.47.3 — LangPicker region list scrolls past ~10 entries
+
+### Fix
+
+The "Select region:" panel in LangPickerScreen rendered every
+region as a `dp(38)` button stacked in a non-scrolling BoxLayout.
+For languages with many regions (e.g. en, fr, ar), the panel
+ran off the bottom of the screen and the Continue button was
+unreachable. The region list now lives inside a `ScrollView`
+capped at `dp(420)` (≈ 10 buttons) — the list grows freely up
+to that cap, then scrolls.
+
+### Files
+
+- ``azt_collab_client/ui/langpicker.py`` — wrap `region_box` in
+  a `ScrollView` with `height: min(region_box.minimum_height,
+  dp(420))` so it collapses to 0 when empty and caps at ~10
+  rows when full.
+
+### Wire format
+
+None. UI-only.
+
 ## 0.47.2 — Auto-commit after atomic_finalize / atomic_commit
 
 ### Diagnosis

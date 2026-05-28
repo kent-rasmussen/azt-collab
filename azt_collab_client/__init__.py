@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.47.2"
+__version__ = "0.47.6"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
