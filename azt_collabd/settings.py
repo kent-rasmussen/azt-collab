@@ -49,14 +49,26 @@ _DEFAULTS = {
     'sync.post_online_grace_s': 60,
     'sync.work_offline': False,
     'sync.push_budget_s': 300,
-    # LAN sync (parked spec, phase 4+). Daemon-wide toggle for the
-    # device-to-device fan-out transport. When False (default) the
-    # listener thread + NsdManager advertise/browse are torn down;
-    # peer-app calls into the LAN endpoints still work for
-    # bookkeeping (pair/share) but no network exposure happens.
-    # Hot-applied — flipping does NOT require a daemon restart
-    # (per feedback_hot_toggle_not_restart).
-    'lan.allow_sync': False,
+    # LAN sync, 0.50+ semantics.
+    #
+    # ``lan.autodiscovery`` (default False since 0.50.2): when
+    # True the daemon keeps mDNS advertise + browse +
+    # MulticastLock + FGS running continuously so paired peers
+    # can find us cold and we auto-recover on Wi-Fi-change events
+    # without a user gesture. When False, discovery happens only
+    # during burst windows triggered by ``sync_nudge`` (user
+    # tapped the sync icon) or by ``_run_commit`` (just made a
+    # local commit). Both phones' bursts must overlap to
+    # rendezvous; the user gesture is the synchronization
+    # primitive.
+    #
+    # Migration from pre-0.50 ``lan.allow_sync`` is handled by
+    # ``lan_autodiscovery()`` reading the old key when the new
+    # one isn't present — existing 'on' users keep being on, and
+    # the migration is invisible.
+    #
+    # Hot-applied — flipping does NOT require a daemon restart.
+    'lan.autodiscovery': False,
 }
 _ENV_MAP = {
     'sync.debounce_ms': 'AZT_SYNC_DEBOUNCE_MS',
@@ -65,7 +77,7 @@ _ENV_MAP = {
     'sync.post_online_grace_s': 'AZT_SYNC_POST_ONLINE_GRACE_S',
     'sync.work_offline': 'AZT_SYNC_WORK_OFFLINE',
     'sync.push_budget_s': 'AZT_SYNC_PUSH_BUDGET_S',
-    'lan.allow_sync': 'AZT_LAN_ALLOW_SYNC',
+    'lan.autodiscovery': 'AZT_LAN_AUTODISCOVERY',
 }
 
 _lock = threading.Lock()
@@ -199,7 +211,17 @@ def post_online_grace_s():
 
 
 def work_offline():
-    return bool(get('sync.work_offline', False))
+    """Deprecated 0.50: WAN backoff replaces the work_offline
+    toggle. Always returns False. The persisted ``sync.work_offline``
+    key is left on disk for back-compat with older peers / a
+    possible downgrade; this accessor ignores it.
+
+    Callers were either:
+      - gating push attempts (now handled by ``wan_backoff``), or
+      - surfacing ``S.WORK_OFFLINE_ENABLED`` to the user.
+    Both flows go away. The "save power on metered network" use
+    case is left to a future per-network policy (see audit doc)."""
+    return False
 
 
 def push_budget_s():
@@ -277,16 +299,65 @@ def set_work_offline(value: bool):
     set_('sync.work_offline', bool(value))
 
 
+def lan_autodiscovery():
+    """Read the daemon-wide LAN auto-discovery toggle (0.50+).
+    Default True (in 0.50.0; will flip to False once burst-mode
+    discovery lands in 0.50.1). When True, mDNS advertise +
+    browse + MulticastLock + FGS run continuously so paired peers
+    can find us automatically. When False, none of those run —
+    discovery only happens during burst windows triggered by a
+    user gesture (and in 0.50.0 the burst-mode fallback isn't
+    implemented yet, so False effectively means "LAN off
+    entirely").
+
+    Name: "autodiscovery" rather than "passive_discovery" because
+    "passive" reads from the user's perspective (the user is
+    passive — the device discovers automatically for them).
+    True = automatic; False = the user has to nudge.
+
+    Migration from pre-0.50 ``lan.allow_sync``: if the new key
+    is absent and the old key is present, return the old value.
+    The migration is read-only here — actual rewriting happens
+    on the next ``set_lan_autodiscovery`` call. Old peers that
+    still write ``lan.allow_sync`` keep working until they
+    upgrade."""
+    data = _load_raw()
+    if isinstance(data, _LoadFailed):
+        return _DEFAULTS['lan.autodiscovery']
+    if 'lan.autodiscovery' in data:
+        return bool(_coerce('lan.autodiscovery',
+                            data['lan.autodiscovery']))
+    if 'lan.allow_sync' in data:
+        # Old key present, new key absent: existing user upgrading.
+        # Preserve their setting (an existing 'on' user keeps
+        # auto-discovery; an existing 'off' user keeps the same
+        # quiet behaviour) — the migration is invisible.
+        return bool(data['lan.allow_sync'])
+    # Env override on the new key
+    env_name = _ENV_MAP.get('lan.autodiscovery')
+    if env_name and env_name in os.environ:
+        return _coerce('lan.autodiscovery', os.environ[env_name])
+    return _DEFAULTS['lan.autodiscovery']
+
+
+def set_lan_autodiscovery(value: bool):
+    """Persist the LAN auto-discovery toggle. Writes the new key;
+    leaves any pre-0.50 ``lan.allow_sync`` value untouched so a
+    downgrade still finds something sensible. The actual
+    start/stop of mDNS + locks is the ``lan_listener`` module's
+    responsibility — this setter just writes the bit."""
+    set_('lan.autodiscovery', bool(value))
+
+
+# Back-compat shim: existing callers continue to read
+# ``lan_allow_sync``. Phase out the alias once all sites have
+# migrated to the new name.
 def lan_allow_sync():
-    """Read the daemon-wide LAN-sync toggle. Default False."""
-    return bool(get('lan.allow_sync', False))
+    """Deprecated 0.50: use ``lan_autodiscovery``. Returns the
+    same value via the migration path."""
+    return lan_autodiscovery()
 
 
 def set_lan_allow_sync(value: bool):
-    """Persist the LAN-sync toggle. The actual start/stop of the
-    listener thread + NsdManager advertise/browse is the
-    ``lan_listener`` module's responsibility — this setter just
-    writes the bit. The listener module's ``apply_toggle()`` runs
-    in the same RPC handler call so the user sees the FGS
-    notification / mDNS exposure change immediately."""
-    set_('lan.allow_sync', bool(value))
+    """Deprecated 0.50: use ``set_lan_autodiscovery``."""
+    set_lan_autodiscovery(value)

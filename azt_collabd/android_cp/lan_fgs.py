@@ -54,6 +54,19 @@ _STATE = {
     'wifi_lock': None,
     'multicast_lock': None,
 }
+# Reference-counted arm/disarm (0.50+). Each in-flight operation
+# increments its counter; when both counters drop to zero AND
+# ``lan.passive_discovery`` is off, ``arm_release_for_operation``
+# tears the FGS + locks down.
+#
+# ``discovery``: bursts of mDNS query/listen. Needs MulticastLock +
+# FGS (so the process stays alive long enough for replies to land).
+# ``transfer``: outbound/inbound push or clone. Needs WifiLock +
+# FGS (radio in high-perf so the pack doesn't stall).
+_REF = {
+    'discovery': 0,
+    'transfer': 0,
+}
 
 
 _NOTIFICATION_ID = 0xAC0B1A    # arbitrary, uniquely ours
@@ -146,116 +159,33 @@ def _build_minimal_notification(ctx):
 
 def start_fgs():
     """Promote the ``:provider`` service to a foreground service of
-    type ``specialUse``. No-op on desktop. Idempotent."""
+    type ``specialUse``. No-op on desktop. Idempotent.
+
+    Pre-0.50: called directly when ``lan.allow_sync`` toggled on.
+    Post-0.50: still works for back-compat, but the preferred entry
+    points are the ref-counted ``arm_for_*`` helpers."""
     with _LOCK:
-        if _STATE['foreground']:
-            return
-        if not _on_android():
-            return
-        svc = _get_service()
-        if svc is None:
-            print('[lan-fgs] no PythonService.mService; skipping',
-                  file=sys.stderr, flush=True)
-            return
-        notification = _build_minimal_notification(svc)
-        if notification is None:
-            print('[lan-fgs] no notification; cannot promote',
-                  file=sys.stderr, flush=True)
-            return
-        try:
-            from jnius import autoclass
-            ServiceInfo = autoclass(
-                'android.content.pm.ServiceInfo')
-            Build = autoclass('android.os.Build$VERSION')
-            # Call Service.startForeground directly. The Service
-            # base class has had startForeground(int, Notification)
-            # since API 5 and the 3-arg overload with
-            # foregroundServiceType since API 29. Skip the
-            # ServiceCompat wrapper — jnius static-method resolution
-            # against the androidx helper class doesn't see the
-            # ``startForeground`` overloads on this build.
-            if Build.SDK_INT >= 29:
-                svc.startForeground(
-                    _NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            else:
-                svc.startForeground(_NOTIFICATION_ID, notification)
-        except Exception as ex:
-            print(f'[lan-fgs] startForeground failed: {ex!r}',
-                  file=sys.stderr, flush=True)
-            return
-        _STATE['foreground'] = True
-        print('[lan-fgs] promoted to foreground (specialUse / '
-              f'{_FGS_SUBTYPE})', file=sys.stderr, flush=True)
+        _start_fgs_unlocked()
 
 
 def stop_fgs():
     """Demote out of foreground state. No-op on desktop. Idempotent."""
     with _LOCK:
-        if not _STATE['foreground']:
-            return
-        if not _on_android():
-            _STATE['foreground'] = False
-            return
-        svc = _get_service()
-        if svc is None:
-            _STATE['foreground'] = False
-            return
-        try:
-            # Same reason as start_fgs: call Service.stopForeground
-            # directly. The boolean removeNotification arg has been
-            # there since API 5; the Service.STOP_FOREGROUND_REMOVE
-            # int variant only exists in N+ via ServiceCompat which
-            # jnius can't see here.
-            svc.stopForeground(True)
-        except Exception as ex:
-            print(f'[lan-fgs] stopForeground failed: {ex!r}',
-                  file=sys.stderr, flush=True)
-        _STATE['foreground'] = False
+        _stop_fgs_unlocked()
 
 
 def acquire_wifi_locks():
     """Acquire ``WIFI_MODE_FULL_HIGH_PERF`` + ``MulticastLock`` so
     Wi-Fi stays awake and multicast packets reach us. The high-perf
     mode is the real battery cost the user pays for while the LAN
-    toggle is on. No-op on desktop. Idempotent."""
+    toggle is on. No-op on desktop. Idempotent.
+
+    Pre-0.50 caller path: ``lan_listener.apply_toggle`` calls this
+    when the toggle goes on. Post-0.50 the preferred path is the
+    ref-counted ``arm_for_discovery`` / ``arm_for_transfer`` helpers
+    which only acquire what they need."""
     with _LOCK:
-        if _STATE['wifi_lock'] is not None and \
-                _STATE['multicast_lock'] is not None:
-            return
-        if not _on_android():
-            return
-        try:
-            from jnius import autoclass
-        except ImportError:
-            return
-        try:
-            ActivityThread = autoclass('android.app.ActivityThread')
-            app = ActivityThread.currentApplication()
-            if app is None:
-                return
-            WifiManager = autoclass('android.net.wifi.WifiManager')
-            wifi = app.getSystemService('wifi')
-            if wifi is None:
-                return
-            if _STATE['wifi_lock'] is None:
-                lock = wifi.createWifiLock(
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                    'azt_collab_lan_sync')
-                lock.setReferenceCounted(False)
-                lock.acquire()
-                _STATE['wifi_lock'] = lock
-            if _STATE['multicast_lock'] is None:
-                mlock = wifi.createMulticastLock(
-                    'azt_collab_lan_sync')
-                mlock.setReferenceCounted(False)
-                mlock.acquire()
-                _STATE['multicast_lock'] = mlock
-            print('[lan-fgs] acquired WifiLock + MulticastLock',
-                  file=sys.stderr, flush=True)
-        except Exception as ex:
-            print(f'[lan-fgs] wifi lock acquire failed: {ex!r}',
-                  file=sys.stderr, flush=True)
+        _acquire_wifi_locks_unlocked(want_wifi=True, want_mcast=True)
 
 
 def release_wifi_locks():
@@ -272,3 +202,208 @@ def release_wifi_locks():
                 print(f'[lan-fgs] release {key} raised: {ex!r}',
                       file=sys.stderr, flush=True)
             _STATE[key] = None
+
+
+# ── reference-counted lifecycle (0.50+) ────────────────────────────
+#
+# The old "hold everything while toggle is on" model is replaced by
+# ref counts: each operation arms what it needs, releases on
+# completion. When both counters drop to zero and the user hasn't
+# opted into passive discovery, everything goes down.
+#
+# All four helpers are idempotent and safe to call from any thread;
+# all gating is done inside ``_apply_state_locked`` to keep the
+# acquire/release decisions in one place.
+
+
+def _apply_state_locked():
+    """Recompute desired FGS + lock state from the ref counts + the
+    persisted ``lan.passive_discovery`` flag. Must be called with
+    ``_LOCK`` held. Acquires and releases the underlying jnius
+    handles to match desired state. Idempotent."""
+    try:
+        from .. import settings as _settings
+        passive = _settings.lan_autodiscovery()
+    except Exception:
+        passive = False
+    discovery_active = (_REF['discovery'] > 0)
+    transfer_active = (_REF['transfer'] > 0)
+    want_fgs = passive or discovery_active or transfer_active
+    want_mcast = passive or discovery_active
+    want_wifi = passive or transfer_active
+
+    if want_fgs and not _STATE['foreground']:
+        # _LOCK is recursive within the same thread (threading.Lock is
+        # not, but we're called from already-locked context — start_fgs
+        # takes _LOCK again; refactor to avoid double-acquire).
+        # ``_start_fgs_unlocked`` does the platform-side work without
+        # taking _LOCK.
+        _start_fgs_unlocked()
+    elif not want_fgs and _STATE['foreground']:
+        _stop_fgs_unlocked()
+
+    if want_mcast or want_wifi:
+        _acquire_wifi_locks_unlocked(
+            want_wifi=want_wifi, want_mcast=want_mcast)
+    if not want_wifi and _STATE['wifi_lock'] is not None:
+        _release_one_lock_unlocked('wifi_lock')
+    if not want_mcast and _STATE['multicast_lock'] is not None:
+        _release_one_lock_unlocked('multicast_lock')
+
+
+def arm_for_discovery():
+    """Increment the discovery ref count + apply state. Use during
+    an mDNS burst (announce + browse + wait for replies)."""
+    with _LOCK:
+        _REF['discovery'] += 1
+        _apply_state_locked()
+
+
+def disarm_for_discovery():
+    """Decrement the discovery ref count + reapply state."""
+    with _LOCK:
+        if _REF['discovery'] > 0:
+            _REF['discovery'] -= 1
+        _apply_state_locked()
+
+
+def arm_for_transfer():
+    """Increment the transfer ref count + apply state. Use around
+    an outbound push or while accepting an inbound pack."""
+    with _LOCK:
+        _REF['transfer'] += 1
+        _apply_state_locked()
+
+
+def disarm_for_transfer():
+    """Decrement the transfer ref count + reapply state."""
+    with _LOCK:
+        if _REF['transfer'] > 0:
+            _REF['transfer'] -= 1
+        _apply_state_locked()
+
+
+def apply_passive_state():
+    """Reconcile to the persisted ``lan.passive_discovery`` flag.
+    Called on flag change so a flip-to-on raises FGS + locks even
+    when no ref count is active. Idempotent."""
+    with _LOCK:
+        _apply_state_locked()
+
+
+def snapshot():
+    """Diagnostic: current state without taking actions."""
+    with _LOCK:
+        return {
+            'foreground': bool(_STATE['foreground']),
+            'wifi_lock_held': _STATE['wifi_lock'] is not None,
+            'multicast_lock_held': _STATE['multicast_lock'] is not None,
+            'ref_discovery': _REF['discovery'],
+            'ref_transfer': _REF['transfer'],
+        }
+
+
+# ── internal: locked variants ─────────────────────────────────────
+#
+# The public start_fgs / stop_fgs / acquire_wifi_locks /
+# release_wifi_locks helpers all take _LOCK themselves; the locked
+# variants below do the platform-side work assuming the caller
+# already holds _LOCK. Used by _apply_state_locked.
+
+
+def _start_fgs_unlocked():
+    if _STATE['foreground']:
+        return
+    if not _on_android():
+        return
+    svc = _get_service()
+    if svc is None:
+        print('[lan-fgs] no PythonService.mService; skipping',
+              file=sys.stderr, flush=True)
+        return
+    notification = _build_minimal_notification(svc)
+    if notification is None:
+        print('[lan-fgs] no notification; cannot promote',
+              file=sys.stderr, flush=True)
+        return
+    try:
+        from jnius import autoclass
+        ServiceInfo = autoclass('android.content.pm.ServiceInfo')
+        Build = autoclass('android.os.Build$VERSION')
+        if Build.SDK_INT >= 29:
+            svc.startForeground(
+                _NOTIFICATION_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        else:
+            svc.startForeground(_NOTIFICATION_ID, notification)
+    except Exception as ex:
+        print(f'[lan-fgs] startForeground failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    _STATE['foreground'] = True
+    print('[lan-fgs] promoted to foreground (specialUse / '
+          f'{_FGS_SUBTYPE})', file=sys.stderr, flush=True)
+
+
+def _stop_fgs_unlocked():
+    if not _STATE['foreground']:
+        return
+    if not _on_android():
+        _STATE['foreground'] = False
+        return
+    svc = _get_service()
+    if svc is None:
+        _STATE['foreground'] = False
+        return
+    try:
+        svc.stopForeground(True)
+    except Exception as ex:
+        print(f'[lan-fgs] stopForeground failed: {ex!r}',
+              file=sys.stderr, flush=True)
+    _STATE['foreground'] = False
+
+
+def _acquire_wifi_locks_unlocked(want_wifi=True, want_mcast=True):
+    if not _on_android():
+        return
+    try:
+        from jnius import autoclass
+    except ImportError:
+        return
+    try:
+        ActivityThread = autoclass('android.app.ActivityThread')
+        app = ActivityThread.currentApplication()
+        if app is None:
+            return
+        WifiManager = autoclass('android.net.wifi.WifiManager')
+        wifi = app.getSystemService('wifi')
+        if wifi is None:
+            return
+        if want_wifi and _STATE['wifi_lock'] is None:
+            lock = wifi.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                'azt_collab_lan_sync')
+            lock.setReferenceCounted(False)
+            lock.acquire()
+            _STATE['wifi_lock'] = lock
+        if want_mcast and _STATE['multicast_lock'] is None:
+            mlock = wifi.createMulticastLock('azt_collab_lan_sync')
+            mlock.setReferenceCounted(False)
+            mlock.acquire()
+            _STATE['multicast_lock'] = mlock
+    except Exception as ex:
+        print(f'[lan-fgs] wifi lock acquire failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
+def _release_one_lock_unlocked(key):
+    lock = _STATE.get(key)
+    if lock is None:
+        return
+    try:
+        if lock.isHeld():
+            lock.release()
+    except Exception as ex:
+        print(f'[lan-fgs] release {key} raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    _STATE[key] = None

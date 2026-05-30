@@ -28,9 +28,9 @@ import sys
 
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from .themed_popup import ThemedButton as Button
 from kivy.uix.label import Label
-from kivy.uix.popup import Popup
+from .themed_popup import ThemedPopup as Popup
 from kivy.uix.scrollview import ScrollView
 
 from . import theme

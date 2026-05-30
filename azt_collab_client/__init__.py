@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.48.0"
+__version__ = "0.50.15"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -165,7 +165,7 @@ __version__ = "0.48.0"
 # WAN-behind / LAN-behind / at-risk states. Force the floor so
 # the bootstrap popup prompts a daemon rebuild before that misread
 # happens.
-MIN_SERVER_VERSION = "0.48.0"
+MIN_SERVER_VERSION = "0.49.1"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``
@@ -1274,6 +1274,44 @@ def release_slot(langcode):
     return out if isinstance(out, list) else []
 
 
+def rebind_slot(langcode, slot):
+    """User-driven slot-claim recovery (0.50.9+).
+
+    Tells the daemon "this slot on this project is still ours,
+    even though the existing claim has a stale identity." The
+    daemon rewrites the slot file's ``peer_id`` + ``device_name``
+    to its current values and refreshes ``claimed_at`` to now,
+    so the rebind wins any concurrent claim by another peer in
+    the merge.
+
+    Used when this device's ``peer_id`` has changed since the
+    slot was originally claimed (server-APK reinstall regenerated
+    the LAN identity; user cleared app data) but the user knows
+    from context — typically a contributor-name match against
+    the existing claim's ``device_name`` — that the slot is
+    theirs. The peer-side guard rail is a confirm popup; this
+    RPC is just the persistence half.
+
+    Returns ``True`` on success, ``False`` if the daemon refused
+    (slot doesn't exist, no peer identity, slot name fails
+    validation, etc.). Treat any failure as "fall back to the
+    slot picker" — the same shape as a fresh claim attempt.
+
+    Does NOT create a new claim. If you want "claim this slot"
+    (whether or not one exists), use :func:`claim_slot` instead.
+    """
+    if not langcode or not slot:
+        return False
+    try:
+        resp = call(
+            'POST',
+            f'/v1/projects/{langcode}/slots/{slot}/rebind',
+            {})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
+
+
 def lan_pair_request_send(peer_id, langcode=''):
     """Initiate a Nearby-pair request to *peer_id* (an mDNS-
     discovered, currently-unpaired device). Carries our identity
@@ -1834,6 +1872,32 @@ def project_status(langcode):
     if not resp.get('ok'):
         return None
     return ProjectStatus.from_dict(resp)
+
+
+def sync_nudge(langcode=''):
+    """Unified sync gesture (since 0.50): reset WAN backoff for the
+    project (or all projects if *langcode* is empty), fire an
+    immediate WAN push attempt, and fire a LAN burst-discovery +
+    fan-out. Same semantics as the sync icon: "try everything now,
+    ignore any backoff."
+
+    Returns ``Result``; on transport failure returns a
+    SERVER_UNAVAILABLE-typed Result rather than raising — peers can
+    call this from a tap handler without try/except.
+
+    Replaces ``sync_project`` for the user-tap case; ``sync_project``
+    is kept for callers that need the per-project synchronous
+    push-and-return contract (e.g., post-publish flush)."""
+    body = {'langcode': langcode} if langcode else {}
+    try:
+        resp = call('POST', '/v1/sync/nudge', body)
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result(statuses=[])
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
 def sync_project(langcode):
@@ -2419,7 +2483,7 @@ __all__ = [
     'lan_pair_request_send', 'lan_pair_request_resolve',
     'lan_nearby_unpaired',
     'project_kv_get', 'project_kv_set', 'project_kv_list',
-    'list_slots', 'claim_slot', 'release_slot',
+    'list_slots', 'claim_slot', 'release_slot', 'rebind_slot',
     'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
     'github_app_install_url', 'github_app_client_id',
     'github_device_flow_start', 'github_device_flow_status',
@@ -2432,7 +2496,7 @@ __all__ = [
     'create_project_from_template',
     'clone_project',
     'clone_project_start', 'clone_project_status',
-    'project_status', 'sync_project',
+    'project_status', 'sync_project', 'sync_nudge',
     'commit_project', 'request_sync', 'poll_job',
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',

@@ -149,6 +149,15 @@ class ProjectStatus:
     # yet (pre-init, or pre-first-commit project). Since 0.45.45.
     # See CLIENT_INTEGRATION.md § 17b Background refresh obligation.
     head_sha: str = ''
+    # Foreign-device topic-branch orphan count. Number of
+    # ``refs/remotes/origin/azt-pending-*`` refs whose
+    # device-name suffix isn't this daemon's — i.e. cross-device
+    # orphans the local janitor can't safely sweep. Diagnostic
+    # only; non-zero means "another device's incomplete push is
+    # still parked on this remote." Peers may surface as a
+    # "remote has leftover branches" indicator in a sync-detail
+    # screen; it's not a sync-blocking condition. Since 0.50.15.
+    foreign_topic_orphan_count: int = 0
 
     @classmethod
     def from_dict(cls, d):
@@ -178,4 +187,6 @@ class ProjectStatus:
             lan_allow_sync=bool(d.get('lan_allow_sync', False)),
             lan_pushed_sha=str(d.get('lan_pushed_sha', '') or ''),
             head_sha=str(d.get('head_sha', '') or ''),
+            foreign_topic_orphan_count=int(
+                d.get('foreign_topic_orphan_count', 0) or 0),
         )

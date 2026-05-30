@@ -192,7 +192,7 @@ def _make_prefetch_state(requested):
     }
 
 
-def _prefetch_worker(repo, paths):
+def _prefetch_worker(repo, paths, lan_extras=None):
     """Iterate ``paths`` and warm each via ``get_image_path``.
     Increments ``_prefetch_state[repo]['completed']`` on each
     successful resolve; ``failed`` otherwise. Updates ``finished``
@@ -262,6 +262,34 @@ def _prefetch_worker(repo, paths):
                   f'of {state["requested"]})',
                   file=sys.stderr, flush=True)
             return
+    # LAN-extras pass (0.50.14+): opportunistically grab variants
+    # the WAN-policy gate would have skipped. No upstream fallback;
+    # a peer-cache miss is a silent no-op so we don't waste cycles
+    # or burn bandwidth. Doesn't affect requested / completed /
+    # failed in the cache-status state — these are bonus images.
+    lan_hits = 0
+    for path in lan_extras or []:
+        # Cheap pre-check: skip if already on disk (e.g. a prior
+        # lan_extras pass landed it). _resolve_image_target +
+        # isfile is much cheaper than the per-call peer iteration.
+        try:
+            t = _resolve_image_target(repo, path)
+        except Exception:
+            t = None
+        if t is not None and os.path.isfile(t):
+            continue
+        if get_image_path_lan_only(repo, path) is not None:
+            lan_hits += 1
+        # Re-check daemon shutdown (state could have been nuked
+        # between iterations).
+        with _cache_status_lock:
+            if _prefetch_state.get(repo) is None:
+                return
+    if lan_hits:
+        print(f'[cawl] prefetch lan_extras: {lan_hits} bonus '
+              f'variant(s) pulled from paired peers '
+              f'(repo={repo!r})',
+              file=sys.stderr, flush=True)
     with _cache_status_lock:
         state = _prefetch_state.get(repo)
         if state is not None:
@@ -269,10 +297,20 @@ def _prefetch_worker(repo, paths):
             state['finished_at'] = time.time()
 
 
-def start_prefetch(repo, paths):
+def start_prefetch(repo, paths, lan_extras=None):
     """Kick off a background prefetch of *paths* for *repo*. The
     daemon's worker iterates the list and warms the cache; peers
     poll ``cache_status`` for progress.
+
+    ``lan_extras`` (optional, since 0.50.14) is a list of
+    additional rel_paths to opportunistically fetch from paired
+    LAN peers ONLY — no upstream GitHub fallback for these. Used
+    by ``auto_prefetch`` to pull extra variants beyond what the
+    ``cawl.prefetch_all_variants=False`` policy allows over WAN:
+    if a paired peer already has them cached on the LAN, take
+    them for free; if not, skip. These don't count toward
+    ``requested`` / ``completed`` / ``failed`` in the cache-
+    status state — they're a side-channel bonus.
 
     Idempotency: if a prefetch is already running for this repo
     AND its requested-set matches *paths*, return the existing
@@ -295,6 +333,10 @@ def start_prefetch(repo, paths):
     if not isinstance(paths, (list, tuple)):
         return None
     paths = [p for p in paths if isinstance(p, str) and p]
+    if lan_extras is not None and isinstance(lan_extras, (list, tuple, set)):
+        lan_extras = [p for p in lan_extras if isinstance(p, str) and p]
+    else:
+        lan_extras = []
     requested = len(paths)
     with _cache_status_lock:
         existing = _prefetch_state.get(repo)
@@ -339,7 +381,7 @@ def start_prefetch(repo, paths):
                 snapshot = dict(state)
         return snapshot
     t = threading.Thread(
-        target=_prefetch_worker, args=(repo, paths),
+        target=_prefetch_worker, args=(repo, paths, lan_extras),
         name=f'cawl-prefetch-{repo}', daemon=True)
     _prefetch_threads[repo] = t
     t.start()
@@ -415,10 +457,18 @@ def auto_prefetch(repo):
     if last is not None and (now - last) < _AUTO_PREFETCH_THROTTLE_S:
         return
     _auto_prefetch_last_at[repo] = now
-    paths = _index_image_paths(repo)
-    if not paths:
+    paths_wan = _index_image_paths(repo)
+    if not paths_wan:
         return
-    start_prefetch(repo, paths)
+    # LAN extras = the variants the WAN-policy filter dropped.
+    # When ``cawl.prefetch_all_variants=True`` (everything is
+    # WAN-eligible) this set is empty and we skip the second
+    # pass. When the policy restricts WAN to the preferred
+    # variant, the LAN side opportunistically grabs the rest if a
+    # paired peer has them cached — peer-side bandwidth is free.
+    all_paths = _index_image_paths_all(repo)
+    lan_extras = sorted(set(all_paths) - set(paths_wan))
+    start_prefetch(repo, paths_wan, lan_extras=lan_extras)
 
 
 def on_online_edge():
@@ -459,8 +509,39 @@ def _index_image_paths(repo):
     marker, falling back to the first file if no variant marker
     is present. True — returns every image-shaped entry.
 
+    This is the **WAN-allowed** set: when the policy is False,
+    upstream fetching is restricted to the preferred variant to
+    save metered bandwidth. The LAN side ignores this filter (see
+    ``_index_image_paths_all`` and ``_prefetch_worker``'s
+    ``lan_extras`` arm) — peer-cached variants are free to take
+    if they're already on the LAN.
+
     Empty list if the index isn't cached yet (the seed JSON or a
     successful index fetch populates it)."""
+    images = _index_image_paths_all(repo)
+    if not images:
+        return []
+    try:
+        from . import store as _store
+        prefetch_all = _store.get_cawl_prefetch_all_variants()
+    except Exception:
+        prefetch_all = False
+    if prefetch_all:
+        return images
+    return _filter_preferred_variant_per_id(images)
+
+
+def _index_image_paths_all(repo):
+    """Unfiltered image-path list — every image-shaped entry in
+    the index, no variant policy applied. Used as the LAN-side
+    fetch list: even when ``cawl.prefetch_all_variants=False``
+    restricts WAN to one image per CAWL id, the LAN side will
+    happily take all variants that a paired peer has cached
+    (0.50.14+). Bandwidth on LAN is essentially free; restricting
+    LAN to the same filter as WAN would mean two phones on the
+    same team can't share the non-preferred variants the
+    first-phone-to-the-tower already downloaded.
+    """
     cached = _read_cached_index(repo)
     if cached is None:
         return []
@@ -472,14 +553,46 @@ def _index_image_paths(repo):
         if (isinstance(full, str)
                 and full.lower().endswith(('.png', '.jpg', '.jpeg'))):
             images.append(full)
-    try:
-        from . import store as _store
-        prefetch_all = _store.get_cawl_prefetch_all_variants()
-    except Exception:
-        prefetch_all = False
-    if prefetch_all:
-        return images
-    return _filter_preferred_variant_per_id(images)
+    return images
+
+
+def get_image_path_lan_only(repo, rel_path):
+    """Try to land bytes for ``(repo, rel_path)`` from a paired
+    LAN peer's cache and persist them locally. Returns the
+    canonical on-disk path on success, ``None`` on miss.
+
+    Distinct from ``get_image_path`` in that we do NOT fall
+    through to GitHub on miss. Use this for the prefetch
+    worker's ``lan_extras`` arm: variants the WAN-policy gate
+    forbade us from fetching upstream, but which we'll
+    opportunistically grab from LAN if available.
+    """
+    repo = (repo or '').strip()
+    if not repo or not _looks_safe_rel_path(rel_path):
+        return None
+    target = _resolve_image_target(repo, rel_path)
+    if target is None:
+        return None
+    if os.path.isfile(target):
+        return target
+    with _lock_for(target):
+        if os.path.isfile(target):
+            return target
+        data = _fetch_image_bytes_from_lan_peer(repo, rel_path)
+        if data is None:
+            return None
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f'{target}.tmp.{os.getpid()}'
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except OSError as ex:
+            print(f'[cawl] LAN-only cache write failed for '
+                  f'{repo!r}/{rel_path!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+            return None
+    return target
 
 
 def _filter_preferred_variant_per_id(paths):
@@ -930,6 +1043,162 @@ def _looks_safe_rel_path(rel_path):
     return True
 
 
+def _fetch_image_bytes_from_lan_peer(repo, rel_path):
+    """Try paired LAN peers for cached image bytes before going to
+    GitHub (NOTES #3, since 0.50.14).
+
+    When two phones share a project, both prefetch the same CAWL
+    image set independently — pre-0.50.14 each downloaded the full
+    set from GitHub (1700+ images for SILCAWL), wasting bandwidth
+    on metered field links. This helper asks each currently-
+    resolved paired peer "do you have this byte cached?" via the
+    LAN listener's ``/v1/lan/cawl_fetch`` endpoint. First 200
+    response wins; 404 / connection failure moves to the next
+    peer. Returns ``None`` (caller falls through to GitHub) if no
+    peer has it.
+
+    Cost shape: each unhit-then-hit lookup is one TLS handshake
+    + one round-trip on the LAN, ~tens of ms per image on a quiet
+    Wi-Fi. For a 1700-image prefetch where peer A has all the
+    bytes and peer B is the requester, that's ~30 s of LAN work
+    vs. minutes-to-hours of upstream cellular download. The win
+    grows on slower upstream / metered links.
+
+    The "two peers prefetch in parallel from cold" case isn't the
+    target — both peers' caches are still empty so neither can
+    serve the other. The case this fixes is "second peer arrives
+    after first finished" or "first peer is online, second peer
+    has a metered link."
+
+    Quietly returns None on any failure: this is an optional
+    optimization step before the GitHub fetch.
+
+    ``rel_path`` is the path inside the repo. We send it through
+    to the peer verbatim; a nested rel_path
+    (``0001_body/foo.png``) disambiguates the same-basename-
+    different-variant case, while a flat basename gets
+    canonicalized via the receiving daemon's index (same
+    fallback as ``get_image_path``).
+    """
+    try:
+        from . import peer_id as _peer_id
+        from . import peers as _peers
+        from . import lan_discovery as _lan_discovery
+    except ImportError:
+        return None
+    # Our own identity — needed for body-auth on the request.
+    try:
+        ident = _peer_id.ensure()
+    except RuntimeError:
+        return None
+    our_peer_id = ident.get('peer_id', '')
+    our_fp = ident.get('fp', '')
+    if not our_peer_id or not our_fp:
+        return None
+    # ``repo`` is the ``<owner>/<name>`` slug for CAWL repos.
+    if '/' not in repo:
+        return None
+    owner, name = repo.split('/', 1)
+    # Send the full rel_path. Flat basenames work too (the
+    # listener canonicalizes via its index), but a nested rel_path
+    # disambiguates the same-basename-different-variant case —
+    # ``0001_body/foo.png`` and ``0002_other/foo.png`` would
+    # otherwise both flatten to ``foo.png`` and the listener could
+    # only return one.
+    if (not rel_path or '..' in rel_path
+            or rel_path.startswith('.')
+            or rel_path.startswith('/')):
+        return None
+    paired = []
+    try:
+        paired = list(_peers.list_peers() or [])
+    except Exception:
+        return None
+    if not paired:
+        return None
+    body_json = json.dumps({
+        'peer_id': our_peer_id,
+        'fp': our_fp,
+        'owner': owner,
+        'repo': name,
+        'rel_path': rel_path,
+    }).encode('utf-8')
+    for entry in paired:
+        peer_id = entry.get('peer_id', '')
+        expected_fp = entry.get('fp', '')
+        if not peer_id or not expected_fp:
+            continue
+        endpoint = _lan_discovery.get_endpoint(peer_id)
+        if endpoint is None:
+            # Static endpoint fallback — same shape as
+            # lan_clone._resolve_endpoint.
+            for source in ('static_endpoints', 'endpoints'):
+                for raw in (entry.get(source) or []):
+                    try:
+                        h, p = raw.rsplit(':', 1)
+                        endpoint = (h, int(p))
+                        break
+                    except (ValueError, TypeError):
+                        continue
+                if endpoint is not None:
+                    break
+        if endpoint is None:
+            continue
+        host, port = endpoint
+        bytes_or_none = _post_lan_cawl_fetch(
+            host, port, expected_fp, body_json)
+        if bytes_or_none is not None:
+            print(f'[cawl] LAN-peer cache hit: {peer_id[:8]!r} '
+                  f'served {rel_path!r} '
+                  f'({len(bytes_or_none)} bytes)',
+                  file=sys.stderr, flush=True)
+            return bytes_or_none
+    return None
+
+
+def _post_lan_cawl_fetch(host, port, expected_fp, body_json):
+    """POST to a peer's ``/v1/lan/cawl_fetch`` endpoint. Returns
+    the response bytes on 200, ``None`` on 404 / connection
+    failure / TLS mismatch / any other error.
+
+    Same TLS-pinning shape as ``lan_clone._build_pool_manager``
+    and ``lan_push._build_ssl_context`` (we trust the peer's
+    self-signed cert by fingerprint, not by CA chain)."""
+    try:
+        from . import peer_id as _peer_id
+    except ImportError:
+        return None
+    cert_path = _peer_id.cert_path()
+    key_path = _peer_id.key_path()
+    if not cert_path or not key_path:
+        return None
+    try:
+        import ssl as _ssl
+        import urllib3 as _urllib3
+        ctx = _ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        pm = _urllib3.PoolManager(
+            ssl_context=ctx,
+            assert_hostname=False,
+            assert_fingerprint=expected_fp,
+            cert_reqs='CERT_NONE',
+            timeout=_urllib3.Timeout(connect=2.0, read=15.0),
+            retries=False,
+        )
+        resp = pm.request(
+            'POST',
+            f'https://{host}:{int(port)}/v1/lan/cawl_fetch',
+            body=body_json,
+            headers={'Content-Type': 'application/json'})
+        if resp.status == 200:
+            return resp.data
+        return None
+    except Exception:
+        return None
+
+
 def _fetch_image_bytes_from_github(repo, rel_path):
     """Pull a single image's bytes from
     ``raw.githubusercontent.com``. Returns the bytes on success;
@@ -1110,28 +1379,34 @@ def get_image_path(repo, rel_path):
     with _lock_for(target):
         if os.path.isfile(target):
             return target
-        try:
-            data = _fetch_image_bytes_from_github(repo, rel_path)
-        except (urllib.error.URLError, OSError, TimeoutError,
-                http.client.HTTPException) as ex:
-            # ``http.client.HTTPException`` covers ``InvalidURL``
-            # (raised when ``_validate_path`` sees control chars
-            # in the URL — e.g., literal spaces from an un-encoded
-            # filename) and other http.client-level errors that
-            # don't extend OSError, which urllib's do_open
-            # wouldn't otherwise wrap in URLError.
-            # Log every failure verbosely — the peer-side circuit
-            # breaker handles spam suppression after N consecutive
-            # failures, so the daemon doesn't need its own coalescer.
-            # A silent daemon-side backoff actively hurt diagnosis
-            # (0.41.4-0.41.7): when the daemon went silent it was
-            # impossible to tell from the peer side whether the
-            # fetch had been attempted at all.
-            print(f'[cawl] image fetch failed for '
-                  f'{repo!r}/{rel_path!r}: '
-                  f'{type(ex).__name__}: {ex}',
-                  file=sys.stderr, flush=True)
-            return None
+        # NOTES #3 (0.50.14): before paying for an upstream
+        # round-trip, ask paired LAN peers. Quietly returns None
+        # if no paired peer has the byte cached or LAN isn't
+        # available; the GitHub fetch is unchanged.
+        data = _fetch_image_bytes_from_lan_peer(repo, rel_path)
+        if data is None:
+            try:
+                data = _fetch_image_bytes_from_github(repo, rel_path)
+            except (urllib.error.URLError, OSError, TimeoutError,
+                    http.client.HTTPException) as ex:
+                # ``http.client.HTTPException`` covers ``InvalidURL``
+                # (raised when ``_validate_path`` sees control chars
+                # in the URL — e.g., literal spaces from an un-encoded
+                # filename) and other http.client-level errors that
+                # don't extend OSError, which urllib's do_open
+                # wouldn't otherwise wrap in URLError.
+                # Log every failure verbosely — the peer-side circuit
+                # breaker handles spam suppression after N consecutive
+                # failures, so the daemon doesn't need its own coalescer.
+                # A silent daemon-side backoff actively hurt diagnosis
+                # (0.41.4-0.41.7): when the daemon went silent it was
+                # impossible to tell from the peer side whether the
+                # fetch had been attempted at all.
+                print(f'[cawl] image fetch failed for '
+                      f'{repo!r}/{rel_path!r}: '
+                      f'{type(ex).__name__}: {ex}',
+                      file=sys.stderr, flush=True)
+                return None
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp = f'{target}.tmp.{os.getpid()}'
         try:

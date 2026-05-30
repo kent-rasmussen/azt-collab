@@ -9,7 +9,975 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.48.0 — Peer-interaction round: nearby pairing, shared decisions watcher, KV / slot claims
+## 0.50.15 — Audit open-medium burn-down: #3 + #4 + #5 + #6
+
+Closes the four open-medium items from
+`.scratch/audit-2026-05-29-comms-data-loss-convergence/findings.md`.
+After this release the audit roll-up shows **0 open-medium**;
+only 4 open-low defensive nitpicks remain.
+
+### #3 — Topic-branch orphan visibility
+
+`repo._janitor_sweep_topic_branches` only sweeps refs with our
+own device-name suffix, so cross-device orphans
+(`refs/remotes/origin/azt-pending-fr-otherphone`) accumulate
+indefinitely. Adding a count to `project_status` so a user
+troubleshooting a heavy remote can see them.
+
+- New `repo._count_foreign_topic_orphans(repo)` — walks
+  `repo.refs.allkeys()` and counts `azt-pending-*` refs whose
+  suffix isn't our `device_name`.
+- New `ProjectStatus.foreign_topic_orphan_count` field (default
+  0). Wired through `_h_project_status` in `server.py` and
+  `ProjectStatus.from_dict` in `azt_collab_client/projects.py`.
+- Informational only — peers can render a "remote has leftover
+  branches" indicator. Not a sync-blocking condition.
+
+### #4 — HEAD detached + ancestry guard refused — observability
+
+`lan_listener.py` re-attaches HEAD to `refs/heads/main` after a
+post-receive reset only when `head_is_ancestor(HEAD, main)` is
+true. When ancestry legitimately fails (main NOT a descendant
+of HEAD — local has unmerged work) the re-attach is unsafe and
+gets skipped — but pre-0.50.15 that skip was silent. The
+merge-loop the original 0.46.5 guard was supposed to break
+could resume on the next receive.
+
+Now emits a structured `[data-quality] head-detached-no-reattach
+langcode=… head=… main=… reason=main-not-descendant-of-head`
+log line whenever the ancestry check returns false. Greppable
+from `adb logcat` or daemon-log share. No functional fix —
+the safe action when ancestry fails is genuinely "do nothing"
+(re-attaching to main would lose work at HEAD); the
+observability gap is what the audit called out and what this
+closes.
+
+### #5 — Connectivity-probe adaptive backoff
+
+The watcher's `_has_internet` probe ran at fixed
+`connectivity_poll_s` (default 30 s) regardless of activity. On
+an idle phone in a pocket all day that wakes the radio every
+30 s for nothing. Pre-0.50.15 the WAN-backoff curve I shipped
+in 0.50.0 covered the PUSH side but the underlying probe
+itself wasn't adaptive.
+
+- New module-state `_probe_idle_streak` + helpers
+  `_adaptive_probe_interval(base)` / `_reset_probe_backoff()` /
+  `_bump_probe_backoff()` in `scheduler.py`.
+- Watcher loop increments the streak when state didn't change
+  this tick; resets it when the probed state flips. Sleep
+  doubles per step (30s → 60s → 2m → 4m → cap 5m).
+- `drain_pushes_now` (user-nudge entry) resets the streak so a
+  user gesture wakes the next probe promptly. The online-edge
+  branch already resets via the state-change path.
+
+### #6 — LAN endpoint cache TTL
+
+`lan_discovery._endpoints` held resolved peers indefinitely. A
+peer that restarted on a new ephemeral port stayed unreachable
+until either the 3-failure restart-browse threshold tripped
+(~90 s of "connection refused" hammering) or the user manually
+flipped the LAN toggle.
+
+- `_endpoints` value shape changed from `(host, port)` to
+  `(host, port, monotonic_ts)`.
+- `get_endpoint` returns None and drops the entry when older
+  than `_ENDPOINT_TTL_S = 300.0` (5 min — covers ~5 mDNS
+  re-announce cycles of headroom under standard zeroconf
+  defaults).
+- `known_endpoints` filters expired entries.
+- Both writers (zeroconf `_record`, NsdManager
+  `onServiceResolved`) stamp `time.monotonic()` on insert.
+
+### Tests
+
+`tests/test_audit_open_med.py` — 12 cases:
+
+- #3: empty repo returns 0; own-suffix excluded; foreign
+  suffixes counted; unset device-name edge case.
+- #5: streak math doubles per step; caps at 300s; reset to 0;
+  no-op reset.
+- #6: fresh entry returns; expired returns None + drops;
+  `known_endpoints` filters expired; unknown peer returns None.
+
+#4 is observability-only (a log line) and isn't unit-tested —
+its branch lives inside a deeply-nested LAN-receive handler
+that needs a full mock receive-pack pipeline to reach. Field
+matrix covers it via greppable `[data-quality]` tag.
+
+## 0.50.14 — NOTES #3: LAN-shared CAWL cache between paired peers (with all-variants pull)
+
+Closes the last open NOTES item. Daemon-only; **no peer rebuild
+required** — `CAWLHandle.open_read` semantics don't change.
+
+### Problem
+
+Two phones sharing the same project each independently download
+the full CAWL image set from the upstream repo (~1700 images
+for SILCAWL). On a metered field link that's wasted bandwidth
+twice over, plus contention between the two parallel prefetches
+starves `auto_sync`.
+
+### Fix
+
+`get_image_path` in `azt_collabd/cawl.py` now tries paired LAN
+peers' caches before reaching for GitHub:
+
+1. Local daemon cache (unchanged).
+2. LAN-discoverable paired peers' caches (NEW).
+3. GitHub fetch via `cawl_image_repo` (unchanged fallback).
+
+Plumbing:
+
+- New listener endpoint `POST /v1/lan/cawl_fetch` in
+  `lan_listener.py` (`_handle_cawl_fetch_bodyauth`). Body-auth
+  via ``{peer_id, fp, owner, repo, rel_path}`` — same shape as
+  other signalling endpoints. Response: 200
+  `application/octet-stream` with the bytes if cached, 404 JSON
+  if not, 403 JSON if peer_id/fp don't match `peers.json`.
+  Accepts both nested rel_paths
+  (`0001_body/foo.png` — preferred; disambiguates
+  same-basename variants) and flat basenames (canonicalized via
+  local index, back-compat).
+- New requester `_fetch_image_bytes_from_lan_peer(repo, rel_path)`
+  in `cawl.py`. Iterates paired peers (mDNS-resolved or
+  static-endpoint), fires the POST against each, returns the
+  first 200. Quietly returns None on no-peers / no-endpoints /
+  all-404 so the GitHub fetch is unchanged.
+- TLS-pinning shape matches `lan_clone._build_pool_manager` —
+  self-signed cert trusted by fingerprint, not CA chain.
+
+### LAN ignores the WAN variant-policy filter
+
+`cawl.prefetch_all_variants=False` (the default) restricts WAN
+prefetch to the preferred variant per CAWL id to save metered
+bandwidth. **The LAN side doesn't honor this filter**: peer
+bytes are free, so when one phone on the team has already
+downloaded every variant, others get them all over LAN
+regardless of their own variant-policy setting. The user's
+phrasing: *"once one person on a team has downloaded all
+images, others get them all for free, even if they set just
+get one image/line."*
+
+Implementation:
+
+- New `_index_image_paths_all(repo)` — unfiltered full index.
+- New `get_image_path_lan_only(repo, rel_path)` — LAN fetch
+  without GitHub fallback; writes bytes to local cache on hit,
+  returns None on miss.
+- `start_prefetch(repo, paths, lan_extras=None)` takes a second
+  list of paths to opportunistically pull from LAN only. These
+  don't count toward `requested` / `completed` / `failed` in
+  the cache-status state — they're bonus.
+- `auto_prefetch` builds both lists: WAN-eligible = filtered
+  (`_index_image_paths`); LAN extras = `all_paths - wan_paths`.
+- `_prefetch_worker` runs WAN-eligible paths through
+  `get_image_path` (LAN-then-WAN) as before, then runs LAN
+  extras through `get_image_path_lan_only`. Skips lan_extras
+  paths already on disk to avoid burning the per-peer
+  iteration for no reason.
+
+Cost shape: each lookup is one TLS handshake + one LAN
+round-trip (~tens of ms). For a 1700-image prefetch where peer
+A has the bytes cached and peer B is the requester, that's ~30
+seconds of LAN work vs. minutes-to-hours of upstream cellular
+download.
+
+### Cases this doesn't fix
+
+- Two peers prefetching simultaneously from cold caches: neither
+  has the bytes to share yet. Both end up fetching from upstream
+  (same as pre-0.50.14). The win only materializes once one peer
+  has cached something.
+- Peer B asks peer A, peer A has the byte but is currently
+  offline / on a different Wi-Fi: 404 / connection failure
+  surfaces, peer B falls through to GitHub. Same outcome as
+  pre-0.50.14 for that image; not a regression.
+
+### Tests
+
+`tests/test_cawl_lan_share.py` — 12 cases covering the listener
+endpoint shape (peer-auth gating, fp mismatch, 404 on missing,
+200 on cached, basename canonicalization via index, traversal
+refusal on basename / owner / repo) and the requester helper
+(empty paired list / unresolvable endpoints / bad slug / bad
+basename → None; multi-peer iterate with second-peer hit;
+first-peer hit short-circuits).
+
+### NOTES status
+
+`NOTES_TO_DAEMON.md` live queue is now empty. The file stays
+as the canonical queue for future peer-to-daemon items; it's
+just at zero right now.
+
+## 0.50.13 — Drop stale NOTES item #4 (fresh GUIDs shipped in 0.50.8)
+
+NOTES housekeeping: "Fresh GUIDs when creating a project from
+a template" shipped in 0.50.8 (`_mint_fresh_guids` in
+`projects.py`, called from `create_from_template`), but the
+NOTES entry wasn't deleted at the time. Per the NOTES rule
+("When you act on an item, delete it from this file") the
+CHANGELOG is the historical record; the live queue should only
+hold open items.
+
+Remaining open NOTES item after this cleanup: **LAN-shared
+CAWL cache between paired peers** (bandwidth/battery win on
+metered links when two phones share a project).
+
+## 0.50.12 — Auto-route `CONTRIBUTOR_UNSET` on QR scan to server settings
+
+0.50.11 added a popup for the `CONTRIBUTOR_UNSET` case, but the
+established suite convention (per
+`CLIENT_INTEGRATION.md` § 17 — *"toast + open_server_ui()"*) is
+to skip the popup and route the user straight to the settings
+page where they can type their name. Aligning the scan-flow
+with that pattern.
+
+`_finish_on_main`'s `CONTRIBUTOR_UNSET` branch now:
+
+- Emits a status line via `_emit_status` (the picker's status
+  bar) explaining "Set your name on the next screen, then scan
+  the QR again."
+- Calls `open_server_ui(on_status=_emit_status)` — Android
+  fires the server APK's launch intent, desktop spawns
+  `python -m azt_collabd ui`. User lands on the settings page
+  directly, sets their name, returns to the peer to re-scan.
+- No popup ceremony.
+
+The `SERVER_ERROR` / `SERVER_UNAVAILABLE` and paired-but-no-
+project branches from 0.50.11 keep their popups — those carry
+detail the user (or a maintainer) needs to read.
+
+## 0.50.11 — Surface `CONTRIBUTOR_UNSET` + `SERVER_ERROR` on QR scan
+
+0.50.10 misdiagnosed: I claimed the user's scan failed because
+the QR was pair-only (no langcode). Wrong — the QR was from
+the "Share project (QR)" path and carried langcode just fine.
+The actual cause: `_h_lan_pair_accept` calls
+`_refuse_if_contributor_unset()` first, and when the receiving
+phone has no contributor set the call returns 200/ok with
+`Result(CONTRIBUTOR_UNSET)` — NOT `LAN_PAIRED`. The receiver's
+`_on_result` worker checks `if w_result.has(S.LAN_PAIRED)` to
+gate the clone phase, so an unset contributor silently skips
+clone. The user saw the "LAN is on" popup (auto-enable fires
+*before* pair_accept), landed on an empty picker, and pair
+didn't actually land in `peers.json`.
+
+Fix in `_finish_on_main`: route `CONTRIBUTOR_UNSET` to a clear
+popup *"Set your name first"* explaining how to fix it. Also
+route `SERVER_ERROR` / `SERVER_UNAVAILABLE` (bad QR payload,
+transport failure) to a popup with the daemon's detail string,
+so future pair refusals aren't silent either. The
+paired-only-but-no-project branch from 0.50.10 stays — covers
+the case where pair_accept succeeded but the daemon didn't
+clone (langcode missing, share-allowlist refusal, etc.); body
+copy slightly broadened.
+
+The auto-enabled-LAN-toggle leak (we turn LAN on in
+`_auto_enable_lan` BEFORE pair_accept's contributor check
+fires) is a separate issue worth noting: a pair refusal still
+leaves LAN on and prompts the "Keep on / Turn off" popup. The
+right shape is to defer auto-enable until after pair_accept
+returns LAN_PAIRED, but that's a bigger refactor and out of
+scope for this fix.
+
+## 0.50.10 — Surface "paired-only" outcome on QR scan
+
+Field smoke on 0.50.9: user tapped "Receive a project", scanned
+a QR, saw the "LAN is on" popup, landed back on the picker with
+no project. From the log: `POST /v1/lan/pair/accept` succeeded;
+no `/v1/lan/clone` call followed.
+
+Diagnosis: the scanned QR was generated via "Pair a phone" on
+the sender's side rather than "Share project (QR)", so its
+payload had an empty `langcode`. The receiver's
+`lan_popups._on_result` (since 0.49.3) gates the clone phase on
+`if (langcode and peer_id and w_result.has(S.LAN_PAIRED))` —
+which silently skips the clone when the QR didn't carry a
+project. User saw no feedback, no error, no project.
+
+Fix in `_finish_on_main`: surface a clear paired-only popup
+when the result has `LAN_PAIRED` without `LAN_PROJECT_CLONED`
+or `LAN_PROJECT_REOPENED`. Title: *"Paired, but no project
+came with this QR"*. Body explains the next step: on the other
+phone, open the project to share, tap **Share project (QR)**,
+scan that QR. French translation added.
+
+Doesn't fire on the collision case
+(`LAN_PROJECT_COLLISION_UNRELATED`) which has its own routing.
+
+## 0.50.9 — NOTES #2 closed: eager peer_id + claim tiebreaker + rebind_slot
+
+Three-phase landing of NOTES item #2 (stable device identity
+for slot-fallback matching), plus the audit-#9 tiebreaker
+fix that lives in the same code path. NOTES #2 removed.
+
+### Phase 1 — Eager-init `peer_id` on daemon startup
+
+`reconcile_on_startup` in `scheduler.py` now calls
+`peer_id.ensure()` unconditionally. Pre-0.50.9 the ed25519
+keypair + self-signed X.509 cert were generated lazily — only
+when LAN sync was enabled or the QR generator opened. On
+builds that never enabled LAN, `lan_peer_id()` returned `''`,
+slot claims got empty-peer_id entries, and peer-side fallback
+matching chained to `device_name` (which can change during
+the project's lifetime: server-APK reinstall, factory reset,
+user edit). Eager-init makes `peer_id` reliably available so
+it's the stable identity for slot claims, future per-device
+state, and the audit-#9 tiebreaker.
+
+Defensive: a build without the `cryptography` package falls
+through with a logged warning rather than refusing daemon
+startup. Same empty-peer_id behaviour as pre-0.50.9 for that
+edge case.
+
+Contract update in `azt_collab_client/CLAUDE.md`'s
+"Daemon-owned state" table: `lan_peer_id` is now eager-init
+since 0.50.9; persists across daemon respawn but NOT app-data
+wipe.
+
+### Phase 2 — Cross-peer-deterministic slot tiebreaker (audit #9)
+
+Two NTP-synced phones claiming the same slot in the same
+second tie on `claimed_at` (ISO-8601 second granularity).
+Pre-0.50.9 the `_later_claim` tiebreaker fell back to
+`peer_id` lexicographic — but with lazy peer_id init, both
+sides often had empty `peer_id`, and the tiebreak returned
+`a` (which is "ours" on whichever peer's merge is running).
+Different peers picked different winners; the merge diverged.
+
+`_later_claim` in `project_kv.py` now cascades:
+
+1. `claimed_at` (later wins).
+2. `peer_id` lexicographic (non-empty beats empty).
+3. `device_name` lexicographic (legacy fallback when both
+   peer_ids are empty).
+
+The chain is a property of the claim itself, not of which
+side of the merge it landed on — so peer A and peer B
+compute the same winner. With Phase 1 eager-init, the
+`device_name` tier only matters for transitional pre-0.50.9
+claims.
+
+### Phase 3 — `slot_rebind` RPC for identity recovery
+
+New `POST /v1/projects/<lang>/slots/<slot>/rebind` endpoint
++ `rebind_slot(langcode, slot)` client wrapper. Rewrites an
+existing claim's `peer_id` + `device_name` to the daemon's
+current values and refreshes `claimed_at` to now.
+
+Use case: this device's `peer_id` changed (server-APK
+reinstall regenerated crypto; user cleared app data) but the
+user knows the slot is still theirs. Peer-side guard rail is
+a confirm popup driven by a contributor-name match against
+the existing claim's `device_name`; this RPC is just the
+persistence half. Daemon doesn't gate on anything beyond
+input validation.
+
+Returns `True` on success, `False` if the slot doesn't exist
+(rebind only retags existing claims; for "claim or replace"
+use `claim_slot`). Backed by new `project_kv.slot_rebind`.
+
+Doc: `CLIENT_INTEGRATION.md` § 21 — added to the slot API
+surface + the tiebreak section.
+
+### Tests
+
+`tests/test_slot_identity.py` covers: timestamp ordering,
+non-empty-peer_id beats empty, device_name fallback for
+legacy collisions, pathological-all-blank termination,
+rebind rewrites identity, rebind refuses missing/invalid
+slots, rebind preserves one-slot-per-peer invariant.
+
+### NOTES status
+
+Two open items remain: #3 LAN-shared CAWL cache between
+paired peers, #4 (NOTES #4 was deleted in 0.50.8 — fresh
+GUIDs at template import shipped). Original NOTES #1
+(atomic_commit RPC) shipped pre-0.50, removed from queue
+in 0.50.8.
+
+## 0.50.8 — NOTES cleanup: drop #1 (atomic_commit), implement #4 (fresh template GUIDs)
+
+NOTES audit pass after 0.50.7. One item already shipped on
+the daemon side and was just stale in the file; another is
+small + isolated and lands here.
+
+### Dropped from `NOTES_TO_DAEMON.md` (was #1)
+
+"Atomic LIFT commit on URI projects" — the
+`/v1/projects/<lang>/atomic_commit` and
+`/v1/projects/<lang>/atomic_finalize` RPCs are shipped (see
+`server.py:_h_project_atomic_commit` / `_h_project_atomic_finalize`
+and the dispatch at `server.py:3459-3461`). Client wrappers
+`atomic_commit_bytes` / `atomic_finalize_pending` are exposed
+in `azt_collab_client/__init__.py`. Tests in
+`tests/test_atomic_commit.py`. The peer-side switch from
+`open_write` fallback to these wrappers is a peer-side
+migration, not a daemon-side gap, so the item is removed from
+the daemon NOTES queue.
+
+### NOTES #4 — Fresh GUIDs when creating from a template
+
+`<entry guid="...">` values are only required to be unique
+within one LIFT file, but templates currently propagate their
+guids verbatim into every project derived from them — two
+SILCAWL-derived projects share 1700+ identical guids
+entry-for-entry. Any peer-side state keyed by guid alone
+(caches, retry queues, future shared-clipboard features) ends
+up ambiguous across project switches sharing a template
+lineage.
+
+Fix:
+
+- New `azt_collabd/projects.py:_mint_fresh_guids(xml_bytes)` —
+  walks all `<entry guid="...">` elements, rewrites each to a
+  fresh UUID-4, then walks every `ref="..."` attribute and
+  rewrites those whose value matches one of the just-rewritten
+  guids (so intra-template `<relation>` links survive the
+  rename). Conservative: refs whose value is NOT one of the
+  rewritten guids (sense ids, etc.) are left alone.
+- `create_from_template` calls it on the downloaded bytes
+  before settling them at `<vernlang>.lift`. Defensive: any
+  transform failure logs and falls back to the original bytes
+  so a non-LIFT / malformed template doesn't break the
+  download path (the downstream LIFT reader will produce a
+  more specific error).
+- One-shot at template→project conversion time; **existing
+  projects keep their guids unchanged** — not a migration.
+
+Tests in `tests/test_mint_fresh_guids.py`: guid freshness,
+relation-ref follow-rename, non-entry refs preserved, non-LIFT
+flow-through, malformed-XML flow-through, distinct guids per
+run, 200-entry scale check.
+
+## 0.50.7 — Make peer threading explicit in the contract; restore retry budget
+
+Reverts the 0.50.6 budget shortening and moves the
+responsibility to where it belongs: the peer contract.
+
+The 0.50.5 splash-then-crash was a peer-side bug — the
+recorder calls ``migrate_from_prefs`` on the main UI thread
+at startup, so a 3 s null-bundle retry blocks frame rendering
+past Android's ANR threshold. 0.50.6 shortened the transport
+budget to 0.7 s as a workaround. That degrades the common
+cold-spawn case (legitimate 1.9 s import: peers waiting one
+extra bootstrap warmup tick) just to absorb a peer-side bug.
+
+Better shape:
+
+- **New § 17c Rule 7 in CLIENT_INTEGRATION.md**: *RPC calls
+  MUST NOT run on the main UI thread.* Documents the failure
+  mode (ContentResolver returns null on missing bundle →
+  transport retries → main thread blocked → ANR) and the
+  required peer shape (worker thread + ``Clock.schedule_once``
+  marshal back). Covers startup-time RPCs explicitly —
+  ``migrate_from_prefs``, ``check_server_compat``, last-project
+  load — all of which are common offenders.
+- **Transport budget restored** to
+  ``_NULL_BUNDLE_RETRY_BACKOFF_S = (0.1, 0.2, 0.4, 0.8, 1.6)``
+  (3.1 s cumulative). Same as pre-0.50.6. Comment updated to
+  cite the new contract rule.
+- Peer maintainers must move their startup RPCs off the main
+  thread; this is now a hard contract violation, not a
+  defensive workaround.
+
+The 0.50.5 auto-launch + 0.50.4 adaptive popup still ship and
+will fire normally once peers comply with Rule 7.
+
+## 0.50.6 — Shorten null-bundle retry to keep main thread under ANR threshold
+
+Field smoke on 0.50.5 surfaced a critical gap: on a freshly
+cleared / freshly installed server APK, the peer just shows
+its splash for ~3 s then **crashes outright** with no popup
+and no recovery. None of the 0.50.4 / 0.50.5 logic (adaptive
+popup, auto-launch on null-bundle streak) ever fires because
+the peer process is already dead.
+
+Root cause: `azt_collab_client/transports/android_cp.py`'s
+null-bundle retry sleeps cumulatively 0.1+0.2+0.4+0.8+1.6 =
+**3.1 s on whatever thread called it**. The recorder's
+startup calls `migrate_from_prefs` synchronously on the main
+UI thread before bootstrap takes over. With a missing daemon
+bundle (`_python_bundle does not exist`), every retry returns
+null, the budget burns through, and Android's ANR watchdog
+sees a UI thread that hasn't drawn a frame in 3+ seconds →
+ART kills the peer.
+
+Fix: shorten `_NULL_BUNDLE_RETRY_BACKOFF_S` from
+`(0.1, 0.2, 0.4, 0.8, 1.6)` to `(0.1, 0.2, 0.4)` —
+cumulative 0.7 s, comfortably under any ANR threshold. The
+remaining budget still absorbs hot-cold races (daemon
+:provider idle-stopped seconds ago, Python respawn mid-import)
+where 0.7 s is sufficient. Legitimate cold-spawn imports
+(~1.9 s on mid-range Android) will surface `null_bundle`
+sooner; bootstrap's adaptive warmup loop catches them on
+attempt 2 or 3, which is one extra retry on the bootstrap
+path vs one ANR-killed peer.
+
+Architectural note: any peer-side RPC made from the main UI
+thread is now main-thread-blocking for at most 0.7 s. The
+proper long-term fix is for the peer to not make RPCs from
+the main thread at all — that's a peer-side refactor, not
+fixable at the canonical seam. The 0.7 s budget is a defense-
+in-depth so even a worst-case startup-call-on-main-thread
+peer survives.
+
+## 0.50.5 — Auto-launch AZT Collaboration on `null_bundle` (no popup)
+
+User pointed out that the existing stale-code recovery
+(`_prompt_server_reboot_to_apply`) already auto-fires
+`_open_server_apk_launcher` without making the user tap a
+popup button — it just shows a toast. The `null_bundle` case
+(cache-clear / fresh install / bundle missing) should follow
+the same shape.
+
+Change in `bootstrap.py`'s null-bundle fast-fail branch
+(``_check_server``, the ``streak >= _NULL_BUNDLE_FAIL_FAST``
+arm): instead of immediately showing the unresponsive popup,
+the first time we hit the streak we auto-launch AZT
+Collaboration with a toast (*"Setting up the sync service for
+the first time — tap back when AZT Collaboration finishes
+loading."*) and schedule a re-probe via
+`_post_install_continuation`. New loop guard
+`ctx._null_bundle_autolaunch_attempted` ensures a second
+null-bundle streak after the auto-launch falls through to the
+popup as before — i.e. if the user dismissed the server APK
+before extract finished, or if the launcher intent itself
+failed.
+
+Reset of `ctx.null_bundle_streak = 0` on auto-launch so the
+re-probe enters a fresh warmup loop rather than fast-failing
+again on the very next null.
+
+Net user experience for the fresh-install / cleared-cache
+case: open peer → daemon crash-loops for a few seconds →
+peer auto-flips to AZT Collaboration with a toast → user
+sees picker UI loading → user switches back → daemon
+extracted + ready, peer continues.
+
+The 0.50.4 adaptive popup body still ships as the
+last-resort message when the auto-launch couldn't recover
+(launcher intent failure or user-dismissed-during-extract).
+
+## 0.50.4 — Adaptive unresponsive-popup body for `null_bundle` case
+
+Smoke surfaced the canonical post-cache-clear failure: the
+server APK's `:provider` process crash-loops on `_python_bundle
+does not exist`, because clearing app data wipes the unpacked
+bundle but Python bootstrap inside `:provider` can't re-extract
+itself (only PythonActivity does). Same failure shape after a
+fresh install before the user opens the server APK.
+
+Existing recovery (open server APK → its PythonActivity
+triggers p4a bundle extract → return to peer) already worked,
+but the peer's "AZT Collaboration not responding" popup
+recommended "Restart server" first — which can't help when the
+daemon's code isn't on disk to run.
+
+Fix in `azt_collab_client/ui/bootstrap.py:_prompt_server_unresponsive`:
+when `ctx.last_error_kind == 'null_bundle'`, swap the body to
+lead with **Open {name}** as the right action and explicitly
+note that **Restart server won't help in this case**. The
+non-null-bundle path keeps the original wording. French
+translation added.
+
+User-visible flow after this change: open peer on a freshly-
+cleared / freshly-installed device → daemon crash-loops for a
+few seconds → bootstrap fast-fails at `null_bundle_streak >= 3`
+→ adaptive popup tells user to tap Open. After Open: server APK
+launches, p4a extracts the bundle, picker UI shows. Switch back
+to peer → first compat probe may catch the daemon mid-startup
+(returns daemon-not-ready or another null) → adaptive backoff
+retries → second probe succeeds. "Fails once, then works" —
+expected behaviour given bundle-extract + first-import timing.
+
+## 0.50.3 — Contributor-name UX fixes from 0.50.2 smoke
+
+Two bugs surfaced on first hardware smoke of the contributor
+name field in the daemon settings UI:
+
+- **Stale "Required: …" message**: still named "commit
+  authorship" as the only reason to set a name. With LAN sync
+  shipping the same field is also the peer label other phones
+  see. Reworded to: *"Required: your name is used to label
+  your work on both Internet sync (GitHub commits) and
+  local-network sync (peer label other phones see). Sync
+  refuses until this is set."* French translation updated to
+  match.
+- **"Saved." on empty input**: tapping outside an empty
+  contributor field fired the focus-loss save handler, which
+  ran `set_contributor('')` (a no-op-shaped success) and
+  rendered "Saved." in dim text — overwriting the red
+  Required-… error and making the empty state look accepted.
+  `save_contributor` now early-returns when the trimmed input
+  is empty, leaving whatever message was up in place. The
+  Required-… error stays visible until the user actually
+  types a name.
+
+## 0.50.2 — Burst-mode LAN discovery + online-edge auto-recovery
+
+Closes the two phases the 0.50.0 release deferred: burst-mode
+mDNS (Phase 3) and the online-edge auto-recovery hook (Phase 6).
+The `lan.autodiscovery` default also flips to **False** now that
+burst mode has the LAN do useful work when it's off.
+
+### Phase 3 — Burst-mode LAN discovery
+
+New `azt_collabd/lan_burst.py`: `start_burst(window_s=30.0)`
+arms a discovery window by incrementing the `lan_fgs` discovery
+ref + calling `lan_listener.apply_toggle()`. Worker thread
+sleeps until expiry, then disarms. Multiple concurrent
+`start_burst` calls share the same worker — *latest expiry
+wins*, never shortens a longer in-flight window.
+
+`lan_listener.apply_toggle()` now reads the union of
+`lan.autodiscovery` *and* the `lan_fgs` discovery ref count, so:
+
+- `autodiscovery=True` → continuous LAN (today's behaviour).
+- `autodiscovery=False, no burst` → LAN fully down. Saves
+  battery; needs a user gesture to rendezvous.
+- `autodiscovery=False, burst active` → listener + mDNS + locks
+  come up for the window; tear down after.
+
+Burst triggers wired:
+- `_h_sync_nudge` (user tapped sync icon).
+- `_run_commit`'s `COMMITTED_LOCAL` branch (so a fresh commit
+  re-arms LAN even with autodiscovery off).
+- The connectivity watcher's online-edge handler (Phase 6).
+
+### Phase 6 — Online-edge auto-recovery
+
+Cheap alternative to a real `ConnectivityManager.NetworkCallback`
+(which would need PythonJavaClass glue, ACCESS_NETWORK_STATE,
+and manifest work). The existing connectivity watcher already
+fires `_has_internet()` every `connectivity_poll_s` (default
+30 s); we hook its offline → online transition to:
+
+1. `wan_backoff.nudge(langcode)` for every pending-push project
+   — next drain tick fires immediately instead of waiting out a
+   24 h curve point.
+2. `lan_burst.start_burst()` — paired peers freshly on the same
+   Wi-Fi can rendezvous without a user gesture.
+
+Latency: up to one connectivity-poll tick (~30 s) vs a real
+NetworkCallback's near-instant delivery. Acceptable trade for
+not adding Java glue + a manifest permission.
+
+### `lan.autodiscovery` default flipped to False
+
+Per the 0.50.0 plan: now that burst mode covers the
+`autodiscovery=False` case, the default flips. Existing users
+with persisted `lan.allow_sync=True` keep autodiscovery on
+(migration unchanged). Fresh installs default to burst-only —
+the battery win the 0.50 rework targeted.
+
+### Tests
+
+`tests/test_lan_burst.py` covers: ref-arm on `start_burst`,
+disarm after window, concurrent-extend math (latest expiry
+wins, refs don't double), and that `apply_toggle` brings the
+listener up when a burst is armed even with
+`autodiscovery=False`.
+
+## 0.50.1 — Naming + test plumbing fixups after 0.50.0
+
+Small follow-ups after 0.50.0 shipped its first round of edits;
+no behaviour change beyond the rename.
+
+- **Settings key rename**: `lan.passive_discovery` →
+  `lan.autodiscovery`. Reads from the user's perspective:
+  `True` = the device discovers automatically (user passive),
+  `False` = the user has to nudge. The accessor
+  (`settings.lan_autodiscovery` / `set_lan_autodiscovery`) and the
+  env var (`AZT_LAN_AUTODISCOVERY`) move with it; the back-compat
+  shims `lan_allow_sync` / `set_lan_allow_sync` still delegate
+  correctly. Migration from pre-0.50 `lan.allow_sync` is
+  preserved.
+- **Project-root `conftest.py`** added so `pytest tests/…` (and
+  not just `python -m pytest`) resolves `azt_collabd` / 
+  `azt_collab_client` imports. No `pip install -e .` needed.
+- **Per-test `$AZT_HOME` isolation**: `tests/conftest.py:azt_home`
+  now clears `paths._AZT_HOME_CACHE` so each test's tmp dir
+  actually takes effect. Without this, the first test seeded
+  the module-global cache and every subsequent test wrote to
+  *that* dir — a silent state-leak that masked stale tests as
+  passing.
+- **Stale `test_contributor.py` device-name tests rewritten**
+  against the 0.49.0 derive-from-contributor contract.
+  Pre-0.49.0 they tested an independent persisted `device_name`
+  field with its own autodetect + setter; 0.49.0 made it derived
+  and `set_device_name` a no-op. The old tests were silently
+  passing only via the cache leak above; the rewrites pin the
+  current contract.
+- **French translation drift fixups**: 12 missing msgids filled
+  in with plausible French — memory-merge warning, paired-device
+  manage popup wording, the `'Share [{{langcode}}] project'`
+  KV-template variant, etc. Refine in a future pass if a French
+  reviewer flags anything off.
+
+## 0.50.0 — Power-driven sync rebuild: WAN backoff + LAN lifecycle
+
+End-to-end rework of how the daemon manages connectivity attempts
+and the LAN radio, driven by the 2026-05-29 design conversation
+on power cost. Replaces "fire every 30 s while toggle is on" with
+"fire on user gesture + exponential backoff for failure recovery."
+
+`MIN_CLIENT_VERSION` bumped to 0.50.0 because the semantics of
+`sync.work_offline` change and a new `sync_nudge` RPC is the
+canonical sync gesture; pre-0.50 peers calling deprecated paths
+may be confused about toggle state.
+
+### Phase 1 — Persistent WAN backoff
+
+New `azt_collabd/wan_backoff.py`: per-project exponential backoff,
+30 s → 1 m → 2 m → ... → cap at 24 h. State persists to
+`$AZT_HOME/wan_state.json` because a 24 h backoff is meaningless
+if every Android OOM-respawn resets to "try now." On daemon
+restart `reset_due_times_on_startup` clears `next_attempt_at` for
+a free immediate retry while preserving `consecutive_failures`,
+so a fresh failure re-enters the curve at the right step rather
+than starting fresh.
+
+The 24 h cap is sized for field workflows where the phone may be
+offline for 14 days at a time: at the cap we probe once a day,
+~365× less radio chatter than the pre-0.50 30 s cadence, with no
+loss of eventual recovery — the user can always tap sync to break
+out of the curve. Tests in `tests/test_wan_backoff.py` pin the
+math and the persistence contract.
+
+`scheduler._drain_pending_push` now gates per-project on
+`wan_backoff.is_due(langcode)`; the `work_offline` gate and the
+`post_online_grace_s` gate are removed (the curve does both jobs
+more cleanly). The watcher loop's per-tick cost on an offline-
+for-hours project drops to one comparison-against-timestamp.
+
+### Phase 2 — Unified `sync_nudge` RPC
+
+New `POST /v1/sync/nudge` endpoint + `sync_nudge(langcode='')`
+client wrapper. Resets WAN backoff for one project (or all
+projects if empty langcode), fires an immediate WAN push attempt,
+and fires LAN fan-out. Same semantics as the sync icon: "try
+everything now, ignore backoff."
+
+Per-project gesture: `sync_nudge(langcode='fr')`. Daemon-wide
+sync icon: `sync_nudge()`. The old `sync_project(langcode)` is
+kept for callers that need the per-project synchronous
+push-and-return contract (publish flush, etc.); for the user-tap
+case, prefer `sync_nudge`.
+
+### Phase 3-5 — LAN autodiscovery toggle migration
+
+Replaces `lan.allow_sync` with `lan.autodiscovery`:
+
+- **Default `True` in 0.50.0** (was: `False` for
+  `lan.allow_sync`). Reason: the burst-mode discovery that makes
+  `autodiscovery=False` useful is deferred to 0.50.1 — in
+  0.50.0, False means LAN is entirely off. To avoid a UX
+  regression for fresh installs, the default stays at "always
+  discoverable" until burst-discovery lands; the default will
+  flip to False with 0.50.1.
+- **Migration**: existing users with `lan.allow_sync=True` keep
+  autodiscovery on (no behaviour change). Existing users with
+  `lan.allow_sync=False` keep it off.
+- **`sync.work_offline` is deprecated** and always returns
+  `False` regardless of persisted value. The exponential backoff
+  curve replaces the user-toggle for the offline case; the
+  "working but metered network" case (the one real use the
+  toggle covered) is logged for future per-network policy.
+
+New ref-counted lock lifecycle in `android_cp/lan_fgs.py`:
+`arm_for_discovery` / `disarm_for_discovery` (MulticastLock + FGS
+for the burst), `arm_for_transfer` / `disarm_for_transfer`
+(WifiLock + FGS for the active push). Operations increment;
+completion decrements; at zero refs with `autodiscovery=False`
+everything goes down. Validates on desktop without jnius —
+platform-side calls early-return, ref math runs anyway. Tests
+in `tests/test_lan_fgs_refcount.py`.
+
+### What's not in this release (deferred)
+
+- **Burst-mode mDNS discovery** — the briefly-on rendezvous
+  window that gives `autodiscovery=False` any meaning. The
+  lifecycle plumbing (ref-counted `arm_for_discovery`) is in
+  place but the `burst_discovery(window_s)` orchestration that
+  ties `sync_nudge` into a temporary lights-on window is a
+  follow-up. In 0.50.0, `autodiscovery=False` effectively
+  means "LAN entirely off" — paired peers can't find each other
+  without flipping the toggle back on. That's why the 0.50.0
+  default is True (preserving today's behaviour); the default
+  flips to False once burst-mode lands in 0.50.1.
+- **`ConnectivityManager.NetworkCallback` for auto-recovery on
+  Wi-Fi (re)connect** — only matters when
+  `autodiscovery=True`; deferred.
+
+### Smoke tests included
+
+- `tests/test_wan_backoff.py` — curve math, persistence, nudge
+  semantics, restart behaviour, corruption handling.
+- `tests/test_lan_fgs_refcount.py` — ref-count balance, nesting,
+  thread safety, back-compat for pre-0.50 callers.
+
+Run with `pytest tests/ -q`.
+
+## 0.49.4 — LAN clone timeout + post-clone host-load guard
+
+Two follow-ups to the 0.49.3 QR pair-clone fix.
+
+### Daemon: bounded `dulwich.porcelain.clone` in `lan_clone`
+
+`azt_collabd/lan_clone.py:_do_lan_clone` ran `porcelain.clone`
+with no socket timeout. A wedged peer held the RPC open until
+the client's default `rpc.call` timeout (300 s) gave up, after
+which the daemon's caller still didn't know whether to retry
+or report the failure differently.
+
+- New `_LAN_CLONE_TIMEOUT_S = 180.0` (under the 300 s RPC
+  timeout so the daemon can return a typed status before the
+  client times out the call).
+- `_socket_timeout` context manager (mirror of
+  `repo._socket_timeout`; duplicated rather than cross-imported
+  to keep `lan_clone` independent of the heavier `repo`
+  module).
+- New typed status `LAN_CLONE_TIMEOUT` (`peer_id`, `langcode`,
+  `timeout_s`, `detail`) emitted from `clone_from_peer` when
+  `_do_lan_clone` tags the failure with the `clone_timed_out:`
+  sentinel. Generic clone failures still route to
+  `LAN_PEER_UNREACHABLE` (which already covers "couldn't
+  reach an endpoint"). `_looks_like_timeout` walks the
+  exception cause/context chain so dulwich/urllib3 wrapping
+  shapes don't slip through.
+
+### Client: user-visible toast on the failure shapes
+
+`azt_collab_client/ui/lan_popups.py:_finish_on_main` previously
+silently fell through when the QR clone Result didn't carry
+`LAN_PROJECT_CLONED` / `LAN_PROJECT_REOPENED`. Now:
+
+- New `_show_lan_failure_popup(title, message)` — one-button
+  info popup, dismissable. Inlined in `lan_popups.py` rather
+  than promoted to `popups.py` because the only callers are
+  the two LAN clone failure shapes; promote later if a third
+  site needs the same shape.
+- `_finish_on_main` checks for `LAN_CLONE_TIMEOUT` and
+  `LAN_PEER_UNREACHABLE` and renders the right popup — but
+  only when the result doesn't ALSO carry a success code
+  (avoids a scary timeout toast over a usable project).
+- New `LAN_CLONE_TIMEOUT` translation handler in
+  `translate.py`. French strings added.
+
+### Picker: guard `app.load_lift` against host-raised exceptions
+
+`azt_collab_client/ui/picker.py:receive_from_phone:_on_done`
+called `app.load_lift(path, langcode)` (peer host's callback)
+without exception handling. A raise inside the host (FS error,
+XML parse failure on a fresh-clone LIFT, schema mismatch)
+propagated out of the Clock-scheduled finisher; Kivy logged
+the traceback and the user was left on the picker with the
+popup dismissed and no project actually opened. Now wrapped:
+on failure, log the host's exception and `_populate_projects`
+so the new project row is at least visible.
+
+The host's data-loss handling is still the host's
+responsibility — this guard only prevents the picker from
+ending up in undefined state.
+
+## 0.49.3 — Progress popup + threaded RPCs on QR pair-clone
+
+Field report: new phone, no existing project, QR scan succeeded
+but then "went to a black screen." Root cause: the picker's
+"Receive from another phone" → "Scan QR code" path dismissed its
+own popup at `lan_popups.py:_scan` (line 1055) **before**
+`scan_to_pair` was called. After the QR-scanner activity returned
+to Kivy, `_on_result` invoked `lan_pair_accept` + `lan_clone`
+**synchronously on the Kivy main thread**. First-contact LAN
+clone over TLS is 10 s — minutes; for the duration the main
+thread was blocked and the SDL surface stayed black with no
+widget to draw.
+
+Fix in `azt_collab_client/ui/lan_popups.py:_on_result`:
+
+- Mount a non-dismissable "Receiving project" popup immediately
+  after the JSON payload validates. Two-line content: live phase
+  label ("Pairing with the other phone…" → "Copying project to
+  this phone…") + a sub-line warning that first-time copy can
+  take a minute or two.
+- Run `lan_pair_accept` + `lan_clone` on a daemon worker thread
+  so the Kivy event loop keeps rendering frames. The popup we
+  just mounted only gets drawn if the main thread can run a
+  paint pass before the RPC starts — without threading, the
+  popup is invisible too.
+- Phase-label updates marshal back to the main thread via
+  `Clock.schedule_once`. Completion likewise — `progress_popup.
+  dismiss()` runs on main, then routes into the existing
+  `_resolve_adopt_origin_then_done` / `_final_done` chain.
+- Exceptions in the worker collapse to a typed `SERVER_ERROR`
+  status carrying `error='pair/clone raised: …'` so the
+  picker's `on_done` path still has a Result to dispatch on
+  instead of the user seeing a stuck popup.
+
+New translatable strings (added in `translate.py` is not needed —
+they're rendered via `_tr` directly from `lan_popups.py`; French
+entries added to `locales/fr/LC_MESSAGES/azt_collab_client.po`):
+"Receiving project", "Pairing with the other phone…", "Copying
+project to this phone…", "First-time copy over the local network
+can take a minute or two. Please keep both phones close
+together."
+
+Independent follow-ups not landed in this release (logged in
+`.scratch/audit-2026-05-29-comms-data-loss-convergence/findings.md`):
+
+- `azt_collabd/lan_clone.py` has no client-side socket timeout
+  around `dulwich.porcelain.clone()`. A wedged peer holds the
+  RPC open for the full transport-layer default. Worth adding a
+  bounded timeout + typed `LAN_CLONE_TIMEOUT` status so the
+  worker thread can route an "is the other phone still nearby?"
+  toast instead of waiting forever.
+- No exception routing if post-clone `open_project` /
+  `load_lift` raises. Belongs in the picker's `on_done` consumer,
+  not in this popup.
+
+## 0.49.2 — Wire `extra_remotes` through the push path
+
+0.49.0 documented (CHANGELOG section 4) that the push iteration over
+`Project.extra_remotes` was not yet wired through `repo.py` — the
+data model captured the user's "Use both" preference but only the
+primary `remote_url` was actually pushed. Closed in this release:
+
+- New `_push_extras_step(repo, project_dir, result)` in
+  `azt_collabd/repo.py`. Iterates each entry in `extra_remotes` and
+  publishes the local branch tip with a publish-only refspec (no
+  fetch, no merge). Per-URL credentials via
+  `get_sync_credentials(extra_url)` so an extra on a different host
+  uses the right token.
+- Called after the primary `_push_step_locked` in both
+  `_push_repo_locked` (scheduler drain loop) and `_sync_repo_locked`
+  (user-Sync button). **Tries every URL each call, independent of
+  the primary's success/failure** — a transient primary failure
+  doesn't suppress secondary publishes.
+- New typed status codes `EXTRA_REMOTE_PUSHED` (params: `url`,
+  `branch`) and `EXTRA_REMOTE_PUSH_FAILED` (params: `url`, `error`),
+  mirrored in `azt_collab_client/status.py`. Translations added to
+  the client's English handlers and the French .po. Auto-sync paths
+  should route silent on the failure code; user-Sync may surface a
+  per-remote breakdown.
+- Misleading comment in `server.py:_h_lan_resolve_conflict` rewritten
+  to name `_push_extras_step` (was: `repo._push_to_remote_url`, which
+  doesn't exist).
+
+No `MIN_CLIENT_VERSION` bump — old peers that don't decode the new
+codes will render them via the unknown-code fallback (`[CODE]
+{params!r}`) until they update. Same wire shape, additive only.
+
+Behaviour change peers should be aware of: a project on "Use both"
+that previously appeared to be silently dropping commits to the
+secondary will now actually deliver them. If the secondary host
+diverged during the gap, the first push pass after upgrade will
+surface `EXTRA_REMOTE_PUSH_FAILED` with a non-FF rejection — the
+user reconciles the secondary by hand (the daemon never fetches
+from secondaries).
+
+## 0.49.0 — Peer-interaction round: nearby pairing, shared decisions watcher, KV / slot claims
 
 End-to-end work driven by the 2026-05-28 architecture
 discussion on "peer interaction for 3+ devices on the same
@@ -148,6 +1116,18 @@ existing LIFT pipeline.
   ``claimed_at`` is later. Loser sees on next sync that
   they're not in ``list_slots`` and is re-prompted by the
   peer UI.
+- KV / slot writes hold ``project_lock`` during the
+  on-disk write, the same lock
+  ``_reset_working_tree_after_receive`` takes during its
+  status check + integrate-or-reset decision. Closes the
+  receive-races-a-pending-write hole: the receive's
+  ``porcelain.status`` runs either fully before our write
+  (no unstaged path to clobber; hard reset is safe) or
+  fully after (sees our file as unstaged; runs
+  ``integrate_head_into_working_tree`` through the
+  slot/KV merge branches instead of reset). No window
+  where status reads clean and ``reset --hard`` fires
+  over a fresh write.
 
 Peer contract + locked semantics + recommended flow in
 ``CLIENT_INTEGRATION.md`` § 21. NOTES_TO_DAEMON.md item
@@ -180,8 +1160,8 @@ Touched:
   ``_list`` / ``list_slots`` / ``claim_slot`` /
   ``release_slot``), ``lan_clone`` gains
   ``user_initiated`` kwarg, ``__all__`` updated,
-  ``__version__`` → ``0.48.0``,
-  ``MIN_SERVER_VERSION`` → ``0.48.0``.
+  ``__version__`` → ``0.49.0``,
+  ``MIN_SERVER_VERSION`` → ``0.49.0``.
 - ``azt_collab_client/ui/__init__.py`` — re-exports
   ``install_decision_watcher``.
 - ``azt_collab_client/status.py`` — adds
@@ -196,7 +1176,7 @@ Touched:
   deleted (acted on); LANOK item also deleted (resolved
   in 0.47.0).
 - ``azt_collabd/__init__.py`` —
-  ``MIN_CLIENT_VERSION`` → ``0.48.0``.
+  ``MIN_CLIENT_VERSION`` → ``0.49.0``.
 - ``azt_collabd/status.py`` — mirror of new pair-request
   codes.
 - ``azt_collabd/pending_decisions.py`` — adds
@@ -227,23 +1207,110 @@ Touched:
 
 Additive. New endpoints listed under each section above.
 ``MIN_CLIENT_VERSION`` and ``MIN_SERVER_VERSION`` both
-bumped to ``0.48.0`` — peers that predate the new
+bumped to ``0.49.0`` — peers that predate the new
 pending-decision kind mis-render incoming
 ``KIND_PAIR_REQUEST`` entries, and old daemons can't
 emit them; the floor bump means cross-version mismatches
 show the upgrade popup instead of partial behavior.
 
-### Known follow-ups
+### 7. Bootstrap recovery: Restart server + safe wording
 
-- Push iteration over ``extra_remotes`` (data-model-only
-  today; see § 4).
-- Migration that drops the legacy ``collab.device_name``
-  config field once existing installs have rolled past
-  one release with the derived-only ``get_device_name``
-  so the legacy-honour branch can go.
-- Peer-side UI work for the Nearby-unpaired list + slot
-  picker + ``team_size`` row — recorder team's pickup
-  per CLIENT_INTEGRATION.md §§ 20a, 21.
+Two UX fixes on the "server is installed but the daemon
+isn't responding" path:
+
+- The unresponsive-popup
+  (``_prompt_server_unresponsive``) now wires an
+  ``on_restart_server`` callback through to the canonical
+  install popup, so the "Restart server" button appears.
+  Same code path the sync-settings page uses
+  (cooperative ``POST /v1/admin/restart``); empirically
+  the most reliable recovery when the ``:provider``
+  process is wedged / frozen / stale-bundle. Body text
+  promotes Restart server as the primary action ahead of
+  Open / Quit. New
+  ``_restart_server_unresponsive`` helper falls back to
+  ``_prompt_server_unresponsive`` on failure (instead of
+  the server-too-old popup, which is the wrong identity
+  for this flow). The previously-rendered "Try again"
+  button is dropped from this popup — Restart server
+  subsumes it (cooperative restart re-probes compat on
+  acceptance, which is what Try-again did).
+- The stale-bundle path
+  (``_prompt_server_reboot_to_apply``) no longer shows
+  a popup at all. The previous popup recommended
+  "uninstall and reinstall AZT Collaboration" (data
+  loss — uninstall wipes ``$AZT_HOME`` including
+  projects, credentials, jobs;
+  [[never-suggest-uninstall-apk]]) and offered a
+  Restart server button that didn't actually help. Both
+  were wrong: per ``server_apk/service.py``'s comment
+  block on ``_maybe_reextract_python_bundle``,
+  cooperative restart of ``:provider`` cannot fix a
+  stale bundle because the proper unpack does
+  ``recursiveDelete(files/app/)`` first, wiping the
+  very code ``:provider`` is running.
+
+  The actual fix is to launch the server APK's
+  ``PythonActivity`` (which runs in a separate
+  process), where p4a's bootstrap sees the
+  ``.version`` markers that ``:provider`` invalidated
+  on its last spawn and re-extracts the bundle
+  cleanly. The new path fires
+  ``_open_server_apk_launcher()`` on detection: shows
+  a toast "Refreshing the sync service code — tap back
+  when AZT Collaboration finishes loading", sends the
+  launcher intent, schedules a compat re-probe.
+  Android brings AZT Collaboration to the foreground;
+  PythonActivity re-extracts; user navigates back; the
+  next ``:provider`` lazy-spawn loads the fresh code.
+  Loop guard prevents re-firing if the user dismisses
+  AZT Collaboration before the extract completes.
+  Fallback popup retained only for the case where
+  ``getLaunchIntentForPackage`` returns null (jnius /
+  PackageManager unhealthy on the peer); body text
+  there tells the user to open AZT Collaboration from
+  the launcher manually.
+
+  ``_show_update_blocked_popup``'s previously-added
+  ``on_restart_server`` parameter is removed since no
+  caller now uses it.
+
+### 8. Uniform theming for popups + their buttons
+
+Every Python-built popup in the LAN / peer flows
+(Paired devices, Receive a project, Pair request,
+Adopt origin, Remote conflict, share-project, scan-to-
+pair, install-server, …) used Kivy's stdlib ``Popup``
+and ``Button`` — neither of which follows the suite's
+active palette. Result: bevelled grey buttons on a grey
+9-patch backdrop, two visual languages on the same
+screen as the themed picker.
+
+New ``azt_collab_client/ui/themed_popup.py``:
+
+- ``ThemedPopup`` — paints ``theme.BG`` into the popup
+  backdrop, ``theme.TEXT`` title text,
+  ``theme.ACCENT`` separator. Drop-in for
+  ``kivy.uix.popup.Popup``.
+- ``ThemedButton`` — replaces ``kivy.uix.button.Button``
+  with the picker's ``RecBtn`` / ``NavBtn`` visual
+  (8 dp rounded corners, themed fill + text colours,
+  9-patch bevel stripped). Default flavour is the
+  picker's secondary ``NavBtn`` (``theme.SURFACE``
+  fill, ``theme.ACCENT`` text). Callers that already
+  pass ``background_color=theme.ACCENT`` to mark a
+  primary action auto-switch to the ``RecBtn`` flavour
+  (``theme.ACCENT`` fill, white text) without any
+  callsite change.
+
+Imports swapped in ``lan_popups.py``, ``decisions.py``,
+``popups.py``, ``bootstrap.py``. The bootstrap
+``_show_update_blocked_popup`` ModalView gains the
+same canvas.before paint inline (one callsite, not
+worth a separate themed subclass). Theme tracking is
+live — toggling palette via ``theme.set_theme`` would
+re-render the next-opened popup against the new
+palette without code changes.
 
 ## 0.47.6 — LangPicker re-pick: restore region_scroll visibility
 

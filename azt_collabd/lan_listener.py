@@ -469,6 +469,100 @@ def _handle_share_declined(environ, start_response, peer_id,
     return _json_response(start_response, '200 OK', {'ok': True})
 
 
+def _handle_cawl_fetch_bodyauth(environ, start_response):
+    """Serve a CAWL image byte stream over LAN to a paired peer
+    (NOTES #3, since 0.50.14).
+
+    Body: ``{peer_id, fp, owner, repo, rel_path}`` — same
+    body-auth shape as the other signalling endpoints (peer_id/fp
+    lookup against ``peers.json``; no TLS-layer client auth, see
+    ``_build_server`` for why). ``rel_path`` is the full nested
+    path inside the repo (e.g. ``0001_body/foo.png``); a flat
+    basename is also accepted and canonicalized via the local
+    index. Sending the full ``rel_path`` is preferred because
+    same-basename-different-variant entries (two ``foo.png`` files
+    in different id directories) need to be disambiguated for the
+    "fetch all variants over LAN" case.
+
+    Response:
+      - 200 ``application/octet-stream`` with the bytes if we have
+        them cached locally.
+      - 404 JSON if we don't have the byte cached.
+      - 403 JSON if the caller isn't a paired peer.
+      - 400 JSON on malformed body.
+
+    Why a separate endpoint vs. piggybacking on the existing
+    dulwich git fallthrough: CAWL images aren't tracked in any
+    project's git tree (they live under ``$AZT_HOME/cawl/...``,
+    a daemon-private directory) so they're invisible to dulwich's
+    smart-protocol app. A purpose-built byte server is the
+    minimum surface to expose them.
+    """
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    fp = str(payload.get('fp', '') or '')
+    owner = str(payload.get('owner', '') or '').strip()
+    repo = str(payload.get('repo', '') or '').strip()
+    rel_path = str(
+        payload.get('rel_path') or payload.get('basename') or ''
+    ).strip()
+    if len(peer_id) != 64 or len(fp) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id / fp wrong length'})
+    if not owner or not repo or not rel_path:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'owner / repo / rel_path '
+                                        'required'})
+    # Peer auth: must be in peers.json with the claimed fp.
+    entry = _peers.get_peer(peer_id)
+    if entry is None or str(entry.get('fp', '') or '') != fp:
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False,
+                               'error': 'not_paired_or_fp_mismatch'})
+    # rel_path safety: no leading slash (absolute), no ``..`` for
+    # traversal, no backslashes, no hidden-file leading dot.
+    # ``/`` BETWEEN components is fine (and expected) for nested
+    # rel_paths like ``0001_body/foo.png``.
+    if ('\\' in rel_path or '..' in rel_path
+            or rel_path.startswith('.') or rel_path.startswith('/')):
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'bad_rel_path'})
+    if '/' in owner or '/' in repo:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'bad_owner_or_repo'})
+    from . import cawl as _cawl
+    repo_slug = f'{owner}/{repo}'
+    # Flat basename (no '/'): canonicalize via local index. With a
+    # nested rel_path the requester has already done the
+    # disambiguation — use it directly.
+    if '/' not in rel_path:
+        rel_path, _found = _cawl._resolve_basename_via_index(
+            repo_slug, rel_path)
+    target = _cawl.image_path(repo_slug, rel_path)
+    if target is None or not os.path.isfile(target):
+        return _json_response(start_response, '404 Not Found',
+                              {'ok': False, 'error': 'not_cached'})
+    try:
+        with open(target, 'rb') as f:
+            body = f.read()
+    except OSError as ex:
+        return _json_response(start_response, '500 Internal Error',
+                              {'ok': False,
+                               'error': f'read_failed: {ex!r}'})
+    start_response('200 OK', [
+        ('Content-Type', 'application/octet-stream'),
+        ('Content-Length', str(len(body))),
+    ])
+    return [body]
+
+
 def _handle_pair_request(environ, start_response):
     """Inbound Nearby-pair request from an unpaired device.
 
@@ -582,6 +676,10 @@ def _peer_acl_middleware(app):
             return _handle_pair_request(environ, start_response)
         if method == 'POST' and path_info == '/v1/lan/pair_response':
             return _handle_pair_response(environ, start_response)
+        if (method == 'POST'
+                and path_info == '/v1/lan/cawl_fetch'):
+            return _handle_cawl_fetch_bodyauth(
+                environ, start_response)
         # Non-signalling fallthrough: dulwich.web's git smart-
         # protocol app. URL-level ACL is handled at backend-build
         # time — ``_build_dict_backend`` only mounts projects that
@@ -977,6 +1075,25 @@ def _reset_working_tree_after_receive(langcode):
                                       f'{langcode!r}: re-attach '
                                       f'failed: {ex!r}',
                                       file=sys.stderr, flush=True)
+                        else:
+                            # Audit finding #4 (0.50.15): ancestry
+                            # check failed or walker raised. The
+                            # re-attach is unsafe (main is NOT a
+                            # descendant of HEAD; rewriting HEAD to
+                            # main would silently drop the work
+                            # at HEAD). Pre-0.50.15 this fell
+                            # through silently and the merge-loop
+                            # could resume on the next receive.
+                            # Emit a structured log line — same
+                            # format as other [data-quality] tags
+                            # so a daemon-log search surfaces it.
+                            print(f'[data-quality] '
+                                  f'head-detached-no-reattach '
+                                  f'langcode={langcode!r} '
+                                  f'head={head_sha_raw[:12].decode()} '
+                                  f'main={main_sha[:12].decode()} '
+                                  f'reason=main-not-descendant-of-head',
+                                  file=sys.stderr, flush=True)
                 head_sha = repo.refs[b'HEAD']
                 porcelain.reset(repo, mode='hard', treeish=head_sha)
                 print(f'[lan-listener] post-receive reset '
@@ -1199,27 +1316,36 @@ def stop():
 
 
 def apply_toggle():
-    """Reconcile the listener lifecycle with the daemon-wide
-    ``lan.allow_sync`` setting. Called from the toggle RPC handler
-    after the setting is persisted; safe to call from anywhere.
-    Hot-applied — no daemon restart required.
+    """Reconcile the listener lifecycle with the union of:
+      - ``lan.autodiscovery`` (continuous-on policy bit), and
+      - ``lan_fgs`` discovery ref count > 0 (a burst is active).
 
-    Order on toggle ON: acquire WifiLocks first (so multicast is
-    available before any NsdManager browse fires later in phase 5),
-    then promote the :provider service to FGS (so the OS can't
-    kill us mid-handshake), then start the listener thread.
-    Reverse on OFF.
+    Called from the toggle RPC handler after the setting is
+    persisted, from ``lan_burst.start_burst`` /
+    ``lan_burst._burst_done``, and from the watcher's reconcile
+    tick. Safe to call from anywhere; hot-applied — no daemon
+    restart required.
+
+    Order on UP: acquire WifiLocks first (so multicast is
+    available before any NsdManager browse fires), then promote
+    the :provider service to FGS (so the OS can't kill us mid-
+    handshake), then start the listener thread. Reverse on
+    DOWN.
 
     Per-step failure attribution: each phase logs its own
-    ``[lan-listener] {step} failed`` line so a field log immediately
-    identifies whether WifiLock, FGS promotion, or socket bind is
-    the failing seam. Pre-0.46.x the three steps shared one
-    try/except and the message lost which step actually raised.
-    Idempotent: when called from the watcher's reconcile tick on a
-    healthy daemon, the ``not is_running()`` / ``is_running()``
+    ``[lan-listener] {step} failed`` line so a field log
+    immediately identifies whether WifiLock, FGS promotion, or
+    socket bind is the failing seam. Idempotent: when called on
+    a healthy daemon, the ``not is_running()`` / ``is_running()``
     guards short-circuit so no work is done."""
     from .android_cp import lan_fgs as _lan_fgs
-    desired = _settings.lan_allow_sync()
+    # Up if either reason is active: user picked continuous, or a
+    # burst is currently armed. The burst path uses
+    # ``arm_for_discovery`` which bumps the ref count we're
+    # reading here.
+    autodiscovery = _settings.lan_autodiscovery()
+    burst_armed = (_lan_fgs.snapshot().get('ref_discovery', 0) > 0)
+    desired = autodiscovery or burst_armed
     if desired and not is_running():
         try:
             _lan_fgs.acquire_wifi_locks()

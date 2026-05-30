@@ -446,6 +446,69 @@ def derive_remote_url(working_dir):
         return ''
 
 
+def _mint_fresh_guids(xml_bytes):
+    """Return a copy of *xml_bytes* (a LIFT document) where every
+    ``<entry guid="...">`` carries a fresh UUID-4 and every
+    ``ref="..."`` attribute that pointed at one of those old guids
+    is rewritten to the new value.
+
+    Used by ``create_from_template`` so two projects derived from
+    the same template don't share entry GUIDs entry-for-entry.
+    LIFT only requires ``<entry guid="...">`` to be unique within a
+    single file, but several peer-side features key state off guid
+    alone (caches, retry queues, future shared-clipboard work);
+    those features misbehave silently when two distinct projects
+    in the same daemon share 1700+ identical guids out of a SILCAWL
+    template.
+
+    Conservative-by-design:
+      - Only rewrites ``<entry guid="...">`` — leaves
+        ``<sense id="...">`` and other identifier slots alone.
+      - Only rewrites ``ref="..."`` attributes whose value matches
+        one of OUR rewritten entry guids. A ``ref`` on some other
+        LIFT element with a non-guid value (sense ids, etc.) is
+        left alone.
+      - Returns the input bytes unchanged on parse failure or if
+        no ``<entry guid="...">`` is found (so a non-LIFT template
+        flows through untouched and the downstream consumer sees
+        the same content it would have seen before this transform
+        existed).
+
+    Note on serialization: ``ET.tostring`` writes the document
+    without preserving the original ``<?xml ... ?>`` declaration
+    verbatim. We emit ``<?xml version='1.0' encoding='utf-8'?>``,
+    which matches the convention every other write site in the
+    daemon uses (``lift_merge`` and ``atomic_recovery`` both
+    serialize via ET).
+    """
+    import uuid
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+
+    mapping = {}
+    for entry in root.iter('entry'):
+        old = entry.get('guid')
+        if not old:
+            continue
+        new = str(uuid.uuid4())
+        mapping[old] = new
+        entry.set('guid', new)
+
+    if not mapping:
+        return xml_bytes
+
+    for elem in root.iter():
+        ref = elem.get('ref')
+        if ref and ref in mapping:
+            elem.set('ref', mapping[ref])
+
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+
 def create_from_template(template_url, vernlang, dest_dir,
                          timeout=60, size_cap=10 * 1024 * 1024):
     """Download a LIFT template and register it as a project.
@@ -453,6 +516,10 @@ def create_from_template(template_url, vernlang, dest_dir,
     Returns the resulting Project. ``size_cap`` (default 10 MiB) defends
     against accidentally pulling a giant repo via a misconfigured URL —
     the SILCAWL template is ~200 KB, so this is plenty of head-room.
+
+    Mints fresh ``<entry guid="...">`` values on import (since 0.50.8;
+    see ``_mint_fresh_guids``) so two projects derived from the same
+    template don't collide on guid-keyed state.
 
     Raises ``ValueError`` for missing args, ``RuntimeError`` for download
     failures.
@@ -485,6 +552,20 @@ def create_from_template(template_url, vernlang, dest_dir,
     if len(content) < 50:
         raise RuntimeError(
             f'template download too small ({len(content)} bytes)')
+
+    # Mint fresh entry GUIDs before settling the file in place.
+    # Defensive: any failure during the transform falls back to the
+    # original bytes so a template that's almost-but-not-quite-LIFT
+    # (e.g. served via a 200 OK error page) doesn't break the
+    # download path entirely — it'll fail more specifically later
+    # when LIFT readers try to parse it.
+    try:
+        content = _mint_fresh_guids(content)
+    except Exception as ex:
+        print(f'[create_from_template] _mint_fresh_guids failed '
+              f'(template GUIDs unchanged): {ex!r}',
+              file=sys.stderr, flush=True)
+
     fd, tmp = tempfile.mkstemp(prefix='.template.', suffix='.lift',
                                dir=project_dir)
     try:

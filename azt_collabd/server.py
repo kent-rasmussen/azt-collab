@@ -955,9 +955,12 @@ def _h_lan_resolve_conflict(body):
             return 200, {"ok": False,
                          "error": f'set_remote_url failed: {ex!r}'}
     elif mode == 'dual_publish':
-        # Record incoming as a secondary remote. The push path
-        # (repo._push_to_remote_url) iterates the primary plus
-        # extra_remotes after; secondaries are best-effort and a
+        # Record incoming as a secondary remote. The push paths
+        # (``_push_repo_locked`` / ``_sync_repo_locked``) call
+        # ``_push_extras_step`` after the primary; each entry in
+        # ``extra_remotes`` is published every push pass, with
+        # per-URL ``EXTRA_REMOTE_PUSHED`` / ``EXTRA_REMOTE_PUSH_FAILED``
+        # surfaced separately. Secondaries are best-effort and a
         # failure on one doesn't block the others. Per
         # CLIENT_INTEGRATION.md § 20a "Use both" — user picked
         # to publish to both Internet locations.
@@ -1159,6 +1162,64 @@ def _h_set_work_offline(body):
     except Exception:
         pass
     return 200, {"ok": True, "work_offline": enabled}
+
+
+def _h_sync_nudge(body):
+    """``POST /v1/sync/nudge`` with optional ``{langcode}`` —
+    the unified "try sync now" gesture. Resets WAN backoff for
+    one project (or all, if no langcode supplied), fires an
+    immediate WAN push pass, and fires a LAN burst-discovery +
+    fan-out so paired peers in the room get the latest. Same
+    semantics as the sync icon: "I'm telling you to try
+    everything right now, regardless of backoff."
+
+    Always returns ``{ok: True}`` — failures are visible via
+    the next ``project_status`` poll. The point of the nudge
+    is *attempt scheduling*, not delivery confirmation; if
+    nothing was actually pending or every attempt failed, the
+    user sees that via the same status indicators they were
+    already watching.
+    """
+    langcode = str((body or {}).get('langcode', '') or '')
+    from . import scheduler as _scheduler
+    try:
+        _scheduler.drain_pushes_now(langcode=langcode)
+    except Exception as ex:
+        print(f'[sync_nudge] drain raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    # LAN: arm a burst (Phase 3), then fan out. ``start_burst`` is
+    # a no-op increment when ``lan.autodiscovery=True`` (the radio
+    # is already up); when it's False the burst brings up the
+    # listener + mDNS + locks for ``DEFAULT_WINDOW_S`` (default
+    # 30 s) so paired peers' parallel bursts can discover us.
+    try:
+        from . import lan_burst as _lan_burst
+        _lan_burst.start_burst()
+    except Exception as ex:
+        print(f'[sync_nudge] start_burst raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    try:
+        if langcode:
+            p = projects.get(langcode)
+            if p is not None:
+                from . import lan_push as _lan_push
+                _lan_push.fan_out(p)
+        else:
+            data = projects._load_raw()
+            for lang in data:
+                p = projects.get(lang)
+                if p is not None:
+                    try:
+                        from . import lan_push as _lan_push
+                        _lan_push.fan_out(p)
+                    except Exception as ex:
+                        print(f'[sync_nudge] LAN fan-out '
+                              f'{lang!r} raised: {ex!r}',
+                              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[sync_nudge] LAN dispatch raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
 
 
 def _h_set_cawl_prefetch_all_variants(body):
@@ -2297,6 +2358,16 @@ def _h_project_status(langcode, _body):
     # pre-first-commit). Cheap to read; held off the dulwich
     # ``refs`` lookup, no full status walk required.
     head_sha = ''
+    # Foreign-device topic-branch orphan visibility (audit
+    # finding #3, 0.50.15). Count refs/remotes/origin/azt-pending-*
+    # entries that do NOT carry our own device_name suffix —
+    # those are orphans left by other devices' incomplete
+    # uploads. The janitor (``repo._maybe_run_janitor``) only
+    # sweeps OUR own; foreign orphans stay until their owner
+    # device returns, which can be never. Surface the count so
+    # a user troubleshooting "why is this remote so heavy" can
+    # see them.
+    foreign_topic_orphan_count = 0
     try:
         from dulwich.repo import Repo
         _r = Repo(p.working_dir)
@@ -2306,6 +2377,12 @@ def _h_project_status(langcode, _body):
                 head_sha = _h.decode('ascii', 'replace')
             else:
                 head_sha = str(_h)
+            try:
+                from .repo import _count_foreign_topic_orphans
+                foreign_topic_orphan_count = \
+                    _count_foreign_topic_orphans(_r)
+            except Exception:
+                foreign_topic_orphan_count = 0
         finally:
             try:
                 _r.close()
@@ -2412,6 +2489,16 @@ def _h_project_status(langcode, _body):
         # complete set of events that mutate the on-disk view of
         # this project the peer is rendering.
         "head_sha": head_sha,
+        # Foreign-device topic-branch orphan count (since 0.50.15,
+        # audit finding #3). Number of
+        # ``refs/remotes/origin/azt-pending-*`` refs whose
+        # device-name suffix isn't ours — i.e. orphans left by
+        # other devices' incomplete uploads that our janitor
+        # can't safely sweep (false-positive risk if their device
+        # is mid-Phase-A). Informational only; peers can render a
+        # warning or a "this remote is messy" diagnostic without
+        # acting on it. Pre-0.50.15 peers ignore the unknown key.
+        "foreign_topic_orphan_count": foreign_topic_orphan_count,
     }
 
 
@@ -2522,8 +2609,17 @@ def _h_project_kv_set(langcode, key, body):
     """``POST /v1/projects/<lang>/kv/<key>`` — write a scalar
     project-KV value and fire a debounced commit so it
     propagates to paired peers via the existing sync
-    pipeline. Body: ``{value: str}``."""
+    pipeline. Body: ``{value: str}``.
+
+    Held under ``project_lock`` so an incoming LAN receive
+    can't race past our write and ``reset --hard`` over the
+    new file before its ``status`` check sees it as unstaged.
+    See ``lan_listener._reset_working_tree_after_receive``
+    which serializes on the same lock and inspects working-
+    tree mods inside that critical section.
+    """
     from . import project_kv as _pkv
+    from .locks import LockTimeout
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
@@ -2535,7 +2631,10 @@ def _h_project_kv_set(langcode, key, body):
     if value is None:
         value = ''
     try:
-        _pkv.kv_set(p.working_dir, key, str(value))
+        with project_lock(p.working_dir, timeout=10):
+            _pkv.kv_set(p.working_dir, key, str(value))
+    except LockTimeout:
+        return 503, {"ok": False, "error": "busy"}
     except Exception as ex:
         return 500, {"ok": False,
                      "error": f'kv_set raised: {ex!r}'}
@@ -2600,10 +2699,68 @@ def _h_project_slot_claim(langcode, body):
     except Exception as ex:
         return 500, {"ok": False,
                      "error": f'no_lan_identity: {ex!r}'}
-    ok = _pkv.slot_claim(p.working_dir, ident['peer_id'],
-                         store.get_device_name(), slot)
+    # Held under project_lock for the same reason as kv_set —
+    # closes the race where a LAN receive's status-check could
+    # miss our pending claim and hard-reset over it.
+    from .locks import LockTimeout
+    try:
+        with project_lock(p.working_dir, timeout=10):
+            ok = _pkv.slot_claim(p.working_dir, ident['peer_id'],
+                                 store.get_device_name(), slot)
+    except LockTimeout:
+        return 503, {"ok": False, "error": "busy"}
     if not ok:
         return 400, {"ok": False, "error": "claim_refused"}
+    _touch_project(langcode)
+    job_id = scheduler.commit_project(langcode)
+    return 200, {"ok": True, "slot": slot, "job_id": job_id}
+
+
+def _h_project_slot_rebind(langcode, slot, _body):
+    """``POST /v1/projects/<lang>/slots/<slot>/rebind`` — rewrite
+    the identity atoms (peer_id + device_name) of an existing
+    slot claim to this daemon's current values.
+
+    Used by the user-driven recovery flow (0.50.9+) when the
+    daemon's ``peer_id`` changed since the slot was claimed
+    (server-APK reinstall regenerated the LAN identity; user
+    cleared app data) but the user knows the slot is still
+    theirs. The peer-side guard rail is a confirm popup driven
+    by a contributor-name match against the existing claim's
+    ``device_name``; this RPC is just the persistence half.
+
+    Refreshes ``claimed_at`` to now, so a rebind wins any
+    concurrent claim by another peer in the merge.
+
+    Returns 400 ``slot_not_found`` if no claim exists at that
+    slot (rebind only retags existing claims; it doesn't create
+    new ones — for that the peer uses ``slot_claim`` directly).
+    """
+    from . import project_kv as _pkv
+    from . import peer_id as _peer_id_mod
+    from .locks import LockTimeout
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    slot = str(slot or '')
+    if not slot or not _pkv._is_safe_name(slot):
+        return 400, {"ok": False, "error": "bad_slot"}
+    refusal = _refuse_if_contributor_unset()
+    if refusal is not None:
+        return refusal
+    try:
+        ident = _peer_id_mod.ensure()
+    except Exception as ex:
+        return 500, {"ok": False,
+                     "error": f'no_lan_identity: {ex!r}'}
+    try:
+        with project_lock(p.working_dir, timeout=10):
+            ok = _pkv.slot_rebind(p.working_dir, ident['peer_id'],
+                                  store.get_device_name(), slot)
+    except LockTimeout:
+        return 503, {"ok": False, "error": "busy"}
+    if not ok:
+        return 400, {"ok": False, "error": "slot_not_found"}
     _touch_project(langcode)
     job_id = scheduler.commit_project(langcode)
     return 200, {"ok": True, "slot": slot, "job_id": job_id}
@@ -2616,6 +2773,7 @@ def _h_project_slot_release(langcode, _body):
     slot N". Idempotent — empty list if we held nothing."""
     from . import project_kv as _pkv
     from . import peer_id as _peer_id_mod
+    from .locks import LockTimeout
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
@@ -2624,7 +2782,12 @@ def _h_project_slot_release(langcode, _body):
     except Exception as ex:
         return 500, {"ok": False,
                      "error": f'no_lan_identity: {ex!r}'}
-    released = _pkv.slot_release(p.working_dir, ident['peer_id'])
+    try:
+        with project_lock(p.working_dir, timeout=10):
+            released = _pkv.slot_release(p.working_dir,
+                                         ident['peer_id'])
+    except LockTimeout:
+        return 503, {"ok": False, "error": "busy"}
     if released:
         _touch_project(langcode)
         scheduler.commit_project(langcode)
@@ -3334,6 +3497,8 @@ def dispatch(method, path, body):
             return _h_set_daemon_log_to_file(body)
         if path == '/v1/admin/restart':
             return _h_admin_restart(body)
+        if path == '/v1/sync/nudge':
+            return _h_sync_nudge(body)
         if path == '/v1/recent/last_project':
             return _h_set_last_project(body)
         if path == '/v1/projects/register':
@@ -3390,6 +3555,10 @@ def dispatch(method, path, body):
             if len(parts) == 6 and parts[4] == 'slots' \
                     and parts[5] == 'release':
                 return _h_project_slot_release(parts[3], body)
+            if len(parts) == 7 and parts[4] == 'slots' \
+                    and parts[6] == 'rebind':
+                return _h_project_slot_rebind(
+                    parts[3], parts[5], body)
         return 404, {"ok": False, "error": "not_found"}
 
     return 405, {"ok": False, "error": "method_not_allowed"}

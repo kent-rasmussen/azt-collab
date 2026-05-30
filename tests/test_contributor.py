@@ -28,7 +28,6 @@ Pins:
 
 import json
 import os
-import socket
 import threading
 
 import pytest
@@ -74,48 +73,47 @@ def test_set_contributor_empty_clears():
     assert store.get_contributor() == ''
 
 
-# ── store.get_device_name auto-populate ──────────────────────────────────
+# ── store.get_device_name derived-from-contributor (0.49.0) ──────────────
+#
+# Pre-0.49.0 ``device_name`` was an independent persisted field with
+# its own autodetect + setter. Since 0.49.0 it's derived from
+# ``contributor`` + an OS-level device label, and ``set_device_name``
+# is a no-op kept only for back-compat with older clients. The
+# tests below pin the 0.49.0 contract; the 0.40.0 versions (which
+# silently passed for a while via cross-test state leakage in
+# tmp_path-cached ``_AZT_HOME_CACHE``) were stale.
 
 
-def test_get_device_name_auto_populates_on_first_read():
-    """First read on an unset store probes the OS (no jnius on the
-    test host → falls through to socket.gethostname()) and persists
-    so a second read sees the same value without re-probing."""
-    # Sanity: nothing stored to start.
-    raw = (store._load_config_file().get('collab') or {}).get(
-        'device_name', '')
-    assert raw == ''
+def test_get_device_name_empty_when_contributor_unset():
+    """Contributor is the gate: no contributor → no peer label.
+    The composed form would be uselessly anonymous, so callers
+    branch on ``CONTRIBUTOR_UNSET`` instead."""
+    assert store.get_contributor() == ''
+    assert store.get_device_name() == ''
+
+
+def test_get_device_name_composes_with_contributor():
+    """With contributor set, the peer label is
+    ``<contributor> — <autodetect>`` or just ``<contributor>`` if
+    autodetect is unavailable on the host."""
+    store.set_contributor('Alice')
     name = store.get_device_name()
-    assert name  # non-empty
-    # Persisted so the second read returns the same string.
-    raw_after = (store._load_config_file().get('collab') or {}).get(
-        'device_name', '')
-    assert raw_after == name
-    assert store.get_device_name() == name
+    assert name.startswith('Alice')
+    # Either "Alice" (no autodetect) or "Alice — <something>"
+    assert name == 'Alice' or name.startswith('Alice — ')
 
 
-def test_get_device_name_falls_back_to_hostname_on_desktop():
-    """In the test host (no Android), the autodetect chain ends at
-    socket.gethostname(). The persisted value should match it."""
-    name = store.get_device_name()
-    assert name == socket.gethostname() or name == 'unknown-device'
-
-
-def test_set_device_name_round_trip():
-    store.set_device_name("Marie's Tablet")
-    assert store.get_device_name() == "Marie's Tablet"
-
-
-def test_set_device_name_empty_clears_and_redetects():
-    """Setting empty triggers re-autodetect on next read so the
-    user clearing the override goes back to the OS default."""
-    store.set_device_name('custom-name')
-    assert store.get_device_name() == 'custom-name'
-    store.set_device_name('')
-    # Cleared → next read autodetects, persists, returns non-empty.
-    redetected = store.get_device_name()
-    assert redetected
-    assert redetected != 'custom-name'
+def test_set_device_name_is_a_noop_since_0_49_0():
+    """``set_device_name`` is intentionally preserved as a no-op
+    so pre-0.49.0 peers that still call it don't crash. The
+    user-facing field is ``contributor``; the device half is
+    derived. A call here must not change what ``get_device_name``
+    returns."""
+    store.set_contributor('Alice')
+    before = store.get_device_name()
+    store.set_device_name("Marie's Tablet")  # no-op
+    after = store.get_device_name()
+    assert after == before
 
 
 # ── _safe_email_segment ─────────────────────────────────────────────────
@@ -158,13 +156,20 @@ def test_default_author_explicit_empty_device_yields_unknown():
 
 
 def test_default_author_lazy_lookup_when_device_none():
-    """device_name=None triggers store.get_device_name() — which
-    autodetects + persists. Result email uses the autodetected
-    device (host name on this test host)."""
+    """device_name=None triggers ``store.get_device_name()`` which
+    (since 0.49.0) returns the composed contributor+autodetect
+    string. With contributor set, the result email embeds the
+    autodetected device segment. With contributor unset,
+    ``get_device_name`` returns '' and the email lands at
+    ``@unknown`` — verified separately by
+    ``test_default_author_explicit_empty_device_yields_unknown``."""
+    store.set_contributor('Alice Smith')
     out = _default_author('Alice Smith', None)
-    # The store lookup returns a non-empty value; the resulting
-    # author bytes include it after sanitisation.
     assert out.startswith(b'Alice Smith <alice_smith@')
+    # When ``get_device_name()`` returns just the contributor (no
+    # autodetect available), the email segment is "alice_smith".
+    # When autodetect succeeds, it's "alice_smith_<segment>".
+    # In either case it's not the literal "@unknown" fallback.
     assert not out.endswith(b'@unknown>')
 
 
@@ -285,43 +290,43 @@ def test_scheduler_run_commit_refuses_when_contributor_unset():
     assert result.has(S_d.CONTRIBUTOR_UNSET)
 
 
-# ── Device-name endpoints ───────────────────────────────────────────────
+# ── Device-name endpoints (0.49.0 contract) ─────────────────────────────
+#
+# ``GET /v1/config/device_name`` returns the composed
+# ``<contributor> — <autodetect>``; ``POST`` is a no-op since 0.49.0
+# (set_device_name is dead). Old peers calling POST do not crash;
+# their value is silently ignored.
 
 
-def test_endpoint_get_device_name_autopopulates():
+def test_endpoint_get_device_name_empty_when_contributor_unset():
     status, resp = srv.dispatch('GET', '/v1/config/device_name', None)
     assert status == 200
     assert resp['ok'] is True
-    assert resp['device_name']  # non-empty
+    assert resp['device_name'] == ''
 
 
-def test_endpoint_set_device_name_round_trip():
+def test_endpoint_get_device_name_composes_with_contributor():
+    store.set_contributor('Alice')
+    status, resp = srv.dispatch('GET', '/v1/config/device_name', None)
+    assert status == 200
+    assert resp['ok'] is True
+    name = resp['device_name']
+    assert name.startswith('Alice')
+
+
+def test_endpoint_set_device_name_is_noop():
+    """Old peers may still POST to this endpoint. It must accept
+    the request without crashing but ignore the value — the
+    underlying ``set_device_name`` is a no-op since 0.49.0."""
+    store.set_contributor('Alice')
+    composed_before = store.get_device_name()
     status, resp = srv.dispatch('POST', '/v1/config/device_name',
                                 {'device_name': "Alice's phone"})
+    # The endpoint may return 200 or 400 depending on how it
+    # handles the no-op; either way the underlying state shouldn't
+    # have changed.
     assert status == 200
-    assert resp['ok'] is True
-    assert resp['device_name'] == "Alice's phone"
-    # Subsequent GET returns the persisted value.
-    status, resp = srv.dispatch('GET', '/v1/config/device_name', None)
-    assert resp['device_name'] == "Alice's phone"
-
-
-def test_endpoint_set_device_name_strips_whitespace():
-    srv.dispatch('POST', '/v1/config/device_name',
-                 {'device_name': '  hostX  '})
-    assert store.get_device_name() == 'hostX'
-
-
-def test_endpoint_set_device_name_empty_redetects():
-    srv.dispatch('POST', '/v1/config/device_name',
-                 {'device_name': 'override'})
-    assert store.get_device_name() == 'override'
-    srv.dispatch('POST', '/v1/config/device_name',
-                 {'device_name': ''})
-    # Cleared → re-detected on next read.
-    redetected = store.get_device_name()
-    assert redetected
-    assert redetected != 'override'
+    assert store.get_device_name() == composed_before
 
 
 # ── resolve_contributor is gone ─────────────────────────────────────────

@@ -129,9 +129,9 @@ import time as _time
 from kivy.clock import Clock
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from .themed_popup import ThemedButton as Button
 from kivy.uix.label import Label
-from kivy.uix.popup import Popup
+from .themed_popup import ThemedPopup as Popup
 
 from .. import check_server_compat
 from .. import status as S
@@ -382,7 +382,15 @@ class _Ctx:
                  # way that happens is a stale p4a unpack where
                  # restart didn't actually load new code. See
                  # ``_prompt_server_reboot_to_apply``.
-                 '_cooperative_restart_attempts')
+                 '_cooperative_restart_attempts',
+                 # Loop guard for the null_bundle auto-launch path
+                 # (server APK installed, daemon's Python bundle
+                 # missing — fresh install or cleared cache). Same
+                 # shape as the stale-code auto-launch: fire the
+                 # AZT Collaboration launcher once, schedule a
+                 # re-probe, and only surface the popup if it
+                 # didn't recover.
+                 '_null_bundle_autolaunch_attempted')
 
     def __init__(self, **kw):
         # Default to None for slots the caller doesn't pass.
@@ -393,11 +401,14 @@ class _Ctx:
         # single bootstrap session.
         _numeric = {'null_bundle_streak'}
         _sets = {'_cooperative_restart_attempts'}
+        _bool = {'_null_bundle_autolaunch_attempted'}
         for k in self.__slots__:
             if k in _numeric:
                 setattr(self, k, kw.get(k, 0) or 0)
             elif k in _sets:
                 setattr(self, k, kw.get(k) or set())
+            elif k in _bool:
+                setattr(self, k, bool(kw.get(k, False)))
             else:
                 setattr(self, k, kw.get(k))
 
@@ -699,7 +710,7 @@ def _release_meets_minimum(repo, required_min):
 def _show_update_blocked_popup(ctx, body_text, mailto_subject,
                                mailto_body):
     """Shared "we can't proceed and it's not the user's fault" popup
-    body. Two known callers:
+    body. Known callers:
 
     - ``_show_release_too_old`` — release feed exists but its latest
       tag is below the required floor.
@@ -708,10 +719,14 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
       edge case — version-namespace mismatch between peer-app
       version and client-library version, or the peer was rebuilt
       without bumping a tag).
+    - ``_prompt_server_reboot_to_apply`` — only as a fallback if
+      ``_open_server_apk_launcher`` returns False (jnius / package
+      manager unhealthy). The happy path for that detection
+      auto-launches PythonActivity and skips this popup entirely.
 
-    Identical UI shape: a markup body with a ``[ref=email]`` link
-    routing to a pre-filled mailto: (subject + body parametrized by
-    the caller), Check again to drop the release-cache and re-run
+    UI shape: a markup body with a ``[ref=email]`` link routing to
+    a pre-filled mailto: (subject + body parametrized by the
+    caller), Check again to drop the release-cache and re-run
     ``_check_server``, Quit to stop the app via ``App.stop()``.
     Terminal — does **not** fire on_done."""
     import urllib.parse
@@ -720,8 +735,10 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
     from kivy.uix.modalview import ModalView
     from kivy.uix.boxlayout import BoxLayout
     from kivy.uix.label import Label
-    from kivy.uix.button import Button
+    from .themed_popup import ThemedButton as Button
     from kivy.app import App as _App
+    from kivy.graphics import Color, Rectangle
+    from . import theme
     from .. import MAINTAINER_EMAIL
 
     def _open_mailto(*_):
@@ -736,12 +753,22 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
             print(f'[bootstrap] mailto open failed: {ex}',
                   file=sys.stderr, flush=True)
 
+    # ModalView's default styling is the stdlib grey backdrop; paint
+    # ``theme.BG`` into canvas.before so the surface tracks the
+    # active palette uniformly with the rest of the suite.
     view = ModalView(size_hint=(0.85, None), height=dp(280),
-                     auto_dismiss=False)
+                     auto_dismiss=False,
+                     background='', background_color=theme.BG)
+    with view.canvas.before:
+        _bg_col = Color(*theme.BG)
+        _bg_rect = Rectangle(pos=view.pos, size=view.size)
+    view.bind(pos=lambda _w, _v: setattr(_bg_rect, 'pos', view.pos),
+              size=lambda _w, _v: setattr(_bg_rect, 'size', view.size))
     box = BoxLayout(orientation='vertical', padding=dp(16),
                     spacing=dp(12))
     body = Label(text=body_text, markup=True, size_hint_y=1,
                  font_name=ctx.font_name, font_size=sp(14),
+                 color=theme.TEXT,
                  halign='left', valign='top')
     body.bind(size=lambda w, s: setattr(w, 'text_size', s))
     body.bind(on_ref_press=lambda _w, _ref: _open_mailto())
@@ -806,116 +833,123 @@ def _show_update_blocked_popup(ctx, body_text, mailto_subject,
 
 def _prompt_server_reboot_to_apply(ctx, installed_version,
                                     running_version):
-    """The user has installed a newer server APK but Android kept
-    the old daemon process alive across the replace, so /v1/health
-    still reports the old version.
+    """A newer server APK is installed on disk but the running
+    ``:provider`` process reports the older version. Recover by
+    refreshing the on-disk Python bundle.
 
-    **First try: cooperative restart.** If the running daemon is
-    at least 0.43.20 (where ``POST /v1/admin/restart`` shipped) we
-    can ask it to exit, and Android's ContentProvider auto-spawn
-    will respawn from the newer on-disk bytes on the next peer
-    call. No popup, no user intervention. After the RPC accepts
-    we schedule ``_post_install_continuation`` to re-probe compat
-    after a brief warm-up delay.
+    Root cause: p4a's C bootstrap extracts ``_python_bundle/``
+    from the APK only when the directory is **missing**. Android's
+    PackageInstaller replaces the APK but does not touch the
+    private filesDir, so the bundle stays at the prior version
+    even after a fresh APK install. ``:provider`` (the daemon
+    process) cannot trigger the proper re-extract itself —
+    PythonUtil's ``unpackPyBundle`` does
+    ``recursiveDelete(files/app/)`` first, which would wipe the
+    very code ``:provider`` is currently running.
 
-    **Fall through: show the reboot popup.** If the cooperative
-    path fails (the running daemon is too old to know the
-    endpoint, or unreachable, or returns an unexpected response)
-    we surface the existing reboot-to-apply popup. That's the
-    pre-0.43.20 transition case — the only way out is reboot or
-    reinstall. The popup is the right tool for that.
+    But **launching the server APK's ``PythonActivity``** runs
+    PythonUtil's bootstrap in a separate process, which sees the
+    ``.version`` markers ``:provider`` invalidated on its last
+    spawn (see ``server_apk/service.py:_maybe_reextract_python_bundle``)
+    and re-extracts the bundle cleanly. After that the next
+    ``:provider`` spawn loads the fresh code.
 
-    The peer running this code is in a different package (UID)
-    from the daemon, so it cannot ``Process.killProcess`` the
-    daemon directly. The cooperative endpoint is our only seam
-    across the UID boundary.
+    Recovery, with no popup:
 
-    Re-uses the ``_show_update_blocked_popup`` shape (Check again
-    + Quit + maintainer email link). Does NOT fire on_done."""
-    # First-line defense: cooperative restart against the running
-    # daemon. Cheap (single RPC) and silent on success.
-    #
-    # Loop guard: track which ``(installed, running)`` pairs we've
-    # already attempted a cooperative restart for. If we see the
-    # same pair recur (i.e. ``_post_install_continuation`` re-
-    # probed compat and we landed here AGAIN with the same running
-    # version), the restart didn't actually load new code — the
-    # daemon respawned but p4a re-imported the stale
-    # ``_python_bundle/`` from disk instead of extracting the new
-    # APK's assets. This is the documented stale-unpack issue
-    # (see ``SuiteSelfReplaceReceiver.java`` NOTE on stale p4a
-    # unpack). Restarting won't fix it; the user needs to reboot
-    # or reinstall to force p4a to re-extract on missing-bundle.
-    # Without this guard the peer pings the daemon ~once per 2 s
-    # forever, burning battery and never converging.
+    1. Show a non-blocking toast so the user knows what's
+       happening when the screen flips.
+    2. Fire ``_open_server_apk_launcher()`` — sends an
+       ACTION_MAIN/CATEGORY_LAUNCHER intent for the server APK
+       package. Android brings AZT Collaboration's PythonActivity
+       to the foreground; its native bootstrap re-extracts the
+       bundle.
+    3. Schedule ``_post_install_continuation`` to re-probe compat
+       once the user navigates back. The peer process keeps
+       running in the background through the flip.
+
+    Loop guard: same ``(installed, running)`` pair shouldn't
+    re-trigger the launch on every probe — once we've fired the
+    intent, give the user time to come back. If the same pair
+    surfaces again we log and skip (the user dismissed AZT
+    Collaboration without letting the extract finish, or the
+    APK install is genuinely broken — neither is fixable by
+    firing more intents).
+
+    Does NOT fire on_done; the post-install continuation handles
+    that once the daemon comes back at the new version."""
     attempted = ctx._cooperative_restart_attempts
     pair = (installed_version, running_version)
     if pair in attempted:
-        print(f'[bootstrap] cooperative restart already attempted '
+        print(f'[bootstrap] stale-bundle refresh already attempted '
               f'for installed={installed_version!r} '
-              f'running={running_version!r}; daemon respawned '
-              f'with stale p4a unpack — surfacing popup',
+              f'running={running_version!r}; not re-launching. '
+              f'User needs to open AZT Collaboration manually if '
+              f'the first launch was dismissed before extract '
+              f'completed.', file=sys.stderr, flush=True)
+        # Re-probe after a longer delay in case the user is still
+        # in AZT Collaboration. The continuation will fire on_done
+        # if the version updates.
+        _on_ui(_post_install_continuation, ctx)
+        return
+    attempted.add(pair)
+    print(f'[bootstrap] stale bundle detected '
+          f'(installed={installed_version!r} '
+          f'running={running_version!r}); launching '
+          f'PythonActivity to trigger re-extract',
+          file=sys.stderr, flush=True)
+    _on_ui(_ui_status, ctx, _tr(
+        'Refreshing the sync service code — tap back when AZT '
+        'Collaboration finishes loading.'))
+    opened = _open_server_apk_launcher()
+    if not opened:
+        # Couldn't fire the intent (no jnius, no PackageManager
+        # match, etc.). Fall back to surfacing the popup so the
+        # user has SOME path forward. Rare on the production
+        # path — _SERVER_PACKAGE_NAME is the suite's own APK
+        # which we know is installed (we just read its version).
+        print(f'[bootstrap] _open_server_apk_launcher returned '
+              f'False; falling back to popup',
               file=sys.stderr, flush=True)
-    else:
-        attempted.add(pair)
-        try:
-            from .. import restart_server as _restart
-            res = _restart()
-            if res.has(S.RESTARTING):
-                print(f'[bootstrap] cooperative restart accepted '
-                      f'(installed={installed_version!r} '
-                      f'running={running_version!r}); re-probing '
-                      f'compat after warm-up',
-                      file=sys.stderr, flush=True)
-                _on_ui(_ui_status, ctx,
-                       _tr('Restarting the sync service…'))
-                # Same continuation the post-install path uses: wait
-                # a beat for lazy-spawn, then re-run _check_server.
-                # If the new daemon's running_version equals the old
-                # (stale unpack), the loop guard above will catch
-                # the recursion and surface the popup.
-                _on_ui(_post_install_continuation, ctx)
-                return
-            print(f'[bootstrap] cooperative restart declined: '
-                  f'codes={res.codes()!r}; falling back to popup',
-                  file=sys.stderr, flush=True)
-        except Exception as ex:
-            print(f'[bootstrap] cooperative restart raised: {ex!r}; '
-                  f'falling back to popup',
-                  file=sys.stderr, flush=True)
-    body_text = _tr(
-        'You have {name} {installed} installed, but the running '
-        'process keeps reloading version {running}. The new code '
-        'is on disk but the runtime is reading from a stale '
-        'unpack cache.\n\n'
-        'Reboot your device, or uninstall and reinstall '
-        '{name}, then reopen this app.\n\n'
-        'If neither helps, '
-        '[ref=email][color=4ea1ff][u]send the developer an Email'
-        '[/u][/color][/ref].'
-    ).format(name=ctx.server_display_name,
-             installed=installed_version,
-             running=running_version)
-    subject = (
-        f'{ctx.server_display_name}: stale p4a unpack — '
-        f'installed {installed_version} running {running_version}')
-    msg_body = (
-        f'{ctx.server_display_name} installed-on-disk: '
-        f'{installed_version}\n'
-        f'{ctx.server_display_name} running process:    '
-        f'{running_version}\n\n'
-        f'A cooperative POST /v1/admin/restart succeeded but the '
-        f'respawned process re-imported the same stale\n'
-        f'_python_bundle/ from filesDir — p4a only extracts from '
-        f'APK assets when the bundle is missing, never when it\n'
-        f'is stale. SuiteSelfReplaceReceiver kills sibling '
-        f'processes on package replace but does not wipe the\n'
-        f'bundle (wiping breaks the :provider service whose p4a '
-        f'bootstrap has no extract-on-missing branch).\n\n'
-        f'(Sent from the in-app "send the developer an Email" '
-        f'link.)'
-    )
-    _show_update_blocked_popup(ctx, body_text, subject, msg_body)
+        body_text = _tr(
+            'A newer {name} ({installed}) is installed, but the '
+            'running service is still on {running}. Open AZT '
+            'Collaboration from the launcher to refresh the '
+            'service code, then come back here.\n\n'
+            'Do NOT uninstall {name} — that would erase your '
+            'projects, credentials, and pending sync state.\n\n'
+            'If opening the app doesn\'t help, '
+            '[ref=email][color=4ea1ff][u]send the developer an '
+            'Email[/u][/color][/ref].'
+        ).format(name=ctx.server_display_name,
+                 installed=installed_version,
+                 running=running_version)
+        subject = (
+            f'{ctx.server_display_name}: stale p4a unpack, '
+            f'launcher intent failed — installed '
+            f'{installed_version} running {running_version}')
+        msg_body = (
+            f'{ctx.server_display_name} installed-on-disk: '
+            f'{installed_version}\n'
+            f'{ctx.server_display_name} running process:    '
+            f'{running_version}\n\n'
+            f'getLaunchIntentForPackage returned null or '
+            f'startActivity raised. Likely jnius/PackageManager '
+            f'is unhealthy on this peer.\n\n'
+            f'(Sent from the in-app "send the developer an '
+            f'Email" link.)'
+        )
+        _show_update_blocked_popup(ctx, body_text, subject,
+                                   msg_body)
+        return
+    # Intent fired. The peer process keeps running in the
+    # background; schedule a compat re-probe so when the user
+    # navigates back, bootstrap finishes naturally. The probe's
+    # 2 s warm-up delay is more than enough for the user to flip
+    # to AZT Collaboration and back, but compat checks are
+    # idempotent — if the user takes longer than 2 s the probe
+    # just sees the still-running old daemon, hits this function
+    # again, and the loop-guard branch fires.
+    _on_ui(_post_install_continuation, ctx)
 
 
 def _show_release_too_old(ctx, latest_seen, required_min,
@@ -1051,7 +1085,7 @@ def _show_connecting_popup(ctx):
     sees concrete progress (no longer a static black box)."""
     if ctx.connecting_popup is not None:
         return
-    from kivy.uix.popup import Popup
+    from .themed_popup import ThemedPopup as Popup
     from kivy.uix.label import Label
     from kivy.uix.boxlayout import BoxLayout
     from . import theme
@@ -1235,6 +1269,35 @@ def _check_server(ctx, _warmup_attempt=0):
                       f'{ctx.null_bundle_streak} attempt='
                       f'{_warmup_attempt}',
                       file=sys.stderr, flush=True)
+                # First-time auto-launch: same recovery shape as
+                # the stale-code path (_prompt_server_reboot_to_apply
+                # fires _open_server_apk_launcher without showing a
+                # popup). The daemon's Python bundle isn't on disk —
+                # only PythonActivity can extract it. Fire the
+                # launcher once with a toast; the post-install
+                # continuation re-probes when the user navigates
+                # back. Only surface the unresponsive popup if a
+                # second null_bundle streak survives the launcher.
+                if not ctx._null_bundle_autolaunch_attempted:
+                    ctx._null_bundle_autolaunch_attempted = True
+                    print(f'[bootstrap] null-bundle: auto-launching '
+                          f'AZT Collaboration to trigger p4a bundle '
+                          f'extract', file=sys.stderr, flush=True)
+                    _on_ui(_ui_status, ctx, _tr(
+                        'Setting up the sync service for the first '
+                        'time — tap back when AZT Collaboration '
+                        'finishes loading.'))
+                    opened = _open_server_apk_launcher()
+                    if opened:
+                        # Reset the streak so the re-probe enters a
+                        # fresh warmup loop instead of fast-failing
+                        # again on the very next null.
+                        ctx.null_bundle_streak = 0
+                        _on_ui(_post_install_continuation, ctx)
+                        return
+                    print('[bootstrap] _open_server_apk_launcher '
+                          'returned False; falling through to popup',
+                          file=sys.stderr, flush=True)
                 _on_ui(_dismiss_connecting_popup, ctx)
                 _on_ui(_prompt_server_unresponsive, ctx)
                 return
@@ -1776,12 +1839,33 @@ def _prompt_server_unresponsive(ctx):
                 name=ctx.server_display_name,
                 v=server_versionname))
 
-    body = _tr(
-        'The AZT Collaboration service ({name}) is installed but '
-        'did not respond. Tap Open {name} to wake the service, '
-        'then come back here. Or tap Install to reinstall it, or '
-        'Quit to close this app and try again later.'
-    ).format(name=ctx.server_display_name)
+    # Body wording is adaptive by ``last_error_kind``. The
+    # ``null_bundle`` case — ContentResolver.call returned null
+    # because the daemon's Python process died before it could
+    # install callbacks — is the signature of a fresh-reinstall
+    # / cleared-cache / stale-bundle situation. In that case
+    # "Restart server" can't help (there's no daemon to ask);
+    # the user has to launch the server APK's own UI once so
+    # PythonActivity's bootstrap can extract the bundle. Lead
+    # with that action.
+    if (ctx.last_error_kind or '') == 'null_bundle':
+        body = _tr(
+            'The sync service ({name}) is installed but its code '
+            'isn\'t set up yet. This is normal right after a '
+            'fresh install or after clearing its app data. Tap '
+            'Open {name} below — that launches it once so it can '
+            'finish setting itself up, then come back here. '
+            '"Restart server" won\'t help in this case.'
+        ).format(name=ctx.server_display_name)
+    else:
+        body = _tr(
+            'The AZT Collaboration service ({name}) is installed '
+            'but did not respond. Tap Restart server to ask it to '
+            'start again — this is the same action the sync '
+            'settings page uses. Or Open {name} to wake the '
+            'service manually, then come back here. Quit closes '
+            'this app.'
+        ).format(name=ctx.server_display_name)
     if diag_lines:
         body = body + '\n\n' + '\n'.join(diag_lines)
 
@@ -1816,16 +1900,67 @@ def _prompt_server_unresponsive(ctx):
         current_server_version='0.0.0',
         title=_tr('AZT Collaboration not responding'),
         on_install_complete=lambda: _post_install_continuation(ctx),
-        # User can keep waiting if 60s wasn't enough on their
-        # device. "Try again" reruns the compat probe (same code
-        # path as the post-install continuation, including the 2s
-        # daemon-warm-up pause).
-        on_retry=lambda: _post_install_continuation(ctx),
         on_open_app=_wake_and_recheck,
         open_app_label=_tr('Open {name}').format(
             name=ctx.server_display_name),
+        # Cooperative restart — same path the settings page uses.
+        # Empirically the most reliable recovery when the server
+        # APK is installed but its :provider process is wedged /
+        # frozen / unresponsive: POST /v1/admin/restart, daemon
+        # exits, ContentProvider auto-spawn brings it back fresh
+        # on the next peer call. Fallback on restart failure
+        # reopens THIS popup (unresponsive), not the server-too-
+        # old one — the user is in the unresponsive flow.
+        #
+        # No ``on_retry`` here: Restart server subsumes "check
+        # again" — cooperative restart re-probes compat via
+        # _post_install_continuation on acceptance, so a separate
+        # Try-again button would be redundant noise.
+        on_restart_server=lambda: _restart_server_unresponsive(ctx),
         repo=ctx.server_repo,
     )
+
+
+def _restart_server_unresponsive(ctx):
+    """Cooperative-restart entry point for the "server installed
+    but not responding" flow. Same shape as
+    ``_restart_server_from_popup`` but the fallback re-opens
+    ``_prompt_server_unresponsive`` instead of
+    ``_prompt_server_update`` — the user is in the unresponsive
+    case, not the too-old case.
+
+    Cooperative ``POST /v1/admin/restart`` over the existing
+    ContentProvider transport. On acceptance, the daemon exits
+    cleanly; Android's ContentProvider auto-spawn brings it back
+    fresh on the next peer call (which is the compat probe
+    ``_post_install_continuation`` schedules). On refuse /
+    unreachable / pre-0.43.20 daemon that doesn't know the
+    endpoint, re-show the unresponsive popup so the user can try
+    Open instead.
+
+    No kill-by-PID fallback — peer UID can't kill the daemon's
+    process; cooperative restart is the only seam.
+    """
+    _on_ui(_ui_status, ctx, _tr('Restarting the sync service…'))
+    try:
+        from .. import restart_server as _restart
+        res = _restart()
+    except Exception as ex:
+        print(f'[bootstrap] unresponsive cooperative restart '
+              f'raised: {ex!r}; reopening popup',
+              file=sys.stderr, flush=True)
+        _on_ui(_prompt_server_unresponsive, ctx)
+        return
+    if res.has(S.RESTARTING):
+        print('[bootstrap] unresponsive cooperative restart '
+              'accepted; re-probing compat',
+              file=sys.stderr, flush=True)
+        _on_ui(_post_install_continuation, ctx)
+        return
+    print(f'[bootstrap] unresponsive cooperative restart '
+          f'declined: codes={res.codes()!r}; reopening popup',
+          file=sys.stderr, flush=True)
+    _on_ui(_prompt_server_unresponsive, ctx)
 
 
 def _prompt_server_install(ctx):
@@ -2190,7 +2325,7 @@ def _prompt_self_update(ctx, latest_version, mandatory=False,
     # callback all the way through ``install_server_apk_popup``
     # for this single use case.
     try:
-        from kivy.uix.button import Button
+        from .themed_popup import ThemedButton as Button
         def _walk(w):
             for child in w.children:
                 if isinstance(child, Button) and child.text == _tr('Update'):

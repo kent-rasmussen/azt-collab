@@ -36,18 +36,43 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
 
+from kivy.clock import Clock
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from .themed_popup import ThemedButton as Button
 from kivy.uix.image import Image
 from kivy.uix.label import Label
-from kivy.uix.popup import Popup
+from .themed_popup import ThemedPopup as Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 
 from . import theme
 from ..translate import tr as _tr
+
+
+def _show_lan_failure_popup(title, message, font_name='Roboto'):
+    """One-button info popup used to surface clone failures (timeout,
+    peer unreachable) that previously vanished into a silent
+    fall-through in ``_finish_on_main``. Single OK button dismisses;
+    the user lands back on the picker so they can retry or pick a
+    different path."""
+    body = BoxLayout(orientation='vertical', spacing=dp(12),
+                     padding=dp(16))
+    body.add_widget(Label(
+        text=message, font_size=sp(13), font_name=font_name,
+        halign='center', valign='top',
+        text_size=(dp(280), None)))
+    ok_btn = Button(text=_tr('OK'), size_hint_y=None,
+                    height=dp(44), font_size=sp(13),
+                    font_name=font_name)
+    body.add_widget(ok_btn)
+    popup = Popup(title=title, content=body,
+                  size_hint=(0.9, 0.5), auto_dismiss=False)
+    ok_btn.bind(on_release=lambda *_: popup.dismiss())
+    popup.open()
+    return popup
 
 
 def _auto_enable_lan(font_name='Roboto'):
@@ -364,25 +389,78 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                     {'error': 'unknown_qr_payload',
                      'raw': text[:200]})]))
             return
-        # Pair always happens first. Even an unpaired peer who only
-        # wanted to clone needs to be paired so the cert handshake
-        # for the LAN clone succeeds.
-        result = lan_pair_accept(payload)
         peer_id = str(payload.get('peer_id', '') or '')
         langcode = str(payload.get('langcode', '') or '')
         repo_url = str(payload.get('repo_url', '') or '')
-        # Combined: payload carried a project → fire the LAN clone
-        # synchronously and merge its Result into ours so the caller
-        # sees a single Result with both pair + clone statuses.
-        # ``vernlang`` is the linguistic code; separate from
-        # ``langcode`` (project name / key) since 0.45.0.
-        if (langcode and peer_id
-                and result.has(S.LAN_PAIRED)):
-            vernlang = str(payload.get('vernlang', '') or '')
-            clone_result = lan_clone(peer_id, langcode, repo_url,
-                                     vernlang=vernlang)
-            for status in clone_result.statuses:
-                result.statuses.append(status)
+        vernlang = str(payload.get('vernlang', '') or '')
+
+        # User-visible progress popup for the synchronous pair +
+        # clone RPCs. The previous pending_offers_popup was
+        # dismissed before scan_to_pair was called (picker.py:
+        # _scan → popup.dismiss → scan_to_pair), so without this
+        # the user sees a frozen black screen for the full clone
+        # duration (10 s — minutes on a fresh phone). The two
+        # halves below must NOT run on the Kivy main thread, or
+        # this popup we just mounted won't get drawn either —
+        # offload to a worker and marshal back via Clock.
+        phase_label = Label(
+            text=_tr('Pairing with the other phone…'),
+            font_size=sp(14), font_name=font_name,
+            halign='center', valign='middle',
+            text_size=(dp(280), None))
+        sub_label = Label(
+            text=_tr('First-time copy over the local network can '
+                     'take a minute or two. Please keep both '
+                     'phones close together.'),
+            font_size=sp(11), color=theme.TEXT_DIM,
+            font_name=font_name,
+            halign='center', valign='top',
+            size_hint_y=None, height=dp(80),
+            text_size=(dp(280), dp(80)))
+        body = BoxLayout(orientation='vertical', spacing=dp(12),
+                         padding=dp(16))
+        body.add_widget(phase_label)
+        body.add_widget(sub_label)
+        progress_popup = Popup(
+            title=_tr('Receiving project'),
+            content=body, size_hint=(0.9, 0.5),
+            auto_dismiss=False)
+        progress_popup.open()
+
+        def _set_phase(label_text):
+            phase_label.text = label_text
+
+        def _worker():
+            # Pair always happens first. Even an unpaired peer who
+            # only wanted to clone needs to be paired so the cert
+            # handshake for the LAN clone succeeds.
+            try:
+                w_result = lan_pair_accept(payload)
+                # Combined: payload carried a project → fire the
+                # LAN clone synchronously here on this worker
+                # thread and merge its Result into ours so the
+                # caller sees a single Result with both pair +
+                # clone statuses. ``vernlang`` is the linguistic
+                # code; separate from ``langcode`` (project name /
+                # key) since 0.45.0.
+                if (langcode and peer_id
+                        and w_result.has(S.LAN_PAIRED)):
+                    Clock.schedule_once(
+                        lambda dt: _set_phase(
+                            _tr('Copying project to this phone…')),
+                        0)
+                    clone_result = lan_clone(peer_id, langcode,
+                                             repo_url,
+                                             vernlang=vernlang)
+                    for status in clone_result.statuses:
+                        w_result.statuses.append(status)
+            except Exception as ex:
+                w_result = Result(statuses=[Status(
+                    'SERVER_ERROR',
+                    {'error': f'pair/clone raised: {ex!r}'})])
+            Clock.schedule_once(
+                lambda dt: _finish_on_main(w_result), 0)
+
         # Adopt-origin always-confirm prompt. If the LAN clone
         # stashed an adopt-origin pending decision, surface it now
         # (in-flow with the scan gesture) rather than deferring to
@@ -394,11 +472,101 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
             if on_done is not None:
                 on_done(r)
 
-        if result.has(S.LAN_ADOPT_ORIGIN_NEEDED):
-            _resolve_adopt_origin_then_done(
-                result, _final_done, font_name)
-            return
-        _final_done(result)
+        def _finish_on_main(result):
+            try:
+                progress_popup.dismiss()
+            except Exception:
+                pass
+            # Surface a user-visible toast on the two failure shapes
+            # that mean "the clone didn't land" but aren't crashes:
+            # stalled transfer (LAN_CLONE_TIMEOUT) or no endpoint
+            # reached (LAN_PEER_UNREACHABLE). Only when the result
+            # doesn't ALSO carry a success code — a partial result
+            # with both reopen + timeout (rare race) should not
+            # render a scary timeout toast over a usable project.
+            got_project = result.has_any(
+                S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED)
+            if not got_project and result.has(S.LAN_CLONE_TIMEOUT):
+                _show_lan_failure_popup(
+                    _tr('Could not finish receiving the project'),
+                    _tr('Copying the project timed out. Is the '
+                        'other phone still nearby and on the same '
+                        'Wi-Fi? Try the scan again when both '
+                        'phones are close together.'),
+                    font_name)
+            elif (not got_project
+                    and result.has(S.LAN_PEER_UNREACHABLE)):
+                _show_lan_failure_popup(
+                    _tr('Could not reach the other phone'),
+                    _tr('The other phone did not respond on this '
+                        'network. Check that both phones are on '
+                        'the same Wi-Fi and that the sharing '
+                        'phone has Local-network sharing turned '
+                        'on.'),
+                    font_name)
+            elif result.has(S.CONTRIBUTOR_UNSET):
+                # Daemon refused pair_accept because this device's
+                # contributor name isn't set. Same routing as the
+                # rest of the suite per CLIENT_INTEGRATION.md
+                # § 17 — toast + open_server_ui() — so the user
+                # lands directly on the settings page where they
+                # can type their name and come back to re-scan.
+                _emit_status(_tr(
+                    'Set your name on the next screen, then scan '
+                    'the QR again.'))
+                try:
+                    from .. import open_server_ui
+                    open_server_ui(on_status=_emit_status)
+                except Exception as ex:
+                    print(f'[scan_to_pair] open_server_ui raised: '
+                          f'{ex!r}', file=sys.stderr, flush=True)
+            elif (not got_project
+                    and result.has(S.LAN_PAIRED)
+                    and not result.has(S.LAN_PROJECT_COLLISION_UNRELATED)):
+                # Pair succeeded but no project arrived. Either
+                # the QR carried no langcode (pair-only QR, rare
+                # — current peer surface only exposes the
+                # share-project QR path), or the daemon-side
+                # share-allowlist gate refused. Tell the user the
+                # likely fix.
+                _show_lan_failure_popup(
+                    _tr('Paired, but no project came with this QR'),
+                    _tr('You\'re now paired with the other phone, '
+                        'but the project didn\'t come over. On '
+                        'the other phone, open the project you '
+                        'want to share, tap "Share project (QR)", '
+                        'and scan the new QR it shows.'),
+                    font_name)
+            elif (not got_project
+                    and result.has_any(S.SERVER_ERROR,
+                                       S.SERVER_UNAVAILABLE)):
+                # pair_accept didn't even reach the daemon's
+                # business logic — bad QR payload, transport
+                # broke, etc. The error string lives on the
+                # SERVER_ERROR status's params; render it so the
+                # user (or a maintainer) can see what failed.
+                detail = ''
+                for s in result.statuses:
+                    if s.code in (S.SERVER_ERROR,
+                                  S.SERVER_UNAVAILABLE):
+                        detail = (s.params or {}).get('error', '')
+                        if not detail:
+                            detail = (s.params or {}).get(
+                                'detail', '')
+                        break
+                _show_lan_failure_popup(
+                    _tr('Pairing failed'),
+                    _tr('The pairing call did not succeed: '
+                        '{detail}').format(detail=detail or '?'),
+                    font_name)
+            if result.has(S.LAN_ADOPT_ORIGIN_NEEDED):
+                _resolve_adopt_origin_then_done(
+                    result, _final_done, font_name)
+                return
+            _final_done(result)
+
+        threading.Thread(target=_worker, daemon=True,
+                         name='lan-scan-pair-clone').start()
 
     def _on_cancel():
         _emit_status(_tr('Pairing cancelled.'))

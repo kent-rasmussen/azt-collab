@@ -35,6 +35,19 @@ REMOTE_UPDATED = 'REMOTE_UPDATED'
 REMOTE_UNCHANGED = 'REMOTE_UNCHANGED'
 REMOTE_REPO_CREATED = 'REMOTE_REPO_CREATED'
 PUSHED = 'PUSHED'
+# One additional Internet-hosted remote (``Project.extra_remotes``)
+# received the local branch tip on this push pass. Emitted per-URL
+# after the primary push so a project on "Use both" can show "1
+# of 2 remotes received the commits" partial state. Params: ``url``
+# (the extra), ``branch``. Best-effort — secondaries don't block
+# the primary's success / failure routing.
+EXTRA_REMOTE_PUSHED = 'EXTRA_REMOTE_PUSHED'
+# One additional remote rejected the push (network error, non-FF
+# rejection, auth missing for that host). Params: ``url``, ``error``.
+# Distinct from PUSH_FAILED so peers can route the user-Sync
+# response without confusing the primary's status. Auto-sync paths
+# stay silent on this code; the next drain retries.
+EXTRA_REMOTE_PUSH_FAILED = 'EXTRA_REMOTE_PUSH_FAILED'
 PULLED = 'PULLED'
 CLONED = 'CLONED'
 LIFT_FOUND = 'LIFT_FOUND'
@@ -242,6 +255,15 @@ LAN_UNPAIRED = 'LAN_UNPAIRED'
 LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
 LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
 LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
+# Daemon-side socket timeout fired during ``dulwich.porcelain.clone``
+# in ``lan_clone._do_lan_clone``. Distinct from LAN_PEER_UNREACHABLE
+# (couldn't resolve an endpoint at all): a TCP/TLS connection was
+# established but the packfile transfer stalled past
+# ``_LAN_CLONE_TIMEOUT_S``. Params: ``peer_id``, ``langcode``,
+# ``timeout_s``. Surfaced to user-initiated LAN scans / accepts so
+# the UI can prompt "is the other phone still nearby?" instead of
+# waiting on the RPC's 300 s default.
+LAN_CLONE_TIMEOUT = 'LAN_CLONE_TIMEOUT'
 
 # Combined-pair-share-clone flow (parked spec § "Combined scan flow",
 # 0.45.0). The same scan gesture that pairs two phones also clones

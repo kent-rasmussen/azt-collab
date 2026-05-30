@@ -29,6 +29,14 @@ REMOTE_UPDATED = 'REMOTE_UPDATED'
 REMOTE_UNCHANGED = 'REMOTE_UNCHANGED'
 REMOTE_REPO_CREATED = 'REMOTE_REPO_CREATED'
 PUSHED = 'PUSHED'
+# Per-URL success/failure on each entry in ``Project.extra_remotes``.
+# Emitted after the primary push so "Use both" projects can show
+# partial state. Params: ``url`` (+ ``branch`` on success;
+# ``error`` on failure). Auto-sync paths route silent; user-Sync
+# may surface a "1 of 2 remotes received the commits" toast.
+# Daemon 0.49.2+. See azt_collabd/status.py for the full rationale.
+EXTRA_REMOTE_PUSHED = 'EXTRA_REMOTE_PUSHED'
+EXTRA_REMOTE_PUSH_FAILED = 'EXTRA_REMOTE_PUSH_FAILED'
 PULLED = 'PULLED'
 CLONED = 'CLONED'
 LIFT_FOUND = 'LIFT_FOUND'
@@ -164,6 +172,9 @@ LAN_UNPAIRED = 'LAN_UNPAIRED'
 LAN_PEER_UNREACHABLE = 'LAN_PEER_UNREACHABLE'
 LAN_FP_MISMATCH = 'LAN_FP_MISMATCH'
 LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
+# Socket timeout during the LAN clone's packfile transfer.
+# Params: peer_id, langcode, timeout_s. See azt_collabd/status.py.
+LAN_CLONE_TIMEOUT = 'LAN_CLONE_TIMEOUT'
 
 # Combined-pair-share-clone flow codes — see ``azt_collabd/status.py``
 # for the full per-code rationale.

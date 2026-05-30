@@ -2175,6 +2175,77 @@ button pressed, screen left) — never to **state observations**
 triggers create feedback loops where the daemon's own state
 update kicks off the next round of RPCs.
 
+### Rule 7 — RPC calls MUST NOT run on the main UI thread
+
+Every call into ``azt_collab_client`` that hits the daemon
+(``call(...)`` directly, or any wrapper that does — including
+``migrate_from_prefs``, ``check_server_compat``,
+``list_projects``, ``project_status``, ``sync_project``,
+``commit_project``, all LAN endpoints, all credentials
+endpoints) MUST run on a worker thread.
+
+Failure mode this rule closes (field-observed, 0.50.5):
+
+- Server APK installed but its private ``files/app/_python_bundle/``
+  is missing (fresh install before the user opened the server
+  APK; cleared app data; uninstall-without-data-wipe variant).
+- ``ContentResolver.call`` returns null because the daemon's
+  Python crashed before installing the provider callbacks.
+- The transport retries on null bundle with adaptive backoff
+  (see ``transports/android_cp.py:_NULL_BUNDLE_RETRY_BACKOFF_S``).
+  Cumulative sleep can be several seconds.
+- If the call ran on the main UI thread, **Android's ANR
+  watchdog kills the peer** before bootstrap renders any
+  recovery UI. Splash → 3 s → process death. The peer's user
+  has zero feedback and zero recovery path.
+
+The transport's retry budget is sized to absorb legitimate
+cold-spawn races (daemon ``:provider`` idle-stopped seconds
+ago, Python interpreter mid-respawn). The daemon CANNOT
+guarantee any upper bound on call latency: a clone, push, or
+LIFT merge legitimately takes seconds-to-minutes. The peer is
+the only side that knows which calls are user-facing and
+which can block.
+
+What "main UI thread" means on Android: the thread Kivy
+schedules ``Clock`` callbacks on; the thread that fires
+``Button.on_release``; the thread that built and dispatches
+``App.build()``. p4a routes all of these through the SDL main
+thread. Any synchronous RPC scheduled in that flow blocks
+frame rendering — and beyond 1-2 s of unrendered frames,
+Android starts the ANR clock.
+
+Required peer-side shape:
+
+```python
+def do_user_sync(self, langcode):
+    threading.Thread(
+        target=self._sync_worker, args=(langcode,),
+        daemon=True, name='sync-worker').start()
+
+def _sync_worker(self, langcode):
+    result = sync_project(langcode)        # safe on worker
+    Clock.schedule_once(
+        lambda dt: self._handle(result), 0) # marshal to main
+```
+
+The "marshal back to main via ``Clock.schedule_once``" half
+is what lets the worker safely mutate Kivy widgets after the
+call returns.
+
+**Startup-time RPCs are NOT exempt.** ``migrate_from_prefs``,
+the initial ``check_server_compat``, any "preload last
+project" call — all of these run before the user can do
+anything, and so the temptation is to call them inline.
+Don't. Spawn a worker (the bootstrap module already has the
+pattern in ``_check_server`` — see also the recorder's
+``prewarm_*`` pattern in 0.50.6+).
+
+The transport will not silently shorten its retry budget to
+absorb peers that violate this rule — that produces worse
+behaviour on the common cold-spawn case to defend against a
+peer-side bug.
+
 ### What the daemon does on its own (so peers don't need to)
 
 So peer maintainers know what *not* to reinvent:
@@ -2897,7 +2968,7 @@ daemon's merge driver.
 ```python
 from azt_collab_client import (
     project_kv_get, project_kv_set, project_kv_list,
-    list_slots, claim_slot, release_slot,
+    list_slots, claim_slot, release_slot, rebind_slot,
 )
 
 # Scalar KV — every phone agrees on this value.
@@ -2909,6 +2980,14 @@ claim_slot(langcode, '2')           # claim slot 2 for this device
 slots = list_slots(langcode)         # {'2': {peer_id, claimed_at,
                                      #        device_name}, ...}
 release_slot(langcode)               # drop every slot held by us
+
+# Identity-recovery: when our peer_id changed (server-APK
+# reinstall regenerated crypto) but the user knows the slot is
+# still theirs, rebind the existing claim to our current
+# peer_id + device_name. Gate this behind a confirm popup that
+# matches the user's contributor name against the existing
+# claim's device_name (since 0.50.9).
+rebind_slot(langcode, '2')
 ```
 
 Notes on each:
@@ -2933,6 +3012,20 @@ Notes on each:
   per-device without coordination.
 - **``release_slot(langcode)``** — removes every slot held
   by this device. Idempotent.
+- **``rebind_slot(langcode, slot)``** — rewrites the
+  ``peer_id`` + ``device_name`` of an existing claim to this
+  daemon's current values, and refreshes ``claimed_at`` to now
+  so the rebind wins any concurrent claim by another peer in
+  the merge. Returns ``True`` on success, ``False`` if the
+  slot doesn't exist (rebind only retags existing claims;
+  use ``claim_slot`` for "claim or replace"). Use as the
+  user-driven recovery path when ``list_slots`` shows a
+  ``device_name`` matching the user's contributor but a
+  ``peer_id`` that doesn't match this device's
+  ``lan_peer_id()`` — likely a server-APK reinstall
+  regenerated the crypto identity but the slot is still
+  semantically the user's. Gate behind a confirm popup; the
+  daemon doesn't ask any questions. Since 0.50.9.
 
 ### Locked semantics
 
@@ -2972,11 +3065,24 @@ behaviour without spelunking the CHANGELOG):
 4. **Tiebreak: later ``claimed_at`` wins.** Merge picks
    the version whose embedded ISO timestamp is later
    (lexicographic compare = chronological for UTC ISO
-   format). Ties on equal timestamps break by
-   alphabetic ``peer_id``. Reasoning: matches the user's
-   "I tapped first" mental model. Implementation detail —
-   if field data ever shows misbehaviour, the daemon can
-   switch tiebreak rules without changing the wire format.
+   format). Ties on equal timestamps cascade through a
+   stable chain so two NTP-synced phones claiming the same
+   slot in the same second still converge on one winner
+   (audit-#9 fix, 0.50.9):
+
+   1. ``peer_id`` lexicographic (preferred).
+      Since 0.50.9 the daemon eager-inits ``peer_id`` on
+      startup, so any 0.50.9+ claim has a real 64-char hex
+      pubkey here.
+   2. ``device_name`` lexicographic (fallback for legacy
+      claims with empty ``peer_id`` written by pre-0.50.9
+      daemons).
+
+   The tiebreak chain is a property of the claim itself
+   (not of which side of the merge it landed on), so peer
+   A and peer B both compute the same winner. Implementation
+   detail — if field data ever shows misbehaviour, the daemon
+   can switch tiebreak rules without changing the wire format.
 
 ### Hard rules
 

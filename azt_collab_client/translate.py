@@ -147,6 +147,10 @@ _HANDLERS = {
                                          if 'url' in p else
                                          _fmt(_tr('Pushed to {branch}.'), p)
                                          if 'branch' in p else _tr('Pushed.')),
+    S.EXTRA_REMOTE_PUSHED:    lambda p: _fmt(
+        _tr('Also pushed to {url} (branch: {branch}).'), p),
+    S.EXTRA_REMOTE_PUSH_FAILED: lambda p: _fmt(
+        _tr('Additional remote {url} rejected the push: {error}'), p),
     S.PULLED:                 lambda p: _tr('Pulled latest changes.'),
     S.CLONED:                 lambda p: _fmt(_tr('Cloned to {dir}'), p),
     S.LIFT_FOUND:             lambda p: _fmt(_tr('Found: {file}'), p),
@@ -196,6 +200,10 @@ _HANDLERS = {
     S.LAN_UNPAIRED:           lambda p: _tr('Forgot paired device.'),
     S.LAN_PEER_UNREACHABLE:   lambda p: _tr(
         'Paired device is not reachable on this network.'),
+    S.LAN_CLONE_TIMEOUT:      lambda p: _tr(
+        'Copying the project timed out. Is the other phone still '
+        'nearby and on the same Wi-Fi? Try again when both phones '
+        'are close together.'),
     S.LAN_FP_MISMATCH:        lambda p: _tr(
         'A paired device presented an unexpected security '
         'fingerprint. It may have been reinstalled; re-pair from '

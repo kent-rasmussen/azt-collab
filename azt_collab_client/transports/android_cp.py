@@ -126,10 +126,19 @@ class AndroidContentProviderTransport(Transport):
     # the observed daemon cold-spawn import (~1.9 s on a mid-range
     # Android device — see ``[boot-trace-daemon]`` ``module_loaded``
     # → ``after_install_callbacks``) plus margin. If the daemon
-    # truly isn't there (signature mismatch / authority gone) we
-    # surface ``null_bundle`` after burning this 3 s budget; the
-    # outer bootstrap path then renders its "unresponsive" popup
-    # as before.
+    # truly isn't there (signature mismatch / authority gone, fresh
+    # install with bundle not yet extracted) we surface
+    # ``null_bundle`` after burning this 3 s budget; the outer
+    # bootstrap path then renders its "unresponsive" popup / fires
+    # ``_open_server_apk_launcher`` per § 0.50.5.
+    #
+    # **The 3 s blocks whichever thread called us.** Peers MUST NOT
+    # call into the transport from the main UI thread — see
+    # CLIENT_INTEGRATION.md § 17c Rule 7. We don't shorten this
+    # budget to defend against peer-side misuse; that would degrade
+    # the common cold-spawn case (peer waits one more bootstrap
+    # warmup tick) for everyone, just to make a single misbehaving
+    # peer survive Android's ANR watchdog.
     _NULL_BUNDLE_RETRY_BACKOFF_S = (0.1, 0.2, 0.4, 0.8, 1.6)
 
     def _raw_call(self, method, path, body, timeout):

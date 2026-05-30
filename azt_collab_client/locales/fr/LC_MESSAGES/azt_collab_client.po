@@ -358,6 +358,12 @@ msgstr "Dépôt distant {owner_repo} créé."
 msgid "Pushed to {url} (branch: {branch})."
 msgstr "Envoyé vers {url} (branche : {branch})."
 
+msgid "Also pushed to {url} (branch: {branch})."
+msgstr "Également envoyé vers {url} (branche : {branch})."
+
+msgid "Additional remote {url} rejected the push: {error}"
+msgstr "Le dépôt supplémentaire {url} a rejeté l'envoi : {error}"
+
 msgid "Pushed to {branch}."
 msgstr "Envoyé vers {branch}."
 
@@ -1145,6 +1151,177 @@ msgstr "Appairage annulé."
 msgid "Scan the pairing QR shown on the other phone."
 msgstr "Scannez le QR d'appairage affiché sur l'autre téléphone."
 
+msgid "Pairing with the other phone…"
+msgstr "Appairage avec l'autre téléphone…"
+
+msgid "Copying project to this phone…"
+msgstr "Copie du projet vers ce téléphone…"
+
+msgid ""
+"First-time copy over the local network can take a minute or two. Please "
+"keep both phones close together."
+msgstr ""
+"La première copie via le réseau local peut prendre une minute ou deux. "
+"Gardez les deux téléphones à proximité."
+
+msgid "Receiving project"
+msgstr "Réception du projet"
+
+msgid "OK"
+msgstr "OK"
+
+msgid "Could not finish receiving the project"
+msgstr "Impossible de terminer la réception du projet"
+
+msgid ""
+"Copying the project timed out. Is the other phone still nearby and on "
+"the same Wi-Fi? Try the scan again when both phones are close together."
+msgstr ""
+"La copie du projet a expiré. L'autre téléphone est-il toujours à proximité "
+"et sur le même Wi-Fi ? Réessayez le scan quand les deux téléphones sont "
+"proches."
+
+msgid "Could not reach the other phone"
+msgstr "Impossible de joindre l'autre téléphone"
+
+msgid ""
+"The other phone did not respond on this network. Check that both phones "
+"are on the same Wi-Fi and that the sharing phone has Local-network "
+"sharing turned on."
+msgstr ""
+"L'autre téléphone n'a pas répondu sur ce réseau. Vérifiez que les deux "
+"téléphones sont sur le même Wi-Fi et que le partage réseau local est "
+"activé sur le téléphone qui partage."
+
+msgid ""
+"Copying the project timed out. Is the other phone still nearby and on "
+"the same Wi-Fi? Try again when both phones are close together."
+msgstr ""
+"La copie du projet a expiré. L'autre téléphone est-il toujours à "
+"proximité et sur le même Wi-Fi ? Réessayez quand les deux téléphones "
+"sont proches."
+
+# Pair-flow informational/failure popups (0.50.10 / 0.50.11).
+msgid "Paired, but no project came with this QR"
+msgstr "Appairé, mais aucun projet n'est arrivé avec ce QR"
+
+msgid ""
+"You're now paired with the other phone, but the project "
+"didn't come over. On the other phone, open the project you "
+"want to share, tap \"Share project (QR)\", and scan the new "
+"QR it shows."
+msgstr ""
+"Vous êtes maintenant appairé avec l'autre téléphone, mais "
+"le projet n'est pas arrivé. Sur l'autre téléphone, ouvrez "
+"le projet à partager, touchez « Partager le projet (QR) », "
+"et scannez le nouveau QR qui s'affiche."
+
+msgid "Set your name on the next screen, then scan the QR again."
+msgstr ""
+"Définissez votre nom sur l'écran suivant, puis scannez à "
+"nouveau le QR."
+
+msgid "Pairing failed"
+msgstr "Échec de l'appairage"
+
+msgid "The pairing call did not succeed: {detail}"
+msgstr "L'appel d'appairage a échoué : {detail}"
+
+# Null-bundle auto-launch toast (0.50.5). Same pattern as the
+# stale-code auto-launch — we fire the AZT Collaboration
+# launcher without a popup; the toast tells the user what's
+# happening.
+msgid ""
+"Setting up the sync service for the first time — tap back "
+"when AZT Collaboration finishes loading."
+msgstr ""
+"Configuration initiale du service de synchronisation — "
+"revenez ici quand AZT Collaboration a fini de charger."
+
+# Cache-clear / stale-bundle popup body (0.50.4). Surfaced when
+# the daemon process is alive enough to crash but not enough to
+# install ContentProvider callbacks (the ``null_bundle`` kind).
+msgid ""
+"The sync service ({name}) is installed but its code isn't set "
+"up yet. This is normal right after a fresh install or after "
+"clearing its app data. Tap Open {name} below — that launches "
+"it once so it can finish setting itself up, then come back "
+"here. \"Restart server\" won't help in this case."
+msgstr ""
+"Le service de synchronisation ({name}) est installé mais son "
+"code n'est pas encore configuré. C'est normal juste après une "
+"nouvelle installation ou après avoir effacé ses données. "
+"Touchez Ouvrir {name} ci-dessous — cela le lance une fois pour "
+"qu'il termine sa configuration, puis revenez ici. "
+"« Redémarrer le serveur » ne fonctionnera pas dans ce cas."
+
+# Translation-coverage drift caught 2026-05-29: msgids that
+# existed in source but had no fr.po entry. Filled in with
+# plausible French; refine in a future pass if needed.
+
+msgid ""
+"Not enough memory to merge right now ({mem_available_mb} MB available, "
+"{min_required_mb} MB needed). Close other apps and the next sync will "
+"retry."
+msgstr ""
+"Mémoire insuffisante pour fusionner maintenant ({mem_available_mb} Mo "
+"disponibles, {min_required_mb} Mo nécessaires). Fermez d'autres "
+"applications et la prochaine synchronisation réessaiera."
+
+msgid "A paired device"
+msgstr "Un appareil appairé"
+
+msgid "Turn off"
+msgstr "Désactiver"
+
+msgid "Keep on"
+msgstr "Garder activé"
+
+msgid "Keep local-network sharing on?"
+msgstr "Garder le partage réseau local activé ?"
+
+msgid "Local-network sharing is on."
+msgstr "Le partage réseau local est activé."
+
+msgid ""
+"Leave it on so future commits can sync over the local network too, or "
+"turn it off if you only needed it for this exchange."
+msgstr ""
+"Laissez-le activé pour que les futures synchronisations passent aussi "
+"par le réseau local, ou désactivez-le si vous n'en aviez besoin que "
+"pour cet échange."
+
+msgid "Unpair"
+msgstr "Désappairer"
+
+msgid "Confirm unpair"
+msgstr "Confirmer le désappairage"
+
+msgid ""
+"Unpair \"{name}\"?\n"
+"\n"
+"This phone will no longer auto-share with that device. Re-pair by "
+"scanning a new QR."
+msgstr ""
+"Désappairer « {name} » ?\n"
+"\n"
+"Ce téléphone ne partagera plus automatiquement avec cet appareil. "
+"Réappairez en scannant un nouveau QR."
+
+msgid ""
+"Project: {langcode}\n"
+"(not published to GitHub — share over local network only)"
+msgstr ""
+"Projet : {langcode}\n"
+"(non publié sur GitHub — partage uniquement sur le réseau local)"
+
+# KV-template form: brace-escaped for KV pre-processing, then
+# .format() called at runtime. The msgid here mirrors the source
+# literal ``'Share [{{langcode}}] project'`` exactly so the AST
+# walker in test_translation_coverage finds it.
+msgid "Share [{{langcode}}] project"
+msgstr "Partager le projet [{{langcode}}]"
+
 # LAN sync — paired-devices list + per-peer manage popup.
 msgid "Unnamed device"
 msgstr "Appareil sans nom"
@@ -1371,8 +1548,15 @@ msgstr "Aucune URL distante — publiez d'abord."
 msgid "Project: {langcode}\nRemote: {remote_url}"
 msgstr "Projet : {langcode}\nDistant : {remote_url}"
 
-msgid "Required: your name is used for commit authorship; sync and publish refuse until this is set."
-msgstr "Requis : votre nom est utilisé pour la paternité des commits ; la synchronisation et la publication sont refusées tant que ceci n'est pas défini."
+msgid ""
+"Required: your name is used to label your work on both Internet sync "
+"(GitHub commits) and local-network sync (peer label other phones see). "
+"Sync refuses until this is set."
+msgstr ""
+"Requis : votre nom sert à étiqueter votre travail à la fois pour la "
+"synchronisation Internet (commits GitHub) et la synchronisation réseau "
+"local (étiquette visible par les autres téléphones). La synchronisation "
+"est refusée tant que ce nom n'est pas défini."
 
 # ── CAWL wordlist cache row ───────────────────────────────────────────
 
@@ -1444,3 +1628,167 @@ msgstr ""
 "Fichier inhabituellement volumineux enregistré : {path} "
 "({bytes:,} octets). L'enregistreur sert à élicitation de listes de "
 "mots — vérifiez s'il s'agit d'une erreur d'enregistrement."
+
+# ── 0.48.0 — Nearby-pair status codes (translate.py) ──────────────────────
+
+msgid "Waiting for {device_name} to accept the pair request…"
+msgstr "En attente que {device_name} accepte la demande d'association…"
+
+msgid "{device_name} accepted the pair request."
+msgstr "{device_name} a accepté la demande d'association."
+
+msgid "{device_name} declined the pair request."
+msgstr "{device_name} a refusé la demande d'association."
+
+msgid "Pair request to {device_name} timed out."
+msgstr "Demande d'association à {device_name} expirée."
+
+# ── 0.48.0 — Shared decisions watcher (ui/decisions.py) ───────────────────
+
+msgid "Project share offer"
+msgstr "Proposition de partage de projet"
+
+msgid "{device_name} wants to share project '{langcode}' with you."
+msgstr "{device_name} veut partager le projet « {langcode} » avec vous."
+
+msgid ""
+"Accept to download the project from this device. It will appear "
+"in your project list, but won't replace your current project."
+msgstr ""
+"Acceptez pour télécharger le projet depuis cet appareil. Il "
+"apparaîtra dans votre liste de projets, mais ne remplacera pas "
+"votre projet actuel."
+
+msgid "Receive a project"
+msgstr "Recevoir un projet"
+
+msgid "Decline"
+msgstr "Refuser"
+
+msgid "Accept"
+msgstr "Accepter"
+
+msgid "Pair request"
+msgstr "Demande d'association"
+
+msgid "{device_name} wants to pair with this device."
+msgstr "{device_name} veut s'associer avec cet appareil."
+
+msgid ""
+"They're working on project '{langcode}'. If you accept and you "
+"also have this project, it will be shared automatically."
+msgstr ""
+"Ils travaillent sur le projet « {langcode} ». Si vous acceptez "
+"et que vous avez aussi ce projet, il sera partagé automatiquement."
+
+msgid ""
+"Accept to add this device to your paired list. You can share "
+"projects with them after pairing."
+msgstr ""
+"Acceptez pour ajouter cet appareil à votre liste d'appairages. "
+"Vous pourrez partager des projets avec lui après l'association."
+
+msgid "Back up to the Internet?"
+msgstr "Sauvegarder sur Internet ?"
+
+msgid "{device_name} pushes project '{langcode}' to:"
+msgstr "{device_name} envoie le projet « {langcode} » vers :"
+
+msgid ""
+"Using the same Internet location from this device means future "
+"commits go to the Internet too, not just over the local network."
+msgstr ""
+"Utiliser le même emplacement Internet depuis cet appareil "
+"signifie que les futures modifications iront aussi sur Internet, "
+"et pas seulement sur le réseau local."
+
+msgid "No, local only"
+msgstr "Non, uniquement local"
+
+msgid "Yes, use it"
+msgstr "Oui, l'utiliser"
+
+msgid "Two Internet locations for the same project"
+msgstr "Deux emplacements Internet pour le même projet"
+
+msgid ""
+"Project '{langcode}' is set up to push to two different places. "
+"Pick which one(s) this device should use."
+msgstr ""
+"Le projet « {langcode} » est configuré pour être envoyé vers "
+"deux emplacements différents. Choisissez celui ou ceux que cet "
+"appareil doit utiliser."
+
+msgid "Your current setting:"
+msgstr "Votre configuration actuelle :"
+
+msgid "{device_name} uses:"
+msgstr "{device_name} utilise :"
+
+msgid "Keep mine"
+msgstr "Garder la mienne"
+
+msgid "Use both"
+msgstr "Utiliser les deux"
+
+msgid "Switch to theirs"
+msgstr "Passer à la sienne"
+
+msgid "Resolve Internet location"
+msgstr "Résoudre l'emplacement Internet"
+
+# ── 0.48.0 — Bootstrap recovery (ui/bootstrap.py) ─────────────────────────
+
+msgid ""
+"The AZT Collaboration service ({name}) is installed but did not "
+"respond. Tap Restart server to ask it to start again — this is "
+"the same action the sync settings page uses. Or Open {name} to "
+"wake the service manually, then come back here. Quit closes this "
+"app."
+msgstr ""
+"Le service AZT Collaboration ({name}) est installé mais n'a pas "
+"répondu. Touchez Redémarrer le service pour lui demander de "
+"redémarrer — c'est la même action que celle utilisée dans les "
+"paramètres de synchronisation. Ou Ouvrir {name} pour réveiller "
+"le service manuellement, puis revenez ici. Quitter ferme cette "
+"application."
+
+msgid ""
+"Refreshing the sync service code — tap back when AZT "
+"Collaboration finishes loading."
+msgstr ""
+"Actualisation du code du service de synchronisation — "
+"revenez ici lorsque AZT Collaboration aura fini de charger."
+
+msgid ""
+"A newer {name} ({installed}) is installed, but the running "
+"service is still on {running}. Open AZT Collaboration from the "
+"launcher to refresh the service code, then come back here.\n"
+"\n"
+"Do NOT uninstall {name} — that would erase your projects, "
+"credentials, and pending sync state.\n"
+"\n"
+"If opening the app doesn't help, "
+"[ref=email][color=4ea1ff][u]send the developer an "
+"Email[/u][/color][/ref]."
+msgstr ""
+"Une version plus récente de {name} ({installed}) est "
+"installée, mais le service actif est toujours sur {running}. "
+"Ouvrez AZT Collaboration depuis le lanceur pour actualiser le "
+"code du service, puis revenez ici.\n"
+"\n"
+"NE désinstallez PAS {name} — cela effacerait vos projets, vos "
+"identifiants et l'état de synchronisation en attente.\n"
+"\n"
+"Si l'ouverture de l'application ne résout pas le problème, "
+"[ref=email][color=4ea1ff][u]envoyez un courriel au "
+"développeur[/u][/color][/ref]."
+
+msgid "Restarting the sync service…"
+msgstr "Redémarrage du service de synchronisation…"
+
+msgid "AZT Collaboration not responding"
+msgstr "AZT Collaboration ne répond pas"
+
+msgid "Open {name}"
+msgstr "Ouvrir {name}"

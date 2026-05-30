@@ -246,6 +246,44 @@ def slot_claim(working_dir, peer_id, device_name, slot):
     return True
 
 
+def slot_rebind(working_dir, peer_id, device_name, slot):
+    """Rewrite the identity atoms (peer_id + device_name) of an
+    existing slot claim to the caller's current values, AND
+    refresh ``claimed_at`` to now so the rebind wins any
+    concurrent claim by another peer in the merge.
+
+    Used by the user-driven recovery flow when a device's
+    ``peer_id`` changed (server-APK reinstall regenerated the
+    crypto identity; cache clear wiped ``$AZT_HOME/peer_id``)
+    but the user knows the slot is still theirs. Caller is
+    responsible for confirming user intent (peer-side popup,
+    contributor-name match against the existing claim's
+    ``device_name``); the daemon doesn't gate on anything
+    beyond input validation. 0.50.9+.
+
+    Returns ``True`` on success, ``False`` if:
+      - ``slot`` fails name validation;
+      - ``peer_id`` isn't a 64-char hex string;
+      - the slot file doesn't exist (no claim to rebind).
+
+    The one-slot-per-peer invariant is preserved: any other
+    slot file currently held by ``peer_id`` is dropped first.
+
+    Raises on filesystem failure (caller wraps).
+    """
+    if not _is_safe_name(slot):
+        return False
+    if len(peer_id) != 64:
+        return False
+    path = _slot_path(working_dir, slot)
+    if not os.path.exists(path):
+        return False
+    _purge_own_claims(working_dir, peer_id, except_slot=slot)
+    body = _format_slot_file(peer_id, device_name)
+    _atomic_write(path, body)
+    return True
+
+
 def slot_release(working_dir, peer_id):
     """Remove every slot currently held by *peer_id*. Returns
     the list of slots that were released. Idempotent — empty
@@ -381,11 +419,31 @@ def _parse_text(text):
 def _later_claim(a, b):
     """Return whichever of *a* / *b* has the later
     ``claimed_at``. Lexicographic compare on ISO-8601 UTC
-    strings = chronological compare for the formats we
-    write. Tiebreaks on equal timestamps by peer_id
-    (deterministic; rare since ISO is second-granularity and
-    the simultaneous-claim window is ms). Returns None if
-    both lack a parseable timestamp."""
+    strings = chronological compare for the formats we write.
+    Returns None if both lack a parseable timestamp.
+
+    Tiebreak when timestamps are equal — the field-observed
+    audit-#9 case (two NTP-synced phones claim the same slot
+    in the same second). The tiebreak chain MUST be a property
+    of the claim itself, not of which side of the merge it
+    landed on, so peer A and peer B compute the same winner and
+    both peers converge on it.
+
+    1. ``peer_id`` lexicographic (preferred). Since 0.50.9 the
+       daemon eager-inits its ``peer_id`` on startup, so every
+       new claim file written by a 0.50.9+ daemon has a
+       non-empty 64-char hex pubkey here.
+    2. ``device_name`` lexicographic (fallback). Pre-0.50.9
+       claims written without crypto have empty ``peer_id``;
+       this picks a deterministic winner via the next stable
+       atom on the claim. Eventually all such legacy claims
+       will be displaced by newer ones; the fallback only
+       matters during the migration window.
+    3. Last resort: return *a*. Both peer_ids empty AND both
+       device_names empty AND timestamps equal — pathological
+       (every identity atom blank), but at least the merge
+       terminates instead of looping.
+    """
     a_ts = (a or {}).get('claimed_at', '')
     b_ts = (b or {}).get('claimed_at', '')
     if not a_ts and not b_ts:
@@ -398,10 +456,25 @@ def _later_claim(a, b):
         return a
     if b_ts > a_ts:
         return b
-    # Equal timestamps — peer_id alphabetical fallback.
+    # Equal timestamps. Primary tiebreak: peer_id. A non-empty
+    # peer_id beats empty (so a 0.50.9+ claim wins over a legacy
+    # claim with the same timestamp — the right call when the
+    # newer daemon has a stable identity to anchor the claim).
     a_pid = (a or {}).get('peer_id', '')
     b_pid = (b or {}).get('peer_id', '')
-    return a if a_pid <= b_pid else b
+    if a_pid and not b_pid:
+        return a
+    if b_pid and not a_pid:
+        return b
+    if a_pid and b_pid:
+        return a if a_pid <= b_pid else b
+    # Both peer_ids empty (legacy case). Secondary tiebreak:
+    # device_name lexicographic.
+    a_dn = (a or {}).get('device_name', '')
+    b_dn = (b or {}).get('device_name', '')
+    if a_dn or b_dn:
+        return a if a_dn <= b_dn else b
+    return a
 
 
 def _resolve_kv_file(path):

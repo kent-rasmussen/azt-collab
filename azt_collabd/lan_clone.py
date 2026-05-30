@@ -40,8 +40,10 @@ clones can take minutes.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import socket
 import ssl
 import sys
 
@@ -53,6 +55,52 @@ from . import projects as _projects
 from . import status as _S
 from .paths import azt_home
 from .status import Result
+
+
+# Bounded wall-clock for a single ``dulwich.porcelain.clone`` over the
+# LAN transport. Picked below the client's default RPC timeout (300 s
+# per ``azt_collab_client.rpc.call``) so the daemon can surface a typed
+# LAN_CLONE_TIMEOUT before the client gives up and routes a generic
+# SERVER_ERROR. A LAN clone of a small project is seconds; large
+# projects with audio can be tens of seconds. 180 s leaves headroom
+# for both while keeping a wedged peer from holding the RPC open
+# indefinitely.
+_LAN_CLONE_TIMEOUT_S = 180.0
+
+
+@contextlib.contextmanager
+def _socket_timeout(seconds):
+    """Set ``socket.setdefaulttimeout`` for the body; restore on exit.
+    Mirror of ``repo._socket_timeout`` — duplicated rather than
+    cross-imported to keep ``lan_clone`` independent of the much
+    heavier ``repo`` module."""
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(prev)
+
+
+def _looks_like_timeout(exc):
+    """True iff *exc* (or any cause/context in its chain) is a socket
+    timeout. dulwich wraps the raw exception in a few different
+    shapes depending on dulwich/urllib3 version, so check the chain
+    rather than just the surface type."""
+    cur = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, socket.timeout):
+            return True
+        if isinstance(cur, TimeoutError):
+            return True
+        msg = str(cur).lower()
+        if 'timed out' in msg or 'timeout' in msg:
+            return True
+        cur = getattr(cur, '__cause__', None) \
+            or getattr(cur, '__context__', None)
+    return False
 
 
 def _resolve_endpoint(peer_entry):
@@ -204,12 +252,15 @@ def _do_lan_clone(host, port, langcode, expected_fp, dest_dir):
             return '', f'wipe_dest_failed: {ex}'
     os.makedirs(dest_dir, exist_ok=True)
     try:
-        porcelain.clone(url, dest_dir, pool_manager=pm)
+        with _socket_timeout(_LAN_CLONE_TIMEOUT_S):
+            porcelain.clone(url, dest_dir, pool_manager=pm)
     except TypeError:
         # dulwich without pool_manager kwarg — same fallback as
         # lan_push. Refuse rather than fall back to unpinned TLS.
         return '', 'dulwich_pool_manager_unsupported'
     except Exception as ex:
+        if _looks_like_timeout(ex):
+            return '', f'clone_timed_out: {ex!r}'
         return '', f'clone_failed: {ex!r}'
     lift_path = _find_lift_in(dest_dir)
     if not lift_path:
@@ -308,8 +359,18 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
     lift_path, err = _do_lan_clone(
         host, port, langcode, expected_fp, dest_dir)
     if err:
-        result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
-                   detail=err)
+        # Distinguish "connection stalled mid-transfer" from "could
+        # not resolve / connect at all" so the UI can route the
+        # right user-facing prompt. ``_do_lan_clone`` tags the
+        # timeout case with the ``clone_timed_out:`` prefix.
+        if err.startswith('clone_timed_out:'):
+            result.add(_S.LAN_CLONE_TIMEOUT, peer_id=peer_id,
+                       langcode=langcode,
+                       timeout_s=_LAN_CLONE_TIMEOUT_S,
+                       detail=err)
+        else:
+            result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
+                       detail=err)
         return result
     # Strip the LAN listener URL from ``.git/config``'s origin.
     # ``_do_lan_clone`` runs dulwich's clone which sets origin to

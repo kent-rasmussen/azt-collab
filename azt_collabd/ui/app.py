@@ -2431,14 +2431,23 @@ class SettingsScreen(Screen):
         inp.focus = True
         if msg is not None:
             msg.text = _tr(
-                'Required: your name is used for commit authorship; '
-                'sync and publish refuse until this is set.')
+                'Required: your name is used to label your work on '
+                'both Internet sync (GitHub commits) and local-network '
+                'sync (peer label other phones see). Sync refuses '
+                'until this is set.')
             msg.color = theme.RED
 
     def save_contributor(self):
         """Called on the contributor input losing focus. Persists the
         trimmed value to the server (config.json :: collab.contributor)
         and shows a transient confirmation.
+
+        Empty input is NOT treated as a successful save: tapping
+        outside an empty field would otherwise overwrite the
+        ``Required: …`` red message with a green ``Saved.``, which
+        looks like the empty value was accepted. Instead we leave
+        whatever message was up (typically the on-entry
+        ``Required: …`` from ``refresh_settings``) in place.
 
         Runs the RPC on a worker thread so a focus-loss triggered by
         tapping a sibling button (e.g. GitLab) doesn't block the UI
@@ -2449,6 +2458,12 @@ class SettingsScreen(Screen):
         if inp is None:
             return
         name = (inp.text or '').strip()
+        if not name:
+            # Don't fire the RPC and don't claim "Saved." — the
+            # field is still empty, the user hasn't actually set
+            # anything, and the on-entry "Required:" message is
+            # the right thing to keep showing.
+            return
         threading.Thread(
             target=self._save_contributor_worker,
             args=(name,), daemon=True).start()

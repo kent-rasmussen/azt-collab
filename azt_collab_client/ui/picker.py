@@ -373,6 +373,24 @@ class ProjectPickerScreen(Screen):
                   f"langcode={langcode!r} path={path!r} — "
                   f"emitting to host",
                   flush=True)
-            app.load_lift(path, langcode)
+            # Host's ``load_lift`` may raise (file-system errors,
+            # XML parse failure, host-side schema mismatch on a
+            # fresh-clone LIFT). Without this guard the exception
+            # propagates out of the Clock-scheduled finisher,
+            # Kivy logs it, and the user is left on the picker
+            # with the popup dismissed and no project actually
+            # opened — undefined state. Wrap so a host raise
+            # leaves the picker in a clean state (project list
+            # refreshed so the new project's row is visible
+            # even though we couldn't auto-open it).
+            try:
+                app.load_lift(path, langcode)
+            except Exception as ex:
+                print(f"[picker] host load_lift raised for "
+                      f"langcode={langcode!r}: {ex!r} — falling "
+                      f"back to project-list refresh",
+                      flush=True)
+                Clock.schedule_once(
+                    lambda *_: self._populate_projects(), 0)
 
         pending_offers_popup(on_done=_on_done)

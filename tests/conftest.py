@@ -69,10 +69,30 @@ _install_jnius_stub()
 @pytest.fixture(autouse=True)
 def azt_home(tmp_path, monkeypatch):
     """Point ``$AZT_HOME`` at a per-test temp dir. Autouse so every
-    test gets a clean credentials/store/config without opt-in."""
+    test gets a clean credentials/store/config without opt-in.
+
+    Also clears the module-level cache in
+    ``azt_collabd.paths._AZT_HOME_CACHE`` and the client-side
+    equivalent. Without that, the first test seeds the cache with
+    its tmp dir and every subsequent test writes to *that* dir
+    instead of its own — symptoms are state leakage that looks
+    like the production code is buggy.
+    """
     home = tmp_path / 'azt_home'
     home.mkdir()
     monkeypatch.setenv('AZT_HOME', str(home))
+    try:
+        from azt_collabd import paths as _server_paths
+        _server_paths._AZT_HOME_CACHE = None
+    except ImportError:
+        pass
+    try:
+        from azt_collab_client import paths as _client_paths
+        # Client mirror has its own cache.
+        if hasattr(_client_paths, '_AZT_HOME_CACHE'):
+            _client_paths._AZT_HOME_CACHE = None
+    except ImportError:
+        pass
     return home
 
 

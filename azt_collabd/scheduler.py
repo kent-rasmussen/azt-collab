@@ -50,6 +50,7 @@ from collections import OrderedDict
 from . import projects
 from . import settings as _settings
 from . import status as S
+from . import wan_backoff
 from .net import _has_internet
 from .paths import azt_home
 from .repo import (
@@ -231,9 +232,41 @@ def reconcile_on_startup():
         _jobs.clear()
         _jobs.update(loaded)
         _persist_locked()
-        if interrupted or stale:
-            print(f'[scheduler] reconcile_on_startup: '
-                  f'interrupted={interrupted} gc={len(stale)}', flush=True)
+    # WAN backoff: clear ``next_attempt_at`` for all projects so the
+    # restart counts as a free immediate retry. ``consecutive_failures``
+    # is preserved — if the first post-restart attempt also fails, the
+    # curve re-enters at the same step rather than starting fresh.
+    try:
+        wan_backoff.reset_due_times_on_startup()
+    except Exception as ex:
+        print(f'[scheduler] wan_backoff.reset_due_times_on_startup '
+              f'failed: {ex!r}', file=sys.stderr, flush=True)
+    # Eager-init the per-device peer_id (0.50.9). Pre-0.50.9
+    # ``peer_id.ensure()`` only ran when LAN sync was enabled or
+    # the QR generator opened — so on builds that never enabled
+    # LAN, ``lan_peer_id()`` returned ``''`` and slot claims got
+    # empty-peer_id entries, forcing the peer-side fallback chain
+    # to match on the more fragile ``device_name``. Eager-init
+    # makes peer_id always available so it's the stable identity
+    # for slot claims, future per-device state, and the audit-#9
+    # tiebreaker in the slot merge driver. Best-effort: a build
+    # without the cryptography package logs a warning and falls
+    # through to the pre-0.50.9 empty-peer_id behaviour rather
+    # than refusing to start the daemon.
+    try:
+        from . import peer_id as _peer_id
+        _peer_id.ensure()
+    except RuntimeError as ex:
+        print(f'[scheduler] peer_id.ensure on startup failed: '
+              f'{ex!r}; slot claims will use empty peer_id and '
+              f'fall back to device_name matching',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[scheduler] peer_id.ensure unexpected: {ex!r}',
+              file=sys.stderr, flush=True)
+    if interrupted or stale:
+        print(f'[scheduler] reconcile_on_startup: '
+              f'interrupted={interrupted} gc={len(stale)}', flush=True)
     # Run outside the scheduler lock — touches the filesystem, not
     # the jobs registry. Best-effort; never raises.
     _sweep_legacy_orphans()
@@ -461,11 +494,21 @@ def _run_commit(langcode):
         # surfaces on the next peer poll. Idempotent: fan_out
         # internally peeks each peer's main first and no-ops if
         # they're already at our HEAD. 0.45.32.
+        # Post-commit LAN fan-out: when autodiscovery is on, peers
+        # are reachable directly; when it's off we kick off a
+        # burst so paired peers' parallel bursts can rendezvous
+        # with us during the window. ``start_burst`` is cheap when
+        # the LAN is already up.
         try:
-            from . import settings as _settings
-            if _settings.lan_allow_sync():
-                from . import lan_push as _lan_push
-                _lan_push.fan_out(p)
+            from . import lan_burst as _lan_burst
+            _lan_burst.start_burst()
+        except Exception as ex:
+            print(f'[commit] {langcode!r} post-commit burst '
+                  f'raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+        try:
+            from . import lan_push as _lan_push
+            _lan_push.fan_out(p)
         except Exception as ex:
             print(f'[commit] {langcode!r} post-commit LAN fan-out '
                   f'raised: {ex!r}',
@@ -508,20 +551,39 @@ def is_online_cached():
     return _last_online_state
 
 
-def drain_pushes_now():
-    """Public entry point: fire a push-drain pass immediately,
-    bypassing the post-online grace gate. Called when the user
-    toggles work_offline OFF — they just expressed intent to push,
-    so waiting for the next watcher tick is the wrong UX.
+def drain_pushes_now(langcode=''):
+    """User-nudge entry point: clear WAN backoff and fire a push
+    pass immediately. Used by ``sync_nudge`` (the unified "try
+    everything now" gesture, since 0.50).
 
-    Respects work_offline (no-op if still on) and online state
-    (no-op if offline)."""
-    if _settings.work_offline():
-        return
+    *langcode* targets one project; empty string nudges every
+    pending project. ``wan_backoff.nudge`` clears ``next_attempt_at``
+    while preserving ``consecutive_failures``, so one bad nudge
+    doesn't reset weeks of accumulated curve to zero — a fresh
+    failure re-enters the curve at the same step.
+
+    No-op if offline (no point burning the network attempt on a
+    cold radio). Caller already routed the user gesture so the UI
+    knows they tried; the next ``ConnectivityManager`` event or
+    the user's next nudge will drive the actual push."""
     if not _has_internet():
         return
+    # User-gestured nudge → the watcher's probe-backoff streak
+    # should reset so the next periodic tick fires at base
+    # cadence rather than at whatever long interval the idle
+    # streak had grown to. Cheap; no-op if streak already 0.
+    _reset_probe_backoff(reason='user-nudge')
     try:
-        _drain_pending_push()
+        if langcode:
+            wan_backoff.nudge(langcode)
+        else:
+            try:
+                data = projects._load_raw()
+            except Exception:
+                data = {}
+            for lang in data:
+                wan_backoff.nudge(lang)
+        _drain_pending_push(ignore_backoff=True)
     except Exception as ex:
         print(f'[scheduler] drain_pushes_now failed: {ex}',
               file=sys.stderr, flush=True)
@@ -543,10 +605,28 @@ def _watcher_loop():
             _online_since = now
         elif not online:
             _online_since = None
-        # On offline → online edge, nudge CAWL to retry any prefetch
-        # that was offline-skipped or circuit-broken while we were
-        # offline. Push drain has its own gate (grace + work_offline)
-        # and runs every tick, not just on edges.
+        # On offline → online edge: this is Phase 6 of the 0.50
+        # sync rebuild — the cheap "ConnectivityManager
+        # auto-recovery" surrogate. We don't subscribe to a real
+        # Android NetworkCallback (would need Java glue +
+        # ACCESS_NETWORK_STATE permission); the existing TCP probe
+        # detects the same transition within one poll interval
+        # (default 30 s). On the edge we:
+        #
+        #   1. Reset WAN backoff for every pending-push project so
+        #      the next drain tick fires immediately instead of
+        #      waiting out a 24 h curve.
+        #   2. Fire a LAN burst (cheap when autodiscovery=True;
+        #      brings up listener + mDNS for the window when
+        #      autodiscovery=False) so paired peers on a freshly
+        #      joined Wi-Fi can rendezvous.
+        #   3. Nudge CAWL to retry prefetch.
+        # Track whether the probed state changed this tick; the
+        # adaptive sleep at the bottom of the loop uses it.
+        if prev != online:
+            _reset_probe_backoff(reason='state-change')
+        else:
+            _bump_probe_backoff()
         if prev is False and online is True:
             # Log which resolver path served the probe — useful when
             # debugging field reports of "browser works but sync
@@ -562,24 +642,36 @@ def _watcher_loop():
             except Exception:
                 pass
             try:
+                data = projects._load_raw()
+                for langcode_, entry_ in data.items():
+                    if entry_.get('pending_push'):
+                        wan_backoff.nudge(langcode_)
+            except Exception as ex:
+                print(f'[watcher] online-edge backoff reset '
+                      f'raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+            try:
+                from . import lan_burst as _lan_burst
+                _lan_burst.start_burst()
+            except Exception as ex:
+                print(f'[watcher] online-edge LAN burst raised: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+            try:
                 from . import cawl as _cawl
                 _cawl.on_online_edge()
             except Exception as ex:
                 print(f'[cawl] on_online_edge dispatch failed: {ex}',
                       file=sys.stderr, flush=True)
-        # Drain tick: github push is gated by online + post-online
-        # grace + work_offline; LAN fan-out is gated separately on
-        # ``lan.allow_sync`` (LAN works offline by definition, so
-        # work_offline=on + LAN=on means "LAN-only sync"). Run the
-        # drain whenever *either* channel might fire so a
-        # work-offline user with LAN paired phones still gets their
-        # commits sneakernet'd across. Inside ``_drain_pending_push``
-        # each channel re-checks its own gate.
-        grace = _settings.post_online_grace_s()
-        github_eligible = (online and not _settings.work_offline()
-                           and _online_since is not None
-                           and (now - _online_since) >= grace)
-        lan_eligible = _settings.lan_allow_sync()
+        # Drain tick (since 0.50): WAN push is gated per-project
+        # by ``wan_backoff.is_due(langcode)``. The watcher itself
+        # doesn't gate on ``work_offline`` / ``grace`` anymore —
+        # those existed to avoid hammering on flaky connections,
+        # which the exponential curve does more cleanly. LAN
+        # fan-out is no longer fired from this loop; it's driven
+        # by user nudge (``sync_nudge``) and by ``_run_commit``
+        # after a successful local commit. The drain still gets
+        # called every tick but it's cheap when nothing is due.
+        github_eligible = online
         # LAN-listener split-brain reconcile. The persisted toggle and
         # the listener thread can drift apart in three ways:
         #   * APK update / kill -9 killed the host while
@@ -615,7 +707,7 @@ def _watcher_loop():
         except Exception as ex:
             print(f'[scheduler] lan_listener.drain_pending_resets '
                   f'failed: {ex!r}', file=sys.stderr, flush=True)
-        if github_eligible or lan_eligible:
+        if github_eligible:
             try:
                 _drain_pending_push()
             except Exception as ex:
@@ -644,10 +736,60 @@ def _watcher_loop():
         except Exception as ex:
             print(f'[scheduler] _drain_atomic_orphans failed: {ex}',
                   file=sys.stderr, flush=True)
-        # Sleep with periodic checks of the stop event
-        interval = max(5.0, float(_settings.connectivity_poll_s()))
+        # Adaptive probe interval (audit finding #5, 0.50.15).
+        # Pre-0.50.15 we slept exactly ``connectivity_poll_s``
+        # every tick — fine on a phone that's about to push, but
+        # wasteful on an idle phone in a pocket all day (radio
+        # wake every 30 s for ages even when nothing has changed).
+        # Grow the interval on consecutive same-state ticks
+        # (no online-edge AND no pending pushes ready to fire),
+        # cap at 5 min, and reset whenever something interesting
+        # happens. The state-change case (offline → online edge)
+        # already resets ``_probe_idle_streak`` above; nudge
+        # entry points (``drain_pushes_now``) reset it too.
+        base = max(5.0, float(_settings.connectivity_poll_s()))
+        interval = _adaptive_probe_interval(base)
         if _watcher_stop.wait(timeout=interval):
             break
+
+
+# Adaptive connectivity-probe state (0.50.15, audit finding #5).
+# Grows when consecutive ticks find no state change AND nothing
+# WAN-pending. Reset on online-edge / user nudge / fresh commit.
+# Cap at 5 min — at the cap, a state flip from offline → online
+# is detected within one cap interval, which is acceptable for
+# the "phone in a pocket all day" use case (the user's gesture
+# resets the streak anyway when they touch the app).
+_PROBE_BACKOFF_CAP_S = 300.0
+_PROBE_BACKOFF_MAX_SHIFT = 4  # 2^4 = 16× base before cap clamps
+_probe_idle_streak = 0
+
+
+def _adaptive_probe_interval(base):
+    """Compute the next probe sleep interval. Doubles each
+    ``_probe_idle_streak`` step up to ``_PROBE_BACKOFF_CAP_S``."""
+    streak = max(0, min(_probe_idle_streak, _PROBE_BACKOFF_MAX_SHIFT))
+    interval = base * (1 << streak)
+    return min(interval, _PROBE_BACKOFF_CAP_S)
+
+
+def _reset_probe_backoff(reason=''):
+    """Drop ``_probe_idle_streak`` to 0. Call from any path that
+    represents "something just happened, the next probe should
+    fire promptly" — user nudge, online-edge, fresh commit."""
+    global _probe_idle_streak
+    if _probe_idle_streak != 0:
+        _probe_idle_streak = 0
+        if reason:
+            print(f'[watcher] probe backoff reset ({reason})',
+                  file=sys.stderr, flush=True)
+
+
+def _bump_probe_backoff():
+    """Increment ``_probe_idle_streak`` by 1. Called once per
+    no-state-change probe tick."""
+    global _probe_idle_streak
+    _probe_idle_streak += 1
 
 
 # Doubling backoff for stuck-commit retry, capped at 1 hour. Base
@@ -749,15 +891,19 @@ def _drain_stuck_commits():
             _set_pending_push(langcode, True)
 
 
-def _drain_pending_push():
-    """Push any project flagged ``pending_push`` (or with local
-    commits ahead of remote). Called every watcher tick when at
-    least one channel might fire — github (gated on online +
-    post-online grace + ``!work_offline``) or LAN (gated on
-    ``lan.allow_sync``). Each channel re-checks its own gate
-    inside the loop so a work-offline user with LAN paired phones
-    still gets their commits sneakernet'd across, and a no-LAN
-    user with normal connectivity gets just the github push."""
+def _drain_pending_push(ignore_backoff=False):
+    """Push any project flagged ``pending_push``. WAN attempts are
+    gated by ``wan_backoff.is_due(langcode)`` so an offline-for-
+    hours project doesn't wake the radio every connectivity tick
+    — the curve doubles up to a 24 h cap. ``ignore_backoff=True``
+    is the user-nudge path: ``wan_backoff.nudge()`` has already
+    cleared ``next_attempt_at``, and we fire all pending projects
+    regardless of the WAN due times so a tap-to-sync is responsive.
+
+    LAN fan-out is independent and (per the design rebuild in
+    0.50) is no longer fired from this drain loop — it's fired
+    by user nudges and by ``_run_commit`` after a successful
+    local commit. The scheduler drain stays WAN-only."""
     try:
         data = projects._load_raw()
     except Exception:
@@ -768,54 +914,40 @@ def _drain_pending_push():
         return
     print(f'[scheduler] drain pushes: {candidates!r}',
           file=sys.stderr, flush=True)
-    from . import settings as _settings
-    github_enabled = not _settings.work_offline()
-    lan_enabled = _settings.lan_allow_sync()
     for langcode in candidates:
         p = projects.get(langcode)
         if p is None:
             continue
-        # ── GitHub push (gated by !work_offline) ───────────────
-        if github_enabled:
-            git_user, token = get_sync_credentials(p.remote_url)
-            if not token:
-                # No credentials — leave pending_push set; next
-                # user gesture will route the AUTH_REQUIRED prompt.
-                pass
-            else:
-                try:
-                    res = _push_repo(p.working_dir, git_user, token)
-                except Exception as ex:
-                    print(f'[scheduler] drain push {langcode!r} '
-                          f'raised: {ex!r}',
-                          file=sys.stderr, flush=True)
-                    res = None
-                if res is not None:
-                    codes = res.codes()
-                    print(f'[scheduler] drain push {langcode!r} '
-                          f'codes={codes!r}',
-                          file=sys.stderr, flush=True)
-                    if 'PUSHED' in codes:
-                        _set_pending_push(langcode, False)
-                        projects.set_last_sync(langcode)
-        else:
-            print(f'[scheduler] drain push {langcode!r} skipped '
-                  f'(work_offline=on)',
+        if not ignore_backoff and not wan_backoff.is_due(langcode):
+            # Curve says wait. Don't bother probing credentials or
+            # the network — that's the whole point of the curve.
+            continue
+        git_user, token = get_sync_credentials(p.remote_url)
+        if not token:
+            # No credentials — leave pending_push set; the next
+            # user gesture routes AUTH_REQUIRED. Don't advance the
+            # backoff curve: nothing failed network-wise.
+            continue
+        try:
+            res = _push_repo(p.working_dir, git_user, token)
+        except Exception as ex:
+            print(f'[scheduler] drain push {langcode!r} '
+                  f'raised: {ex!r}',
                   file=sys.stderr, flush=True)
-        # ── LAN fan-out (gated by lan.allow_sync) ──────────────
-        # Independent of github — fires even when work_offline is
-        # on (that's the entire point of LAN sync). Success here
-        # does NOT clear pending_push: github stays authoritative,
-        # LAN is opportunistic redundancy / offline-mode sneakernet.
-        if lan_enabled:
-            try:
-                from . import lan_push as _lan_push
-                _lan_push.fan_out(p)
-            except Exception as ex:
-                print(f'[scheduler] LAN fan-out raised for '
-                      f'{langcode!r}: {ex!r}',
-                      file=sys.stderr, flush=True)
+            res = None
+        if res is None:
+            wan_backoff.record_failure(langcode)
+            continue
+        codes = res.codes()
+        print(f'[scheduler] drain push {langcode!r} '
+              f'codes={codes!r}',
+              file=sys.stderr, flush=True)
+        if 'PUSHED' in codes:
+            _set_pending_push(langcode, False)
+            projects.set_last_sync(langcode)
+            wan_backoff.record_success(langcode)
+        elif 'NOTHING_TO_COMMIT' in codes or 'NO_REMOTE' in codes:
+            # No-op outcomes don't advance the backoff curve.
+            pass
         else:
-            print(f'[lan-fanout] {langcode!r}: skipped '
-                  f'(lan.allow_sync=off)',
-                  file=sys.stderr, flush=True)
+            wan_backoff.record_failure(langcode)

@@ -501,7 +501,7 @@ def _autodetect_device_name():
 def get_device_name():
     """Composed peer label = ``<contributor> — <autodetect>``.
 
-    Since 0.47.7 device_name is **derived** from contributor +
+    Since 0.49.0 device_name is **derived** from contributor +
     OS-level device label rather than independently stored.
     Returns the empty string when contributor is unset (peer
     label is "not set"); LAN operations refuse with
@@ -513,9 +513,16 @@ def get_device_name():
     other paired devices see in their peer roster and what gets
     stamped on the git author email slot.
 
-    The pre-0.47.7 ``device_name`` config field is still read
-    if present (legacy peers persisted it via an old set_device_name
-    path that no longer exists); a future migration will drop it.
+    Pre-0.49.0 ``device_name`` was auto-persisted into
+    ``config.json :: collab.device_name`` on first read. We
+    intentionally **ignore** that legacy value here: there's no
+    user-set override (no settings field ever wrote it), so
+    every legacy value is just a stale autodetect snapshot,
+    and honoring it would defeat the derive-from-contributor
+    change. Cross-peer label churn on upgrade is bounded by
+    the standard 60 s self-heal: the next hello / share_offer /
+    fan-out carries the freshly composed name and paired peers'
+    ``peers.json`` entries update via ``record_pair``.
     """
     contributor = get_contributor()
     if not contributor:
@@ -523,13 +530,6 @@ def get_device_name():
         # read "— moto g - 2025" which is uselessly anonymous.
         # Callers gate on CONTRIBUTOR_UNSET instead.
         return ''
-    # Legacy stored override (pre-0.47.7). If present, honour it
-    # so existing pairings don't see a churn in peer labels on
-    # upgrade. Once the field migrates out we'll drop this branch.
-    legacy = (_load_config_file().get('collab') or {}).get(
-        'device_name', '')
-    if legacy:
-        return legacy
     detected = _autodetect_device_name()
     if not detected or detected == 'unknown-device':
         return contributor

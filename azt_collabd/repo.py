@@ -2535,6 +2535,7 @@ def _push_repo_locked(project_dir, username, token):
         result.add(S.NO_REMOTE)
         return result
     _push_step_locked(repo, project_dir, username, token, remote_url, result)
+    _push_extras_step(repo, project_dir, result)
     return result
 
 
@@ -2580,6 +2581,7 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     # proper commit on local <branch>, not just dirty working tree.
     _commit_step_locked(repo, project_dir, contributor_name, result)
     _push_step_locked(repo, project_dir, username, token, remote_url, result)
+    _push_extras_step(repo, project_dir, result)
     return result
 
 
@@ -2915,6 +2917,30 @@ def _delete_remote_topic_branch(
             f'[sync-trace] topic-branch delete failed (non-fatal) '
             f'for {topic_ref_name!r}: {exc!r}')
         return False
+
+
+def _count_foreign_topic_orphans(repo):
+    """Count ``refs/remotes/origin/azt-pending-*-<device>`` refs
+    whose device-name suffix isn't ours.
+
+    Used by ``project_status`` since 0.50.15 (audit finding #3)
+    to surface visibility of cross-device orphans the janitor
+    can't safely sweep. Returns 0 on any error — this is a
+    diagnostic counter, not a control-flow input.
+    """
+    try:
+        from . import store as _store
+        device_name = _store.get_device_name() or 'unset'
+        safe_dev = re.sub(r'[^A-Za-z0-9._-]', '_', device_name)
+        suffix = b'-' + safe_dev.encode('utf-8')
+        prefix = b'refs/remotes/origin/azt-pending-'
+        count = 0
+        for ref in list(repo.refs.allkeys()):
+            if ref.startswith(prefix) and not ref.endswith(suffix):
+                count += 1
+        return count
+    except Exception:
+        return 0
 
 
 def _janitor_sweep_topic_branches(
@@ -3268,6 +3294,77 @@ def _push_chunked_to_ref(
         f'exceeded cap ({MAX_CONSECUTIVE_FAILURES}); will resume '
         f'next drain')
     return False, None, None
+
+
+def _push_extras_step(repo, project_dir, result):
+    """Best-effort push of the local branch tip to each URL in
+    ``Project.extra_remotes``. Mutates *result* in place; never
+    raises. Caller holds the project lock.
+
+    No fetch, no merge: the primary (``origin``) is the authoritative
+    integration point. Secondaries are publish-only "also send to
+    these URLs" targets. If a secondary rejects with non-FF, the
+    user has diverged the secondary host's state and needs to
+    reconcile it manually — the daemon won't fetch from secondaries
+    or attempt to merge their tips.
+
+    Per-URL outcome:
+      - success → ``S.EXTRA_REMOTE_PUSHED`` (params: url, branch).
+      - failure → ``S.EXTRA_REMOTE_PUSH_FAILED`` (params: url, error).
+
+    Tries every URL each call, independent of the primary's
+    success or failure. Credentials are looked up per-URL via
+    ``get_sync_credentials`` (so an extra on a different host than
+    the primary uses the right token).
+    """
+    from . import projects as _projects
+    from .store import get_sync_credentials
+    from dulwich import porcelain
+
+    langcode = _projects.find_langcode_by_working_dir(project_dir)
+    if not langcode:
+        return
+    p = _projects.get(langcode)
+    if p is None:
+        return
+    extras = list(p.extra_remotes or [])
+    if not extras:
+        return
+    try:
+        branch = porcelain.active_branch(repo).decode(
+            'utf-8', errors='replace')
+    except Exception:
+        branch = 'main'
+    refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
+
+    for extra_url in extras:
+        extra_url = (extra_url or '').strip()
+        if not extra_url:
+            continue
+        git_user, token = get_sync_credentials(extra_url)
+        if not token:
+            result.add(S.EXTRA_REMOTE_PUSH_FAILED,
+                       url=extra_url,
+                       error='no credentials configured for host')
+            continue
+        try:
+            with _socket_timeout(_PUSH_TIMEOUT_S):
+                porcelain.push(
+                    repo, extra_url, refspec,
+                    username=git_user, password=token,
+                    errstream=io.BytesIO(),
+                )
+            result.add(S.EXTRA_REMOTE_PUSHED,
+                       url=extra_url, branch=branch)
+            lift_merge.trace(
+                f'[sync-trace] extra-remote push done: {extra_url!r}')
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] extra-remote push failed: '
+                f'{extra_url!r}: {exc!r}')
+            result.add(S.EXTRA_REMOTE_PUSH_FAILED,
+                       url=extra_url,
+                       error=_format_push_error(exc))
 
 
 def _push_step_locked(repo, project_dir, username, token, remote_url, result):

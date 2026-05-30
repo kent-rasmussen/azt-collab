@@ -53,9 +53,23 @@ _STATE = {
     'browse': None,            # listener / discovery handle
     'zc': None,                # python-zeroconf Zeroconf instance
 }
-# peer_id_hex → (host, port). Mutated by the browse callback; read by
-# the scheduler's fan-out path.
+# peer_id_hex → (host, port, last_seen_monotonic). Mutated by the
+# browse callback; read by the scheduler's fan-out path. The
+# timestamp is a ``time.monotonic()`` value; entries older than
+# ``_ENDPOINT_TTL_S`` are treated as missing by ``get_endpoint``
+# so a peer that restarted on a new ephemeral port stops getting
+# hammered by the fan-out loop after the TTL elapses (was: cached
+# forever until manual LAN toggle flip OR the 3-failure
+# restart-browse threshold tripped). See audit finding #6.
 _endpoints = {}
+
+# Endpoint cache TTL. Sized for the field workflow: an mDNS
+# responder re-announces every 30-120 s under standard zeroconf
+# defaults, so 5 min covers ~5 announce cycles of headroom before
+# we'd treat an entry as stale. A peer that's gone offline (or
+# restarted on a new port) stops getting fan-out requests after
+# ~5 min; the next mDNS announce repopulates the entry.
+_ENDPOINT_TTL_S = 300.0
 
 
 def _detect_mode():
@@ -76,18 +90,33 @@ def _detect_mode():
 
 
 def get_endpoint(peer_id_hex):
-    """Return ``(host, port)`` last seen for *peer_id_hex* via mDNS,
-    or ``None``. Per-process in-memory cache; safe from any
-    thread."""
+    """Return ``(host, port)`` last seen for *peer_id_hex* via
+    mDNS, or ``None`` if not cached OR cached value is older than
+    ``_ENDPOINT_TTL_S`` (default 5 min). Per-process in-memory
+    cache; safe from any thread."""
+    import time
     with _LOCK:
-        return _endpoints.get(peer_id_hex)
+        entry = _endpoints.get(peer_id_hex)
+        if entry is None:
+            return None
+        host, port, last_seen = entry
+        if time.monotonic() - last_seen > _ENDPOINT_TTL_S:
+            # Expired — drop so the next call doesn't repay this
+            # comparison cost on every iteration.
+            del _endpoints[peer_id_hex]
+            return None
+        return (host, port)
 
 
 def known_endpoints():
-    """Return a copy of the full ``peer_id → (host, port)`` map.
-    For diagnostics + the scheduler's fan-out planner."""
+    """Return a copy of the (non-expired) ``peer_id → (host, port)``
+    map. For diagnostics + the scheduler's fan-out planner."""
+    import time
+    now = time.monotonic()
     with _LOCK:
-        return dict(_endpoints)
+        return {pid: (h, p)
+                for pid, (h, p, ts) in _endpoints.items()
+                if now - ts <= _ENDPOINT_TTL_S}
 
 
 def invalidate_endpoint(peer_id_hex):
@@ -208,8 +237,10 @@ def _zc_listener_class():
                     continue
             if not host:
                 return
+            import time as _time
             with _LOCK:
-                _endpoints[peer_id] = (host, int(info.port))
+                _endpoints[peer_id] = (host, int(info.port),
+                                       _time.monotonic())
             print(f'[lan-discovery] add {peer_id[:8]!r} → '
                   f'{host}:{info.port}',
                   file=sys.stderr, flush=True)
@@ -354,8 +385,10 @@ def _build_resolve_listener_class():
                     return
                 host = serviceInfo.getHost().getHostAddress()
                 port = int(serviceInfo.getPort())
+                import time as _time
                 with _LOCK:
-                    _endpoints[peer_id] = (host, port)
+                    _endpoints[peer_id] = (host, port,
+                                           _time.monotonic())
                 print(f'[lan-discovery] nsd resolved '
                       f'{peer_id[:8]!r} → {host}:{port}',
                       file=sys.stderr, flush=True)
