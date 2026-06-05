@@ -232,15 +232,16 @@ def reconcile_on_startup():
         _jobs.clear()
         _jobs.update(loaded)
         _persist_locked()
-    # WAN backoff: clear ``next_attempt_at`` for all projects so the
-    # restart counts as a free immediate retry. ``consecutive_failures``
-    # is preserved — if the first post-restart attempt also fails, the
-    # curve re-enters at the same step rather than starting fresh.
-    try:
-        wan_backoff.reset_due_times_on_startup()
-    except Exception as ex:
-        print(f'[scheduler] wan_backoff.reset_due_times_on_startup '
-              f'failed: {ex!r}', file=sys.stderr, flush=True)
+    # WAN backoff: do NOT clear ``next_attempt_at`` on startup
+    # (0.50.45). Previously the restart counted as a free immediate
+    # retry on the theory that "user-initiated restart" was an
+    # intent-equivalent signal. In practice on Android the daemon
+    # respawns frequently for reasons unrelated to user intent
+    # (OOM, sticky-service restart, APK self-update), and each one
+    # gave a free WAN attempt — undermining the 24h cap the curve
+    # was designed for. Only Sync (user-equivalent nudge via
+    # ``wan_backoff.nudge``) and actual success now reset the
+    # curve. Daemon lifecycle does not.
     # Eager-init the per-device peer_id (0.50.9). Pre-0.50.9
     # ``peer_id.ensure()`` only ran when LAN sync was enabled or
     # the QR generator opened — so on builds that never enabled
@@ -499,16 +500,50 @@ def _run_commit(langcode):
         # burst so paired peers' parallel bursts can rendezvous
         # with us during the window. ``start_burst`` is cheap when
         # the LAN is already up.
+        #
+        # Backoff (0.50.45): only fire the burst when the per-
+        # project counter hits a power of two. ``record_commit``
+        # increments + persists + returns the new count. The
+        # counter resets on actual LAN delivery (see below). A
+        # lone worker still attempts ``fan_out`` (cheap, no-ops
+        # if nobody's reachable) but the radio-wakening burst is
+        # rare. The Sync button always bursts (separate path via
+        # ``lan_backoff.nudge``); online-edge and lifecycle
+        # bursts (0.50.45) also bypass this gate because they
+        # reflect intent, not routine activity.
         try:
+            from . import lan_backoff as _lan_backoff
             from . import lan_burst as _lan_burst
-            _lan_burst.start_burst()
+            n = _lan_backoff.record_commit(langcode)
+            if _lan_backoff._is_power_of_two(n):
+                _lan_burst.start_burst()
+                print(f'[commit] {langcode!r} burst fired '
+                      f'(commits_since_lan_success={n}, '
+                      f'power-of-two)',
+                      file=sys.stderr, flush=True)
+            else:
+                print(f'[commit] {langcode!r} burst skipped '
+                      f'(commits_since_lan_success={n}, '
+                      f'not power-of-two)',
+                      file=sys.stderr, flush=True)
         except Exception as ex:
             print(f'[commit] {langcode!r} post-commit burst '
                   f'raised: {ex!r}',
                   file=sys.stderr, flush=True)
         try:
             from . import lan_push as _lan_push
-            _lan_push.fan_out(p)
+            results = _lan_push.fan_out(p)
+            # If ANY peer received the push, the backoff curve
+            # has done its job — reset. Per-project; other
+            # projects' curves are untouched.
+            if results and any(results.values()):
+                try:
+                    from . import lan_backoff as _lan_backoff
+                    _lan_backoff.record_success(langcode)
+                except Exception as ex_b:
+                    print(f'[commit] {langcode!r} lan_backoff '
+                          f'record_success raised: {ex_b!r}',
+                          file=sys.stderr, flush=True)
         except Exception as ex:
             print(f'[commit] {langcode!r} post-commit LAN fan-out '
                   f'raised: {ex!r}',

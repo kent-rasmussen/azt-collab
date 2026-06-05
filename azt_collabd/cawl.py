@@ -579,6 +579,29 @@ def auto_prefetch(repo):
     paths_wan = _index_image_paths(repo)
     if not paths_wan:
         return
+    # Warm-cache short-circuit (0.50.44). Pre-fix, every throttle
+    # window past, ``start_prefetch`` spawned a fresh worker that
+    # re-walked the entire image index from the on-disk cache —
+    # hundreds of per-path lookups burning CPU on data we already
+    # had. ``cache_status`` is a cheap (memoised) ``os.walk`` plus
+    # index count; if the on-disk count covers the index, the
+    # worker has nothing to do, so skip the whole spawn.
+    #
+    # The semantics of "fully warm" here are deliberately the WAN
+    # index (``paths_wan``), not ``_index_image_paths_all`` — the
+    # LAN extras are opportunistic bonuses that don't gate the
+    # warm-check. A peer policy of ``prefetch_all_variants=False``
+    # would otherwise be considered "never warm" forever.
+    try:
+        status = cache_status(repo)
+        cached = int(status.get('cached', 0) or 0)
+        total = int(status.get('total', 0) or 0)
+        if total > 0 and cached >= total:
+            return
+    except Exception:
+        # Defensive: if cache_status raises we'd rather start a
+        # worker than silently lose prefetch behaviour entirely.
+        pass
     # LAN extras = the variants the WAN-policy filter dropped.
     # When ``cawl.prefetch_all_variants=True`` (everything is
     # WAN-eligible) this set is empty and we skip the second

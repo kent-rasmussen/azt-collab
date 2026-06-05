@@ -21,10 +21,16 @@ langcode::
       "next_attempt_at": 1748538000.0
     }
 
-Daemon startup is treated as a free immediate retry —
-``reset_due_times_on_startup`` clears every ``next_attempt_at``
-without touching ``consecutive_failures`` so a quick re-failure
-re-enters the curve at the right step.
+Daemon lifecycle is **not** an intent signal (0.50.45): a
+respawn does not reset, clear, or shorten the curve.
+``reset_due_times_on_startup`` is retained as a no-op for
+historic / external-caller compatibility but the scheduler no
+longer calls it. Pre-0.50.45 the call gave every project a
+free immediate retry on startup; on Android the daemon respawns
+often enough (OOM, APK self-update, sticky-service restart)
+that the effective cap was the respawn cadence, not the
+documented 24 h. Now only ``record_success`` and ``nudge``
+clear / advance the curve.
 """
 
 from __future__ import annotations
@@ -156,18 +162,16 @@ def nudge(langcode: str) -> None:
 
 
 def reset_due_times_on_startup() -> None:
-    """Daemon startup: free immediate retry for every project that
-    had a deferred attempt. Preserves the failure count so an
-    instant re-failure re-enters the curve at the right point.
-    Idempotent; safe to call multiple times."""
-    state = _load()
-    changed = False
-    for entry in state.values():
-        if entry.get('next_attempt_at'):
-            entry['next_attempt_at'] = 0.0
-            changed = True
-    if changed:
-        _save(state)
+    """Deprecated no-op since 0.50.45. Pre-0.50.45 this cleared
+    every project's ``next_attempt_at`` so a daemon respawn gave
+    a free immediate retry. The scheduler no longer calls it
+    because frequent Android respawns (OOM, APK self-update,
+    sticky-service restart) made the 24 h cap effectively
+    unreachable. Retained as a no-op so any external caller
+    importing the name doesn't break at import time. Use
+    ``nudge(langcode)`` for user-intent resets; ``record_success``
+    handles natural curve resets."""
+    return
 
 
 def snapshot() -> dict:

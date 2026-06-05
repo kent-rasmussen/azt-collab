@@ -561,7 +561,16 @@ class PickerApp(App):
         """Refresh the active screen when the Activity returns to the
         foreground. Cheap call into ``refresh()`` so any state that
         changed elsewhere (project switched via another Activity,
-        credentials updated, etc.) shows up immediately."""
+        credentials updated, etc.) shows up immediately.
+
+        Also fires ``lan_burst_now`` (0.50.45) so a paired peer in
+        the room gets a chance to be discovered without waiting for
+        the user to commit. The burst is a no-op increment when
+        LAN autodiscovery is already on; when it's off (default)
+        this brings the listener + mDNS up for 30s. Lifecycle
+        gesture: "user just opened the app, they're here, the
+        room should know."
+        """
         try:
             current = self.sm.current_screen
         except Exception:
@@ -573,6 +582,15 @@ class PickerApp(App):
             except Exception as ex:
                 print(f'[picker_app] on_resume refresh failed: {ex}',
                       file=sys.stderr, flush=True)
+        # Lifecycle LAN burst — best-effort, never raises (the
+        # wrapper translates transport failure into a typed
+        # Result).
+        try:
+            from azt_collab_client import lan_burst_now
+            lan_burst_now()
+        except Exception as ex:
+            print(f'[picker_app] on_resume lan_burst_now failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
 
     def on_start(self):
         """Once the app is running, watch ``$AZT_HOME/config.json`` so

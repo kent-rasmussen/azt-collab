@@ -205,6 +205,13 @@ LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+# Sender-side outcomes for the user-tap share gesture — see
+# azt_collabd/status.py for the per-code body.
+LAN_OFFER_DELIVERED = 'LAN_OFFER_DELIVERED'
+LAN_OFFER_NOT_DELIVERED = 'LAN_OFFER_NOT_DELIVERED'
+PROJECT_NOT_INITIALISED = 'PROJECT_NOT_INITIALISED'
+PROJECT_UNBORN = 'PROJECT_UNBORN'
+PEER_UNKNOWN = 'PEER_UNKNOWN'
 
 # Nearby-pair flow — see azt_collabd/status.py for the per-code
 # rationale. Sender's outbound request lives 5 min then times out;

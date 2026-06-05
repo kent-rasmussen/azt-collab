@@ -355,6 +355,50 @@ LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+# Sender-side outcomes for the user-tap "Share" / "Offer share
+# again" gesture, added in 0.50.43 so the UI can show meaningful
+# feedback instead of always flashing a generic "Sent."
+#
+# LAN_OFFER_DELIVERED:   Daemon issued the courtesy POST and the
+#                        receiver returned 2xx. Params:
+#                        ``peer_id``, ``langcode``,
+#                        ``post_status`` (HTTPS code),
+#                        ``dispatch`` (receiver's per-state
+#                        classification: noop / no_url /
+#                        stashed_share / stashed_adopt_origin /
+#                        stashed_conflict; '' on pre-0.50.43
+#                        receiver). UI uses ``dispatch`` to pick
+#                        the flash text.
+# LAN_OFFER_NOT_DELIVERED: Daemon ran all local gates fine but
+#                        the POST didn't get a 2xx (peer's
+#                        listener unreachable / TLS handshake
+#                        refused / no endpoint resolvable).
+#                        Params: ``peer_id``, ``langcode``,
+#                        ``post_status``.
+# PROJECT_NOT_INITIALISED: The project has no working_dir or no
+#                        ``.git`` directory yet — typically a
+#                        freshly-registered project the user
+#                        hasn't recorded into. Params:
+#                        ``langcode``. Surfaced from
+#                        ``lan_share_project`` and reusable for
+#                        any future op that requires a git-backed
+#                        project.
+# PROJECT_UNBORN:        The repo exists but has no commits yet
+#                        (HEAD ref unresolvable). Same root cause
+#                        as PROJECT_NOT_INITIALISED from the
+#                        user's perspective ("record an entry
+#                        first"), but distinct because the
+#                        recovery / diagnostic path can differ.
+#                        Params: ``langcode``, ``detail`` (the
+#                        dulwich exception repr).
+# PEER_UNKNOWN:          The peer_id passed isn't in ``peers.json``.
+#                        Surfaced from per-peer ops. Params:
+#                        ``peer_id``.
+LAN_OFFER_DELIVERED = 'LAN_OFFER_DELIVERED'
+LAN_OFFER_NOT_DELIVERED = 'LAN_OFFER_NOT_DELIVERED'
+PROJECT_NOT_INITIALISED = 'PROJECT_NOT_INITIALISED'
+PROJECT_UNBORN = 'PROJECT_UNBORN'
+PEER_UNKNOWN = 'PEER_UNKNOWN'
 
 # Nearby-pair flow (request from an unpaired device discovered via
 # mDNS). The sender posts to the receiver's listener; the receiver

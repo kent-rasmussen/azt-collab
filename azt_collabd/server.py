@@ -564,8 +564,20 @@ def _h_lan_pair_accept(body):
 def _h_lan_unshare_project(body):
     """Remove a project from a paired peer's outbound share list.
     Inverse of ``_h_lan_send_share_offer`` (which is the share-WITH-
-    notification path the client wrapper actually drives). Body /
-    response shapes match the inverse pattern."""
+    notification path the client wrapper actually drives).
+
+    Symmetric since 0.50.44: after the local allowlist removal,
+    fires a best-effort ``send_share_unshared`` courtesy POST to
+    the peer so they can drop *us* from *their* allowlist for the
+    same langcode. Without this, the peer keeps auto-fanning-out
+    to us on every commit even after we've unshared, and our
+    listener no-ops the offer with a logged "carries no repo_url"
+    line (visible asymmetry, the user's mental model is "we are
+    no longer talking about this project"). Best-effort: failure
+    to reach the peer doesn't roll back the local removal.
+
+    Body / response shapes match the inverse pattern.
+    """
     langcode = str((body or {}).get('langcode', '') or '')
     peer_id = str((body or {}).get('peer_id', '') or '')
     if not langcode or not peer_id:
@@ -575,6 +587,14 @@ def _h_lan_unshare_project(body):
     if entry is None:
         return 200, {"ok": False, "error": "peer_unknown",
                      "detail": f"peer_id {peer_id[:8]!r} not paired"}
+    # Best-effort: tell the peer so they mirror the unshare.
+    try:
+        from . import lan_push as _lan_push
+        _lan_push.send_share_unshared(peer_id, langcode)
+    except Exception as ex:
+        print(f'[server] send_share_unshared peer={peer_id[:8]!r} '
+              f'lang={langcode!r} raised: {ex!r}',
+              file=sys.stderr, flush=True)
     return 200, {"ok": True, "peer": entry}
 
 
@@ -1146,13 +1166,27 @@ def _h_lan_send_share_offer(body):
             vernlang = proj.effective_vernlang()
     except Exception:
         pass
+    post_status = 0
+    dispatch = ''
     try:
-        _lan_push.send_share_offer(peer_id, langcode, repo_url,
-                                   vernlang=vernlang)
+        post_status, dispatch = _lan_push.send_share_offer(
+            peer_id, langcode, repo_url, vernlang=vernlang)
     except Exception as ex:
         print(f'[server] send_share_offer raised: {ex!r}',
               file=sys.stderr, flush=True)
-    return 200, {"ok": True, "peer": entry}
+    # Sender-side success line (0.50.43): previously the daemon
+    # was silent on this path, so the user had no way to confirm
+    # from logs whether the courtesy POST actually fired. Print
+    # one line per call regardless of outcome — peer_id prefix,
+    # langcode, HTTPS status (0 on transport failure), receiver
+    # dispatch (or '' if pre-0.50.43 receiver / unreachable).
+    print(f'[server] send_share_offer peer={peer_id[:8]!r} '
+          f'lang={langcode!r} post_status={post_status} '
+          f'dispatch={dispatch!r}',
+          file=sys.stderr, flush=True)
+    return 200, {"ok": True, "peer": entry,
+                 "post_status": int(post_status or 0),
+                 "dispatch": str(dispatch or '')}
 
 
 def _h_lan_set_static_endpoints(body):
@@ -1282,12 +1316,31 @@ def _h_sync_nudge(body):
     except Exception as ex:
         print(f'[sync_nudge] start_burst raised: {ex!r}',
               file=sys.stderr, flush=True)
+    # Sync = user-equivalent intent. Force the LAN backoff curve
+    # eligible for the project(s) involved so the next post-commit
+    # bursts also fire (not just this one). Idempotent.
+    try:
+        from . import lan_backoff as _lan_backoff
+        if langcode:
+            _lan_backoff.nudge(langcode)
+        else:
+            for lang in projects._load_raw():
+                _lan_backoff.nudge(lang)
+    except Exception as ex:
+        print(f'[sync_nudge] lan_backoff.nudge raised: {ex!r}',
+              file=sys.stderr, flush=True)
     try:
         if langcode:
             p = projects.get(langcode)
             if p is not None:
                 from . import lan_push as _lan_push
-                _lan_push.fan_out(p)
+                results = _lan_push.fan_out(p)
+                if results and any(results.values()):
+                    try:
+                        from . import lan_backoff as _lan_backoff
+                        _lan_backoff.record_success(langcode)
+                    except Exception:
+                        pass
         else:
             data = projects._load_raw()
             for lang in data:
@@ -1295,13 +1348,49 @@ def _h_sync_nudge(body):
                 if p is not None:
                     try:
                         from . import lan_push as _lan_push
-                        _lan_push.fan_out(p)
+                        results = _lan_push.fan_out(p)
+                        if results and any(results.values()):
+                            try:
+                                from . import lan_backoff as \
+                                    _lan_backoff
+                                _lan_backoff.record_success(lang)
+                            except Exception:
+                                pass
                     except Exception as ex:
                         print(f'[sync_nudge] LAN fan-out '
                               f'{lang!r} raised: {ex!r}',
                               file=sys.stderr, flush=True)
     except Exception as ex:
         print(f'[sync_nudge] LAN dispatch raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
+
+
+def _h_lan_burst(_body):
+    """``POST /v1/lan/burst`` — bring the LAN radio up for a 30s
+    discovery burst without firing WAN drain or fan-out. The peer
+    calls this on lifecycle events ("user opened the picker",
+    "Activity onResume") to give the daemon a chance to find
+    paired peers in the room when the daemon isn't already
+    bursting.
+
+    Distinct from ``/v1/sync/nudge`` which also drains WAN +
+    fans out for every project — this is the lightweight
+    "just listen for a minute" gesture.
+
+    Sweep on arrival (via the discovery transition detector,
+    0.50.45) handles the "now that I see B, push them anything
+    they're behind on" half. So burst → mDNS finds peers →
+    arrival callback → sweep → catch-up. No periodic anything.
+
+    Always returns ``{ok: True}`` — radio-up is a request, not a
+    delivery confirmation.
+    """
+    try:
+        from . import lan_burst as _lan_burst
+        _lan_burst.start_burst()
+    except Exception as ex:
+        print(f'[lan_burst] start_burst raised: {ex!r}',
               file=sys.stderr, flush=True)
     return 200, {"ok": True}
 
@@ -3689,6 +3778,8 @@ def dispatch(method, path, body):
             return _h_lan_unpair(body)
         if path == '/v1/lan/toggle':
             return _h_lan_set_toggle(body)
+        if path == '/v1/lan/burst':
+            return _h_lan_burst(body)
         if path == '/v1/lan/static_endpoints':
             return _h_lan_set_static_endpoints(body)
         if path == '/v1/lan/clone':

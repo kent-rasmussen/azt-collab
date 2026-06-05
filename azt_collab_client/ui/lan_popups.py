@@ -39,7 +39,9 @@ import sys
 import threading
 
 from kivy.clock import Clock
+from kivy.core.window import Window
 from kivy.metrics import dp, sp
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from .themed_popup import ThemedButton as Button
 from kivy.uix.image import Image
@@ -608,43 +610,114 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                                'other phone.'))
 
 
-def _build_peer_row(peer, on_manage, on_unpair, font_name):
-    """One row in the paired-peers list. Per-row Unpair surfaced
-    directly alongside Manage (0.45.37) so users can clean up
-    stale paired-peer entries (e.g., after the peer wiped + re-
-    paired and got a new ``peer_id``) without first drilling
-    into Manage."""
+class _TapBox(ButtonBehavior, BoxLayout):
+    """BoxLayout that fires ``on_release`` on tap. Used as the
+    composite tap target in the share popup so the whole "Shared
+    / Offer share again" column registers a re-offer no matter
+    where the finger lands. Kivy's ``ButtonBehavior`` is a mixin
+    that adds tap semantics to any widget."""
+    pass
+
+
+def _section_header(text, font_name):
+    """Bold accent-colour section header used by the LAN popups
+    ("This phone" / "Unpaired" / "Paired")."""
+    lbl = Label(
+        text=text, halign='left', valign='middle',
+        size_hint_y=None, height=dp(28), font_size=sp(13),
+        bold=True, color=theme.ACCENT, font_name=font_name)
+    lbl.bind(width=lambda w, *_: setattr(
+        w, 'text_size', (w.width, dp(28))))
+    return lbl
+
+
+def _build_full_row(*, name, peer_id='', endpoint='', projects='',
+                    buttons=None, right_widget=None,
+                    font_name='Roboto'):
+    """Wide row used in the paired-phones / share popups.
+
+    Four stacked labels in the left column: name (bold, falls back
+    to wrap only if it can't fit the popup's full width), full
+    peer_id, endpoint (``ip:port``), shared projects (wraps if
+    long). Right column is either the *buttons* list stacked
+    vertically (Manage/Unpair, Pair, …), or — when the caller
+    needs more than buttons (e.g. a "Shared" label + "Offer share
+    again" link) — a pre-built composite widget supplied as
+    *right_widget*. ``buttons=None`` and ``right_widget=None``
+    together produce an info-only row (the "This phone" header
+    row uses this)."""
     row = BoxLayout(orientation='horizontal', size_hint_y=None,
-                    height=dp(56), spacing=dp(6), padding=dp(4))
-    label_box = BoxLayout(orientation='vertical')
-    name = peer.get('device_name') or _tr('Unnamed device')
-    label_box.add_widget(Label(
-        text=name, halign='left', valign='middle',
-        size_hint_y=None, height=dp(28),
-        font_size=sp(13), bold=True, font_name=font_name,
-        text_size=(dp(190), dp(28))))
-    pid = peer.get('peer_id', '')
-    shared = ', '.join(peer.get('shared_projects') or []) or \
-        _tr('(no projects shared)')
-    label_box.add_widget(Label(
-        text=f'{pid[:8]}… · {shared}',
-        halign='left', valign='middle',
-        size_hint_y=None, height=dp(22),
-        font_size=sp(10), color=theme.TEXT_DIM,
-        text_size=(dp(190), dp(22)),
-        font_name=font_name))
-    row.add_widget(label_box)
-    manage_btn = Button(text=_tr('Manage'), size_hint=(None, None),
-                        width=dp(76), height=dp(40),
-                        font_size=sp(12), font_name=font_name)
-    manage_btn.bind(on_release=lambda *_: on_manage(peer))
-    row.add_widget(manage_btn)
-    unpair_btn = Button(text=_tr('Unpair'), size_hint=(None, None),
-                        width=dp(76), height=dp(40),
-                        font_size=sp(12), font_name=font_name)
-    unpair_btn.bind(on_release=lambda *_: on_unpair(peer))
-    row.add_widget(unpair_btn)
+                    spacing=dp(8), padding=(dp(4), dp(4)))
+
+    info = BoxLayout(orientation='vertical', size_hint_y=None,
+                     spacing=dp(2))
+    info.bind(minimum_height=info.setter('height'))
+
+    def _add(text, *, bold=False, size=sp(10),
+             color=None, min_height=dp(18)):
+        lbl = Label(
+            text=text or '—',
+            halign='left', valign='top',
+            size_hint_y=None, font_size=size, bold=bold,
+            font_name=font_name)
+        if color is not None:
+            lbl.color = color
+        lbl.bind(width=lambda w, *_: setattr(
+            w, 'text_size', (w.width, None)))
+        lbl.bind(texture_size=lambda w, ts: setattr(
+            w, 'height', max(min_height, ts[1])))
+        info.add_widget(lbl)
+        return lbl
+
+    _add(name or _tr('Unnamed device'),
+         bold=True, size=sp(14), min_height=dp(24))
+    _add(peer_id, color=theme.TEXT_DIM)
+    _add(endpoint, color=theme.TEXT_DIM)
+    _add(projects, color=theme.TEXT_DIM)
+
+    row.add_widget(info)
+
+    if right_widget is not None:
+        # Caller-owned composite. We just add it; the caller is
+        # responsible for its size_hint / width.
+        row.add_widget(right_widget)
+    elif buttons:
+        # Right column: size_hint=(None, 1) so it stretches to the
+        # info column's height; buttons stack from the top.
+        btn_col = BoxLayout(orientation='vertical',
+                            size_hint=(None, 1),
+                            width=dp(100), spacing=dp(4),
+                            padding=(0, dp(4)))
+        for b in buttons:
+            btn_col.add_widget(b)
+        # Filler so buttons don't stretch to fill the column.
+        btn_col.add_widget(BoxLayout())
+        row.add_widget(btn_col)
+
+    def _resize(*_):
+        right_h = 0
+        if right_widget is not None:
+            right_h = getattr(right_widget, 'height', 0) or 0
+        row.height = max(info.height + dp(8),
+                         right_h + dp(8), dp(56))
+    info.bind(height=_resize)
+    if right_widget is not None:
+        try:
+            right_widget.bind(height=_resize)
+        except Exception:
+            pass
+    _resize()
     return row
+
+
+def _peer_endpoint_str(peer):
+    """Best-effort 'ip:port' string for a paired-peer entry: prefer
+    the most recently observed live endpoint, fall back to manually-
+    configured static endpoints, '' if neither set."""
+    eps = list(peer.get('endpoints') or [])
+    eps += [e for e in (peer.get('static_endpoints') or [])
+            if e not in eps]
+    return ', '.join(eps)
 
 
 def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
@@ -786,20 +859,33 @@ def paired_phones_popup(font_name='Roboto'):
     leak Clock callbacks after the user closes the screen.
     """
     from .. import (
-        lan_list_peers, lan_nearby_unpaired,
+        lan_list_peers, lan_nearby_unpaired, lan_peer_id,
+        lan_toggle, list_projects,
         lan_pair_request_send, lan_pair_request_status,
         translate_result, S,
     )
 
-    container = BoxLayout(orientation='vertical', spacing=dp(8),
-                          padding=dp(10))
-    container.add_widget(Label(
-        text=_tr('Nearby & paired devices'),
-        size_hint_y=None, height=dp(28), font_size=sp(15),
-        bold=True, color=theme.ACCENT, font_name=font_name))
+    _container_padding = dp(10)
+    _container_spacing = dp(8)
+    _btn_row_h = dp(44)
+    # Chrome the popup adds around its content (title bar + borders);
+    # eyeballed from the ThemedPopup defaults. ``size_hint=(_, None)``
+    # plus an explicit ``height`` includes the title bar, so add it.
+    _popup_chrome = dp(60)
 
-    # Two list_boxes — one per section. Their headers are added
-    # by ``_refresh`` so they hide when their section is empty.
+    container = BoxLayout(orientation='vertical',
+                          spacing=_container_spacing,
+                          padding=_container_padding)
+
+    # Three sections — each is a vertical BoxLayout whose first
+    # child is the section header and whose remaining children are
+    # the rows (or a placeholder when empty). All three headers
+    # render unconditionally so the user can see at a glance which
+    # bucket is empty.
+    this_phone_box = BoxLayout(orientation='vertical',
+                               size_hint_y=None, spacing=dp(4))
+    this_phone_box.bind(
+        minimum_height=this_phone_box.setter('height'))
     nearby_box = BoxLayout(orientation='vertical', size_hint_y=None,
                            spacing=dp(4))
     nearby_box.bind(minimum_height=nearby_box.setter('height'))
@@ -808,16 +894,17 @@ def paired_phones_popup(font_name='Roboto'):
     paired_box.bind(minimum_height=paired_box.setter('height'))
 
     list_box = BoxLayout(orientation='vertical', size_hint_y=None,
-                         spacing=dp(8))
+                         spacing=dp(12))
     list_box.bind(minimum_height=list_box.setter('height'))
+    list_box.add_widget(this_phone_box)
     list_box.add_widget(nearby_box)
     list_box.add_widget(paired_box)
-    scroll = ScrollView()
+    scroll = ScrollView(size_hint_y=None)
     scroll.add_widget(list_box)
     container.add_widget(scroll)
 
     btn_row = BoxLayout(orientation='horizontal', spacing=dp(8),
-                        size_hint_y=None, height=dp(44))
+                        size_hint_y=None, height=_btn_row_h)
     refresh_btn = Button(
         text=_tr('Refresh'), size_hint_x=None, width=dp(120),
         font_size=sp(14), font_name=font_name)
@@ -827,9 +914,35 @@ def paired_phones_popup(font_name='Roboto'):
     btn_row.add_widget(close_btn)
     container.add_widget(btn_row)
 
+    # Shrink-to-fit (0.50.40): the previous ``size_hint=(0.95, 0.9)``
+    # parked the popup at 90% of screen height regardless of content,
+    # leaving most of the dialog empty when the user had only a
+    # paired phone or two. Now the popup sizes itself to content,
+    # capped at 90% of the screen so a long list still scrolls.
     popup = Popup(title=_tr('Nearby & paired devices'),
-                  content=container, size_hint=(0.95, 0.9),
+                  content=container, size_hint=(0.95, None),
                   auto_dismiss=False)
+
+    def _resize_to_content(*_args):
+        # Scroll content needs at least dp(80) to avoid degenerating
+        # into a stub. The three section headers + their
+        # placeholders mean ``list_box.height`` is never zero, but
+        # keep the floor as belt-and-braces.
+        scroll.height = max(list_box.height, dp(80))
+        # Body = list + buttons + inter-child spacing + top/bottom
+        # padding (no inner title widget — the popup chrome shows
+        # it once).
+        body = (scroll.height + _btn_row_h
+                + _container_spacing
+                + _container_padding * 2)
+        popup.height = min(body + _popup_chrome,
+                           Window.height * 0.9)
+
+    def _on_window_resize(*_a):
+        _resize_to_content()
+
+    list_box.bind(height=_resize_to_content)
+    Window.bind(height=_on_window_resize)
 
     # Per-peer Clock events tracking outbound pair-request polls.
     # Mapped by peer_id → Kivy event handle; cancelled on popup
@@ -890,40 +1003,20 @@ def paired_phones_popup(font_name='Roboto'):
         confirm_popup.open()
 
     def _build_nearby_row(entry):
-        """One row in the Nearby (unpaired) list: name/peer-id +
-        Pair button. The button mutates in place once tapped:
-        Pair → "Waiting…" while the poll runs."""
+        """One row in the Nearby (unpaired) list: name / full peer
+        id / endpoint, plus a Pair button. The button mutates in
+        place once tapped: Pair → "Waiting…" while the poll runs."""
         pid = entry.get('peer_id', '') or ''
         device_name = entry.get('device_name') or ''
         endpoint = entry.get('endpoint', '') or ''
-        row = BoxLayout(orientation='horizontal', size_hint_y=None,
-                        height=dp(56), spacing=dp(6), padding=dp(4))
-        label_box = BoxLayout(orientation='vertical')
         primary = device_name or (
             _tr('Device {id}…').format(id=pid[:8])
             if pid else _tr('Unnamed device'))
-        label_box.add_widget(Label(
-            text=primary, halign='left', valign='middle',
-            size_hint_y=None, height=dp(28),
-            font_size=sp(13), bold=True, font_name=font_name,
-            text_size=(dp(190), dp(28))))
-        # Subline: peer_id prefix + endpoint for diagnostic
-        # visibility — same shape as ``_build_peer_row`` keeps
-        # the two sections visually consistent.
-        label_box.add_widget(Label(
-            text=f'{pid[:8]}… · {endpoint}',
-            halign='left', valign='middle',
-            size_hint_y=None, height=dp(22),
-            font_size=sp(10), color=theme.TEXT_DIM,
-            text_size=(dp(190), dp(22)),
-            font_name=font_name))
-        row.add_widget(label_box)
 
         action_btn = Button(
             text=_tr('Pair'),
-            size_hint=(None, None), width=dp(120), height=dp(40),
+            size_hint=(None, None), width=dp(96), height=dp(40),
             font_size=sp(12), font_name=font_name)
-        row.add_widget(action_btn)
 
         def _set_waiting():
             action_btn.text = _tr('Waiting…')
@@ -985,57 +1078,108 @@ def paired_phones_popup(font_name='Roboto'):
             Clock.schedule_once(lambda _t: _set_pair(), 3.0)
 
         action_btn.bind(on_release=_on_pair)
-        return row
+        return _build_full_row(
+            name=primary, peer_id=pid, endpoint=endpoint,
+            projects='', buttons=[action_btn],
+            font_name=font_name)
+
+    def _placeholder(text):
+        """Single-line dim helper shown when a section is empty,
+        so the three section headers stay anchored even with no
+        peers to list."""
+        lbl = Label(
+            text=text, halign='left', valign='middle',
+            size_hint_y=None, height=dp(28),
+            font_size=sp(11), color=theme.TEXT_DIM,
+            font_name=font_name)
+        lbl.bind(width=lambda w, *_: setattr(
+            w, 'text_size', (w.width, dp(28))))
+        return lbl
 
     def _refresh():
         # Cancel any in-flight polls before we wipe the rows
         # holding their button refs.
         _cancel_all_polls()
+        this_phone_box.clear_widgets()
         nearby_box.clear_widgets()
         paired_box.clear_widgets()
 
         nearby = lan_nearby_unpaired() or []
         paired = lan_list_peers() or []
 
+        # --- This phone ----------------------------------------
+        # Same row format as the peers below so a third party in
+        # the room can read off name / uid / IP / projects without
+        # having to interpret a different layout for "us."
+        my_info = lan_peer_id() or {}
+        my_toggle = lan_toggle() or {}
+        my_projects = ', '.join(
+            p.langcode for p in (list_projects() or []))
+        this_phone_box.add_widget(_section_header(
+            _tr('This phone'), font_name))
+        this_phone_box.add_widget(_build_full_row(
+            name=my_info.get('device_name') or _tr('this device'),
+            peer_id=my_info.get('peer_id', '') or '',
+            endpoint=my_toggle.get('endpoint', '') or '',
+            projects=my_projects, buttons=None,
+            font_name=font_name))
+
+        # --- Unpaired (nearby) ---------------------------------
+        nearby_box.add_widget(_section_header(
+            _tr('Unpaired'), font_name))
         if nearby:
-            nearby_box.add_widget(Label(
-                text=_tr('Nearby (unpaired):'),
-                size_hint_y=None, height=dp(24),
-                font_size=sp(12), bold=True, halign='left',
-                valign='middle', font_name=font_name,
-                text_size=(dp(320), dp(24))))
             for entry in nearby:
                 nearby_box.add_widget(_build_nearby_row(entry))
+        else:
+            nearby_box.add_widget(_placeholder(
+                _tr('No nearby phones detected. Tap Refresh after a '
+                    'few seconds.')))
 
+        # --- Paired --------------------------------------------
+        paired_box.add_widget(_section_header(
+            _tr('Paired'), font_name))
         if paired:
-            paired_box.add_widget(Label(
-                text=_tr('Paired:'),
-                size_hint_y=None, height=dp(24),
-                font_size=sp(12), bold=True, halign='left',
-                valign='middle', font_name=font_name,
-                text_size=(dp(320), dp(24))))
             for peer in paired:
-                paired_box.add_widget(_build_peer_row(
-                    peer,
-                    lambda p=peer: _manage_peer_popup(
-                        p, on_refresh=_refresh,
-                        font_name=font_name),
-                    _confirm_unpair,
+                shared = ', '.join(
+                    peer.get('shared_projects') or []) or \
+                    _tr('(no projects shared)')
+                manage_btn = Button(
+                    text=_tr('Manage'),
+                    size_hint=(None, None),
+                    width=dp(96), height=dp(40),
+                    font_size=sp(12), font_name=font_name)
+                manage_btn.bind(
+                    on_release=lambda *_args, p=peer:
+                        _manage_peer_popup(
+                            p, on_refresh=_refresh,
+                            font_name=font_name))
+                unpair_btn = Button(
+                    text=_tr('Unpair'),
+                    size_hint=(None, None),
+                    width=dp(96), height=dp(40),
+                    font_size=sp(12), font_name=font_name)
+                unpair_btn.bind(
+                    on_release=lambda *_args, p=peer:
+                        _confirm_unpair(p))
+                paired_box.add_widget(_build_full_row(
+                    name=peer.get('device_name')
+                        or _tr('Unnamed device'),
+                    peer_id=peer.get('peer_id', '') or '',
+                    endpoint=_peer_endpoint_str(peer),
+                    projects=shared,
+                    buttons=[manage_btn, unpair_btn],
                     font_name=font_name))
-
-        if not nearby and not paired:
-            paired_box.add_widget(Label(
-                text=_tr('No nearby or paired devices yet. Tap '
-                         'Refresh after a few seconds, or use '
-                         '"Pair a phone" to scan another phone\'s '
-                         'QR.'),
-                size_hint_y=None, height=dp(80),
-                font_size=sp(12), color=theme.TEXT_DIM,
-                halign='center', valign='middle', font_name=font_name,
-                text_size=(dp(320), dp(80))))
+        else:
+            paired_box.add_widget(_placeholder(
+                _tr('No phones paired yet. Use "Pair a phone" to '
+                    'scan another phone\'s QR.')))
 
     def _on_close(*_):
         _cancel_all_polls()
+        try:
+            Window.unbind(height=_on_window_resize)
+        except Exception:
+            pass
         popup.dismiss()
 
     _refresh()
@@ -1058,7 +1202,10 @@ def share_project_popup(langcode='', font_name='Roboto'):
       3. Add permission by github username — folds in the existing
          ``grant_collaborator_popup`` for remote collaborators.
     """
-    from .. import lan_list_peers, lan_share_project
+    from .. import (
+        lan_list_peers, lan_share_project, list_projects,
+        translate_result, S,
+    )
     from .popups import grant_collaborator_popup
 
     # Auto-enable LAN BEFORE the QR is rendered. The QR payload's
@@ -1071,93 +1218,256 @@ def share_project_popup(langcode='', font_name='Roboto'):
     # makes sure the QR carries the real listener address.
     auto_enabled = _auto_enable_lan(font_name=font_name)
 
-    container = BoxLayout(orientation='vertical', spacing=dp(10),
-                          padding=dp(12))
-
     title_text = (_tr('Share [{langcode}] project').format(
                       langcode=langcode)
                   if langcode else _tr('Share project'))
-    container.add_widget(Label(
-        text=title_text,
-        size_hint_y=None, height=dp(28), font_size=sp(15),
-        bold=True, color=theme.ACCENT, font_name=font_name))
 
-    # --- Section 1: paired phones list (hidden if none) ---------
-    # Only renders when at least one paired phone exists; otherwise
-    # the QR section below is the natural next step and the empty
-    # paired-phones header would just be visual noise.
-    peers = lan_list_peers()
+    # Outer container: scrollable body + fixed Close button at the
+    # bottom. The body got bigger (this-phone row + larger QR) and
+    # would otherwise clip on shorter screens.
+    container = BoxLayout(orientation='vertical', spacing=dp(8),
+                          padding=dp(12))
+
+    body = BoxLayout(orientation='vertical', size_hint_y=None,
+                     spacing=dp(10))
+    body.bind(minimum_height=body.setter('height'))
+    body_scroll = ScrollView(size_hint=(1, 1))
+    body_scroll.add_widget(body)
+    container.add_widget(body_scroll)
+
+    # --- Section: This phone -----------------------------------
+    # Mirrors the layout used in paired_phones_popup so the user
+    # (and anyone in the room reading over their shoulder) sees
+    # name / uid / IP / projects in the same format for "us" as
+    # for "them."
+    from .. import lan_peer_id, lan_toggle
+    info = lan_peer_id() or {}
+    toggle = lan_toggle() or {}
+    my_projects = ', '.join(
+        p.langcode for p in (list_projects() or []))
+    body.add_widget(_section_header(
+        _tr('This phone'), font_name))
+    body.add_widget(_build_full_row(
+        name=info.get('device_name') or _tr('this device'),
+        peer_id=info.get('peer_id', '') or '',
+        endpoint=toggle.get('endpoint', '') or '',
+        projects=my_projects, buttons=None,
+        font_name=font_name))
+
+    # --- Section: Paired (with per-row share state) -----------
+    # Always render the header so the user can see whether there
+    # are any paired phones to share with; placeholder copy when
+    # empty.
+    #
+    # Two states for the right column:
+    #   - **not shared** — a "Share" button. Tap fires
+    #     ``lan_share_project`` and the column rerenders into the
+    #     shared state.
+    #   - **shared** — a tappable composite (whole column is the
+    #     target, not just a small link) reading "Shared" on top
+    #     with an "Offer share again" hint underneath. Tap re-
+    #     fires ``lan_share_project``. The flash text after a tap
+    #     is driven by the typed :class:`Result` the daemon
+    #     returns: "Already in sync." (receiver already had it),
+    #     "Sent — waiting…" (receiver got a new pending decision),
+    #     "Could not reach the other phone…" (POST didn't 2xx),
+    #     or one of the configuration-error messages
+    #     (PROJECT_UNBORN, LAN_TOGGLE_OFF, …).
+    #
+    # Dedup: each ``_TapBox`` tracks a per-row ``_in_flight`` flag
+    # plus a 3 s cool-down after the flash text shows. Repeated
+    # taps during the cool-down are absorbed — no second HTTPS
+    # POST. Prevents accidental double-fire (finger bounce) and
+    # spam-tapping when the link "doesn't seem to do anything."
+    _DEDUP_SECONDS = 3.0
+
+    def _render_share_unshared(p, col):
+        col.clear_widgets()
+        btn = Button(
+            text=_tr('Share'),
+            size_hint_y=None, height=dp(40),
+            font_size=sp(12), font_name=font_name,
+            background_color=(0.4, 0.4, 0.4, 1))
+
+        def _do_share(*_):
+            if not langcode:
+                return
+            pid = p.get('peer_id', '') or ''
+            if not pid:
+                return
+            lan_share_project(langcode, pid)
+            _render_share_shared(p, col)
+
+        btn.bind(on_release=_do_share)
+        col.add_widget(btn)
+
+    def _render_share_shared(p, col):
+        col.clear_widgets()
+
+        tap = _TapBox(orientation='vertical',
+                      size_hint_y=None, spacing=dp(2),
+                      padding=(dp(4), dp(6)))
+        tap.bind(minimum_height=tap.setter('height'))
+
+        # Top label — bold accent "Shared." Also reads as the
+        # main visual state, so visually distinct from a button.
+        top = Label(
+            text=_tr('Shared'),
+            size_hint_y=None, height=dp(26),
+            font_size=sp(13), bold=True,
+            color=theme.ACCENT, font_name=font_name,
+            halign='center', valign='middle')
+        top.bind(width=lambda w, *_: setattr(
+            w, 'text_size', (w.width, dp(26))))
+        tap.add_widget(top)
+
+        # Sub-line: the affordance text the user reads to know
+        # the column does something. Underlined via Kivy markup
+        # for a link-y feel; the actual hit area is the whole
+        # tap box, so finger placement is forgiving.
+        sub_default = ('[u]' + _tr('Tap to offer share again')
+                       + '[/u]')
+        sub = Label(
+            text=sub_default, markup=True,
+            size_hint_y=None, height=dp(22),
+            font_size=sp(10), color=theme.ACCENT,
+            font_name=font_name,
+            halign='center', valign='middle')
+        sub.bind(width=lambda w, *_: setattr(
+            w, 'text_size', (w.width, dp(22))))
+        tap.add_widget(sub)
+
+        state = {'in_flight': False, 'cooldown': False}
+
+        def _flash(message):
+            """Show *message* for the dedup window in place of the
+            sub-line; suppress further taps for the same window so
+            the user can't queue a second POST while reading the
+            outcome."""
+            state['cooldown'] = True
+            sub.text = message
+            sub.color = theme.TEXT_DIM
+
+            def _restore(_dt):
+                state['cooldown'] = False
+                sub.text = sub_default
+                sub.color = theme.ACCENT
+
+            Clock.schedule_once(_restore, _DEDUP_SECONDS)
+
+        def _reoffer(*_args):
+            if state['in_flight'] or state['cooldown']:
+                return
+            if not langcode:
+                return
+            pid = p.get('peer_id', '') or ''
+            if not pid:
+                return
+            state['in_flight'] = True
+
+            # The RPC is synchronous (waits on the HTTPS POST to
+            # the peer's listener — up to 5 s connect + 10 s
+            # read), so kick it onto a worker so the UI doesn't
+            # freeze for a slow peer. The result lands back on
+            # the main thread via Clock.
+            def _worker():
+                result = lan_share_project(langcode, pid)
+                Clock.schedule_once(
+                    lambda _t: _on_done(result), 0)
+
+            def _on_done(result):
+                state['in_flight'] = False
+                # Pick the most-relevant Status to translate.
+                # Order matters: prefer the typed daemon refusals
+                # (which mean "didn't even try") over the
+                # transport codes.
+                preference = (
+                    S.LAN_TOGGLE_OFF, S.CONTRIBUTOR_UNSET,
+                    S.PEER_UNKNOWN, S.PROJECT_NOT_INITIALISED,
+                    S.PROJECT_UNBORN,
+                    S.LAN_OFFER_NOT_DELIVERED,
+                    S.LAN_OFFER_DELIVERED,
+                    S.SERVER_ERROR, S.SERVER_UNAVAILABLE,
+                )
+                msg = ''
+                for code in preference:
+                    if result.has(code):
+                        # ``translate_result`` walks the whole
+                        # result; passing a single-status
+                        # narrow Result lets us pin the message
+                        # we want.
+                        from ..status import Result as _R
+                        for s in result.statuses:
+                            if s.code == code:
+                                msg = translate_result(_R(
+                                    statuses=[s])) or ''
+                                break
+                        if msg:
+                            break
+                if not msg:
+                    msg = _tr('Offer sent.')
+                _flash(msg)
+
+            threading.Thread(target=_worker, daemon=True,
+                             name='lan-share-reoffer').start()
+
+        tap.bind(on_release=_reoffer)
+        col.add_widget(tap)
+
+    peers = lan_list_peers() or []
+    body.add_widget(_section_header(_tr('Paired'), font_name))
     if peers:
-        container.add_widget(Label(
-            text=_tr('Share with a paired phone:'),
-            size_hint_y=None, height=dp(24),
-            font_size=sp(12), bold=True, font_name=font_name))
-        peers_box = BoxLayout(orientation='vertical',
-                              size_hint_y=None, spacing=dp(4))
-        peers_box.bind(minimum_height=peers_box.setter('height'))
-        peers_scroll = ScrollView(size_hint_y=None, height=dp(140))
-        peers_scroll.add_widget(peers_box)
         for peer in peers:
-            row = BoxLayout(orientation='horizontal',
-                            size_hint_y=None, height=dp(40),
-                            spacing=dp(8))
-            row.add_widget(Label(
-                text=peer.get('device_name') or _tr('Unnamed device'),
-                halign='left', valign='middle',
-                font_size=sp(12), font_name=font_name,
-                text_size=(dp(180), dp(36))))
-            shared = langcode and langcode in (
-                peer.get('shared_projects') or [])
-            btn = Button(
-                text=_tr('Shared') if shared else _tr('Share'),
-                size_hint=(None, None), width=dp(110), height=dp(36),
-                font_size=sp(12), font_name=font_name,
-                background_color=(theme.ACCENT if shared
-                                  else (0.4, 0.4, 0.4, 1)))
-
-            def _share(_btn, p=peer):
-                if not langcode:
-                    return
-                pid = p.get('peer_id', '')
-                if not pid:
-                    return
-                lan_share_project(langcode, pid)
-                _btn.text = _tr('Shared')
-                _btn.background_color = theme.ACCENT
-
-            btn.bind(on_release=_share)
-            row.add_widget(btn)
-            peers_box.add_widget(row)
-        container.add_widget(peers_scroll)
-
-    # --- Section 2: pairing QR (inline; no extra click) --------
-    # Separator only when section 1 actually rendered above —
-    # otherwise "or someone not yet paired" has nothing to be
-    # "or" against.
-    if peers:
-        container.add_widget(Label(
-            text=_tr('— or someone not yet paired —'),
-            size_hint_y=None, height=dp(24),
+            shared_list = peer.get('shared_projects') or []
+            is_shared = bool(langcode and langcode in shared_list)
+            right = BoxLayout(
+                orientation='vertical',
+                size_hint=(None, None),
+                width=dp(140), spacing=dp(4),
+                padding=(0, dp(4)))
+            right.bind(minimum_height=right.setter('height'))
+            if is_shared:
+                _render_share_shared(peer, right)
+            else:
+                _render_share_unshared(peer, right)
+            body.add_widget(_build_full_row(
+                name=peer.get('device_name')
+                    or _tr('Unnamed device'),
+                peer_id=peer.get('peer_id', '') or '',
+                endpoint=_peer_endpoint_str(peer),
+                projects=', '.join(shared_list)
+                         or _tr('(no projects shared)'),
+                right_widget=right, font_name=font_name))
+    else:
+        empty = Label(
+            text=_tr('No phones paired yet. Show the QR below to '
+                     'pair a phone now.'),
+            halign='left', valign='middle',
+            size_hint_y=None, height=dp(28),
             font_size=sp(11), color=theme.TEXT_DIM,
-            halign='center', valign='middle', font_name=font_name,
-            text_size=(dp(320), dp(24))))
-    from .. import lan_pair_qr, lan_peer_id, lan_toggle
-    info = lan_peer_id()
-    toggle = lan_toggle()
+            font_name=font_name)
+        empty.bind(width=lambda w, *_: setattr(
+            w, 'text_size', (w.width, dp(28))))
+        body.add_widget(empty)
+
+    # --- Section: Pair a new phone (inline QR) -----------------
+    from .. import lan_pair_qr
+    body.add_widget(_section_header(
+        _tr('Pair a new phone'), font_name))
     if not info.get('peer_id'):
         err = info.get('error', '') or _tr('unknown')
-        container.add_widget(Label(
+        body.add_widget(Label(
             text=_tr('LAN identity is not available on this device.'),
             size_hint_y=None, height=dp(28),
             font_size=sp(12), color=theme.TEXT_DIM,
             font_name=font_name))
-        container.add_widget(Label(
+        body.add_widget(Label(
             text=str(err), size_hint_y=None, height=dp(22),
             font_size=sp(10), color=theme.TEXT_DIM,
             font_name=font_name))
     else:
         if not toggle.get('on'):
-            container.add_widget(Label(
+            body.add_widget(Label(
                 text=_tr('Turn on local-network sharing in sync '
                          'settings so the other phone can connect '
                          'after scanning.'),
@@ -1168,19 +1478,23 @@ def share_project_popup(langcode='', font_name='Roboto'):
                 text_size=(dp(320), dp(40))))
         qr_payload = lan_pair_qr(langcode=langcode)
         if qr_payload:
+            # Bigger QR (0.50.41): scale 6 → 8 makes each module
+            # easier for a phone camera to lock on at arm's length;
+            # height 200 → 320 gives it real estate proportional to
+            # how often this is the actual share gesture.
             qr_widget, qr_err = _render_qr_widget(
-                qr_payload, scale=6, border=2)
+                qr_payload, scale=8, border=2)
             if qr_widget is not None:
                 qr_widget.size_hint_y = None
-                qr_widget.height = dp(200)
-                container.add_widget(qr_widget)
+                qr_widget.height = dp(320)
+                body.add_widget(qr_widget)
             else:
-                container.add_widget(Label(
+                body.add_widget(Label(
                     text=qr_err, size_hint_y=None, height=dp(28),
                     font_size=sp(11), color=theme.TEXT_DIM,
                     font_name=font_name))
             endpoint_text = qr_payload.get('endpoint', '')
-            container.add_widget(Label(
+            body.add_widget(Label(
                 text=(info.get('device_name')
                       or _tr('this device')) + ' · '
                      + info['peer_id'][:8] + '…'
@@ -1192,13 +1506,13 @@ def share_project_popup(langcode='', font_name='Roboto'):
                 font_name=font_name,
                 text_size=(dp(320), dp(22))))
         else:
-            container.add_widget(Label(
+            body.add_widget(Label(
                 text=_tr('Could not generate pairing QR.'),
                 size_hint_y=None, height=dp(28),
                 font_size=sp(11), color=theme.TEXT_DIM,
                 font_name=font_name))
 
-    # --- Section 3: add github collaborator ---------------------
+    # --- Section: add github collaborator ----------------------
     # Only shown when the project has a github remote — otherwise
     # the invite would NO_REMOTE-error on tap. A user with an
     # unpublished project should Publish first; the daemon settings
@@ -1216,12 +1530,8 @@ def share_project_popup(langcode='', font_name='Roboto'):
         except Exception:
             _project_has_remote = False
     if _project_has_remote:
-        container.add_widget(Label(
-            text=_tr('— Add permission by github username —'),
-            size_hint_y=None, height=dp(24),
-            font_size=sp(11), color=theme.TEXT_DIM,
-            halign='center', valign='middle', font_name=font_name,
-            text_size=(dp(320), dp(24))))
+        body.add_widget(_section_header(
+            _tr('Add permission by github username'), font_name))
         invite_btn = Button(
             text=_tr('Invite someone who isn\'t here'),
             size_hint_y=None, height=dp(44),
@@ -1229,7 +1539,7 @@ def share_project_popup(langcode='', font_name='Roboto'):
         invite_btn.bind(
             on_release=lambda *_: grant_collaborator_popup(
                 langcode, font_name=font_name))
-        container.add_widget(invite_btn)
+        body.add_widget(invite_btn)
 
     close_btn = Button(
         text=_tr('Close'), size_hint_y=None, height=dp(44),

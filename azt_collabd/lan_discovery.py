@@ -63,6 +63,39 @@ _STATE = {
 # restart-browse threshold tripped). See audit finding #6.
 _endpoints = {}
 
+
+def _fire_arrival(peer_id_hex):
+    """Spawn a worker thread that runs ``lan_push.sweep_peer`` for a
+    paired peer that just transitioned from absent → present in
+    mDNS. Lazy import to avoid an ``lan_push → lan_discovery →
+    lan_push`` cycle at module load (``lan_push`` already imports
+    this module for ``_resolve_endpoint``).
+
+    Best-effort: per-peer failures are isolated. ``sweep_peer``
+    walks every shared project with the peer and pushes only the
+    ones they're behind on (via ``_push_to_peer``'s pre-flight
+    ls-remote no-op short-circuit). For an in-sync peer this is
+    one ls-remote round-trip per shared project — cheap, and
+    discovers the "we should be talking" case for free.
+
+    Gated on the peer actually being in ``peers.json``: a non-
+    paired peer arriving on mDNS isn't a sweep target. Their
+    arrival shows up in the "Nearby (unpaired)" UI for the user
+    to act on; no auto-push without a prior pair gesture."""
+    def _worker():
+        try:
+            from . import peers as _peers
+            if _peers.get_peer(peer_id_hex) is None:
+                return
+            from . import lan_push as _lan_push
+            _lan_push.sweep_peer(peer_id_hex)
+        except Exception as ex:
+            print(f'[lan-discovery] arrival sweep '
+                  f'{peer_id_hex[:8]!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+    threading.Thread(target=_worker, daemon=True,
+                     name='lan-arrival-sweep').start()
+
 # Per-peer device_name cache. Populated by the discovery callbacks
 # when a peer's mDNS TXT carries the ``device_name`` field (since
 # 0.50.39 — older peers don't advertise it, so older entries
@@ -267,15 +300,31 @@ def _zc_listener_class():
             device_name = (props.get(b'device_name') or b'').decode(
                 'utf-8', 'ignore')
             import time as _time
+            now = _time.monotonic()
+            # Transition detection (0.50.45): the peer is
+            # "arriving" if there's no prior endpoint, the prior
+            # entry is past TTL, or the host/port changed (peer
+            # rebound to a new port — Wi-Fi flap or daemon
+            # respawn). On transition, fire ``_fire_arrival``
+            # which sweeps any shared projects the peer is
+            # behind on.
             with _LOCK:
-                _endpoints[peer_id] = (host, int(info.port),
-                                       _time.monotonic())
+                prev = _endpoints.get(peer_id)
+                is_arrival = (
+                    prev is None
+                    or (now - prev[2]) > _ENDPOINT_TTL_S
+                    or prev[0] != host
+                    or prev[1] != int(info.port))
+                _endpoints[peer_id] = (host, int(info.port), now)
                 if device_name:
                     _device_names[peer_id] = device_name
             print(f'[lan-discovery] add {peer_id[:8]!r} → '
                   f'{host}:{info.port}'
-                  + (f' name={device_name!r}' if device_name else ''),
+                  + (f' name={device_name!r}' if device_name else '')
+                  + (' [arrival]' if is_arrival else ''),
                   file=sys.stderr, flush=True)
+            if is_arrival:
+                _fire_arrival(peer_id)
 
         def _forget(self, name):
             # We don't carry a name→peer_id map; the next browse pass
@@ -427,16 +476,27 @@ def _build_resolve_listener_class():
                 port = int(serviceInfo.getPort())
                 device_name = _decode_nsd_attr(attrs, 'device_name')
                 import time as _time
+                now = _time.monotonic()
+                # Transition detection (0.50.45) — see the zeroconf
+                # ``_record`` for the rationale. Same shape on NSD.
                 with _LOCK:
-                    _endpoints[peer_id] = (host, port,
-                                           _time.monotonic())
+                    prev = _endpoints.get(peer_id)
+                    is_arrival = (
+                        prev is None
+                        or (now - prev[2]) > _ENDPOINT_TTL_S
+                        or prev[0] != host
+                        or prev[1] != port)
+                    _endpoints[peer_id] = (host, port, now)
                     if device_name:
                         _device_names[peer_id] = device_name
                 print(f'[lan-discovery] nsd resolved '
                       f'{peer_id[:8]!r} → {host}:{port}'
                       + (f' name={device_name!r}'
-                         if device_name else ''),
+                         if device_name else '')
+                      + (' [arrival]' if is_arrival else ''),
                       file=sys.stderr, flush=True)
+                if is_arrival:
+                    _fire_arrival(peer_id)
                 # Persist the freshly-resolved endpoint into the
                 # paired-peer record's ``static_endpoints``. Without
                 # this, ``static_endpoints`` stays frozen at

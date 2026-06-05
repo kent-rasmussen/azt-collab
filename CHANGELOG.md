@@ -9,6 +9,403 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.50.45 — LAN sync convergence: sweep, backoff, lifecycle bursts
+
+Six changes that close the "two phones on the same LAN don't always
+talk to each other" gap, while keeping the no-periodic-polling
+power model intact. See `CLAUDE.md` invariant #10 for the updated
+contract.
+
+### 1. `sweep_peer(peer_id, exclude_langcode='')` helper in `lan_push.py`
+
+Walks every shared project with a peer and pushes only the ones
+they're behind on (relies on `_push_to_peer`'s pre-flight
+ls-remote no-op short-circuit). Past work on projects that
+nobody has committed to recently catches up the next time
+*anyone* is in the room with each other.
+
+### 2. `fan_out` folds in a sweep tail
+
+After pushing the originating project to each peer, `fan_out`
+fires `sweep_peer(peer_id, exclude_langcode=this_project)` for
+that peer. The radio is already up and the TLS handshake is
+warm — pushing the OTHER shared projects in the same window is
+nearly free. "We're already talking to B; tell them about Y
+too."
+
+### 3. mDNS arrival detection → arrival sweep
+
+`lan_discovery._record` (zeroconf) and `onServiceResolved`
+(NsdManager) now compare the new endpoint against the cached
+one. A peer is "arriving" when:
+- no prior endpoint, OR
+- prior endpoint is past `_ENDPOINT_TTL_S` (5 min), OR
+- host/port changed (Wi-Fi flap, peer rebound to a new port).
+
+On arrival of a *paired* peer, `_fire_arrival` spawns a worker
+that runs `sweep_peer(peer_id)`. So when B walks into the room
+with A (or rejoins after a brief drop), A's mDNS notices, A
+sweeps every shared project with B, and B catches up. No
+explicit user gesture required, no periodic radio activity.
+
+### 4. Lifecycle burst triggers — `lan_burst_now()` + picker hook + listener-bind sweep
+
+New `POST /v1/lan/burst` endpoint (and client wrapper
+`lan_burst_now()`) that fires `start_burst()` without any WAN
+drain or fan-out. Lightweight "bring the radio up for 30s so
+mDNS can find someone" gesture. Picker's `on_resume` calls it
+so opening the app brings the room into sync without requiring
+a Sync tap. Peer apps SHOULD call it from their Activity.onResume
+hooks too (one-line addition, no wire format constraint).
+
+Daemon-side, `lan_listener.apply_toggle` fires a sweep of every
+paired peer after a fresh listener bind (worker thread, doesn't
+block the binder). So a daemon respawn followed by listener
+re-bind opportunistically catches up everyone reachable.
+
+### 5. `lan_backoff` — persisted commit-count curve
+
+New module `azt_collabd/lan_backoff.py` with state at
+`$AZT_HOME/lan_state.json`. Per-project counter of
+`commits_since_lan_success`. Post-commit burst fires only when
+the counter is a power of two: 1, 2, 4, 8, 16, 32, 64, …
+
+A lone worker doing 100 commits in a session gets 7 bursts (1,
+2, 4, 8, 16, 32, 64) instead of 100. Radio cost asymptotes
+toward zero. The counter resets on `record_success` (≥1 peer
+received the fan-out) or `nudge` (user pressed Sync). Daemon
+respawn does NOT reset — same rule as the WAN fix in (6).
+
+Sync, online-edge, and lifecycle bursts (item 4) bypass the
+gate. The backoff is specifically on the *routine post-commit
+burst*, not on intent-bearing or one-shot triggers.
+
+### 6. WAN backoff: drop `reset_due_times_on_startup` call
+
+Pre-0.50.45 every daemon respawn cleared every project's
+`next_attempt_at` to 0, giving a free WAN retry. On Android,
+respawn-frequency (OOM, sticky-service restart, APK update)
+was high enough that the 24h cap in the docstring was
+effectively unreachable — the curve was bounded by respawn
+cadence, not by the doubling math.
+
+Now: daemon lifecycle is not a reset signal. Only
+`record_success` (actual push succeeded) and `nudge` (user
+pressed Sync) clear the curve. `reset_due_times_on_startup`
+remains in the module as a no-op for any external caller, with
+an updated docstring.
+
+### Updated invariant in `CLAUDE.md`
+
+Note added to invariant #10: lifecycle events (daemon respawn,
+OOM, APK self-update) are not equivalent to user intent and
+do NOT reset backoff curves. Successful delivery and user-tap
+Sync are the only two paths that reset.
+
+## 0.50.44 — Symmetric unshare, CAWL warm-cache short-circuit, LAN-fanout doc
+
+### Symmetric unshare wire flow
+
+Unshare was asymmetric: phone A unsharing project X with phone B
+removed B from A's allowlist (so A's outbound fan-out skipped B
+going forward), but B's allowlist for A was untouched. B's
+subsequent commits still auto-fanned-out X to A, which A's
+listener then no-op'd with a logged
+`share-offer from … carries no repo_url; no-op (already have project)`
+line. Visible to the user as "we just keep talking about this
+project even though I told it to stop." Closed by 0.50.44:
+
+- New wire endpoint `POST /v1/lan/share_unshared` on every
+  listener — body-auth, body shape `{peer_id, fp, langcode}`.
+- New handler `_handle_share_unshared` in `lan_listener.py`
+  removes the *sender* from the local `shared_projects` allowlist
+  for `langcode`, idempotent.
+- New sender `send_share_unshared(peer_id, langcode)` in
+  `lan_push.py`.
+- `server._h_lan_unshare_project` now fires the courtesy POST
+  after the local allowlist removal. Best-effort — failure to
+  reach the peer doesn't roll back the local removal; the peer
+  catches up the next time their daemon is reachable (manually
+  re-unshare or accept the stale offer; for now no auto-retry).
+
+### CAWL auto_prefetch warm-cache short-circuit
+
+`auto_prefetch(repo)` now calls `cache_status(repo)` before
+spawning a worker. If `cached >= total > 0` (every WAN-policy
+path already on disk), it returns without starting the walk. Pre-
+fix the worker re-walked the entire image index every ~30 s
+(throttle window) even when nothing was missing — the user's
+daemon log showed a `[cawl] worker first bump …` line every
+30–40 s indefinitely. Now: zero worker activity when the cache
+is fully warm. The diagnostic line stays in for one more release
+so the user can confirm the spam is gone before deleting it
+(0.50.45 work).
+
+Note: the trigger (`_touch_project` calling `auto_prefetch` from
+every project-bound RPC) is unchanged — the warm-cache check
+absorbs the cost of frequent calls into a single cheap
+`cache_status` lookup, but the longer-term right answer is moving
+the trigger out of `_touch_project` and onto true project-load
+events. Parked behind verification of this short-circuit.
+
+### CLAUDE.md — LAN fan-out semantics
+
+Stale text in invariant #10 said "the watcher's drain loop fans
+out periodically." This stopped being true in the 0.50.x sync
+rebuild (`scheduler.drain_pushes stays WAN-only`). Updated to
+spell out the actual contract: LAN fan-out is per-commit, per-
+project, event-driven; missed deliveries don't retry; github is
+the convergence safety net; the peer's currently-loaded project
+is **not** a gate — only the per-peer `shared_projects`
+allowlist is. Forward-link to `sync.md` for the rationale.
+
+## 0.50.43 — Re-offer share has feedback, dedup, whole-column tap target, sender-side log
+
+The "Offer share again" affordance added in 0.50.42 had three
+testability problems:
+
+1. The sender daemon was silent on the happy path — only the
+   receiver's daemon log showed anything. With the daemon-log
+   toggle running, the user had no way to confirm from their own
+   logs that the courtesy POST had even left the device.
+2. Tapping the small "Offer share again" link required precise
+   finger placement; if a tap missed the link's hit box, nothing
+   visible happened (the "Shared" label above it was inert), so
+   users repeatedly stabbed at the area.
+3. Rapid double-taps fired two HTTPS POSTs back-to-back.
+
+### Daemon log line (sender-side)
+
+`_h_lan_send_share_offer` now prints one line per call, success
+or fail:
+
+```
+[server] send_share_offer peer='abcd1234' lang='baf' \
+    post_status=200 dispatch='noop'
+```
+
+`post_status` is the HTTPS code the receiver returned (`0` on
+transport failure). `dispatch` is the receiver's per-state
+classification (see next section), `''` when the receiver is
+pre-0.50.43 or the call didn't reach them.
+
+### Receiver dispatch field (additive wire-format change)
+
+`_handle_share_offer` in `lan_listener.py` was returning a bare
+`{ok: True}` regardless of what it did with the payload. Now it
+returns `{ok: True, dispatch: <state>}` with one of:
+
+- `noop` — receiver already has the project at the same
+  `remote_url` — no pending decision stashed.
+- `no_url` — receiver already has the project; sender carried no
+  `remote_url` so there's nothing to learn.
+- `stashed_share` — receiver didn't have the project at all;
+  clone-offer stashed as a pending decision.
+- `stashed_adopt_origin` — receiver had the project but no
+  `remote_url`; URL-adopt prompt stashed.
+- `stashed_conflict` — both sides had a `remote_url` and they
+  differ; URL-conflict prompt stashed.
+
+Additive — old senders ignore the field; new senders treat a 2xx
+without `dispatch` as "delivered, outcome unknown."
+
+`lan_push.send_share_offer` now returns `(status, dispatch)`
+instead of `bool` so the server handler can put both into the
+client-facing RPC response.
+
+### Typed `Result` from `lan_share_project`
+
+Wrapper used to return the updated peer dict on success, `{}` on
+failure — errors silent, no way for the UI to show why. Now
+returns a `Result` carrying one of:
+
+- `LAN_OFFER_DELIVERED` with `dispatch` + `post_status` — picks
+  the per-dispatch flash text from `translate.py`:
+  - `noop` → "Already in sync."
+  - `no_url` → "Other phone already has this project."
+  - `stashed_share` → "Sent — waiting for the other phone to
+    accept."
+  - `stashed_adopt_origin` → "Sent — other phone will be asked
+    to adopt the GitHub URL."
+  - `stashed_conflict` → "Sent — other phone has a different
+    GitHub URL."
+- `LAN_OFFER_NOT_DELIVERED` with `post_status` — "Could not
+  reach the other phone."
+- `LAN_TOGGLE_OFF`, `CONTRIBUTOR_UNSET`, `PROJECT_NOT_INITIALISED`,
+  `PROJECT_UNBORN`, `PEER_UNKNOWN`, `SERVER_ERROR` —
+  gate-failure messages with corrective guidance.
+
+New constants mirrored in both `azt_collabd/status.py` and
+`azt_collab_client/status.py`: `LAN_OFFER_DELIVERED`,
+`LAN_OFFER_NOT_DELIVERED`, `PROJECT_NOT_INITIALISED`,
+`PROJECT_UNBORN`, `PEER_UNKNOWN`. Translations live in
+`azt_collab_client/translate.py`; `_dispatch_msg` helper picks
+the per-dispatch text for `LAN_OFFER_DELIVERED`.
+
+### Whole-column tap target (`_TapBox`)
+
+The two-Label right column in the "shared" state is now a single
+`_TapBox` (a `ButtonBehavior + BoxLayout` mixin) so tapping
+anywhere in the column registers as a re-offer. Visual layout is
+unchanged — bold "Shared" on top, smaller underlined "Tap to
+offer share again" hint below — but the hit area is the whole
+column instead of just the link text. Right-column width bumped
+to `dp(140)` to fit the longer dispatch flash messages without
+truncation.
+
+### Client-side debounce
+
+Each row tracks `in_flight` (a tap is being processed; the
+synchronous HTTPS POST takes up to 15 s in the worst case) and
+`cooldown` (3 s after the flash text appears). Taps during
+either window are absorbed without making a second RPC. The
+synchronous `lan_share_project` call now happens on a worker
+thread so a slow peer doesn't freeze the UI; the result comes
+back via `Clock.schedule_once`.
+
+## 0.50.42 — Share-row "Shared" state is now a label + re-offer link, not a button
+
+User report on the new share_project_popup paired rows: the toggle
+button reading "Shared" suggested a tappable affordance that didn't
+do anything visible (tap re-fires ``lan_share_project``, which is a
+no-op on the daemon allowlist and silently re-POSTs the courtesy
+offer). Two-state semantics now match the actual behaviour:
+
+- **Not shared yet** — a `Share` button. Tap fires
+  ``lan_share_project`` and the column rerenders into the shared
+  state.
+- **Already shared** — a static `Shared` label (no border, accent
+  colour) with an `Offer share again` link beneath it (rendered as
+  a Kivy Label with `[ref][u]…[/u][/ref]` markup so it reads as a
+  link, not a button). Tapping the link re-fires
+  ``lan_share_project``, which on the daemon side re-POSTs the
+  courtesy offer to the peer's listener (useful when the first
+  offer was missed because the peer's listener wasn't up yet).
+  Brief `Sent` confirmation flashes in place of the link for 1.5 s
+  so the tap registers visually.
+
+### `_build_full_row` — new `right_widget` slot
+
+Right column was previously a button stack only. The Shared/re-
+offer composite needs a Label on top of a markup Label, which
+doesn't fit the buttons stack contract (button column has fixed
+`dp(100)` width + filler logic). New optional `right_widget=` arg
+takes a pre-built widget that's added to the row as-is; caller
+owns its sizing. ``buttons=`` keeps working for callers that just
+want a vertical button stack (Manage/Unpair, Pair, …).
+
+## 0.50.41 — Wider LAN-popup rows with full peer details, three named sections
+
+User report on the "Nearby & paired devices" popup:
+
+- the title was rendered twice (once by the popup chrome, once by an
+  inner Label),
+- peer rows were aligned to a second column with capped text,
+- only a peer-id prefix (`xxxxxxxx…`) was shown — no IP, no projects,
+  no way for two phones in a room to verify they were looking at the
+  same device,
+- the "Nearby (unpaired)" / "Paired" sublabels appeared only when
+  their section had content, so the user couldn't tell whether an
+  empty popup meant "nothing detected" or "section hidden."
+
+### `paired_phones_popup`
+
+- Dropped the inner duplicate-title Label; the popup chrome's title
+  bar is now the single source.
+- Three section headers (`This phone` / `Unpaired` / `Paired`)
+  always render, with a dim placeholder line when the section is
+  empty (e.g. "No nearby phones detected. Tap Refresh after a few
+  seconds.").
+- Each row uses the new `_build_full_row` helper: bold name on its
+  own line (wraps only if it can't fit popup width), full peer_id
+  on the next, endpoint (`ip:port`) on the next, shared-projects
+  list on the next. Labels are width-bound so they get the full
+  popup width minus the button column.
+- This-phone row at the top mirrors the layout (name / full uid /
+  bound listener endpoint / all-projects list) so a third party in
+  the room can read off the same fields they see for other phones.
+- Removed `_build_peer_row` (replaced by `_build_full_row`);
+  inlined the paired-row button construction in `_refresh` so each
+  row's Manage/Unpair closes over its own `peer`.
+- `_resize_to_content` updated: the inner title is gone, so the
+  popup height calc no longer counts a `_title_h` row or the spacing
+  to it.
+
+### `share_project_popup`
+
+- Same treatment: dropped the duplicate inner title, added a "This
+  phone" section header + row at the top, the paired-peers list is
+  now a `Paired` section with the same wide row layout (name / full
+  uid / IP / shared-projects + a Share/Shared toggle button), and
+  the QR section sits under its own "Pair a new phone" header.
+- QR rendered larger: `scale` 6 → 8 (each module easier to lock on
+  at arm's length), display height 200 → 320 dp.
+- Body wrapped in a `ScrollView` so the taller content doesn't
+  clip the Close button on short screens; Close stays anchored to
+  the bottom of the popup.
+
+### Helpers added (private, in `azt_collab_client.ui.lan_popups`)
+
+- `_section_header(text, font_name)` — bold accent-coloured
+  width-bound section header used by both popups.
+- `_build_full_row(*, name, peer_id, endpoint, projects,
+  buttons, font_name)` — the new wide row layout. `buttons=None`
+  produces an info-only row (used by the This-phone header rows).
+- `_peer_endpoint_str(peer)` — joins `endpoints` + `static_endpoints`
+  into a single 'ip:port[, …]' string for display.
+
+## 0.50.40 — Shrink popups to content (paired_phones + share_project)
+
+User report: two popups parked at a near-full-screen size while
+showing four lines of content, ~35% screen wasted.
+
+### `paired_phones_popup`
+
+Was `size_hint=(0.95, 0.9)` — 90% of screen height regardless of
+how many nearby / paired devices were actually present. Now uses
+`size_hint=(0.95, None)` with `popup.height` computed from
+content + chrome and capped at `Window.height * 0.9`. The scroll
+view inside is bound to `list_box.height` (with a `dp(80)`
+floor so the empty-state label doesn't get clipped). Window
+resize re-fires the layout calc; the binding is removed on
+popup dismiss so the closed popup doesn't keep a reference to
+the global Window.
+
+### `share_project_popup` paired-phones scroll
+
+The "Share with a paired phone" ScrollView had `height=dp(140)`
+hard-coded — fits ~3 rows, leaves the inside blank when there's
+only one paired peer. Now binds to `peers_box.height` capped at
+`4 × (row_h + spacing)`. A single paired phone takes a single
+row's worth of vertical space; a long list still scrolls.
+
+### Why this wasn't size_hint_y=None from the start
+
+The original popups were sized for "list might be long enough
+to need a big scroll area." The cap-with-content-bound pattern
+gets the same scroll behavior for long lists *and* shrinks for
+short ones, which is what the user actually wanted. The
+remaining size_hint=(0.95, …) popups in this file mostly have
+multi-section content (QR + share + collaborator etc.) where
+a fixed height is genuinely the right shape; only these two
+needed adjustment.
+
+### Files
+
+- `azt_collab_client/ui/lan_popups.py`:
+  - `from kivy.core.window import Window` import.
+  - `paired_phones_popup` — dynamic-height + content-bound scroll
+    + Window-resize re-layout + cleanup-on-dismiss.
+  - `share_project_popup` — `peers_scroll` height binds to
+    `peers_box.height` with a 4-row cap.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.39 → 0.50.40.
+
+### Compatibility
+
+UI-only client change. No wire format implications. Pre-0.50.40
+peers continue to work; the popup that opens is just smaller
+when content is small.
+
 ## 0.50.39 — Nearby (unpaired) list: filter self + surface device_name
 
 Two UX bugs in the 0.50.28 "Nearby (unpaired)" popup. Both

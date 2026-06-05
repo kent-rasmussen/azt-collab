@@ -1033,15 +1033,36 @@ def send_share_offer(peer_id, langcode, repo_url='', vernlang=''):
     them. Sent over LAN as a best-effort HTTPS POST. ``vernlang``
     is the project's linguistic code (== ``langcode`` when the two
     weren't separated). The recipient listener short-circuits on
-    this path and stashes a pending decision. Returns True on a
-    2xx response."""
+    this path and stashes a pending decision (or no-ops if they
+    already have it).
+
+    Returns ``(status, dispatch)`` since 0.50.43:
+
+    - *status* is the HTTPS response code (0 on transport failure).
+    - *dispatch* is the receiver's per-state classification:
+      ``noop`` (already have project, URL matches),
+      ``no_url`` (already have project, sender carried no URL),
+      ``stashed_share`` (receiver didn't have project; clone-offer
+      stashed as pending decision),
+      ``stashed_adopt_origin`` (receiver had project but no
+      remote_url; URL adopt prompt stashed),
+      ``stashed_conflict`` (URLs differ; conflict prompt stashed).
+      ``''`` when the receiver didn't return the field (pre-0.50.43
+      daemon) or the call didn't reach the receiver.
+
+    The sender uses ``dispatch`` for user feedback: "Already in
+    sync" vs. "Sent (waiting on other phone)" vs. "Sent but URL
+    conflict on other phone." Pre-0.50.43 the receiver always
+    returned a bare ``{ok: True}`` so legacy callers should treat
+    a 2xx with empty dispatch as "delivered, outcome unknown".
+    """
     if not _peer_id.cert_path():
-        return False
+        return 0, ''
     try:
         from . import peer_id as _peer_id_mod
         ident = _peer_id_mod.ensure()
     except Exception:
-        return False
+        return 0, ''
     from . import store as _store
     payload = {
         'peer_id': ident['peer_id'],
@@ -1051,8 +1072,40 @@ def send_share_offer(peer_id, langcode, repo_url='', vernlang=''):
         'repo_url': repo_url,
         'vernlang': vernlang,
     }
-    status, _ = _https_post_to_peer(
+    status, body = _https_post_to_peer(
         peer_id, '/v1/lan/share_offer', payload)
+    dispatch = ''
+    if 200 <= status < 300 and body:
+        try:
+            import json as _json
+            decoded = _json.loads(body.decode('utf-8'))
+            if isinstance(decoded, dict):
+                dispatch = str(decoded.get('dispatch', '') or '')
+        except Exception:
+            pass
+    return status, dispatch
+
+
+def send_share_unshared(peer_id, langcode):
+    """Symmetric-unshare notification (0.50.44). The local user
+    has unshared *langcode* with the paired peer; tell them so
+    they can mirror the allowlist removal on their side and stop
+    auto-fanout to us for this langcode. Best-effort fire-and-
+    forget. Returns True on a 2xx response."""
+    if not _peer_id.cert_path():
+        return False
+    try:
+        from . import peer_id as _peer_id_mod
+        ident = _peer_id_mod.ensure()
+    except Exception:
+        return False
+    payload = {
+        'peer_id': ident['peer_id'],
+        'fp': ident['fp'],
+        'langcode': langcode,
+    }
+    status, _ = _https_post_to_peer(
+        peer_id, '/v1/lan/share_unshared', payload)
     return 200 <= status < 300
 
 
@@ -1077,6 +1130,55 @@ def share_declined(peer_id, langcode):
     return 200 <= status < 300
 
 
+def sweep_peer(peer_id, exclude_langcode=''):
+    """Push every shared project with *peer_id* where the peer
+    isn't already at our HEAD. Used by:
+
+    - mDNS arrival (peer just became reachable — catch them up
+      on every stale project, not just whichever we last committed)
+    - Fan-out tail (opportunistic multi-project sweep when we're
+      already pushing one project, the rest are nearly-free)
+    - Daemon listener-bind (we just came up — sweep every paired
+      peer with a known endpoint)
+
+    ``exclude_langcode`` lets the fan-out caller skip the project
+    it just pushed; ``_push_to_peer``'s pre-flight ls-remote would
+    no-op the second push anyway, but the round-trip costs more
+    than the skip.
+
+    Returns a dict ``{langcode: bool}`` of per-project outcomes.
+    Empty dict if the peer isn't paired or we don't share anything
+    with them. Per-project failures are isolated and logged."""
+    from . import projects as _proj
+    entry = _peers.get_peer(peer_id)
+    if entry is None:
+        return {}
+    shared = entry.get('shared_projects') or []
+    out = {}
+    for langcode in shared:
+        if langcode == exclude_langcode:
+            continue
+        try:
+            project = _proj.get(langcode)
+        except Exception:
+            project = None
+        if project is None:
+            continue
+        try:
+            out[langcode] = _push_to_peer(project, entry)
+        except Exception as ex:
+            print(f'[lan-sweep] {peer_id[:8]!r} {langcode!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+            out[langcode] = False
+    if out:
+        ok_count = sum(1 for v in out.values() if v)
+        print(f'[lan-sweep] {peer_id[:8]!r}: '
+              f'{ok_count}/{len(out)} delivered '
+              f'(excluded={exclude_langcode!r})',
+              file=sys.stderr, flush=True)
+    return out
+
+
 def fan_out(project):
     """Push ``project`` to every paired peer that has its langcode
     in ``shared_projects`` and an in-memory or static endpoint.
@@ -1085,6 +1187,12 @@ def fan_out(project):
     callers may log the summary, but the daemon's scheduler treats
     LAN delivery as opportunistic and does not clear pending_push
     based on it.
+
+    Since 0.50.45: after pushing *project* to each candidate, fires
+    ``sweep_peer`` for that peer (excluding *project*) so any OTHER
+    shared projects the peer is behind on catch up in the same
+    radio window. "We're already talking to B; tell them about Y
+    too." Past-work-not-being-committed cases catch up naturally.
 
     Safe to call from any thread; per-peer failures are isolated."""
     all_peers = _peers.list_peers()
@@ -1149,5 +1257,15 @@ def fan_out(project):
         pass
     out = {}
     for entry in candidates:
-        out[entry['peer_id']] = _push_to_peer(project, entry)
+        peer_id = entry['peer_id']
+        out[peer_id] = _push_to_peer(project, entry)
+        # Opportunistic multi-project sweep (0.50.45). The radio
+        # is up, the TLS handshake is warm, and we already
+        # resolved this peer's endpoint — push any other shared
+        # projects they're behind on while we're here.
+        try:
+            sweep_peer(peer_id, exclude_langcode=project.langcode)
+        except Exception as ex:
+            print(f'[lan-fanout] sweep_peer {peer_id[:8]!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
     return out

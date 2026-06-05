@@ -406,6 +406,34 @@ def _handle_share_declined_bodyauth(environ, start_response):
                                   prepared_payload=payload)
 
 
+def _handle_share_unshared_bodyauth(environ, start_response):
+    """Body-auth variant of share_unshared (0.50.44).
+
+    Symmetric-unshare endpoint: phone A's user-tap "unshare X with
+    B" gesture POSTs here on B's listener so B can drop A from B's
+    own ``shared_projects`` allowlist for X. Without this, A's
+    unshare only affected A's outbound fan-out; B's outbound fan-
+    out kept firing to A (which A then no-op'd with a logged
+    ``carries no repo_url; no-op (already have project)`` line).
+    Symmetric unshare closes the asymmetry.
+
+    Distinct from ``share_declined`` (which means "I'm declining
+    the offer you just made") — same wire pattern, different
+    semantics, separate code so future divergence is cheap.
+    """
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id = str(payload.get('peer_id', '') or '')
+    if len(peer_id) != 64:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'peer_id wrong length'})
+    return _handle_share_unshared(environ, start_response, peer_id,
+                                  prepared_payload=payload)
+
+
 def _handle_share_offer(environ, start_response, peer_id,
                        prepared_payload=None):
     """Inbound share-offer handler. Dispatches by local state:
@@ -458,6 +486,11 @@ def _handle_share_offer(environ, start_response, peer_id,
     local_url = ''
     if local_proj is not None:
         local_url = str(getattr(local_proj, 'remote_url', '') or '')
+    # ``dispatch`` is echoed back in the JSON response so the
+    # *sender* can show meaningful UI feedback. Otherwise every
+    # outcome — known-already, freshly-stashed, conflict — looks
+    # identical to the sender as a generic 200 OK. Field added in
+    # 0.50.43 (additive — older senders ignore it).
     if local_proj is None:
         _pending.add(_pending.KIND_SHARE_OFFER, {
             'peer_id': peer_id,
@@ -470,20 +503,21 @@ def _handle_share_offer(environ, start_response, peer_id,
               f'for {langcode!r} stashed (clone-offer)',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
-                              {'ok': True})
+                              {'ok': True,
+                               'dispatch': 'stashed_share'})
     if not repo_url:
         print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
               f'for {langcode!r} carries no repo_url; no-op '
               '(already have project)',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
-                              {'ok': True})
+                              {'ok': True, 'dispatch': 'no_url'})
     if local_url == repo_url:
         print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
               f'for {langcode!r}: remote_url matches local; no-op',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
-                              {'ok': True})
+                              {'ok': True, 'dispatch': 'noop'})
     if not local_url:
         _pending.add(_pending.KIND_ADOPT_ORIGIN, {
             'peer_id': peer_id,
@@ -496,7 +530,8 @@ def _handle_share_offer(environ, start_response, peer_id,
               f'{repo_url!r})',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
-                              {'ok': True})
+                              {'ok': True,
+                               'dispatch': 'stashed_adopt_origin'})
     _pending.add(_pending.KIND_REMOTE_CONFLICT, {
         'peer_id': peer_id,
         'device_name': device_name,
@@ -508,7 +543,9 @@ def _handle_share_offer(environ, start_response, peer_id,
           f'{langcode!r} stashed (remote-conflict '
           f'local={local_url!r} incoming={repo_url!r})',
           file=sys.stderr, flush=True)
-    return _json_response(start_response, '200 OK', {'ok': True})
+    return _json_response(start_response, '200 OK',
+                          {'ok': True,
+                           'dispatch': 'stashed_conflict'})
 
 
 def _handle_share_declined(environ, start_response, peer_id,
@@ -536,6 +573,37 @@ def _handle_share_declined(environ, start_response, peer_id,
               f'{ex!r}', file=sys.stderr, flush=True)
     print(f'[lan-listener] {peer_id[:8]!r} declined share for '
           f'{langcode!r}; allowlist rolled back',
+          file=sys.stderr, flush=True)
+    return _json_response(start_response, '200 OK', {'ok': True})
+
+
+def _handle_share_unshared(environ, start_response, peer_id,
+                           prepared_payload=None):
+    """Inbound symmetric-unshare handler (0.50.44). The sender's
+    user has unshared *langcode* on their side; mirror that on
+    ours by removing the sender from *our* ``shared_projects``
+    allowlist for that langcode. Idempotent: if the sender isn't
+    in our allowlist for this langcode, this is a no-op."""
+    if prepared_payload is not None:
+        payload = prepared_payload
+    else:
+        payload, err = _read_json_body(environ)
+        if payload is None:
+            return _json_response(start_response, '400 Bad Request',
+                                  {'ok': False, 'error': err})
+    langcode = str(payload.get('langcode', '') or '')
+    if not langcode:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False,
+                               'error': 'langcode required'})
+    try:
+        _peers.remove_shared_project(peer_id, langcode)
+    except Exception as ex:
+        print(f'[lan-listener] symmetric unshare '
+              f'remove_shared_project raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    print(f'[lan-listener] {peer_id[:8]!r} symmetric-unshared '
+          f'{langcode!r}; mirrored allowlist removal',
           file=sys.stderr, flush=True)
     return _json_response(start_response, '200 OK', {'ok': True})
 
@@ -742,6 +810,9 @@ def _peer_acl_middleware(app):
                 environ, start_response)
         if method == 'POST' and path_info == '/v1/lan/share_declined':
             return _handle_share_declined_bodyauth(
+                environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/share_unshared':
+            return _handle_share_unshared_bodyauth(
                 environ, start_response)
         if method == 'POST' and path_info == '/v1/lan/pair_request':
             return _handle_pair_request(environ, start_response)
@@ -1450,6 +1521,36 @@ def apply_toggle():
         except Exception as ex:
             print(f'[lan-listener] discovery start failed: {ex!r}',
                   file=sys.stderr, flush=True)
+        # Listener-bind sweep (0.50.45). The radio just came up;
+        # any paired peer we already know an endpoint for (from
+        # ``peers.json::endpoints`` recorded at pair-time, or a
+        # mDNS cache that survived a brief drop) might be
+        # behind on shared projects. Fire one sweep per paired
+        # peer in a worker thread so the binder returns promptly.
+        # ``sweep_peer`` skips peers whose endpoint can't be
+        # resolved, so it's cheap when nobody's actually
+        # reachable — no harm in firing optimistically.
+        def _listener_bind_sweep():
+            try:
+                from . import peers as _peers
+                from . import lan_push as _lan_push
+                for entry in _peers.list_peers():
+                    pid = entry.get('peer_id', '') or ''
+                    if not pid:
+                        continue
+                    try:
+                        _lan_push.sweep_peer(pid)
+                    except Exception as ex:
+                        print(f'[lan-listener] bind-sweep '
+                              f'{pid[:8]!r} raised: {ex!r}',
+                              file=sys.stderr, flush=True)
+            except Exception as ex:
+                print(f'[lan-listener] bind-sweep dispatch '
+                      f'raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+        import threading as _t_mod
+        _t_mod.Thread(target=_listener_bind_sweep, daemon=True,
+                      name='lan-bind-sweep').start()
     elif not desired and is_running():
         try:
             _lan_discovery.stop_browse()

@@ -66,6 +66,29 @@ def _fmt(template, params):
         return template
 
 
+def _dispatch_msg(params):
+    """Translate a LAN_OFFER_DELIVERED ``dispatch`` value into the
+    one-line flash shown next to the "Shared" affordance. Each
+    dispatch value reflects what the receiver did with the offer
+    payload — known-already vs. freshly-stashed pending decision —
+    so the sender can show meaningful feedback. Unknown dispatch
+    (pre-0.50.43 receiver) falls through to a generic "Offer
+    sent." text."""
+    dispatch = str((params or {}).get('dispatch', '') or '')
+    if dispatch == 'noop':
+        return _tr('Already in sync.')
+    if dispatch == 'no_url':
+        return _tr('Other phone already has this project.')
+    if dispatch == 'stashed_share':
+        return _tr('Sent — waiting for the other phone to accept.')
+    if dispatch == 'stashed_adopt_origin':
+        return _tr('Sent — other phone will be asked to adopt the '
+                   'GitHub URL.')
+    if dispatch == 'stashed_conflict':
+        return _tr('Sent — other phone has a different GitHub URL.')
+    return _tr('Offer sent.')
+
+
 def _format_deadline(expires_at):
     """Render an ``expires_at`` unix timestamp as a human-facing
     deadline phrase.
@@ -244,6 +267,25 @@ _HANDLERS = {
         _tr('Share for {langcode} was declined.'), p),
     S.LAN_OFFER_ACCEPTED:     lambda p: _fmt(
         _tr('Accepted share offer for {langcode}.'), p),
+    # Sender-side feedback for the "Share" / "Offer share again"
+    # gesture. ``dispatch`` is the receiver's per-state outcome.
+    # Each dispatch value gets a short string the share popup
+    # flashes in place of the "Shared" affordance. Unknown
+    # ``dispatch`` (pre-0.50.43 receiver, or sender talking to a
+    # daemon that didn't round-trip the field) falls through to
+    # the generic "Offer sent." text.
+    S.LAN_OFFER_DELIVERED:    lambda p: _dispatch_msg(p),
+    S.LAN_OFFER_NOT_DELIVERED: lambda p: _fmt(
+        _tr('Could not reach the other phone (status {post_status}).'),
+        p),
+    S.PROJECT_NOT_INITIALISED: lambda p: _tr(
+        'This project has no commits yet. Record an entry first, '
+        'then try sharing again.'),
+    S.PROJECT_UNBORN:         lambda p: _tr(
+        'This project has no commits yet. Record an entry first, '
+        'then try sharing again.'),
+    S.PEER_UNKNOWN:           lambda p: _tr(
+        'That phone is not paired with this one anymore.'),
     S.LAN_PAIR_REQUEST_PENDING: lambda p: _fmt(
         _tr('Waiting for {device_name} to accept the pair request…'),
         p),

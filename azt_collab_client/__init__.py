@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.50.39"
+__version__ = "0.50.45"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1018,21 +1018,73 @@ def lan_share_project(langcode, peer_id):
     """Share *langcode* with a paired peer: updates the
     ``shared_projects`` allowlist AND fires a best-effort courtesy
     offer to the peer's listener so they see a pending decision
-    on their side. Returns the updated peer entry on success;
-    empty dict on transport failure or unknown peer.
+    on their side.
+
+    Returns a typed :class:`Result` since 0.50.43 (previously
+    returned the updated peer entry dict, or ``{}`` on failure —
+    the dict shape made errors invisible to the UI):
+
+    - On daemon-side gate failure (toggle off, contributor unset,
+      project not initialised, project unborn, peer unknown), the
+      Result carries the corresponding typed :class:`Status`
+      (``LAN_TOGGLE_OFF`` / ``CONTRIBUTOR_UNSET`` /
+      ``PROJECT_NOT_INITIALISED`` / ``PROJECT_UNBORN`` /
+      ``PEER_UNKNOWN``).
+    - On HTTPS-to-peer failure (peer offline, TLS refused, no
+      endpoint resolvable), ``LAN_OFFER_NOT_DELIVERED`` carrying
+      ``post_status`` (HTTPS code, 0 on transport failure).
+    - On 2xx from the receiver, ``LAN_OFFER_DELIVERED`` carrying
+      ``dispatch`` (the receiver's per-state classification:
+      ``noop`` | ``no_url`` | ``stashed_share`` |
+      ``stashed_adopt_origin`` | ``stashed_conflict``; ``''`` if
+      the receiver is pre-0.50.43 and doesn't round-trip the
+      field) and ``post_status``.
 
     Since 0.45.0 the call is "share with notification" — the
     bookkeeping-only flavour is gone. Receiver's UI surfaces the
     offer; they can accept (LAN clone) or decline (rolls our
     allowlist back)."""
+    body = {'langcode': langcode, 'peer_id': peer_id}
     try:
-        resp = call('POST', '/v1/lan/send_share_offer',
-                    {'langcode': langcode, 'peer_id': peer_id})
+        resp = call('POST', '/v1/lan/send_share_offer', body)
     except ServerUnavailable:
-        return {}
+        return Result(statuses=[Status('SERVER_UNAVAILABLE', {
+            'langcode': langcode, 'peer_id': peer_id})])
     if not resp.get('ok'):
-        return {}
-    return resp.get('peer') or {}
+        err = str(resp.get('error') or 'unknown')
+        # Map daemon error strings to typed Status codes. Keep
+        # PEER_UNKNOWN / PROJECT_* distinct so the UI can show
+        # the right corrective phrasing without substring-
+        # matching translated text.
+        code_map = {
+            'lan_toggle_off':           S.LAN_TOGGLE_OFF,
+            'contributor_unset':        S.CONTRIBUTOR_UNSET,
+            'project_unknown':          S.PEER_UNKNOWN,
+            'project_not_initialised':  S.PROJECT_NOT_INITIALISED,
+            'project_unborn':           S.PROJECT_UNBORN,
+            'project_unreadable':       S.SERVER_ERROR,
+            'peer_unknown':             S.PEER_UNKNOWN,
+            'bad_request':              S.SERVER_ERROR,
+        }
+        code = code_map.get(err, S.SERVER_ERROR)
+        params = {'error': err, 'langcode': langcode,
+                  'peer_id': peer_id}
+        if resp.get('detail'):
+            params['detail'] = resp['detail']
+        return Result(statuses=[Status(code, params)])
+    # Daemon accepted the gate-checks. Split on whether the
+    # courtesy POST to the peer's listener actually reached the
+    # peer (2xx).
+    post_status = int(resp.get('post_status') or 0)
+    dispatch = str(resp.get('dispatch', '') or '')
+    params = {'langcode': langcode, 'peer_id': peer_id,
+              'post_status': post_status, 'dispatch': dispatch,
+              'peer': resp.get('peer') or {}}
+    if 200 <= post_status < 300:
+        return Result(statuses=[Status(S.LAN_OFFER_DELIVERED,
+                                       params)])
+    return Result(statuses=[Status(S.LAN_OFFER_NOT_DELIVERED,
+                                   params)])
 
 
 def lan_clone(peer_id, langcode, remote_url='', vernlang='',
@@ -1897,6 +1949,27 @@ def project_status(langcode):
     return ProjectStatus.from_dict(resp)
 
 
+def lan_burst_now():
+    """Ask the daemon to bring the LAN radio up for a 30s discovery
+    burst. Lifecycle gesture: peers call this on Activity resume,
+    picker entry, and similar "user just came back to interact"
+    events so two phones in the same room can find each other
+    without waiting for either to commit. Lighter than
+    ``sync_nudge()`` — no WAN drain, no per-project fan-out
+    (mDNS arrival inside the burst window will trigger a
+    per-peer sweep instead). Returns ``Result``; never raises.
+    Since 0.50.45."""
+    try:
+        resp = call('POST', '/v1/lan/burst', {})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result(statuses=[])
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 def sync_nudge(langcode=''):
     """Unified sync gesture (since 0.50): reset WAN backoff for the
     project (or all projects if *langcode* is empty), fire an
@@ -2629,7 +2702,7 @@ __all__ = [
     'create_project_from_template',
     'clone_project',
     'clone_project_start', 'clone_project_status',
-    'project_status', 'sync_project', 'sync_nudge',
+    'project_status', 'sync_project', 'sync_nudge', 'lan_burst_now',
     'commit_project', 'request_sync', 'poll_job',
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
