@@ -77,3 +77,52 @@ No `list_audio` / `list_images` RPCs needed — both sets of
 basenames are already encoded in the LIFT XML itself (audio in
 `<citation><form>` audiolang text, images in `<illustration
 href=…/>`).
+
+## Surgical field writes (0.50.29) — why a parallel write path
+
+The `atomic_open_write` path above is the **whole-file** contract:
+peer serializes the full LIFT to bytes (typically by building an
+ElementTree DOM, mutating, calling `tree.write`), daemon atomically
+replaces the on-disk file. That's correct, but it's expensive on
+low-RAM Android devices once the project grows: a 4 MB LIFT costs
+~5× source-size DOM in peer memory just to serialise it back, on
+top of the peer's own `entries` dict (~1× source). The recorder's
+field-reported 25 MB working set on the 4 MB en-TH-x-anna project
+crossed Android's LMKD threshold; the kernel SIGKILL surfaced as
+"app back to launcher icon" with no traceback.
+
+The surgical write path (`set_audio` / `set_illustration` RPCs in
+`azt_collabd.lift_surgery`, § 9a of CLIENT_INTEGRATION.md) addresses
+this by moving the byte-level edit into the daemon's process. Peer
+never builds the DOM; daemon reads the file, locates the entry's
+byte range by regex over the file bytes, sub-parses only that
+entry's bytes (one tiny tree), edits the target sub-element,
+`ET.indent`s at the file's detected indent unit, splices back, SAX-
+validates, atomic-writes. Peer-visible memory cost: one RPC body
+(a few hundred bytes).
+
+Why splice rather than full-file rewrite even on the daemon side:
+the byte-stability outside the entry's range is what makes `git
+diff` show only the one entry's lines as changed — load-bearing for
+review-ability and for the LIFT merge driver's per-entry conflict
+detection (`lift_merge.py`). A naive parse-edit-serialise pass on
+the whole file from the daemon side would reformat every entry's
+whitespace and obliterate the diff signal even though the change is
+semantically one field of one entry.
+
+Why per-field endpoints rather than a generic `set_form` RPC:
+typed status codes per field (`AUDIO_SET` vs `ILLUSTRATION_SET`)
+let peers route results without inspecting params; field-shaped
+validation can live daemon-side (e.g., audio filename pattern);
+schema knowledge stays out of the wire. If a third similar setter
+ships (`set_pronunciation`, `set_gloss`), refactor to a generic
+helper — until then the surface stays inspectable.
+
+Other write paths still need `atomic_open_write`. Headword edits,
+sense reordering, deleting an entry, anything that touches multiple
+entries — none of these have surgical RPCs (yet). The peer's
+`_ensure_dom` machinery stays alive for those; the surgical RPCs
+just remove the DOM requirement from the **hot path** (every
+audio save). If a peer reports a new high-frequency write that
+needs surgical treatment, file a `NOTES_TO_DAEMON.md` entry and
+extend the `_do_surgical_edit` helper.

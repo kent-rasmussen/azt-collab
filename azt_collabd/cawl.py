@@ -65,6 +65,26 @@ from . import projects as _projects
 from .paths import azt_home
 
 
+# Load-time marker. Distinctive 0.50.34+ line so a single grep of
+# the daemon log tells us whether the deployed cawl.py is current
+# or whether the bundle is partially stale. The combined daemon
+# fingerprint alone can shift from any single-file edit (e.g., a
+# ``__version__`` bump) without proving this specific module is
+# fresh — and that's exactly the failure shape we hit when the
+# 0.50.30 ``cache_status`` fix appeared deployed (version probe
+# said 0.50.30, overall fingerprint shifted between rebuilds) but
+# the bug behaviour persisted because cawl.py itself wasn't
+# updated. If you don't see this line in the daemon log after a
+# claimed 0.50.34+ deploy, the deploy didn't pick up cawl.py.
+# Compare against ``module_fingerprints()`` for the same answer in
+# structured form.
+sys.stderr.write(
+    '[cawl] module loaded; v0.50.34+ — tuple-returning '
+    'get_image_path; worker bumps source under '
+    "_cache_status_lock alongside state['completed'] += 1\n")
+sys.stderr.flush()
+
+
 # Refresh window for the index. The CAWL → image-URL mapping
 # changes slowly (new images get added, rarely renamed);
 # refreshing once per device per day amortises the GitHub
@@ -189,7 +209,56 @@ def _make_prefetch_state(requested):
         'started_at': time.time(),
         'finished': False,
         'finished_at': None,
+        # Per-source fetch counters (0.50.21). Lets a progress
+        # display tell the user whether bytes are coming from
+        # the local cache (instant), a paired LAN peer (LAN
+        # round-trip), or upstream GitHub (cellular round-trip).
+        # When ``from_lan`` is climbing the user knows the
+        # paired-peer cache is doing its job; when ``from_upstream``
+        # is the only counter advancing the LAN-share path isn't
+        # producing hits and bytes are being pulled over WAN.
+        'from_cache': 0,
+        'from_lan': 0,
+        'from_upstream': 0,
+        # The source the most recently successful fetch came from,
+        # for a one-glance "what's serving right now" display.
+        # Values: ``'cache'`` | ``'lan'`` | ``'upstream'`` | ``''``.
+        'last_source': '',
     }
+
+
+_SOURCE_FIELD = {
+    'cache': 'from_cache',
+    'lan': 'from_lan',
+    'upstream': 'from_upstream',
+}
+
+
+def _bump_source_counter(repo, source):
+    """Thread-safe bump of the per-source counter in
+    ``_prefetch_state[repo]``. ``source`` is one of ``'cache'``,
+    ``'lan'``, ``'upstream'``. Silently no-ops if no prefetch is
+    running for *repo* (e.g. peer-driven on-demand
+    ``get_image_path`` outside any prefetch window).
+
+    Public path for on-demand callers (``server._h_cawl_image`` /
+    Android ContentProvider's image-open handler) so user-driven
+    fetches that land during an active prefetch still contribute
+    to the source counters. The prefetch worker itself bumps
+    inline (under the same lock as ``state['completed'] += 1``)
+    to make "completed without source" impossible by
+    construction; see ``_prefetch_worker``. 0.50.30."""
+    if not source:
+        return
+    field = _SOURCE_FIELD.get(source)
+    if field is None:
+        return
+    with _cache_status_lock:
+        state = _prefetch_state.get(repo)
+        if state is None:
+            return
+        state[field] = int(state.get(field, 0) or 0) + 1
+        state['last_source'] = source
 
 
 def _prefetch_worker(repo, paths, lan_extras=None):
@@ -236,7 +305,7 @@ def _prefetch_worker(repo, paths, lan_extras=None):
 
     consecutive_fail = 0
     for path in paths:
-        target = get_image_path(repo, path)
+        target, source = get_image_path(repo, path)
         with _cache_status_lock:
             state = _prefetch_state.get(repo)
             if state is None:
@@ -245,6 +314,41 @@ def _prefetch_worker(repo, paths, lan_extras=None):
                 return
             if target is not None:
                 state['completed'] += 1
+                if source:
+                    state['last_source'] = source
+                    field = _SOURCE_FIELD.get(source)
+                    if field is not None:
+                        state[field] = int(
+                            state.get(field, 0) or 0) + 1
+                    # One-shot diagnostic: log the FIRST successful
+                    # bump per worker session so we can confirm the
+                    # worker is actually reaching this branch and
+                    # writing into ``state['last_source']``. If you
+                    # see this line in the daemon log but
+                    # ``last_source`` is still rendered empty on
+                    # the peer side, the bug is post-daemon
+                    # (response read / display). 0.50.35.
+                    if not state.get('_logged_first_bump'):
+                        state['_logged_first_bump'] = True
+                        print(f'[cawl] worker first bump: '
+                              f"source={source!r} "
+                              f"state['last_source']="
+                              f"{state['last_source']!r} "
+                              f"state['from_cache']="
+                              f"{state.get('from_cache', 0)} "
+                              f"state['completed']="
+                              f"{state['completed']} "
+                              f"repo={repo!r}",
+                              file=sys.stderr, flush=True)
+                else:
+                    # Bug-class: target landed without a source tag.
+                    # By the post-0.50.30 contract this is
+                    # impossible, but keep a loud breadcrumb so a
+                    # future regression doesn't silently revert the
+                    # "indicator empty while files land" UX.
+                    print(f'[cawl] bug: completed without source '
+                          f'for {repo!r}/{path!r}',
+                          file=sys.stderr, flush=True)
                 consecutive_fail = 0
             else:
                 state['failed'] += 1
@@ -278,8 +382,23 @@ def _prefetch_worker(repo, paths, lan_extras=None):
             t = None
         if t is not None and os.path.isfile(t):
             continue
-        if get_image_path_lan_only(repo, path) is not None:
+        extra_target, extra_source = get_image_path_lan_only(
+            repo, path)
+        if extra_target is not None:
             lan_hits += 1
+            # lan_extras are bonus — they don't move ``completed``,
+            # but they DO move the source counters so the user sees
+            # "via LAN" climb when paired peers are serving variants.
+            with _cache_status_lock:
+                state = _prefetch_state.get(repo)
+                if state is None:
+                    return
+                if extra_source:
+                    state['last_source'] = extra_source
+                    field = _SOURCE_FIELD.get(extra_source)
+                    if field is not None:
+                        state[field] = int(
+                            state.get(field, 0) or 0) + 1
         # Re-check daemon shutdown (state could have been nuked
         # between iterations).
         with _cache_status_lock:
@@ -558,8 +677,10 @@ def _index_image_paths_all(repo):
 
 def get_image_path_lan_only(repo, rel_path):
     """Try to land bytes for ``(repo, rel_path)`` from a paired
-    LAN peer's cache and persist them locally. Returns the
-    canonical on-disk path on success, ``None`` on miss.
+    LAN peer's cache and persist them locally. Returns
+    ``(target, source)`` on success, ``(None, '')`` on miss.
+    Mirror of ``get_image_path``'s return shape (0.50.30 refactor)
+    so callers handle both functions uniformly.
 
     Distinct from ``get_image_path`` in that we do NOT fall
     through to GitHub on miss. Use this for the prefetch
@@ -569,18 +690,18 @@ def get_image_path_lan_only(repo, rel_path):
     """
     repo = (repo or '').strip()
     if not repo or not _looks_safe_rel_path(rel_path):
-        return None
+        return None, ''
     target = _resolve_image_target(repo, rel_path)
     if target is None:
-        return None
+        return None, ''
     if os.path.isfile(target):
-        return target
+        return target, 'cache'
     with _lock_for(target):
         if os.path.isfile(target):
-            return target
+            return target, 'cache'
         data = _fetch_image_bytes_from_lan_peer(repo, rel_path)
         if data is None:
-            return None
+            return None, ''
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp = f'{target}.tmp.{os.getpid()}'
         try:
@@ -591,8 +712,8 @@ def get_image_path_lan_only(repo, rel_path):
             print(f'[cawl] LAN-only cache write failed for '
                   f'{repo!r}/{rel_path!r}: {ex!r}',
                   file=sys.stderr, flush=True)
-            return None
-    return target
+            return None, ''
+    return target, 'lan'
 
 
 def _filter_preferred_variant_per_id(paths):
@@ -758,13 +879,69 @@ def cache_status(repo):
             # failures stay visible as "stuck short of total"
             # rather than "100% with silent failures".
             cached = pf['completed']
-        return {'cached': cached, 'total': pf['requested'],
-                'offline': offline, 'circuit_open': circuit_open,
-                'finished': finished}
-    return {'cached': _walk_image_count(repo),
-            'total': _count_index_images(repo),
-            'offline': False, 'circuit_open': False,
-            'finished': True}
+        # Per-source telemetry (0.50.21). Lets a peer-side
+        # progress display tell the user whether bytes are being
+        # served from a paired LAN peer's cache (free bandwidth)
+        # or pulled over upstream cellular (the expensive path).
+        # When ``from_lan`` is climbing and ``from_upstream`` is
+        # flat, the LAN-share path (NOTES #3 / 0.50.14) is
+        # working. When the inverse holds, paired peers either
+        # don't have the byte cached or aren't reachable, and
+        # bytes are coming over WAN. ``last_source`` is the
+        # source of the most-recent successful fetch — a one-
+        # glance "what's serving right now" tag.
+        last_source = pf.get('last_source', '') or ''
+        # Contract (0.50.30): if ``completed > 0`` and
+        # ``last_source`` is still empty, something fed bytes
+        # without tagging the source — the post-0.50.30 refactor
+        # of ``get_image_path`` made this impossible by
+        # construction, but the daemon's stderr log carries a
+        # loud breadcrumb (``[cawl] bug: completed without
+        # source``) AND the wire response reports
+        # ``last_source='unknown'`` so peer UIs don't render an
+        # empty indicator. Empty stays valid for the "no fetch
+        # has happened yet this session" initial state.
+        if last_source == '' and cached > 0:
+            print(f'[cawl] cache_status bug: cached={cached} but '
+                  f'last_source is empty (repo={repo!r})',
+                  file=sys.stderr, flush=True)
+            last_source = 'unknown'
+        response = {
+            'cached': cached, 'total': pf['requested'],
+            'offline': offline, 'circuit_open': circuit_open,
+            'finished': finished,
+            'from_cache': int(pf.get('from_cache', 0) or 0),
+            'from_lan': int(pf.get('from_lan', 0) or 0),
+            'from_upstream': int(pf.get('from_upstream', 0) or 0),
+            'last_source': last_source,
+        }
+        # Diagnostic: log the actual outbound response so we can
+        # tell whether the empty ``last_source`` a peer reports is
+        # what the daemon ACTUALLY sent or whether the peer
+        # rewrote / dropped the field. If the daemon log shows
+        # ``last_source='cache'`` on the wire and the peer's
+        # `[cache-status]` line shows ``last_source=''``, the
+        # bug is post-daemon. 0.50.35 — intentionally always-on
+        # for now; we can rate-limit or remove after the empty-
+        # ``last_source`` field investigation resolves.
+        print(f'[cawl] cache_status response: '
+              f"repo={repo!r} cached={response['cached']} "
+              f"last_source={response['last_source']!r} "
+              f"from_cache={response['from_cache']} "
+              f"from_lan={response['from_lan']} "
+              f"from_upstream={response['from_upstream']} "
+              f"offline={response['offline']} "
+              f"finished={response['finished']}",
+              file=sys.stderr, flush=True)
+        return response
+    return {
+        'cached': _walk_image_count(repo),
+        'total': _count_index_images(repo),
+        'offline': False, 'circuit_open': False,
+        'finished': True,
+        'from_cache': 0, 'from_lan': 0,
+        'from_upstream': 0, 'last_source': '',
+    }
 
 
 def index_path(repo):
@@ -1308,16 +1485,31 @@ def _resolve_basename_via_index(repo, rel_path):
 
 
 def get_image_path(repo, rel_path):
-    """Return an absolute filesystem path to the cached image
-    bytes for ``(repo, rel_path)``, fetching from GitHub if not
-    yet cached. ``rel_path`` may be a flat filename
-    (``cawl-1234.png``) or a nested path
+    """Return ``(absolute filesystem path, source)`` for the cached
+    image bytes for ``(repo, rel_path)``, fetching from GitHub or
+    a paired LAN peer if not yet cached. ``rel_path`` may be a
+    flat filename (``cawl-1234.png``) or a nested path
     (``0001_body/foo.png``) — CAWL repos commonly nest. A flat
     basename that matches an index entry's basename is
-    automatically resolved to that entry's full nested path
-    (see ``_resolve_basename_via_index``).
+    automatically resolved to that entry's full nested path (see
+    ``_resolve_basename_via_index``).
 
-    Returns ``None`` if:
+    *source* is one of:
+
+    - ``'cache'`` — bytes were already on disk.
+    - ``'lan'`` — fetched from a paired LAN peer's cache.
+    - ``'upstream'`` — fetched from GitHub.
+    - ``''`` — only when *target* is ``None`` (no bytes produced).
+
+    By construction, ``target is not None`` implies a non-empty
+    *source*. The 0.50.30 refactor moved source-counter bumping
+    out of this function — callers (the prefetch worker, the
+    on-demand HTTP / ContentProvider handlers) now do the bump
+    explicitly via ``_bump_source_counter(repo, source)`` so the
+    "completed without source" drift the pre-0.50.30 inline-bump
+    pattern silently allowed becomes impossible.
+
+    Returns ``(None, '')`` if:
 
     - ``repo`` is empty.
     - ``rel_path`` is malformed (path-traversal attempt; absolute
@@ -1336,12 +1528,12 @@ def get_image_path(repo, rel_path):
         print(f'[cawl] get_image_path: empty repo for '
               f'rel_path={original_rel_path!r}',
               file=sys.stderr, flush=True)
-        return None
+        return None, ''
     if not _looks_safe_rel_path(rel_path):
         print(f'[cawl] get_image_path: unsafe input rel_path='
               f'{original_rel_path!r}',
               file=sys.stderr, flush=True)
-        return None
+        return None, ''
     # Canonicalize flat basename → nested path via the index,
     # so subsequent operations (cache target, fetch URL) all
     # use the path GitHub actually has the file at. Already-
@@ -1370,23 +1562,25 @@ def get_image_path(repo, rel_path):
         print(f'[cawl] get_image_path: post-resolve unsafe '
               f'rel_path={rel_path!r}',
               file=sys.stderr, flush=True)
-        return None
+        return None, ''
     target = _resolve_image_target(repo, rel_path)
     if target is None:
-        return None
+        return None, ''
     if os.path.isfile(target):
-        return target
+        return target, 'cache'
     with _lock_for(target):
         if os.path.isfile(target):
-            return target
+            return target, 'cache'
         # NOTES #3 (0.50.14): before paying for an upstream
         # round-trip, ask paired LAN peers. Quietly returns None
         # if no paired peer has the byte cached or LAN isn't
         # available; the GitHub fetch is unchanged.
         data = _fetch_image_bytes_from_lan_peer(repo, rel_path)
+        source = 'lan' if data is not None else ''
         if data is None:
             try:
                 data = _fetch_image_bytes_from_github(repo, rel_path)
+                source = 'upstream'
             except (urllib.error.URLError, OSError, TimeoutError,
                     http.client.HTTPException) as ex:
                 # ``http.client.HTTPException`` covers ``InvalidURL``
@@ -1406,7 +1600,7 @@ def get_image_path(repo, rel_path):
                       f'{repo!r}/{rel_path!r}: '
                       f'{type(ex).__name__}: {ex}',
                       file=sys.stderr, flush=True)
-                return None
+                return None, ''
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp = f'{target}.tmp.{os.getpid()}'
         try:
@@ -1423,5 +1617,5 @@ def get_image_path(repo, rel_path):
             print(f'[cawl] image cache write failed for '
                   f'{target!r}: {type(ex).__name__}: {ex}',
                   file=sys.stderr, flush=True)
-            return None
-        return target
+            return None, ''
+        return target, source

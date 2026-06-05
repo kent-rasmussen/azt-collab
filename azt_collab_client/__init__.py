@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.50.15"
+__version__ = "0.50.39"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1361,6 +1361,29 @@ def lan_pair_request_resolve(decision_id, accept):
     return Result.from_dict(resp.get('result') or {})
 
 
+def lan_pair_request_status(peer_id):
+    """Poll the outbound pair-request state for *peer_id*. Returns
+    one of ``'pending'`` / ``'accepted'`` / ``'declined'`` /
+    ``'timeout'`` / ``'none'``. Terminal states (accept / decline /
+    timeout) clear on read, so the UI calling this in a poll loop
+    sees the terminal state exactly once. ``'none'`` on transport
+    failure or when no outbound request is in flight for this peer.
+
+    Used by the "Nearby (unpaired)" UI to drive the row state
+    after a Pair tap: polls every few seconds while ``'pending'``,
+    refreshes the popup on ``'accepted'``, surfaces a brief
+    message on ``'declined'`` / ``'timeout'``.
+    """
+    try:
+        resp = call('POST', '/v1/lan/pair_request_status',
+                    {'peer_id': peer_id})
+    except ServerUnavailable:
+        return 'none'
+    if not resp.get('ok'):
+        return 'none'
+    return str(resp.get('state', 'none') or 'none')
+
+
 def lan_nearby_unpaired():
     """Return mDNS-discovered devices that are NOT in our
     ``peers.json``. List of ``{peer_id, fp, device_name,
@@ -2151,22 +2174,66 @@ def cawl_prefetch(langcode, paths):
 
 
 def cawl_cache_status(langcode):
-    """Return ``{'image_repo': str, 'cached': int, 'total': int}``
-    for the CAWL image cache backing *langcode*'s image_repo.
+    """Return the full CAWL cache-status dict for *langcode*'s
+    image_repo. Wraps ``GET /v1/projects/<lang>/cawl/cache_status``
+    and forwards EVERY field the daemon emits, so peers get the
+    same surface ``CLIENT_INTEGRATION.md`` § 10 documents.
 
-    ``cached`` is the count of image files currently on disk in the
-    daemon's cache; ``total`` is the image-shaped index entries.
+    Returned shape (every key present, with safe defaults on
+    transport failure or older-daemon responses that don't emit
+    the newer fields)::
+
+        {
+          'image_repo':    str,            # 'owner/repo' or ''
+          'cached':        int,            # files on disk / completed
+          'total':         int,            # working-set size
+          'offline':       bool,           # worker bailed offline
+          'circuit_open':  bool,           # worker bailed after N fails
+          'finished':      bool,           # worker idle for this repo
+          # Per-source telemetry (since daemon 0.50.21). See
+          # CLIENT_INTEGRATION.md § 10 "Per-source telemetry".
+          'from_cache':    int,
+          'from_lan':      int,
+          'from_upstream': int,
+          'last_source':   str,            # 'cache'|'lan'|'upstream'|'unknown'|''
+        }
+
     Peers poll this while a CAWL prefetch is running and surface
     a "Caching images: M / N" indicator so the user knows
     network is being used in the background — without that
     indicator they might disconnect Wi-Fi mid-fetch and end up
-    with a half-warm cache.
+    with a half-warm cache. The per-source fields drive the
+    "via LAN" / "via Internet" tag so the user knows whether
+    LAN-share is producing hits or bytes are coming over the
+    metered link.
 
-    Returns ``{'image_repo': '', 'cached': 0, 'total': 0}`` on
-    any failure (daemon unreachable, project unknown, no image
-    repo configured, endpoint missing on older daemons). Peers
-    treat that as "nothing to show" and hide the indicator."""
-    empty = {'image_repo': '', 'cached': 0, 'total': 0}
+    All fields are zero / empty / False on transport failure
+    (daemon unreachable, project unknown, no image_repo
+    configured, endpoint missing on pre-0.50.21 daemons). Peers
+    treat that as "nothing to show" and hide the indicator.
+
+    **Wrapper bug fixed in 0.50.37**: pre-0.50.37 versions of
+    this wrapper returned only ``image_repo``, ``cached``, and
+    ``total`` even when the daemon emitted the full set —
+    silently stripping the per-source telemetry on every call.
+    Peers that followed ``CLIENT_INTEGRATION.md`` § 10 and read
+    ``status.get('from_lan', 0)`` etc. saw the default zeros
+    instead of the daemon's actual values, regardless of what
+    was on the wire. If you observed empty source telemetry
+    against a daemon at 0.50.21+ before 0.50.37, that was this
+    bug, not the daemon."""
+    empty = {
+        'image_repo': '',
+        'cached': 0,
+        'total': 0,
+        'offline': False,
+        'circuit_open': False,
+        'finished': False,
+        'from_cache': 0,
+        'from_lan': 0,
+        'from_upstream': 0,
+        'last_source': '',
+    }
     try:
         resp = call('GET',
                     f'/v1/projects/{langcode}/cawl/cache_status')
@@ -2178,6 +2245,13 @@ def cawl_cache_status(langcode):
         'image_repo': resp.get('image_repo') or '',
         'cached': int(resp.get('cached') or 0),
         'total': int(resp.get('total') or 0),
+        'offline': bool(resp.get('offline', False)),
+        'circuit_open': bool(resp.get('circuit_open', False)),
+        'finished': bool(resp.get('finished', False)),
+        'from_cache': int(resp.get('from_cache') or 0),
+        'from_lan': int(resp.get('from_lan') or 0),
+        'from_upstream': int(resp.get('from_upstream') or 0),
+        'last_source': str(resp.get('last_source') or ''),
     }
 
 
@@ -2273,6 +2347,65 @@ def atomic_commit_bytes(langcode, rel_path, data):
     try:
         resp = call('POST', f'/v1/projects/{langcode}/atomic_commit',
                     {'path': rel_path, 'data_b64': data_b64})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
+def set_audio(langcode, guid, lang, filename):
+    """Surgically set the audio filename on one LIFT entry for
+    project *langcode*. Goes through the daemon's
+    ``/v1/projects/<lang>/set_audio`` endpoint so the peer doesn't
+    have to hold the full LIFT DOM in memory just to serialise the
+    change back to disk.
+
+    Daemon-side semantics (see ``azt_collabd/lift_surgery.py``):
+    locate the entry by *guid*, find-or-create
+    ``<citation>/<form lang={lang}><text>{filename}</text></form>``,
+    leave other forms in the citation untouched, splice byte-stable
+    around the entry, SAX-validate, atomic write under
+    ``project_lock``, fire ``notify_project_changed``, and schedule
+    a debounced commit.
+
+    Returns a ``Result`` carrying ``S.AUDIO_SET`` on first-time
+    write, ``S.AUDIO_SET_NO_CHANGE`` when the form's text already
+    equalled *filename*, ``S.ENTRY_NOT_FOUND`` if no matching
+    entry exists, ``S.LIFT_INVALID`` if the source or post-splice
+    file failed well-formedness validation, or ``S.BUSY`` if
+    project_lock couldn't be acquired in time. Transport failures
+    translate to ``SERVER_UNAVAILABLE`` / ``SERVER_ERROR`` per the
+    wrapper contract. Since 0.50.29."""
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/set_audio',
+                    {'guid': guid, 'lang': lang,
+                     'filename': filename})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
+def set_illustration(langcode, guid, href):
+    """Surgically set the illustration href on one LIFT entry for
+    project *langcode*. Sibling to ``set_audio`` for image saves;
+    targets ``<sense>/<illustration href={href}/>`` on the entry's
+    first sense (creating the sense if absent).
+
+    Returns a ``Result`` carrying ``S.ILLUSTRATION_SET`` /
+    ``S.ILLUSTRATION_SET_NO_CHANGE`` / ``S.ENTRY_NOT_FOUND`` /
+    ``S.LIFT_INVALID`` / ``S.BUSY`` per the same contract as
+    ``set_audio``. Since 0.50.29."""
+    try:
+        resp = call(
+            'POST', f'/v1/projects/{langcode}/set_illustration',
+            {'guid': guid, 'href': href})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -2481,7 +2614,7 @@ __all__ = [
     'lan_clone', 'lan_pending', 'lan_accept_offer',
     'lan_decline_offer', 'lan_adopt_origin', 'lan_resolve_conflict',
     'lan_pair_request_send', 'lan_pair_request_resolve',
-    'lan_nearby_unpaired',
+    'lan_pair_request_status', 'lan_nearby_unpaired',
     'project_kv_get', 'project_kv_set', 'project_kv_list',
     'list_slots', 'claim_slot', 'release_slot', 'rebind_slot',
     'get_cawl_prefetch_all_variants', 'set_cawl_prefetch_all_variants',
@@ -2500,6 +2633,7 @@ __all__ = [
     'commit_project', 'request_sync', 'poll_job',
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
+    'set_audio', 'set_illustration',
     'set_daemon_log_to_file', 'get_daemon_log',
     'restart_server',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',

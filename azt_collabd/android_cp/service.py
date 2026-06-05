@@ -568,5 +568,12 @@ def _resolve_cawl_path(langcode, rest, mode):
         # form. Segments came from Uri.getPath() which gives us
         # the URL-decoded form already.
         rel_path = '/'.join(rest[1:])
-        return _cawl.get_image_path(repo, rel_path)
+        target, source = _cawl.get_image_path(repo, rel_path)
+        # On-demand fetches during an active prefetch contribute
+        # to the source counters (no-op outside any prefetch
+        # window). Mirrors ``server._h_cawl_image``; see the
+        # comment there. 0.50.30.
+        if target is not None and source:
+            _cawl._bump_source_counter(repo, source)
+        return target
     return None

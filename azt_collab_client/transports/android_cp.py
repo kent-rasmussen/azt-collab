@@ -154,17 +154,6 @@ class AndroidContentProviderTransport(Transport):
         extras = self._Bundle()
         if body is not None:
             extras.putString('body', json.dumps(body))
-        # Always-on first-try probes added in 0.41.16 instrument
-        # every RPC so a field tester without adb can deliver a
-        # first-try-fails trail. Suppress for high-frequency
-        # polling paths (cache_status at 1 Hz) where the probe
-        # is pure noise — "first-try" semantically doesn't apply
-        # to the Nth call of a polling loop.
-        suppress_probe = path.endswith('/cawl/cache_status')
-        if not suppress_probe:
-            from .._debug import first_try_log
-            first_try_log('transport.call.pre',
-                          method=method, path=path)
         # Transparent retry on null Bundle. Two known producers:
         #
         #   1. Cold-daemon spawn race. The peer's call lazy-spawns
@@ -201,7 +190,16 @@ class AndroidContentProviderTransport(Transport):
             import time as _time
             _time.sleep(self._NULL_BUNDLE_RETRY_BACKOFF_S[attempt])
             attempt += 1
-        if not suppress_probe:
+        # Only log when something interesting happened — the daemon
+        # returned null (structural failure) or the retry loop fired
+        # at least once (cold-spawn race). Routine RPCs stay silent;
+        # 0.41.16's always-on pre+post pair was load-bearing for the
+        # 2026-05 Tecno KN4 diagnosis, but post-0.43.9 the retry path
+        # is the fix for the cold-spawn race those probes detected,
+        # so every routine call shipped ``bundle_null=False
+        # null_retries=0`` — pure noise that drowned /sdcard logs.
+        if bundle is None or attempt > 0:
+            from .._debug import first_try_log
             first_try_log('transport.call.post',
                           method=method, path=path,
                           bundle_null=bundle is None,

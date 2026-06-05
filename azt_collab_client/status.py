@@ -51,6 +51,17 @@ NO_REPO = 'NO_REPO'
 # 0.36.0+). Carries ``params['bytes_written']`` and ``params['sha256']``.
 ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 
+# Surgical LIFT edits (daemon 0.50.29+). See ``azt_collabd/status.py``
+# for the full rationale. The ``NO_CHANGE`` variants let peers
+# suppress redundant UI updates when the target already had the new
+# value (e.g., a re-save of the same audio filename).
+AUDIO_SET = 'AUDIO_SET'
+AUDIO_SET_NO_CHANGE = 'AUDIO_SET_NO_CHANGE'
+ILLUSTRATION_SET = 'ILLUSTRATION_SET'
+ILLUSTRATION_SET_NO_CHANGE = 'ILLUSTRATION_SET_NO_CHANGE'
+ENTRY_NOT_FOUND = 'ENTRY_NOT_FOUND'
+LIFT_INVALID = 'LIFT_INVALID'
+
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
@@ -86,6 +97,13 @@ CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
 BRANCH_ERROR = 'BRANCH_ERROR'
 REMOTE_CREATE_FAILED = 'REMOTE_CREATE_FAILED'
+# Informational: publish skipped repo auto-creation because the URL's
+# owner is not the authenticated user (typical when the URL was
+# adopted from a LAN peer). Push proceeds against the URL as-is;
+# success depends on the authenticated user being a collaborator on
+# the target. Params: ``owner``, ``username``, ``url``. Since 0.50.27.
+# See azt_collabd/status.py for the full rationale.
+REMOTE_OWNER_MISMATCH_SKIP_CREATE = 'REMOTE_OWNER_MISMATCH_SKIP_CREATE'
 BUSY = 'BUSY'
 CONFLICTS = 'CONFLICTS'
 SERVICE_RESTARTED = 'SERVICE_RESTARTED'

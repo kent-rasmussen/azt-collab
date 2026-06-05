@@ -809,6 +809,61 @@ def _host_matches_known_lan_peer(host):
     return False
 
 
+def set_remote_origin_url(working_dir, url):
+    """Set / replace ``remote.origin.url`` in ``<working_dir>/.git/config``.
+    Returns True on success, False otherwise. Idempotent (writes only
+    when the value actually changes).
+
+    Used by the adopt-origin / remote-conflict decision-acceptance
+    paths so the ``.git/config`` URL matches the registry's
+    ``Project.remote_url`` after a peer's URL is adopted. Pre-0.50.27
+    those handlers only updated ``projects.json``; the working-tree's
+    git config stayed empty, so the next push had no remote to send
+    to.
+
+    Holds ``project_lock`` per CLAUDE.md invariant #11: any code path
+    that writes ``.git/config`` must serialize against init / sync /
+    strip-lan-origin / etc. Bounded timeout matches the
+    ``strip_lan_origin_if_present`` siblings so we defer rather than
+    block when another writer holds the lock — caller can retry.
+    """
+    if not working_dir or not url:
+        return False
+    try:
+        with project_lock(working_dir, timeout=5.0):
+            repo = _get_repo(working_dir)
+            if repo is None:
+                return False
+            try:
+                config = repo.get_config()
+                try:
+                    existing = config.get(
+                        (b'remote', b'origin'), b'url').decode(
+                            'utf-8', errors='replace')
+                except KeyError:
+                    existing = ''
+                if existing == url:
+                    return True
+                config.set((b'remote', b'origin'), b'url',
+                           _enc(url))
+                config.write_to_path()
+                return True
+            finally:
+                try:
+                    repo.close()
+                except Exception:
+                    pass
+    except LockTimeout:
+        print(f'[set-origin-url] lock busy on {working_dir!r}; '
+              f'caller should retry',
+              file=sys.stderr, flush=True)
+        return False
+    except Exception as ex:
+        print(f'[set-origin-url] {working_dir!r} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+
+
 def strip_lan_origin_if_present(working_dir,
                                 scope_to_paired_peers=True):
     """If ``<working_dir>/.git/config`` has
@@ -1229,6 +1284,22 @@ def _ensure_remote_repo(remote_url, username, token):
         # (every test_local_git_remote case).
         return True, None
     owner, repo_name = parts[0], parts[1]
+
+    # If the URL points at a namespace we're not the authenticated
+    # user of (peer's repo we adopted via LAN share, github org we
+    # belong to, etc.), do not POST /user/repos — that endpoint
+    # creates under the *authenticated* user's namespace regardless
+    # of what owner the URL says, producing an orphan ``B/<repo>``
+    # repo when B publishes to ``A/<repo>``. Skip create and let the
+    # push reveal the real outcome: 200 if we're a collaborator,
+    # 403 if not. See plan doc for context (added 0.50.27).
+    if (is_known_host
+            and username
+            and owner.lower() != str(username).lower()):
+        return True, Status(S.REMOTE_OWNER_MISMATCH_SKIP_CREATE,
+                            owner=owner,
+                            username=username,
+                            url=remote_url)
 
     if 'github.com' in host:
         api_url = 'https://api.github.com/user/repos'
@@ -4401,6 +4472,14 @@ _KNOWN_PATH_PREFIXES = (
     '.git/', '.git\\',
     '.azt_atomic_pending/', '.azt_atomic_pending\\',
     '.azt-collab/', '.azt-collab\\',
+    # .azt/ is the project-shared KV + slot-claim subtree
+    # (project_kv.py, 2026-05-28). _stage_all commits everything
+    # under it; per-path merge resolvers at the top of repo.py
+    # expect .azt/slots/*.txt and .azt/kv/*.txt to be in the
+    # working tree. Omitting it here made every commit pass spam
+    # [data-loss-risk] and fire S.DATA_LOSS_RISK for files that
+    # are in fact being backed up — fixed 0.50.25.
+    '.azt/', '.azt\\',
 )
 _KNOWN_TOPLEVEL_FILES = frozenset((
     '.gitignore', 'README', 'README.md', '.gitattributes',

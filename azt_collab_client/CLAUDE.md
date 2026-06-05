@@ -302,7 +302,9 @@ none of them contain rules themselves (per hard rule #9).
   split, stuck-commit retry, auto-sync silence routing.
 - [`docs/rationale/lift_access.md`](docs/rationale/lift_access.md)
   — LIFT file + audio + image cross-package access;
-  `atomic_open_write` semantics.
+  `atomic_open_write` semantics; surgical field-write RPCs
+  (`set_audio` / `set_illustration`, the why behind the parallel
+  write path for low-memory devices).
 - [`docs/rationale/cawl.md`](docs/rationale/cawl.md) — CAWL image
   cache, suite-scoped daemon ownership, per-project image_repo.
 - [`docs/rationale/i18n.md`](docs/rationale/i18n.md) — gettext

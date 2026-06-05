@@ -408,10 +408,34 @@ def _handle_share_declined_bodyauth(environ, start_response):
 
 def _handle_share_offer(environ, start_response, peer_id,
                        prepared_payload=None):
-    """Inbound share-offer handler. Caller is a paired peer who
-    wants us to clone *langcode* from them. Stash as a pending
-    decision; UI surfaces it on the next visit."""
+    """Inbound share-offer handler. Dispatches by local state:
+
+    - **Project not registered locally**: this is the original
+      "want to clone from this peer?" path — stash
+      ``KIND_SHARE_OFFER``; the user accepts via the decisions
+      UI and the LAN clone follows.
+    - **Project registered, local ``remote_url`` empty, incoming
+      non-empty**: peer is telling us where its github origin
+      lives. Stash ``KIND_ADOPT_ORIGIN`` so the user can opt into
+      pushing to the same upstream (and so a future peer Publish
+      adopts this URL instead of inventing a duplicate). Since
+      0.50.27.
+    - **Project registered, URLs match**: steady-state ping
+      after every peer publishes / shares. Log + no-op so the
+      user doesn't see repeated decisions for an already-known
+      fact.
+    - **Project registered, URLs differ**: fork case — stash
+      ``KIND_REMOTE_CONFLICT`` so the user picks via
+      ``_h_lan_resolve_conflict``. Since 0.50.27.
+    - **Project registered, incoming ``repo_url`` empty**: peer
+      doesn't know any URL either; nothing to learn. Log + no-op.
+
+    Pre-0.50.27 behaviour was "always stash ``KIND_SHARE_OFFER``"
+    regardless of local state, which double-decisioned every
+    already-known share and missed the URL-conflict signal entirely.
+    """
     from . import pending_decisions as _pending
+    from . import projects as _projects
     if prepared_payload is not None:
         payload = prepared_payload
     else:
@@ -427,15 +451,62 @@ def _handle_share_offer(environ, start_response, peer_id,
         return _json_response(start_response, '400 Bad Request',
                               {'ok': False,
                                'error': 'langcode required'})
-    _pending.add(_pending.KIND_SHARE_OFFER, {
+    try:
+        local_proj = _projects.get(langcode)
+    except Exception:
+        local_proj = None
+    local_url = ''
+    if local_proj is not None:
+        local_url = str(getattr(local_proj, 'remote_url', '') or '')
+    if local_proj is None:
+        _pending.add(_pending.KIND_SHARE_OFFER, {
+            'peer_id': peer_id,
+            'device_name': device_name,
+            'langcode': langcode,
+            'repo_url': repo_url,
+            'vernlang': vernlang,
+        })
+        print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
+              f'for {langcode!r} stashed (clone-offer)',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '200 OK',
+                              {'ok': True})
+    if not repo_url:
+        print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
+              f'for {langcode!r} carries no repo_url; no-op '
+              '(already have project)',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '200 OK',
+                              {'ok': True})
+    if local_url == repo_url:
+        print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
+              f'for {langcode!r}: remote_url matches local; no-op',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '200 OK',
+                              {'ok': True})
+    if not local_url:
+        _pending.add(_pending.KIND_ADOPT_ORIGIN, {
+            'peer_id': peer_id,
+            'device_name': device_name,
+            'langcode': langcode,
+            'url': repo_url,
+        })
+        print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
+              f'for {langcode!r} stashed (adopt-origin '
+              f'{repo_url!r})',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '200 OK',
+                              {'ok': True})
+    _pending.add(_pending.KIND_REMOTE_CONFLICT, {
         'peer_id': peer_id,
         'device_name': device_name,
         'langcode': langcode,
-        'repo_url': repo_url,
-        'vernlang': vernlang,
+        'existing_url': local_url,
+        'incoming_url': repo_url,
     })
     print(f'[lan-listener] share-offer from {peer_id[:8]!r} for '
-          f'{langcode!r} stashed',
+          f'{langcode!r} stashed (remote-conflict '
+          f'local={local_url!r} incoming={repo_url!r})',
           file=sys.stderr, flush=True)
     return _json_response(start_response, '200 OK', {'ok': True})
 

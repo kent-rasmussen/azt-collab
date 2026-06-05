@@ -65,6 +65,29 @@ NO_REPO = 'NO_REPO'
 # wrapper ``atomic_commit_bytes``.
 ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 
+# Surgical LIFT edits (since 0.50.29). Both endpoints
+# (``set_audio`` / ``set_illustration``) splice one sub-element
+# into one entry without round-tripping the whole DOM peer-side,
+# so low-memory devices can keep the working set bounded.
+# Params: ``guid``. The ``NO_CHANGE`` variants let peers suppress
+# redundant UI updates when the target attribute already had the
+# new value.
+AUDIO_SET = 'AUDIO_SET'
+AUDIO_SET_NO_CHANGE = 'AUDIO_SET_NO_CHANGE'
+ILLUSTRATION_SET = 'ILLUSTRATION_SET'
+ILLUSTRATION_SET_NO_CHANGE = 'ILLUSTRATION_SET_NO_CHANGE'
+# Surgical-edit failure: no ``<entry guid="X">`` in the LIFT.
+# Params: ``guid``. Distinct from LIFT_INVALID — the file is fine,
+# the entry just isn't there. Peer routing: surface for a
+# user-initiated save (the entry was deleted under us, or the
+# peer's in-memory list drifted from disk).
+ENTRY_NOT_FOUND = 'ENTRY_NOT_FOUND'
+# Surgical-edit failure: source LIFT missing, source parse failure,
+# or post-splice well-formedness check failed (refused to persist
+# invalid XML). Params: ``error`` (free-text detail), ``guid``
+# (when applicable). Treat as data-quality-class for routing.
+LIFT_INVALID = 'LIFT_INVALID'
+
 
 # ── Failures / warnings ────────────────────────────────────────────────────
 NOT_A_REPO = 'NOT_A_REPO'
@@ -116,6 +139,17 @@ CLONE_FAILED = 'CLONE_FAILED'
 CLONE_AUTH_REQUIRED = 'CLONE_AUTH_REQUIRED'
 BRANCH_ERROR = 'BRANCH_ERROR'
 REMOTE_CREATE_FAILED = 'REMOTE_CREATE_FAILED'
+# ``_ensure_remote_repo`` was asked to create a repo for a URL whose
+# parsed owner doesn't match the authenticated user (e.g. peer B
+# adopting peer A's github URL via the LAN adopt-origin flow, then
+# tapping Publish — without this guard, ``POST /user/repos``
+# silently creates ``B/<repo>`` even though the push URL points at
+# ``A/<repo>``, leaving an orphan repo). Informational — push
+# proceeds against the URL as-is; if the authenticated user is a
+# collaborator on the target, push succeeds, otherwise the daemon's
+# push-failure routing kicks in. Params: ``owner`` (URL owner),
+# ``username`` (authenticated user), ``url``. Since 0.50.27.
+REMOTE_OWNER_MISMATCH_SKIP_CREATE = 'REMOTE_OWNER_MISMATCH_SKIP_CREATE'
 BUSY = 'BUSY'
 CONFLICTS = 'CONFLICTS'
 SERVICE_RESTARTED = 'SERVICE_RESTARTED'

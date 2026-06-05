@@ -1184,6 +1184,26 @@ class SettingsScreen(Screen):
         cached = status['cached']
         offline = status.get('offline', False)
         circuit_open = status.get('circuit_open', False)
+        # Diagnostic (0.50.35): log the response the server UI
+        # received. Mirrors the recorder's ``[cache-status]`` log
+        # line so we can triangulate where ``last_source`` is
+        # losing its value — daemon process (`:provider`) emits
+        # the outbound response via cawl.cache_status; this line
+        # captures what the picker_app process saw on the other
+        # side of the ContentProvider transport; the recorder's
+        # own log captures what IT saw. Mismatch points to the
+        # process boundary that drops the field. Will be removed
+        # or rate-limited once the bug is found.
+        import sys
+        print(f'[cache-status] (server-ui) cached={cached} '
+              f"total={total} offline={offline} "
+              f"circuit_open={circuit_open} "
+              f"last_source={status.get('last_source', '')!r} "
+              f"from_cache={status.get('from_cache', 0)} "
+              f"from_lan={status.get('from_lan', 0)} "
+              f"from_upstream={status.get('from_upstream', 0)} "
+              f"image_repo={status.get('image_repo', '')!r}",
+              file=sys.stderr, flush=True)
         if total == 0:
             self._hide_cawl_cache_banner(banner, label)
             return
@@ -1212,12 +1232,36 @@ class SettingsScreen(Screen):
                 '(paused — connectivity lost)').format(
                     cached=cached, total=total)
         else:
-            # Live progress + the explicit "network in use" cue so
-            # the user knows not to disconnect.
-            label.text = _tr(
-                'Caching images: {cached} / {total} '
-                '(network in use — please stay online)').format(
-                    cached=cached, total=total)
+            # Live progress with the source tag (since 0.50.38)
+            # so the user sees whether bytes are coming from a
+            # paired LAN peer (free) or upstream GitHub
+            # (metered). ``last_source`` is the most-recent
+            # successful fetch's source; ``''`` until anything
+            # lands. Cache hits get the generic "network in
+            # use" wording — the message is for active fetches,
+            # not on-disk warmups.
+            last_source = status.get('last_source', '')
+            if last_source == 'lan':
+                label.text = _tr(
+                    'Caching images: {cached} / {total} '
+                    '· via LAN').format(
+                        cached=cached, total=total)
+            elif last_source == 'upstream':
+                label.text = _tr(
+                    'Caching images: {cached} / {total} '
+                    '· via Internet (please stay online)'
+                ).format(cached=cached, total=total)
+            else:
+                # 'cache', 'unknown', or '' — fall back to the
+                # generic "network in use" line. Cache hits
+                # don't justify a "via" tag (no current network
+                # serving anything); 'unknown' / '' indicate
+                # initial state or a bug already loud in the
+                # daemon log via ``[cawl] cache_status bug:``.
+                label.text = _tr(
+                    'Caching images: {cached} / {total} '
+                    '(network in use — please stay online)').format(
+                        cached=cached, total=total)
         label.height = label.texture_size[1]
         banner.height = label.height + dp(12)
         banner.opacity = 1
@@ -2590,6 +2634,30 @@ class SettingsScreen(Screen):
         if project is None or not project.working_dir:
             self._set_publish_msg(_tr(
                 'Project {langcode} not found.').format(langcode=langcode))
+            return
+        # Defensive guard: ``_refresh_publish_row`` already hides
+        # the row when ``project_status.remote_url`` is non-empty,
+        # but a stale-bind to ``on_release`` could still land here
+        # after a successful adopt-origin / publish elsewhere.
+        # Refuse rather than create a duplicate URL — the
+        # ``REMOTE_OWNER_MISMATCH_SKIP_CREATE`` orphan-repo guard
+        # in ``_ensure_remote_repo`` would catch the worst case,
+        # but a no-op refusal here is cheaper and gives a clearer
+        # message. 0.50.27.
+        existing_url = ''
+        try:
+            ps = project_status(langcode)
+        except Exception:
+            ps = None
+        if ps is not None and (ps.remote_url or '').strip():
+            existing_url = ps.remote_url.strip()
+        elif (project.remote_url or '').strip():
+            existing_url = project.remote_url.strip()
+        if existing_url:
+            self._set_publish_msg(_tr(
+                'Project {langcode} is already published at '
+                '{url}.').format(
+                    langcode=langcode, url=existing_url))
             return
         domain = 'gitlab.com' if host == 'gitlab' else 'github.com'
         remote_url = f'https://{domain}/{user}/{langcode}.git'

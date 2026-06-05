@@ -265,47 +265,193 @@ class PickerApp(App):
             self.sm.current = name
 
     def _kick_boot_update_check(self):
-        """Background-thread poll of the server APK's GitHub release.
-        On newer-than-running result, branch UX on _launch_source:
+        """Background-thread poll of the server APK's GitHub
+        release. Always renders the silent badge when a newer
+        version is available; popping a modal is gated by the
+        ``store.last_popped_tag`` throttle (0.50.21) so the user
+        sees the prompt **once per release** rather than every
+        single time the settings page opens.
 
-        - ``'user'``: fire the standard ``check_for_update`` flow
-          (popup + download + install intent) so a launcher-icon
-          tap that finds an outdated server gets prompted to
-          update. Routes status through the daemon settings
-          UI's existing update-msg label.
-        - ``'peer'``: set ``update_available_version`` only. The
-          SettingsScreen's ``refresh`` reads the property and
-          repaints the Update-this-app button as
-          ``Update available · X.Y.Z`` in GREEN. No popup — the
-          peer that opened us already handled its own update
-          surfaces; we don't want a second modal in the user's
-          face on top of whatever the peer just dispatched."""
-        from azt_collab_client.ui.update import check_for_update
+        Branching:
+
+        - ``'peer'``: badge only (silent probe). The peer that
+          opened us already handled its own update surfaces.
+        - ``'user'`` AND latest > running AND latest >
+          ``last_popped_tag``: pop the modal AND stamp
+          ``last_popped_tag = latest`` so subsequent settings
+          opens (until a strictly newer release lands) only
+          render the badge.
+        - ``'user'`` AND latest > running AND latest <=
+          ``last_popped_tag``: badge only, no modal. The user
+          already saw the prompt for this release; we don't
+          re-pop it on every open.
+
+        The probe runs off the UI thread so a slow GitHub fetch
+        doesn't block first paint."""
         from azt_collabd.config import update_repo
-        if self._launch_source == 'user':
-            check_for_update(
-                repo=update_repo(),
-                current_version=azt_collabd.__version__,
-                on_status=self._on_boot_update_status,
-                on_no_update=lambda: None,
-                on_error=lambda msg: print(
-                    f'[picker_app] boot update check failed: {msg}',
-                    file=sys.stderr, flush=True),
-            )
-            return
-        # 'peer' branch — silent probe via the SAME helper but with
-        # a no-op popup path. ``check_for_update``'s on_status fires
-        # 'Downloading…' once it commits to installing, so we
-        # short-circuit before that by setting the property in
-        # on_status's first call and never calling install.
-        # Practical implementation: just hit the GitHub Releases
-        # endpoint ourselves and stash the latest tag.
         import threading
         threading.Thread(
-            target=self._probe_latest_release,
+            target=self._probe_latest_release_and_maybe_pop,
             args=(update_repo(),),
             daemon=True,
             name='boot-update-probe').start()
+
+    def _probe_latest_release_and_maybe_pop(self, repo):
+        """Background worker for ``_kick_boot_update_check``.
+        Fetches the latest tag, badges if newer than running,
+        and pops a **confirm** modal at most once per release
+        (when launch_source == 'user'). The modal asks the user
+        "newer is available, update now?" — only on Yes do we
+        actually fire ``check_for_update`` which downloads +
+        installs. Pre-0.50.23 went straight to download with no
+        confirmation, which surfaced as "Downloading n%…"
+        appearing unprompted on every settings open.
+
+        Version sanity (audit-driven, 0.50.23): the existing
+        ``latest <= running → skip`` gate is **augmented with
+        an explicit ``running > latest`` log** so a dev build
+        sideloaded ahead of the published release is visibly
+        skipped rather than silently. A pre-0.50.23 field case
+        had the daemon starting to download an OLDER version
+        than what was installed; the cause was version-tuple
+        parsing edge cases that this defensive log now surfaces.
+
+        All Kivy mutations marshalled back to the main thread
+        via ``Clock.schedule_once``."""
+        from azt_collab_client.ui.update import _fetch_latest
+        from azt_collab_client import _version_tuple
+        from azt_collabd import store as _store
+        try:
+            release = _fetch_latest(repo)
+        except Exception as ex:
+            print(f'[picker_app] boot update probe fetch failed: '
+                  f'{ex}', file=sys.stderr, flush=True)
+            return
+        tag = (release.get('tag_name') or '').lstrip('vV')
+        if not tag:
+            print('[picker_app] boot update probe: empty tag in '
+                  'release; skipping',
+                  file=sys.stderr, flush=True)
+            return
+        running = azt_collabd.__version__
+        tag_tup = _version_tuple(tag)
+        running_tup = _version_tuple(running)
+        if tag_tup == running_tup:
+            # Same version — nothing to do.
+            return
+        if tag_tup < running_tup:
+            # Local-newer-than-release: typical cause is a dev
+            # build sideloaded ahead of what GitHub has
+            # published. Log loudly so a field tester reading
+            # the daemon log can confirm the "running newer than
+            # latest" case is being detected rather than silently
+            # treating the lower tag as an update. Don't badge
+            # and don't pop.
+            print(f'[picker_app] boot update probe: running '
+                  f'{running!r} is NEWER than latest release '
+                  f'{tag!r} — skipping (sideloaded dev build?)',
+                  file=sys.stderr, flush=True)
+            return
+        # tag > running. Set the badge in any case.
+        def _badge(_dt):
+            self.update_available_version = tag
+            print(f'[picker_app] update available: {tag} '
+                  f'(running {running})',
+                  file=sys.stderr, flush=True)
+        Clock.schedule_once(_badge, 0)
+        # Confirm modal only on launcher-tap path AND only when
+        # this tag is strictly newer than the last one we
+        # popped for.
+        if self._launch_source != 'user':
+            return
+        last_popped = _store.get_last_popped_update_tag()
+        if last_popped and _version_tuple(tag) <= _version_tuple(
+                last_popped):
+            print(f'[picker_app] update {tag!r} already popped '
+                  f'(last={last_popped!r}); badge only',
+                  file=sys.stderr, flush=True)
+            return
+        # Stamp BEFORE firing the popup. Either Yes or No, the
+        # user has been asked about THIS tag — re-popping on
+        # every settings open is the bug we're fixing. A newer
+        # release moves the comparison off this stamp.
+        try:
+            _store.set_last_popped_update_tag(tag)
+        except Exception as ex:
+            print(f'[picker_app] last_popped_tag write failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+        Clock.schedule_once(
+            lambda _dt: self._show_update_confirm_popup(tag), 0)
+
+    def _show_update_confirm_popup(self, latest_version):
+        """Two-button confirm popup: "newer version available —
+        Update / Not now". On Update, fires ``check_for_update``
+        (same path as the in-settings Update button). On Not
+        now, just dismisses; the ``last_popped_tag`` stamp set
+        before this popup fires keeps the next settings open
+        from re-prompting until a newer release lands.
+
+        Plain inline popup — doesn't reuse
+        ``install_server_apk_popup`` because that's heavier
+        machinery shaped around the "server APK isn't installed"
+        case; this is "server APK is installed and running, a
+        newer release exists." Two distinct user moments,
+        different copy and button shape.
+        """
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.metrics import dp, sp
+        from azt_collab_client.ui.themed_popup import (
+            ThemedButton, ThemedPopup)
+        from azt_collab_client.translate import tr as _tr
+        from azt_collab_client.ui import theme as _theme
+
+        body_box = BoxLayout(orientation='vertical',
+                             spacing=dp(12), padding=dp(16))
+        body_box.add_widget(Label(
+            text=_tr(
+                'A newer version of AZT Collaboration is '
+                'available: {version}\n\n'
+                'Update now?').format(version=latest_version),
+            font_size=sp(14), font_name=self._font_name,
+            halign='center', valign='middle',
+            text_size=(dp(280), None)))
+        btn_row = BoxLayout(orientation='horizontal',
+                            size_hint_y=None, height=dp(48),
+                            spacing=dp(8))
+        not_now_btn = ThemedButton(
+            text=_tr('Not now'), font_size=sp(13),
+            font_name=self._font_name)
+        update_btn = ThemedButton(
+            text=_tr('Update'), font_size=sp(13),
+            font_name=self._font_name,
+            background_color=_theme.ACCENT)
+        btn_row.add_widget(not_now_btn)
+        btn_row.add_widget(update_btn)
+        body_box.add_widget(btn_row)
+        popup = ThemedPopup(
+            title=_tr('Update available'),
+            content=body_box, size_hint=(0.9, None),
+            height=dp(280), auto_dismiss=False)
+
+        def _on_update(*_):
+            popup.dismiss()
+            from azt_collab_client.ui.update import check_for_update
+            from azt_collabd.config import update_repo as _ur
+            running = azt_collabd.__version__
+            check_for_update(
+                repo=_ur(),
+                current_version=running,
+                on_status=self._on_boot_update_status,
+                on_no_update=lambda: None,
+                on_error=lambda msg: print(
+                    f'[picker_app] update install failed: {msg}',
+                    file=sys.stderr, flush=True),
+            )
+
+        not_now_btn.bind(on_release=lambda *_: popup.dismiss())
+        update_btn.bind(on_release=_on_update)
+        popup.open()
 
     def _probe_latest_release(self, repo):
         """Read the latest tag from GitHub Releases (used by the

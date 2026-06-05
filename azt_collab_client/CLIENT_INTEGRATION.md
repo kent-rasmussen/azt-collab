@@ -441,6 +441,138 @@ update the ``<illustration href=…>`` reference in the LIFT
 itself in the same flow (two-write pattern: media bytes +
 LIFT-side ref).
 
+## 9a. Surgical LIFT field writes (since 0.50.29)
+
+> **For the rationale** — why a parallel write path exists, why
+> per-field endpoints rather than generic `set_form`, why splice
+> rather than full-file rewrite even on the daemon side — see
+> `docs/rationale/lift_access.md` § "Surgical field writes
+> (0.50.29)". This section is the contract.
+
+For LIFT writes that touch a single sub-element of a single entry —
+the canonical case is "save the audio filename for entry X" or
+"save the illustration href for entry X" — prefer the surgical
+RPCs in `azt_collab_client` over rebuilding the full DOM and
+serialising it back. Two endpoints today:
+
+```python
+from azt_collab_client import set_audio, set_illustration, S
+
+result = set_audio(langcode, entry_guid,
+                   audio_lang,         # e.g. 'en-Zxxx-x-audio'
+                   audio_filename)     # e.g. '1143_d6aa935c_bee.m4a'
+
+result = set_illustration(langcode, entry_guid,
+                          href)        # e.g. '0165_wave.png'
+```
+
+Daemon-side these route through `azt_collabd.lift_surgery`. The
+peer never sees the LIFT bytes; the call returns a typed `Result`.
+
+### Guarantees the daemon provides
+
+1. **Byte-stable outside the target entry's bytes.** Every byte
+   outside `<entry guid="X">…</entry>` equals the input file's
+   bytes at the same offset. `git diff` shows only that entry's
+   lines as changed.
+2. **Other sub-elements inside the entry untouched.** `set_audio`
+   leaves vernacular `<form>` siblings inside `<citation>` alone;
+   `set_illustration` leaves other senses (and any sibling
+   `<illustration>` elements in the target sense, beyond the
+   first) alone.
+3. **Well-formedness validation, mandatory.** Daemon SAX-parses
+   the spliced bytes before the atomic rename; a splice that
+   produced invalid XML is refused, original bytes stay on disk.
+4. **Atomic write.** Sibling-tempfile + `os.replace`, under
+   `project_lock`. A crash mid-write leaves the previous bytes
+   intact.
+5. **`notifyStatusChanged` fires** on success so peers'
+   `ContentObserver` wake within ~10 ms.
+6. **Debounced auto-commit fires** on success — same shape as
+   `atomic_commit_bytes`. The peer does not need to call
+   `commit_project` after.
+
+### Targets
+
+- `set_audio(langcode, guid, lang, filename)` →
+  `<entry guid="X">/<citation>/<form lang="{lang}">/<text>{filename}</text></form>`.
+  Creates `<citation>` if absent.
+- `set_illustration(langcode, guid, href)` →
+  `<entry guid="X">/<sense>/<illustration href="{href}"/>`. Uses
+  the first `<sense>` (creates one if absent); within it, updates
+  the first `<illustration>` (creates one if absent).
+
+If the field doesn't fit one of these two paths (e.g.,
+`<pronunciation>` audio, `<gloss>` text, sense-indexed
+illustration), the peer still needs DOM-rewrite — file a
+NOTES_TO_DAEMON entry naming the field and the daemon team can
+extend the shape.
+
+### Status codes the peer must route
+
+| Status code | When | What the peer does |
+|---|---|---|
+| `S.AUDIO_SET` | First-time write or text replaced. | Optimistic in-memory `entries` dict update (if the peer keeps one); refresh UI to show the new filename. |
+| `S.AUDIO_SET_NO_CHANGE` | The audio-lang form's text already equalled the filename. | No UI feedback needed — peer was likely re-saving the same value (e.g., re-tap of a recording button). |
+| `S.ILLUSTRATION_SET` | First-time write or href replaced. | Same as `AUDIO_SET`. |
+| `S.ILLUSTRATION_SET_NO_CHANGE` | The illustration's href already equalled the value. | Same as `AUDIO_SET_NO_CHANGE`. |
+| `S.ENTRY_NOT_FOUND` | No `<entry guid="X">` in the LIFT. | Real error: the entry was deleted under the peer, or the peer's in-memory list drifted from disk. Surface a toast; reload the entries list. Carries `guid` param. |
+| `S.LIFT_INVALID` | Source file missing, source parse failure, or post-splice well-formedness check failed. | Data-quality-class. Surface the translated toast (carries `error` detail); the daemon refused to persist; the file on disk is still the previous well-formed version. |
+| `S.BUSY` | `project_lock` couldn't be acquired in time. | Silent; the peer's next gesture re-tries naturally. Same envelope as auto-sync `S.BUSY`. |
+| `S.SERVER_UNAVAILABLE` / `S.SERVER_ERROR` | Transport failure. | Silent in auto paths; transient-error toast in user-gesture paths. Per the standard wrapper contract. |
+
+### Migration recipe (DOM-rewrite save → surgical RPC)
+
+```python
+# Before (recorder 1.55.x style, ~25 MB working set on 4 MB LIFT):
+def set_audio(self, guid, filename):
+    entry_el = self._find_entry(guid)
+    # ... walks <citation><form lang=audiolang><text>
+    text_el.text = filename
+    self._save()              # ← this builds + serialises the DOM
+
+def _save(self):
+    self._ensure_dom()        # ~5× source-size allocation
+    if self._indent_dirty:
+        self._indent(self._root)
+    with self.handle.atomic_open_write() as f:
+        self._tree.write(f, encoding='utf-8', xml_declaration=True)
+
+# After (~5 MB working set on 4 MB LIFT):
+def set_audio(self, guid, filename):
+    # Optimistic in-memory update of the peer's entries dict so the
+    # UI updates immediately; the RPC persists in parallel.
+    self._entries[guid].audio = filename
+    result = set_audio(self._langcode, guid,
+                      self._audio_lang, filename)
+    if result.has_any(S.AUDIO_SET, S.AUDIO_SET_NO_CHANGE):
+        return
+    # ENTRY_NOT_FOUND / LIFT_INVALID / SERVER_*  — route per the table
+    # above; revert the optimistic entries dict update if needed.
+    self._handle_save_failure(guid, result)
+```
+
+`_ensure_dom`, `self._tree`, `self._root`, and the per-save
+`_indent` go away **for fields covered by surgical RPCs**. If the
+peer still has other write paths that touch fields not covered by
+`set_audio` / `set_illustration` (e.g., headword edits, sense
+reordering), those paths still need the DOM until matching RPCs
+land.
+
+### First-edit-per-entry diff caveat
+
+The daemon re-emits the touched entry via `ET.tostring` after
+`ET.indent` at the file's detected indent unit. If the file was
+previously written by a peer's `_indent` with a different
+whitespace style, the first surgical edit per entry produces a
+larger-than-minimal diff for that entry (reformatted to
+`ET.tostring`'s convention). Subsequent edits of the same entry
+are stable — the entry's bytes are now in the daemon's canonical
+form. A one-time normalize sweep (touch every entry with a no-op
+`set_audio` call carrying its current value) at recorder startup
+locks the format in across the project; not required for
+correctness, only for cosmetics.
+
 ## 10. CAWL image access
 
 The CAWL → image-URL map and the CAWL image binaries are
@@ -676,6 +808,149 @@ prefetch, ``cached`` falls back to the actually-on-disk count
 so the displayed numbers stay honest. Peers that read the new
 flags can additionally badge the banner "offline" / "paused"
 instead of showing what looks like stuck progress.
+
+### Per-source telemetry (since 0.50.21) — surface LAN vs Internet
+
+`cache_status` carries four additional fields so peers can show
+the user **where bytes are coming from**. The NOTES #3 LAN-share
+path (since 0.50.14) tries paired peers' caches before going to
+GitHub; without surfacing the source, the user can't tell whether
+it's actually working — they just see "Caching images: 45/1700"
+and don't know if those bytes are cellular (expensive on metered
+links) or LAN (free).
+
+| Field | Type | Meaning |
+|---|---|---|
+| ``from_cache`` | int | Count of cache hits this prefetch session — file was already on disk, no fetch needed. |
+| ``from_lan`` | int | Count of bytes pulled from a paired LAN peer's cache via ``/v1/lan/cawl_fetch``. |
+| ``from_upstream`` | int | Count of bytes pulled from GitHub. The expensive one. |
+| ``last_source`` | str | Source of the most-recent successful fetch: ``'cache'``, ``'lan'``, ``'upstream'``, or ``''`` (no successful fetch yet). For a one-glance "what's serving right now" tag. |
+
+All four are zero when no prefetch is running for this repo (the
+fallback branch of ``cache_status``). Pre-0.50.21 daemons don't
+emit these keys; peer code should default-zero on
+``status.get('from_lan', 0)`` etc.
+
+#### Required: read every field verbatim from the response
+
+Every cache_status field listed above (``from_cache``,
+``from_lan``, ``from_upstream``, ``last_source``) **is daemon-
+owned wire content**. Peer-side compliance requires:
+
+1. **Read** the field from the response — ``status.get(...)`` —
+   on every poll.
+2. **Log raw, render flexibly.** If your peer emits a debug log
+   line that names a cache_status field (the typical
+   ``[cache-status] ... last_source='X' from_cache=N ...``
+   shape), the logged value MUST be the unmodified
+   ``status.get(...)`` value. Render code may map
+   ``last_source='cache'`` to an empty display tag for the
+   user (fine), but the diagnostic log line must still show
+   the raw ``'cache'``. Otherwise the log becomes a misleading
+   diagnostic that points investigators at the wrong layer.
+3. **Delta tracking, if any, must update its baseline.** If the
+   peer computes per-poll deltas (``Δcache = from_cache -
+   prev_from_cache``) it MUST advance ``prev_from_cache`` on
+   each poll. A peer that perpetually reports ``Δcache=0`` while
+   the daemon's ``from_cache`` is observably climbing has broken
+   delta tracking.
+
+These three rules describe peer-side hygiene; satisfying them
+doesn't fix a daemon-side bug. The
+``cawl_cache_status`` wrapper in
+``azt_collab_client/__init__.py`` (daemon-team-owned) is
+responsible for forwarding every field the daemon emits — pre-
+0.50.37 it stripped the per-source fields silently and ALL
+peers saw zeros / empty regardless of compliance. If you observe
+the per-source telemetry empty while running a 0.50.21+ daemon,
+check ``__version__`` of the bundled ``azt_collab_client``
+first; 0.50.37+ is required for the fields to actually reach
+peer code.
+
+#### Required peer rendering (when prefetching)
+
+The progress indicator the peer already shows for the
+``cached / total`` count gains a one-line source breakdown so the
+user can verify the LAN-share is producing hits. Two render
+shapes work; pick the one that fits your status surface:
+
+**Inline source tag** — minimal, fits any one-line banner:
+
+```python
+def _tick_cache_status(self):
+    status = cawl_cache_status(self._cache_status_langcode)
+    cached, total = status['cached'], status['total']
+    from_lan = status.get('from_lan', 0)
+    from_upstream = status.get('from_upstream', 0)
+    last_source = status.get('last_source', '')
+    # ...existing offline/circuit_open branches...
+    # When a fetch is in progress, append "via LAN" / "via Internet"
+    # so the user sees which channel served the most recent byte.
+    tag = ''
+    if last_source == 'lan':
+        tag = _('  · via LAN')
+    elif last_source == 'upstream':
+        tag = _('  · via Internet')
+    self._show_cache_indicator(
+        _('Caching images: {cached} / {total}{tag}').format(
+            cached=cached, total=total, tag=tag))
+```
+
+**Breakdown line** — more detail, useful for diagnostic /
+field-tester screens:
+
+```python
+def _tick_cache_status(self):
+    status = cawl_cache_status(self._cache_status_langcode)
+    # ... existing setup ...
+    from_lan = status.get('from_lan', 0)
+    from_upstream = status.get('from_upstream', 0)
+    from_cache = status.get('from_cache', 0)
+    if from_lan or from_upstream or from_cache:
+        breakdown = _(
+            '{lan} from LAN · {wan} from Internet · {cache} already cached'
+        ).format(lan=from_lan, wan=from_upstream, cache=from_cache)
+        self._show_cache_breakdown(breakdown)
+```
+
+#### What good and bad look like (so the user can read the tag)
+
+- **`from_lan` climbing, `from_upstream` flat** — paired LAN peer
+  has the bytes cached and is serving them. No metered-link cost.
+  This is what the NOTES #3 share path is supposed to produce in
+  the "one phone seeded the cache, the next phone is filling its
+  own" case.
+- **`from_upstream` climbing, `from_lan` flat** — either no
+  paired peer has the bytes yet (both phones starting from
+  cold), or the LAN peer isn't reachable (different Wi-Fi,
+  paired-peer record stale). Bytes are pulled over WAN — the
+  user is paying cellular if that's the active connection.
+- **`from_cache` climbing alone, both `from_lan` and
+  `from_upstream` near zero** — most bytes were already on disk
+  from a prior session. Normal on a re-open of a previously-
+  warmed project.
+- **`last_source == ''`** — no fetch has succeeded yet this
+  session. Either the prefetch hasn't started serving (initial
+  state) or every attempt has failed (look at the ``circuit_open``
+  flag for the failure mode).
+
+#### Polling considerations
+
+Same 1 Hz cadence as the existing fields; the new counters are
+all monotonic-increasing during a single prefetch session and
+all reset to zero when a fresh ``start_prefetch`` is fired. Log
+on state change as before — the source counters move fast during
+an active prefetch, so log the *deltas* (``from_lan - prev_lan``,
+etc.) rather than absolute values to keep the log readable.
+
+#### Pre-0.50.21 fallback
+
+Default to zero on every counter so the peer keeps working
+against an older daemon. If you want a visible "this daemon
+predates source telemetry" indicator, gate on the daemon's
+reported version (compat probe gives you ``server_version``) and
+skip the source tag entirely below 0.50.21 — but the simpler
+zero-fallback is fine for production.
 
 Where the indicator lives is peer-specific (collab screen
 status line, persistent toast, banner above the main
@@ -1461,6 +1736,9 @@ the sync settings screen anchored on the work-offline toggle
 | ``S.AUTH_REFRESH_STALE`` | **Silent.** (Peers MAY show a non-intrusive settings banner via ``get_credentials_status()`` → ``github.refresh_broken``.) | Surface the translated toast — names GitHub Connect as the next step. DO NOT route, the toast text covers it. |
 | ``S.DATA_LOSS_RISK`` | **SURFACE (not silenced).** This is a data-loss-class signal — files written by a peer aren't reaching git. The auto/user distinction does NOT apply: ALWAYS render the translated toast / banner with the maintainer-contact wording. Params: ``count`` (int), ``sample`` (up to 5 paths). | Same surface as auto-sync. |
 | ``S.COMMIT_REPEATEDLY_FAILED`` | **SURFACE (not silenced).** Two-or-more successive ``COMMIT_FAILED`` for this project. Same data-loss-class severity as ``DATA_LOSS_RISK``: recordings are accumulating on the device but not entering git history. The catchup-commit pattern (one fat commit landing N stranded recordings after a long failure streak) is exactly what this catches — each prior failed attempt bumps the counter, and a second-or-later failure surfaces the loud status so the user is told to investigate before more files pile up uncommitted. Params: ``count`` (int, running streak), ``error`` (str, last dulwich message). Counter clears on the next successful commit. (The daemon also retries stuck commits in the background with exponential backoff, so the running ``count`` and the ``COMMIT_REPEATEDLY_FAILED`` your peer sees on the next sync attempt may reflect failures the peer never directly triggered. Peers don't need to do anything different — the existing result-iteration handles it.) | Same surface as auto-sync. |
+| ``S.AUDIO_SET`` / ``S.ILLUSTRATION_SET`` / ``S.AUDIO_SET_NO_CHANGE`` / ``S.ILLUSTRATION_SET_NO_CHANGE`` | n/a — these are from ``set_audio`` / ``set_illustration``, not sync. | Surgical-edit success / no-op. Update peer UI; suppress feedback on ``_NO_CHANGE``. See § 9a. (0.50.29+.) |
+| ``S.ENTRY_NOT_FOUND`` | n/a — surgical-edit only. | Toast (carries ``guid``); reload the peer's entries list — the entry was deleted under us or the in-memory list drifted. See § 9a. (0.50.29+.) |
+| ``S.LIFT_INVALID`` | n/a — surgical-edit only. | Translated toast (carries ``error`` detail). Data-quality-class; daemon refused to persist invalid XML and the previous bytes remain on disk. See § 9a. (0.50.29+.) |
 | Everything else (``PUSHED``, ``PULLED``, ``NOTHING_TO_COMMIT``, ``CONFLICTS``, …) | Translate to status line. | Translate to status line. |
 
 ### Code shape — both contexts
@@ -1570,6 +1848,12 @@ S.WORK_OFFLINE_ENABLED    # 'WORK_OFFLINE_ENABLED' ← 0.43.0+, sync_project onl
 S.BUSY                    # 'BUSY'                ← project_lock held; silent (§ 17c)
 S.SERVER_UNAVAILABLE      # 'SERVER_UNAVAILABLE'  ← 0.41.13+
 S.SERVER_ERROR            # 'SERVER_ERROR'        ← 0.41.13+
+S.AUDIO_SET               # 'AUDIO_SET'                ← 0.50.29+, § 9a
+S.AUDIO_SET_NO_CHANGE     # 'AUDIO_SET_NO_CHANGE'      ← 0.50.29+, § 9a
+S.ILLUSTRATION_SET        # 'ILLUSTRATION_SET'         ← 0.50.29+, § 9a
+S.ILLUSTRATION_SET_NO_CHANGE  # 'ILLUSTRATION_SET_NO_CHANGE' ← 0.50.29+, § 9a
+S.ENTRY_NOT_FOUND         # 'ENTRY_NOT_FOUND'          ← 0.50.29+, § 9a
+S.LIFT_INVALID            # 'LIFT_INVALID'             ← 0.50.29+, § 9a
 S.PUSHED / S.PULLED / S.NOTHING_TO_COMMIT / S.CONFLICTS / ...
 ```
 

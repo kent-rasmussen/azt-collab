@@ -9,6 +9,1432 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.50.39 — Nearby (unpaired) list: filter self + surface device_name
+
+Two UX bugs in the 0.50.28 "Nearby (unpaired)" popup. Both
+daemon-side.
+
+### Self showing up in the unpaired list
+
+`_h_lan_nearby_unpaired` filtered out paired peers but never
+filtered out the daemon's own `peer_id`. The daemon's own mDNS
+advertisement is picked up by the local discovery callback (NSD
+and zeroconf both surface the local registration), so the
+running device's own peer_id ended up in `known_endpoints()`
+and then in the Nearby list — confusing UX (users tap "Pair"
+on themselves; the request goes nowhere).
+
+Fixed by treating `peer_id.ensure()['peer_id']` as already-known
+alongside the paired-peer set.
+
+### Empty / cryptic name on unpaired entries
+
+Pre-0.50.39, the daemon's mDNS TXT records carried only
+`peer_id` / `fp` / `v`. `device_name` was not advertised, so
+the discovery side had no way to know an unpaired peer's name
+and `_h_lan_nearby_unpaired` returned `device_name=''` on every
+entry. The peer popup then fell back to `"Device {peer_id[:8]}…"`
+— accurate but useless for picking your colleague's phone out
+of a list.
+
+Fixed by adding `device_name` to TXT on both advertise paths
+(zeroconf + Android NSD) and extracting it on both discovery
+callbacks. A new `_device_names` sibling cache parallels
+`_endpoints` to keep the existing 3-tuple shape of
+`known_endpoints()` stable (the scheduler's fan-out planner
+depends on it).
+
+New `known_device_names()` accessor returns
+`{peer_id: device_name}`; `_h_lan_nearby_unpaired` looks each
+discovered peer up in it and surfaces a non-empty
+`device_name` when available. Pre-0.50.39 peers still
+advertise without `device_name` — those entries fall through
+to the peer_id-prefix fallback in the UI, same as today.
+
+### Why a sibling cache instead of extending `_endpoints`
+
+`known_endpoints()` returns `{peer_id: (host, port)}` and is
+consumed by the fan-out planner / scheduler at multiple sites
+that unpack the 2-tuple inline. Extending to a 3-tuple would
+require a coordinated update across all callers; a sibling
+`known_device_names()` keeps the existing shape stable and
+puts the optional device_name on its own accessor — easier to
+add, easier to remove if we ever consolidate.
+
+### Files
+
+- `azt_collabd/lan_discovery.py` — `_device_names` cache, TXT
+  `device_name` in both advertise paths, extraction in both
+  discovery callbacks, new `known_device_names()` accessor.
+- `azt_collabd/server.py` — `_h_lan_nearby_unpaired` filters
+  self, surfaces device_name from `known_device_names()`.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.38 → 0.50.39.
+
+### Compatibility
+
+- mDNS TXT is additive: pre-0.50.39 peers don't advertise
+  `device_name` and discovery just sees the field as empty.
+- 0.50.39 peers advertise it; older peers reading 0.50.39's
+  TXT just ignore the unknown key.
+- No `MIN_CLIENT_VERSION` bump needed — the new field is
+  daemon-internal (TXT + RPC response), no peer code change
+  required to read it (the popup already reads
+  `entry.get('device_name')` from the response).
+
+## 0.50.38 — Server UI banner shows LAN vs Internet source
+
+The server UI's prefetch progress banner (`_tick_cawl_cache_status`
+in `azt_collabd/ui/app.py`) only rendered "Caching images: X / Y
+(network in use — please stay online)" regardless of where the
+bytes were coming from. Now that 0.50.37 fixes the wrapper bug
+that was hiding the per-source telemetry, the server UI can
+actually use it:
+
+- `last_source == 'lan'` → "Caching images: X / Y · via LAN"
+- `last_source == 'upstream'` → "Caching images: X / Y · via Internet (please stay online)"
+- `last_source == 'cache'` / `'unknown'` / `''` → fall back to the
+  existing generic "network in use" line. Cache hits don't
+  justify a "via" tag (no current network is serving anything);
+  the `'unknown'` / empty cases indicate initial state or a bug
+  already loud in the daemon log via `[cawl] cache_status bug:`.
+
+Same display rule the recorder team's `_apply_cache_status` is
+documented to follow in `CLIENT_INTEGRATION.md` § 10. The server
+UI was the laggard.
+
+The two new sentence-shaped msgids
+(`'Caching images: {cached} / {total} · via LAN'` and
+`'Caching images: {cached} / {total} · via Internet (please stay online)'`)
+already shipped to `azt_collab_client.po` in 0.50.30 along with
+the French translations, so this is a pure code wiring change —
+no catalog additions required.
+
+### Files
+
+- `azt_collabd/ui/app.py` — `_tick_cawl_cache_status` reads
+  `last_source` and branches on it for the active-fetch banner.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.37 → 0.50.38.
+
+### Compatibility
+
+- Server-UI-only display change. Requires daemon at 0.50.21+
+  (per-source telemetry) AND a daemon-side bundle that includes
+  the fixed `cawl_cache_status` wrapper (0.50.37+); both ship in
+  the same APK build, so just rebuild + redeploy normally.
+
+## 0.50.37 — Fix the wrapper bug that 0.50.30-0.50.36 chased in the wrong place
+
+The user found the actual bug. It was in
+`azt_collab_client/__init__.py:2200-2204`, in the
+`cawl_cache_status` wrapper:
+
+```python
+return {
+    'image_repo': resp.get('image_repo') or '',
+    'cached':     int(resp.get('cached') or 0),
+    'total':      int(resp.get('total') or 0),
+}
+```
+
+The wrapper forwarded **only three fields** to peer callers,
+silently dropping every other field the daemon emitted —
+including all four per-source telemetry fields
+(`last_source`, `from_cache`, `from_lan`, `from_upstream`) and
+the three state flags (`offline`, `circuit_open`, `finished`).
+Peers that followed the `CLIENT_INTEGRATION.md` § 10 recipe
+and read `status.get('last_source', '')` got `''` not because
+the recorder logged it wrong, not because the daemon set it
+wrong, but because **the wrapper never delivered it in the
+first place**. Every release from 0.50.21 (when per-source
+telemetry shipped daemon-side) through 0.50.36 has had this
+wrapper bug.
+
+The 0.50.30 → 0.50.35 investigation thread chased a phantom
+daemon-side bug for several iterations because of this. 0.50.30
+refactored `get_image_path` and the worker to enforce coupling
+that was already enforced. 0.50.31-0.50.34 built fingerprint
+diagnostics for stale-deploy detection that was real but
+unrelated. 0.50.35 added daemon-side response logging that
+finally confirmed the daemon was emitting the right values —
+but the wrapper bug only surfaced when the user noticed the
+wrapper code itself, not from the diagnostic logs.
+
+### What 0.50.37 fixes
+
+- **`cawl_cache_status` wrapper forwards every field** the
+  daemon emits, with safe defaults for older daemons:
+  `offline`, `circuit_open`, `finished`, `from_cache`,
+  `from_lan`, `from_upstream`, `last_source` — all the per-
+  source telemetry the contract documents.
+- **Empty fallback dict matches the success-case shape** so
+  peers can safely call `.get(field, default)` without
+  branching on transport failure.
+- **Docstring updated** to list every field and call out the
+  pre-0.50.37 bug explicitly, so a future debugger seeing the
+  symptom on an older bundle has a pointer.
+
+### CLIENT_INTEGRATION.md § 10 contract reframe
+
+The 0.50.36 contract tightening framed the failure as a peer-
+side regression. That framing is wrong — the rules themselves
+(read every field, log raw, advance delta baselines) are still
+reasonable peer-side hygiene, but compliance with them was
+*impossible* against pre-0.50.37 bundles because the wrapper
+stripped the fields before peer code could read them. The
+section now says so explicitly, points at this wrapper as the
+historical cause, and tells peers to check the bundled
+`azt_collab_client.__version__` first when observing empty
+per-source telemetry.
+
+### Files
+
+- `azt_collab_client/__init__.py` — `cawl_cache_status`
+  forwards all fields; empty fallback matches; docstring lists
+  the full shape; `__version__` 0.50.36 → 0.50.37.
+- `azt_collab_client/CLIENT_INTEGRATION.md` § 10 — "Required:
+  read every field verbatim" section reframed to acknowledge
+  the wrapper was the actual cause.
+
+### Compatibility
+
+- Wire format unchanged; this fix is purely client-side.
+- **Peer rebuild required** to pick up the wrapper fix. The
+  daemon side is correct from 0.50.21 onward; what needs to
+  ship is a peer APK rebuilt against client 0.50.37+ so the
+  fields actually reach peer code.
+- The diagnostic logs from 0.50.35
+  (`[cawl] cache_status response:`, `[cawl] worker first bump:`,
+  `[cache-status] (server-ui)`) stay in for this release while
+  the user's peer rebuild propagates. Once a peer at 0.50.37+
+  confirms it sees the per-source values reaching its
+  `[cache-status]` log line, the daemon-side noise can come
+  out in a follow-up.
+
+### Mea culpa
+
+I owe the user an apology for several rounds of confidently
+misdirected investigation. The "daemon code is correct, must
+be deploy" hedge was wrong, and even when the daemon was
+exonerated by the 0.50.35 diagnostic, my next instinct was
+"recorder bug" rather than "look at the wrapper that sits
+between daemon and recorder." The user found it by reading the
+wrapper code directly while I was still proposing diagnostics.
+
+## 0.50.36 — Tighten the cache_status compliance contract
+
+0.50.35's diagnostic log proved the daemon emits `last_source` /
+`from_cache` / `from_lan` / `from_upstream` correctly on the
+wire, and the recorder's `[cache-status]` debug line was logging
+post-render values instead of the raw response values. Three
+release iterations chased a non-bug in the daemon because the
+peer's diagnostic shape didn't surface the wire truth.
+
+To prevent the same investigation shape recurring, `CLIENT_INTEGRATION.md`
+§ 10 "Per-source telemetry" now carries an explicit "Required:
+read every field verbatim from the response" subsection with
+three numbered rules:
+
+1. Read the field — `status.get(...)` — on every poll.
+2. Log raw, render flexibly. Peer diagnostic log lines MUST emit
+   the unmodified response value. Render code may map
+   `last_source='cache'` to an empty display tag (fine), but the
+   *log line* must still show `'cache'`.
+3. If peer-side delta tracking is computed across polls, the
+   baseline MUST advance on each poll. Perpetual `Δcache=0`
+   while the daemon's `from_cache` is climbing is broken delta
+   tracking, not absent telemetry.
+
+The "what good and bad look like" subsection below remains the
+peer-team's display guide; the new "Required" subsection is the
+contract surface peers must satisfy. Linked from the canonical
+0.50.30 → 0.50.35 investigation thread so future readers can see
+the failure shape that motivated the rule.
+
+### Files
+
+- `azt_collab_client/CLIENT_INTEGRATION.md` § 10 — new
+  "Required: read every field verbatim from the response"
+  subsection.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.35 → 0.50.36.
+
+### Compatibility
+
+Doc-only daemon-side. The diagnostic logs from 0.50.35
+(`[cawl] cache_status response:`, `[cawl] worker first bump:`,
+`[cache-status] (server-ui)`) stay in until the recorder
+team resolves their side of the bug; will be removed or rate-
+limited in a follow-up release.
+
+## 0.50.35 — Diagnostic: log cache_status outbound response + worker first bump
+
+0.50.34 confirmed via load-marker that the new cawl.py IS in the
+deployed bundle. Yet the empty-`last_source` symptom persists with
+no `[cawl] cache_status bug:` line firing. The contract code at
+lines 884-888 cannot fail to fire on `last_source == '' and
+cached > 0`. The worker code cannot bump `completed` without
+bumping `last_source`. Both are observably contradicted. Two
+remaining possibilities:
+
+1. The daemon really IS setting `last_source='cache'` correctly,
+   and the peer's `[cache-status]` log line drops or rewrites the
+   value before printing — making the bug post-daemon.
+2. The daemon IS sending `''` for some reason I can't see from
+   reading the source.
+
+This release adds three triangulation diagnostics (the recorder's
+existing `[cache-status]` log is the fourth point):
+
+- **`[cawl] worker first bump: source='cache' state['last_source']='cache' …`** —
+  one-shot per worker session, fires inside `_prefetch_worker`'s
+  bump block right after `state['last_source'] = source`. Proves
+  the worker reached that line AND the assignment landed.
+- **`[cawl] cache_status response: …last_source='cache' from_cache=N …`** —
+  printed unconditionally from `cache_status` (in the daemon's
+  `:provider` process) immediately before return. Shows the
+  actual outbound dict.
+- **`[cache-status] (server-ui) cached=N total=M …last_source='cache' …`** —
+  printed by the server UI's `_tick_cawl_cache_status` (in the
+  picker_app process) when it receives a response from the
+  daemon. Shows what the picker_app process saw on the other
+  side of the ContentProvider transport, separate from what the
+  recorder saw.
+
+Together, these let us triangulate which process boundary drops
+`last_source`:
+
+| Where empty appears |  Diagnosis  |
+|---|---|
+| `[cawl] cache_status response:` shows `''` | Daemon-side bug — code didn't write `last_source` despite the contract. |
+| Daemon log shows `'cache'`, `[cache-status] (server-ui)` shows `''` | ContentProvider transport drops the field crossing the process boundary. |
+| Daemon + server-ui both show `'cache'`, recorder shows `''` | Recorder-side render/log rewrite. |
+
+After redeploy + reproduction:
+
+- If daemon log shows `last_source='cache'` on the wire but the
+  peer's `[cache-status]` log shows `last_source=''` → bug is on
+  the peer side (recorder's render code drops the value).
+- If daemon log shows `last_source=''` on the wire → bug is on the
+  daemon side after all, and I've been misreading code somewhere.
+
+The `cache_status response:` log fires on every poll. That's
+deliberate noise for now while we're investigating; will rate-
+limit or remove once we have the answer.
+
+### Files
+
+- `azt_collabd/cawl.py` — worker first-bump diagnostic;
+  `cache_status` always-on response log.
+- `azt_collabd/ui/app.py` — server UI cache-status tick logs
+  the received response (parallel to the recorder's log).
+- `azt_collab_client/__init__.py` — `__version__` 0.50.34 → 0.50.35.
+
+### Compatibility
+
+No wire format change. The new logs are stderr only.
+
+## 0.50.34 — Per-module fingerprints + cawl.py load marker
+
+Driver: the user verified 0.50.32 fingerprint mechanism works
+(`a322…` → `26b7…` between two consecutive rebuilds), but the
+underlying `last_source=''` bug still persists on the deployed
+daemon. Conclusion: the combined fingerprint changing only proves
+*something* changed in the bundle — typically the `__version__`
+literal in `azt_collab_client/__init__.py`. It does NOT prove
+that the SPECIFIC file carrying the bug fix (`cawl.py`, in this
+case) was actually updated. A single-file deploy gap is exactly
+the blind spot the combined hash has.
+
+This release closes that gap two ways.
+
+### Per-module fingerprint breakdown
+
+- **`module_fingerprints()`** in `_fingerprint.py` — returns a
+  sorted dict mapping each `.py`/`.pyc` file (key:
+  `<pkg_name>/<rel_module>.<ext>`) to its individual 16-char
+  hash. Same hashing inputs as the combined fingerprint, just
+  not folded together.
+- **`/v1/health.modules`** carries the dict on every health
+  probe. Peers / diagnostic scripts can pull it without log
+  scraping.
+- **`python -m azt_collabd fingerprint --modules`** prints one
+  `<hash>  <module>` line per file from the source tree.
+  Output is grep-able and diff-able against the deployed
+  daemon's `modules` dict. Diverging entries point at exactly
+  the files that didn't update.
+
+### cawl.py load marker
+
+- A one-shot `sys.stderr.write` at the top of `cawl.py` prints:
+  ```
+  [cawl] module loaded; v0.50.34+ — tuple-returning get_image_path; worker bumps source under _cache_status_lock alongside state['completed'] += 1
+  ```
+- If you don't see this line in the daemon log after a deploy
+  that's *supposed* to carry 0.50.34, `cawl.py` specifically
+  didn't update — even if the combined fingerprint shifted.
+- Removing or editing the marker requires editing `cawl.py`
+  itself, so the marker can't survive a stale-unpack.
+
+### Diagnostic recipe (use this when "the fix should be deployed
+but the bug persists")
+
+```
+# 1. Snapshot what the source tree expects:
+python -m azt_collabd fingerprint --modules > /tmp/source.txt
+
+# 2. Pull the daemon's modules dict (via /v1/health or however
+# you have access — desktop loopback can curl, Android requires
+# the in-app surface):
+# ...→ /tmp/deployed.txt
+
+# 3. Diff:
+diff /tmp/source.txt <(jq -r '.modules|to_entries[]|"\(.value)  \(.key)"' /tmp/deployed.txt|sort)
+```
+
+Cross-format caveat unchanged from 0.50.32: source-`.py` hashes
+won't match deployed-`.pyc` hashes for the same module. The
+deployed-vs-deployed comparison (before redeploy / after redeploy)
+is the most useful — diverging entries are exactly the files that
+DID update in this deploy cycle.
+
+### Files
+
+- `azt_collabd/_fingerprint.py` — new `module_fingerprints()`
+  function.
+- `azt_collabd/server.py` — `/v1/health` payload includes
+  `modules` dict.
+- `azt_collabd/__main__.py` — `fingerprint` CLI gains `--modules`
+  flag.
+- `azt_collabd/cawl.py` — load-time marker print at the top.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.32 →
+  0.50.34. (0.50.33 was a one-line no-op bump the user shipped
+  to verify the fingerprint mechanism shifts between deploys;
+  no separate CHANGELOG entry for it.)
+
+### Compatibility
+
+- Additive on the wire — `modules` field is new; older peers
+  that don't read it see no change.
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` bump.
+
+## 0.50.32 — Fingerprint walker handles .pyc-only bundles (Android)
+
+0.50.31's fingerprint mechanism only walked `.py` files. On Android,
+p4a strips `.py` and ships only `.pyc` — so the walker found zero
+modules and returned `SHA-256(b'') = e3b0c44298fc1c14…` regardless
+of what code was actually deployed. (Caught by the user's first
+test: source-tree CLI returned `ef4aa50…` against a real source
+tree; daemon returned the empty-input hash.)
+
+### What changed
+
+- **`_collect_modules`** walks both `.py` and `.pyc` files. Handles
+  three on-disk layouts uniformly:
+  - `azt_collabd/cawl.py` (source tree)
+  - `azt_collabd/cawl.pyc` (p4a / legacy `--no-source` layout)
+  - `azt_collabd/__pycache__/cawl.cpython-311.pyc` (default
+    Python compile cache)
+- **`.cpython-XYZ[.opt-N].pyc` suffix stripping** so a module's
+  identity is independent of the Python version that compiled it.
+- **`__pycache__/` segment is folded out** of the rel-module
+  path — that directory is a storage detail, not part of the
+  module identity.
+- **`.py` wins over `.pyc`** when both are present for the same
+  module, so a developer machine with populated `__pycache__/`
+  produces a source-tree-only fingerprint regardless of `.pyc`
+  freshness.
+- **PEP-552 header stripped** from `.pyc` content before hashing
+  (first 16 bytes = magic + flags + timestamp/hash + source size),
+  so two rebuilds of identical source on the same Python version
+  produce identical fingerprints.
+
+### Diagnostic boost in the boot line
+
+- `[fingerprint] daemon=<hex> modules=<N>` — module count is now
+  in the boot-time line. An empty fingerprint with `modules=0`
+  is a configuration error (walker found no files), distinct
+  from a real hash that happens to start with `e3b0c4…`. Helps
+  the next time a similar layout mismatch surfaces.
+- **`[daemon-log] mirroring stdio` line includes the fingerprint**
+  on every install (fresh and respawn). So every daemon respawn
+  prints the fingerprint visibly, not just first-import:
+  ```
+  [daemon-log] mirroring stdio to '/path/daemon.log' (appending —
+  daemon 0.50.32 fingerprint=abcd123456789012 respawn)
+  ```
+
+### Cross-format comparison caveat
+
+The deployed daemon hashes `.pyc` bytecode bytes; the source-tree
+CLI hashes `.py` source bytes. **These differ in absolute value
+even for the same logical content.** The useful comparisons:
+
+- **Source-vs-source** (CLI run on two different checkouts):
+  identical iff source matches.
+- **Deployed-vs-deployed** (fingerprint before and after a
+  redeploy): changes iff the deployment actually picked up new
+  bytes. This is the "did my deploy take?" check.
+- **Source-vs-deployed**: not directly comparable across formats.
+  The diagnostic value is "the deployed fingerprint changed after
+  the redeploy that was supposed to change it" rather than "the
+  deployed fingerprint matches the source-tree hash."
+
+### Files
+
+- `azt_collabd/_fingerprint.py` — walker rewritten; helpers
+  `_normalize_pyc_stem`, `_collect_modules`, `_file_hash_content`,
+  `_count_module_files`; PEP-552 header handling.
+- `azt_collabd/server.py` — `install_stdio_tee` includes
+  `fingerprint=<hex>` in the boot log line.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.31 → 0.50.32.
+
+### Compatibility
+
+- Wire format unchanged. `/v1/health` still emits `fingerprint`
+  the same way.
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` bump.
+- The hash *value* for a given source tree changes between
+  0.50.31 and 0.50.32 because of the `.pyc`-aware walker and
+  `__pycache__/` folding — that's expected and one-time.
+
+## 0.50.31 — Daemon content fingerprint: definitive "is the deployed code current?"
+
+Driver: 0.50.30 shipped a daemon-side fix that should have made
+`last_source=''` impossible while `cached > 0` was reported. The
+device deployed 0.50.30 (confirmed via `/v1/health`), the daemon
+log mirror line said `daemon 0.50.30 respawn`, and the source
+tree confirmed our edits were in `cawl.py` (the diagnostic
+`grep -c 'completed without source' azt_collabd/cawl.py` returned
+`3`). Yet the bug pattern persisted: empty `last_source`, no
+`[cawl] cache_status bug:` log, no `[cawl] bug: completed without
+source` log. The daemon was reporting version 0.50.30 while running
+older `.py` bytes — p4a's stale-unpack issue (`feedback_p4a_stale_unpack_on_apk_update`)
+again. `__version__` is a single string that updates with one
+file edit; the rest of the bundle can ship stale and we'd never
+know from version probes alone.
+
+This release adds the missing signal.
+
+### Content fingerprint
+
+- **New `azt_collabd/_fingerprint.py`.** Walks every `.py` file in
+  `azt_collabd/` and `azt_collab_client/`, hashes `rel_path\0
+  file_bytes\0` per file in sorted order, returns the first 16
+  hex chars of the SHA-256 (64-bit prefix — collision-resistant
+  enough in practice, short enough to eyeball-compare).
+- **Computed once per daemon process at module load**, cached
+  forever. Imported eagerly from `azt_collabd/__init__.py` so the
+  first-call diagnostic print lands in the daemon log between the
+  `before_import_azt_collabd` and `after_import_azt_collabd`
+  boot-trace lines:
+  ```
+  [fingerprint] daemon=ab12cd34ef567890 (sha256 prefix; full=...)
+  ```
+- **Surfaced on `/v1/health`** as the `fingerprint` field
+  alongside `version`. Peers reading `health()` see it
+  unchanged-the-same-call.
+
+### CLI helper
+
+```
+python -m azt_collabd fingerprint
+```
+
+Walks the *source tree* (azt_collab/ checkout) using the same
+hash algorithm and prints the expected fingerprint. Compare
+against the deployed daemon's `/v1/health.fingerprint`:
+
+- **Same** → deploy took, code on device matches your source.
+- **Different** → bundle is stale, deploy didn't actually pick
+  up the latest bytes. Force a clean rebuild
+  (`buildozer android clean` + flash again, per
+  `feedback_p4a_stale_unpack_on_apk_update`).
+
+### Why both inputs are hashed (daemon + client)
+
+Both `azt_collabd/` and `azt_collab_client/` ship in the same
+daemon-side bundle on Android. A stale unpack can leave either
+or both packages with old bytes. Hashing both gives one number
+that covers both surfaces; debugging "which package is stale"
+isn't usually the question — "did anything change" is.
+
+### When to look at it
+
+- After every redeploy: confirm the fingerprint changed.
+- After every "this should fix it but didn't" bug: rule out
+  stale unpack as the cause before chasing logic bugs.
+- Before reporting a daemon-side regression: confirm the
+  deployed code matches the source tree you're reading.
+
+### Files
+
+- `azt_collabd/_fingerprint.py` — new module, the hashing logic.
+- `azt_collabd/__init__.py` — eager-import of fingerprint at
+  module load, exposes via `__fingerprint__`.
+- `azt_collabd/server.py` — `/v1/health` payload includes
+  `fingerprint`.
+- `azt_collabd/__main__.py` — new `fingerprint` CLI subcommand.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.30 →
+  0.50.31.
+
+### Compatibility
+
+- Additive change: `fingerprint` field on `/v1/health` is new;
+  older peers that don't read it see no change in behaviour.
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` bump.
+- The `health()` wrapper in `azt_collab_client.rpc` already
+  returns the raw response dict, so peers read the new field
+  via `health().get('fingerprint', '')` with no client rebuild
+  needed.
+
+### Independent: 0.50.30 fix still ships in this bundle
+
+Once the user does the clean rebuild that this release encourages,
+the 0.50.30 telemetry-correctness fix (refactored `get_image_path`
+returning `(target, source)`, worker bumps source under the same
+lock as `completed`, contract tightening on `cache_status`) is
+also in the deployed bundle. The fingerprint helps confirm both
+land.
+
+## 0.50.30 — CAWL source telemetry: never-empty contract + catalog drop
+
+Driver: field log of CAWL prefetch showing `cached=319 → 323` over
+a 7 s window while `last_source` stayed empty and Δ-counters for
+all three sources (`cache`/`lan`/`upstream`) reported 0. The
+user's question was the right one: if bytes are landing, they came
+from *somewhere* — the indicator should always say which. Empty
+`last_source` while `completed > 0` is a contract violation; the
+user can't tell whether LAN sync is doing its job, which was the
+whole point of the per-source telemetry shipped in 0.50.21.
+
+### Root cause shape
+
+Pre-0.50.30, source bumping lived **inside** `get_image_path`
+(`cawl.py:1442/1448/1505`), while `state['completed'] += 1` lived
+**outside** in the prefetch worker. The two writes targeted the
+same dict under the same lock but via different code paths;
+nothing in the codebase enforced the coupling. Any code path that
+returned a non-None target without going through one of the
+three internal `_bump_source_counter` calls would let `completed`
+move while `last_source` stayed `''`. The code I read doesn't
+have such a path, but the contract was fragile by structure
+rather than failsafe by structure.
+
+### Structural fix
+
+- **`get_image_path` and `get_image_path_lan_only` now return
+  `(target, source)`** where `source` is one of `'cache'` /
+  `'lan'` / `'upstream'` / `''` (only `''` when `target is None`).
+  All internal `_bump_source_counter` calls removed.
+- **`_prefetch_worker` bumps explicitly** in the same
+  `with _cache_status_lock:` block that increments `completed`.
+  The increment and the bump are now atomic under one lock by
+  construction — they cannot drift apart.
+- **`_SOURCE_FIELD`** mapping promoted to a module-level constant
+  for shared use.
+- **`lan_extras` pass** also rewritten to unpack the tuple and
+  bump explicitly; matches the main loop's discipline.
+- **`_bump_source_counter` stays public** for on-demand callers
+  (loopback `_h_cawl_image`, Android ContentProvider's image
+  open) so user-driven fetches during an active prefetch still
+  contribute to the source counters — same pre-refactor
+  behaviour from the user's perspective. Both call sites
+  updated to unpack the tuple and call the helper explicitly.
+
+### Defensive log + never-empty wire contract
+
+Even after the refactor makes "completed without source"
+impossible by construction, two layers of defense catch future
+regressions:
+
+- **Worker-side breadcrumb** — if the worker ever observes
+  `target is not None and source == ''`, it logs
+  `[cawl] bug: completed without source for <repo>/<path>`
+  to stderr. Catches reintroduction of a return-non-None path
+  that skips source tagging.
+- **`cache_status` contract** — if `cached > 0 and last_source
+  == ''`, the daemon logs `[cawl] cache_status bug: cached=N
+  but last_source is empty` AND reports `last_source='unknown'`
+  on the wire so peers never render an empty indicator while
+  files are landing. Empty stays valid for the genuine
+  "no fetch this session yet" initial state.
+
+### Catalog drop (NOTES follow-up)
+
+Two sentence-shaped msgids the recorder's 1.51.1 build uses for
+the per-source progress indicator landed in
+`azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+with French translations:
+
+- `'Caching images: {cached} / {total} · via LAN'` →
+  `'Mise en cache des images : {cached} / {total} · via LAN'`
+- `'Caching images: {cached} / {total} · via Internet (please stay online)'` →
+  `'Mise en cache des images : {cached} / {total} · via Internet (restez connecté)'`
+
+No empty `msgstr` per `feedback_empty_msgstr_renders_blank`.
+NOTES_TO_DAEMON.md entry for this item deleted per the
+"delete on action" convention.
+
+### Files
+
+- `azt_collabd/cawl.py` — `get_image_path` /
+  `get_image_path_lan_only` return tuple; `_prefetch_worker` /
+  lan_extras pass bump explicitly; `_SOURCE_FIELD` constant;
+  `cache_status` contract tightened.
+- `azt_collabd/server.py` — `_h_cawl_image` unpacks tuple, calls
+  `_bump_source_counter` for on-demand fetches.
+- `azt_collabd/android_cp/service.py` — ContentProvider image
+  open path same treatment.
+- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+  — two new msgids with French translations.
+- `azt_collab_client/__init__.py` — `__version__` 0.50.29 →
+  0.50.30.
+- `azt_collab_client/NOTES_TO_DAEMON.md` — cache-indicator
+  msgids entry deleted.
+
+### Compatibility
+
+- No wire-format changes that break older peers. Older clients
+  reading `cache_status` ignore unknown fields; the new
+  `last_source='unknown'` value is a string they'll either show
+  or ignore depending on their per-source rendering branch.
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` bump.
+- The internal `get_image_path` signature changes inside the
+  daemon only; no peer-facing function changed shape.
+
+## 0.50.29 — Surgical LIFT edits: set_audio + set_illustration
+
+Driver: `NOTES_TO_DAEMON.md` 2026-06-04 — the recorder runs on
+low-memory devices (PowerVR Rogue GE8300, ~1 GB user-memory) and
+field projects have crossed 4 MB LIFT (en-TH-x-anna hit 4,263,377
+bytes on 2026-06-04 with the daemon's `[data-quality]` large-file
+warning firing). The peer's current pattern holds the LIFT
+`entries` dict (~1× source) plus the full ElementTree DOM (~5×
+source) in memory just to serialise the tree back on every audio
+save. Steady-state working set was ~25 MB on this project — enough
+that Android's LMKD started reaping the peer process during normal
+recording sessions, surfacing as "back to launcher icon" with no
+Python traceback (kernel SIGKILL gives the runtime no chance to
+log). Today's release lifts the DOM requirement from the peer by
+moving the byte-level surgery into the daemon.
+
+### What landed
+
+- **`azt_collabd/lift_surgery.py`** — new module. Two public
+  functions: `set_audio(working_dir, lift_path, guid, lang,
+  filename)` and `set_illustration(working_dir, lift_path, guid,
+  href)`. Shared pipeline:
+
+  1. Read the LIFT as bytes.
+  2. Locate `<entry guid="X">…</entry>` (or `<entry guid="X"/>`)
+     via `_ENTRY_TAG_RE` over the file bytes; LIFT doesn't nest
+     entries so a single forward scan suffices. Returns
+     `[start, end)` byte range.
+  3. Sub-parse just the entry bytes with `ET.fromstring` — a tiny
+     in-memory tree, not the document.
+  4. Edit: find-or-create the target sub-element. For audio:
+     `<citation>/<form lang={lang}>/<text>`; other forms in the
+     citation untouched. For illustration:
+     `<sense>/<illustration href=...>` on the first sense.
+  5. `ET.indent` at the file's detected indent unit (sniffs the
+     whitespace before the entry's open tag — handles 2-space,
+     tab, 4-space styles uniformly).
+  6. `ET.tostring`, splice into the original file bytes by simple
+     concatenation around `[start, end)`. Bytes outside the
+     entry's range are preserved exactly.
+  7. SAX-parse the spliced bytes to validate well-formedness;
+     refuse to persist invalid XML.
+  8. Sibling-tempfile + `os.replace`, holding `project_lock` per
+     CLAUDE.md invariant #11.
+
+- **`POST /v1/projects/<lang>/set_audio`** /
+  **`POST /v1/projects/<lang>/set_illustration`** — daemon dispatch
+  in `server.py`. On success: auto-fire `scheduler.commit_project`
+  (debounced) and `android_cp.notify.notify_project_changed` so
+  `ContentObserver` peers wake within ~10 ms (same shape as
+  `_h_project_atomic_commit`).
+
+- **Client wrappers** `set_audio(langcode, guid, lang, filename)`
+  and `set_illustration(langcode, guid, href)` in
+  `azt_collab_client/__init__.py`; added to `__all__`. Transport
+  failures translate to `SERVER_UNAVAILABLE` / `SERVER_ERROR` per
+  the wrapper contract.
+
+- **Six new status codes** mirrored in both `status.py` files:
+  `AUDIO_SET`, `AUDIO_SET_NO_CHANGE`, `ILLUSTRATION_SET`,
+  `ILLUSTRATION_SET_NO_CHANGE`, `ENTRY_NOT_FOUND`, `LIFT_INVALID`.
+  The `NO_CHANGE` variants let peers suppress redundant UI updates
+  when a re-save of the same value lands. English + French
+  translations added; no half-shipped empty `msgstr`.
+
+### Guarantees provided to peers
+
+Per the surgical contract:
+
+1. **Byte-stable outside the target entry's bytes.** Every byte
+   outside `[entry_start, entry_end)` equals the input file's
+   bytes at the same offset. `git diff` shows only the one
+   entry's lines as changed.
+2. **Other forms in `<citation>` untouched.** The vernacular's
+   `<form lang="seh">…` (or whatever the project uses for text)
+   sits beside the audio form; we touch only `<form lang="{audio
+   lang}">`.
+3. **Well-formedness validation, mandatory.** A failed splice
+   never persists; the original bytes remain on disk.
+4. **Atomic write.** Sibling tempfile + `os.replace`. A crash mid-
+   write leaves the previous file intact.
+5. **`project_lock` held throughout.** Serializes against the
+   daemon's own merge-output writes and any other `atomic_commit`
+   from peers.
+6. **`notifyStatusChanged` fires** on success so observer peers
+   refresh fast.
+
+### What the peer saves
+
+Per the NOTES entry's math: the recorder's `_save()` no longer
+needs to build the ElementTree DOM (`self._ensure_dom()` becomes a
+no-op for these write paths). Peer steady-state LIFT memory drops
+from `entries + DOM` (~6× source) to `entries`-only (~1× source) —
+roughly 25 MB → 5 MB on the 4 MB en-TH-x-anna project that drove
+the report. On smaller projects the absolute saving is smaller
+but the relative cliff disappears: every recording session no
+longer pushes a fresh ~20 MB allocation through the JVM heap.
+
+### Files
+
+- `azt_collabd/lift_surgery.py` — new module.
+- `azt_collabd/server.py` — `_h_set_audio` /
+  `_h_set_illustration` handlers + dispatch in the projects
+  router.
+- `azt_collab_client/__init__.py` — `set_audio` /
+  `set_illustration` wrappers; `__all__` updated;
+  `__version__` 0.50.28 → 0.50.29.
+- `azt_collabd/status.py` + `azt_collab_client/status.py` — six
+  new codes mirrored.
+- `azt_collab_client/translate.py` — handlers for the new codes.
+- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+  — French translations.
+- `azt_collab_client/NOTES_TO_DAEMON.md` — surgical-set_audio
+  entry deleted per the file's "delete on action" convention.
+
+### Compatibility
+
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` change. Peers
+  that don't call the new wrappers keep working with the old
+  DOM-based save path; they only need to migrate when they want
+  the memory relief.
+- Wire format: two new endpoints, no breaking changes to existing
+  ones.
+- Peer migration: drop `_ensure_dom` / `self._tree` / `self._root`
+  in the recorder's `lift.py`; rewrite `set_audio` and the
+  illustration save path to call the new wrappers. Optimistic
+  in-memory `entries` dict updates stay; the DOM goes away.
+
+### Known follow-ups (not blocking)
+
+- A peer-side normalize pass at recorder startup (one-time DOM
+  build + write per entry, to lock in the daemon's `ET.indent`
+  format) would make subsequent surgical edits produce minimal
+  per-entry diffs from day one rather than spreading the
+  reformat across many sessions. Not required for correctness.
+
+## 0.50.28 — Surface mDNS-discovered unpaired peers in the UI
+
+Discovery audit driver: pairing today is QR-only because the
+"Nearby (unpaired)" sender flow documented in
+`CLIENT_INTEGRATION.md` § 20 was never wired into any UI.
+`lan_nearby_unpaired()` and `lan_pair_request_send()` shipped as
+client wrappers; nothing called them. Users discovered each other
+exclusively via QR scan, and the `KIND_PAIR_REQUEST` receive
+path could never fire because no sender existed.
+
+### What landed
+
+- **`paired_phones_popup` (`azt_collab_client/ui/lan_popups.py:769`)
+  rebuilt with two sections.** Top section "Nearby (unpaired)"
+  calls `lan_nearby_unpaired()` and renders one row per mDNS-
+  discovered device that is not in `peers.json`. Each row has a
+  Pair button that fires `lan_pair_request_send(peer_id, '')`
+  and replaces itself with "Waiting…" while a 2 s Clock poll
+  drives `lan_pair_request_status(peer_id)` through `pending` →
+  `accepted` / `declined` / `timeout`. On accept the row
+  migrates into the Paired section on the next refresh. Bottom
+  section is the existing paired-peers list (same `_build_peer_row`,
+  same Manage / Unpair affordances).
+
+- **Title and empty-state copy updated.** Popup title is now
+  "Nearby & paired devices"; the empty state ("No nearby or
+  paired devices yet…") nudges Refresh + QR scan as the two
+  available routes.
+
+- **New `lan_pair_request_status(peer_id)` client wrapper
+  (`azt_collab_client/__init__.py`).** Thin wrapper over the
+  existing `POST /v1/lan/pair_request_status` endpoint —
+  returns `'pending'` / `'accepted'` / `'declined'` /
+  `'timeout'` / `'none'`. Terminal states clear on read per the
+  daemon contract in `_h_lan_pair_request_status`; the UI's
+  poll loop sees the terminal state exactly once. Added to
+  `__all__`.
+
+- **Clock-event hygiene.** Every in-flight pair-request poll
+  registers in `_active_polls[peer_id] = Clock event` and gets
+  cancelled on popup dismiss / Refresh tap. Closing the popup
+  mid-poll no longer leaks Clock callbacks.
+
+### Why this seam (not the picker)
+
+`paired_phones_popup` is the documented "peer roster /
+settings screen" per `CLIENT_INTEGRATION.md:3044`. It is also
+where users go to manage pairing already — adding the
+discovery surface here keeps the entry points colocated.
+The picker remains the home for QR-scan pairing (the in-
+person first-pair flow) and for "open / clone a project."
+Mixing nearby-peer discovery into the picker would smear
+two different mental models.
+
+### Files
+
+- `azt_collab_client/__init__.py` — new
+  `lan_pair_request_status` wrapper; `__all__` updated;
+  `__version__` 0.50.27 → 0.50.28.
+- `azt_collab_client/ui/lan_popups.py` — `paired_phones_popup`
+  restructured into two sections; new helpers
+  `_build_nearby_row`, `_cancel_all_polls`; shared
+  `_active_polls` tracking.
+- `azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`
+  — French translations for the 10 new msgids (no half-shipped
+  empty `msgstr ""` per `feedback_empty_msgstr_renders_blank`).
+
+### Compatibility
+
+- No wire-format change. New wrapper hits an endpoint that has
+  existed since 0.45.0; the UI uses returns that were already
+  defined.
+- No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` change.
+
+## 0.50.27 — Stop creating duplicate GitHub repos on peer publish
+
+Audit driver: a user-reported scenario where device A publishes a
+project to GitHub, device B clones from A over LAN, then B taps
+the Publish button. Pre-0.50.27 outcome: B silently creates a
+second GitHub repo under B's namespace even when A's repo was
+already known to the daemon. Two contributing bugs and three
+propagation gaps, all closed in this release.
+
+### Bug fixes
+
+- **`_ensure_remote_repo` (`azt_collabd/repo.py:1200`) no longer
+  creates a repo when the URL's parsed owner is not the
+  authenticated user.** Pre-fix: `POST /user/repos` always
+  created under the authenticated user, ignoring the URL's
+  owner — so publishing to `A/<repo>` while authenticated as B
+  produced an orphan `B/<repo>` as a side effect, then pushed
+  to `A/<repo>` (which only succeeded if B was a collaborator).
+  Post-fix: when `owner != username`, skip creation; the push
+  succeeds if B is a collaborator on A's repo, otherwise the
+  daemon's normal push-failure routing surfaces a clear error.
+  New `S.REMOTE_OWNER_MISMATCH_SKIP_CREATE` typed status (mirrored
+  in `azt_collab_client/status.py`, translated) so the user sees
+  "Pushing to {owner}'s repo at {url} as collaborator…"
+  instead of silence.
+
+- **`_h_lan_adopt_origin` / `_h_lan_resolve_conflict` now write
+  `.git/config` (`azt_collabd/server.py:917, 945`).** Pre-fix:
+  accepting the adopt-origin pending decision updated
+  `projects.json` (the registry) but left `.git/config` empty;
+  the registry said "remote_url=X" while the working tree had
+  no origin, so the next push had no remote to send to. Post-
+  fix: both handlers also call `repo.set_remote_origin_url(...)`
+  (new helper, holds `project_lock` per CLAUDE.md invariant
+  #11) so adopted URLs land on the working tree's `.git/config`
+  immediately.
+
+### Propagation: `remote_url` as first-class LAN metadata
+
+- **Post-publish fan-out (`server.py:1944`).** After
+  `init_project` succeeds, the daemon now iterates every paired
+  peer whose `shared_projects` allow-list contains this langcode
+  and sends `lan_push.send_share_offer(peer_id, langcode,
+  remote_url, vernlang)` to each. Best-effort, per-peer failures
+  don't block the response. New helper
+  `peers.peers_sharing_project(langcode)` does the iteration.
+  Effect: A publishes → B (already paired and sharing this
+  project) learns A's GitHub URL → B's `_do_publish` adopts the
+  URL instead of inventing a duplicate.
+
+- **Receive-side share-offer dispatch
+  (`lan_listener._handle_share_offer`).** Pre-0.50.27 every
+  incoming share-offer stashed `KIND_SHARE_OFFER`, even for
+  projects the receiver already had registered. Post-fix the
+  handler dispatches by local state:
+
+  - Project not registered locally → `KIND_SHARE_OFFER`
+    (today's "want to clone?" path).
+  - Project registered, incoming `repo_url` empty → log + no-op.
+  - Project registered, URLs match → log + no-op (steady-state).
+  - Project registered, local `remote_url` empty, incoming
+    non-empty → `KIND_ADOPT_ORIGIN` (peer is telling us where
+    GitHub origin lives; user can opt in).
+  - Project registered, URLs differ → `KIND_REMOTE_CONFLICT`
+    (fork case; user resolves via the existing
+    `_h_lan_resolve_conflict` UI).
+
+  Client UI handlers for both `KIND_ADOPT_ORIGIN` and
+  `KIND_REMOTE_CONFLICT` already exist (`decisions.py:141, 144`)
+  so no peer rebuild is required — older peers see the new
+  decision kinds and route through the existing popups.
+
+### Publish UI safeguard
+
+- **`_do_publish` (`azt_collabd/ui/app.py:2589`) refuses to
+  invent a URL when one is already known.** Defensive guard:
+  `_refresh_publish_row` already hides the row when
+  `project_status.remote_url` is populated, but a stale-bound
+  `on_release` could still land in `_do_publish` after
+  acceptance of an adopt-origin decision elsewhere on the
+  screen. Post-fix the handler re-checks `project_status` /
+  `Project.remote_url` and shows "Project {langcode} is already
+  published at {url}." instead of building a fresh
+  `<user>/<langcode>` URL. Combined with the orphan-repo guard
+  in `_ensure_remote_repo`, even a worst-case stale-bind no
+  longer produces a duplicate repo.
+
+### Known residual: concurrent-publish race
+
+If A and B both tap Publish within the same second (mutual LAN
+share, neither has published yet), neither has a pending
+adopt-origin decision and both will create separate
+`<self>/<langcode>` repos before the fan-out can propagate. The
+next fan-out from each then lands on the other as a
+`KIND_REMOTE_CONFLICT` and the user picks via the existing
+resolve-conflict UI. Rare enough to leave as a known mode; not
+solved by daemon-side election in this release.
+
+### Files
+
+- `azt_collabd/repo.py` — `_ensure_remote_repo` owner check;
+  new `set_remote_origin_url(working_dir, url)` helper holding
+  `project_lock`.
+- `azt_collabd/peers.py` — new `peers_sharing_project(langcode)`
+  iterator.
+- `azt_collabd/server.py` — `_h_init_project` post-success fan-
+  out; `_h_lan_adopt_origin` / `_h_lan_resolve_conflict` mirror
+  `set_remote_url` to `.git/config`.
+- `azt_collabd/lan_listener.py` — `_handle_share_offer`
+  dispatches by local-state quadrant.
+- `azt_collabd/ui/app.py` — `_do_publish` defensive guard.
+- `azt_collabd/status.py` + `azt_collab_client/status.py` —
+  `REMOTE_OWNER_MISMATCH_SKIP_CREATE` typed status.
+- `azt_collab_client/translate.py` — translation for the new
+  status.
+
+### Compatibility
+
+- Wire format unchanged. Share-offer payload still carries
+  `peer_id`, `fp`, `device_name`, `langcode`, `repo_url`,
+  `vernlang` — the change is the receive-side dispatch.
+- No `MIN_CLIENT_VERSION` bump. Older peer builds (0.50.0+)
+  already render the new decision kinds via existing
+  `decisions.py` handlers.
+- An older daemon won't fan out on publish; new peers gracefully
+  degrade to today's behaviour (no propagation).
+
+## 0.50.26 — Throttle urllib3 logger to INFO
+
+dulwich was already capped at WARNING in `azt_collabd/net.py:18`,
+but urllib3 was on its default level and kept emitting DEBUG
+records on every HTTPS setup (`Starting new HTTPS connection`,
+`Converted retries value`, …). Kivy's root handler caught them,
+rendered with the `[DEBUG  ]` prefix and shipped to logcat
+stderr (priority `E`). Pure noise during routine clone/fetch/
+push, drowning real log content.
+
+`logging.getLogger('urllib3').setLevel(logging.INFO)` drops the
+DEBUG chatter while still letting real WARN/ERROR records
+through. If we later decide urllib3 should be silent unless
+something is wrong, ratchet to WARNING to match dulwich.
+
+## 0.50.25 — `.azt/` no longer trips the data-loss-risk detector
+
+The slot-claim / project-KV subsystem (`project_kv.py`, added
+2026-05-28) stores per-device coordination state at
+`.azt/kv/<key>.txt` and `.azt/slots/<slot>.txt`. `_stage_all`
+commits these correctly — they're the inputs to the per-path
+merge resolvers at the top of `repo.py` (lines 559-593).
+
+The `_detect_uncommittable` allow-list (`_KNOWN_PATH_PREFIXES`,
+`repo.py:4398`) was updated when `.azt-collab/` (diagnostics)
+and `.azt_atomic_pending/` (intentionally excluded from git)
+landed, but missed `.azt/` when the slot-claim subsystem
+arrived. Result: every commit pass spammed
+`[data-loss-risk] uncommittable file in project_dir: '.azt/...'`
+to the daemon log and fired `S.DATA_LOSS_RISK` to peers,
+routing user-side as the loud "your recordings aren't being
+backed up" banner — for files that were in fact landing in
+git just fine.
+
+Fix: add `.azt/` (both posix and Windows separator forms) to
+`_KNOWN_PATH_PREFIXES`. Mirrors how `.azt-collab/` is allowed
+broadly — `_stage_all` already commits the whole subtree, so
+the allow-list should reflect that.
+
+Peers running pre-0.50.25 daemons will continue to see the
+spurious banner until the daemon updates; this is a daemon-
+side fix only, no client wire change.
+
+## 0.50.24 — Quiet the Android-CP first-try transport probe
+
+Two `[first-try] transport.call.pre` / `.post` log lines were
+landing on every Android ContentProvider RPC — at boot the picker
+fires ~10 RPCs in under half a second, so /sdcard logs were
+drowning in ``bundle_null=False null_retries=0`` lines that carry
+no information.
+
+The probes were added in 0.41.16 to diagnose a "first-try-fails,
+second-try-works" crash on a remote tester's Tecno KN4 who
+couldn't run logcat — always-on emit was the only way to capture
+the trail. That diagnosis fed into the null-Bundle retry loop
+landed in 0.43.9, which is now the *fix* for the cold-spawn race
+the probe was detecting. So in the steady state every routine
+call ships the same `bundle_null=False null_retries=0` post-line
+and a useless pre-line.
+
+This release:
+
+- Drops the pre-probe entirely. It carried no info beyond the
+  post (same method+path are echoed back).
+- Emits the post-probe only when something abnormal happened:
+  `bundle is None` (structural denial) OR `attempt > 0`
+  (cold-spawn retry actually fired).
+
+Routine traffic stays silent; any re-occurrence of the null-
+Bundle race still leaves a `transport.call.post` trail with
+`bundle_null` / `null_retries` populated. The
+`/cawl/cache_status` suppression branch is gone — the new
+abnormal-only gate already covers the polling-loop noise it
+existed to suppress.
+
+Other `first_try_log` call sites (`lift_io.openFileDescriptor`,
+`picker.on_enter`, `picker_app.main_entry`, settings-screen
+ticks) are one-shot or low-frequency lifecycle events; left
+unchanged.
+
+## 0.50.23 — Confirm popup before boot-update download + skip-on-older
+
+Closes the 0.50.20 / 0.50.21 thread on the boot-update flow.
+The user reported seeing "Downloading n%…" appear unprompted
+on every settings open — the old `_kick_boot_update_check`
+called `check_for_update` directly, which starts downloading
+without confirmation. Worse, a separate field case had the
+flow trying to download an OLDER version than what was
+installed.
+
+### Confirm popup (was the immediate request)
+
+New `_show_update_confirm_popup(latest_version)` on
+``PickerApp``. Two buttons: "Update" and "Not now". Plain
+inline popup (doesn't reuse ``install_server_apk_popup``
+because that's shaped around the "server APK not installed"
+case; this is the different "server APK is running, newer
+release available" moment, with different copy and button
+shape).
+
+- **Update**: dismisses the popup and fires
+  ``check_for_update`` — same download/install path as the
+  in-settings Update button.
+- **Not now**: just dismisses. The ``last_popped_tag`` stamp
+  was already set BEFORE the popup fired, so the next
+  settings open with the same latest tag just renders the
+  badge without re-prompting. A newer release moves the
+  comparison off this stamp.
+
+### Version-sanity check (user-requested)
+
+The existing ``latest <= running → skip`` gate is augmented
+with an **explicit ``running > latest`` log line** so a dev
+build sideloaded ahead of the published release surfaces in
+the daemon log rather than being silently skipped. Quote:
+
+```
+[picker_app] boot update probe: running 0.51.0-dev is NEWER
+than latest release 0.50.21 — skipping (sideloaded dev
+build?)
+```
+
+Pre-0.50.23 also skipped this case (the ``<=`` comparison
+catches it), but the silent-skip made it hard to confirm
+from a log whether the version-tuple parse had gone weird in
+a field-observed "downloading an older version" scenario.
+The explicit log + the popup gate together close the
+"unprompted download" surface.
+
+### French translations
+
+Added for the new popup strings ("Update available", body
+template with {version}, "Update", "Not now"). The "Not now"
+string already existed in the catalog for an unrelated
+context.
+
+## 0.50.22 — Document CAWL source telemetry in CLIENT_INTEGRATION.md
+
+Documentation-only. `CLIENT_INTEGRATION.md` § 10
+"CAWL image access / Daemon-driven prefetch" gains a new
+sub-section **"Per-source telemetry (since 0.50.21) — surface
+LAN vs Internet"** that:
+
+- Lists the four new ``cache_status`` fields (``from_cache``,
+  ``from_lan``, ``from_upstream``, ``last_source``).
+- Shows two peer-side rendering patterns: minimal inline tag
+  ("Caching images: 45/1700  · via LAN") and detailed
+  breakdown ("12 from LAN · 33 from Internet · 0 already
+  cached").
+- Documents what good vs bad LAN-share signatures look like
+  so a field tester reading the banner can tell whether the
+  paired-peer cache is actually serving bytes.
+- Pre-0.50.21 fallback note (default-zero on the unknown keys).
+
+The actual telemetry shipped in 0.50.21; this release just
+makes the peer contract explicit so recorder/viewer
+maintainers know what fields to read and how to render them.
+
+(Skipped 0.50.21's pending boot-update-auto-download fix —
+user re-prioritised to this doc task first. The auto-download
+question stays open; revisit in a separate release.)
+
+## 0.50.21 — Boot-update popup throttled + CAWL prefetch source telemetry
+
+Two unrelated items in one release.
+
+### Boot-update popup fires once per release, not per settings open
+
+User reports: opening the server APK's settings (launcher tap)
+auto-pops the "newer release available" modal every time. The
+0.41.x behaviour was "popup-on-boot if newer," intended as a
+discovery surface — but it's intrusive when the user opens
+settings frequently without intending to update.
+
+Fix:
+
+- New `store.get_last_popped_update_tag` /
+  `set_last_popped_update_tag` track the most-recent release
+  tag we've already surfaced as a popup.
+- `_kick_boot_update_check` is restructured: always probes
+  GitHub once per launch and badges if newer than running
+  (unchanged silent-badge behaviour). Pops the modal only if
+  the latest tag is **strictly newer** than `last_popped_tag`.
+- After the modal fires we stamp `last_popped_tag = latest`,
+  so the next settings open with the same latest tag just
+  badges. A newer release lands → modal re-fires (one per
+  release, which is the intent of the discovery surface).
+- `'peer'` launch source is still badge-only (unchanged).
+
+### CAWL prefetch source telemetry — LAN vs Internet
+
+User asked: "Can we indicate which worked last (LAN vs
+upstream) in the update text so we know which is being used?"
+The NOTES #3 LAN-share path (0.50.14) is hard to confirm is
+actually working without surfacing per-fetch source.
+
+New fields on `cache_status(repo)`:
+
+- `from_cache: int` — count of cache hits this prefetch
+  session (file was already on disk).
+- `from_lan: int` — count of bytes pulled from a paired LAN
+  peer's cache.
+- `from_upstream: int` — count of bytes pulled from
+  GitHub.
+- `last_source: 'cache' | 'lan' | 'upstream' | ''` — source
+  of the most-recently successful fetch, for a one-glance
+  "what's serving right now" indicator.
+
+Wired via new `_bump_source_counter(repo, source)` helper.
+Fetch paths in `get_image_path` and `get_image_path_lan_only`
+call it on each successful resolve. Peer-side progress
+display can now show e.g. "1245 from LAN · 12 from
+Internet · 3 from cache (last: LAN)" so the user can see
+whether the paired-peer share is doing its job.
+
+## 0.50.20 — Contributor validity + clone-button visibility + auto-launch reliability
+
+Four threads, batched.
+
+### Contributor validity check
+
+Field smoke surfaced the value ``)`` stored as a contributor —
+passed the non-empty truthiness check everywhere but isn't a
+usable display name. The settings UI's save path accepted it
+because ``inp.text.strip() = ')'`` is truthy. Then every
+downstream gate (picker visibility, lan_pair_accept, etc.)
+treated it as "set" while the user thought their name wasn't
+filled in.
+
+- New ``store.is_valid_contributor(name)`` — requires at least
+  one alphanumeric character (Unicode letter or digit).
+  Rejects ``)``, ``!!!``, whitespace-only, etc. Empty string
+  is the legitimate "clear" path and is NOT rejected.
+- ``store.set_contributor`` now returns ``False`` and refuses
+  to store an invalid input. Empty / whitespace-only still
+  succeeds (= clear).
+- ``_h_set_contributor`` surfaces the refusal as
+  ``{ok: False, error: 'invalid_contributor', detail: ...}``
+  so the peer can route to a clear error message.
+- The picker's ``_refresh_contributor_state`` treats any
+  alphanumeric-less value as unset for gating — junk in store
+  no longer unlocks the receive button.
+
+### Clone Internet Repository stays visible
+
+0.50.18 hid the clone button when contributor unset; user
+correctly pushed back — public-repo clones don't need a
+contributor. Only the "Receive a project from another phone"
+button is gated now. The notice text still mentions private
+repos as a heads-up since hitting Clone on a private repo will
+fail downstream, but the button stays clickable.
+
+### Auto-launch reliability for null_bundle on a peer
+
+User reports the 0.50.5 auto-launch isn't firing on a freshly-
+cleared server. Two upgrades:
+
+1. **Streak counts ``transport_error`` too**, not just
+   ``null_bundle`` exact. A daemon crash-looping on a missing
+   ``_python_bundle/`` can surface EITHER kind depending on
+   whether the provider's Java side has registered yet when
+   each peer call lands; 0.50.5 only counted one variant and
+   the streak never accumulated to 3 in mixed runs. Now both
+   advance the counter. ``daemon_not_ready`` still resets
+   (it's the deliberate "boot in progress, just wait"
+   signal). Unknown kinds neither advance nor reset.
+
+2. **``_open_server_apk_launcher`` adds diagnostic logging at
+   every failure seam** and a context fallback. Previously a
+   single ``return False`` covered ``mActivity is None``,
+   ``getLaunchIntentForPackage`` returning None, the
+   ``startActivity`` call itself raising, and several other
+   cases — peer-side logs gave no hint which one. Each path
+   now emits its own
+   ``[bootstrap] _open_server_apk_launcher: <step> <reason>``
+   line. When ``PythonActivity.mActivity`` is briefly null
+   (Activity recreation race), falls back to
+   ``ActivityThread.currentApplication`` for the package
+   manager + startActivity. Both context shapes accept the
+   ``FLAG_ACTIVITY_NEW_TASK`` flag we set.
+
+### Use plain `Label` for the picker's contributor-unset notice (was 0.50.19)
+
+(Folded into this release.) 0.50.18 used ``BodyLabel:`` in the
+picker KV, which depends on app.py's settings KV being loaded
+first. Peer-app hosts (recorder, viewer) don't load that KV.
+Replaced with a plain ``Label:`` carrying styling inline so
+the picker KV is self-contained.
+
+## 0.50.19 — Use plain `Label` for the picker's contributor-unset notice
+
+0.50.18 used `BodyLabel:` in the picker KV. `BodyLabel` is a
+dynamic-class rule (`<BodyLabel@Label>:`) defined inside
+`azt_collabd/ui/app.py`'s settings KV. The PickerApp host loads
+that KV via `register_settings_kv` *before* the picker KV
+(`picker_app.py:223-225`), so the rule resolves there — but
+peer-app hosts (recorder, viewer) don't load the daemon-side
+settings KV at all, so the picker KV's reference to
+`BodyLabel` either fails to instantiate or silently falls back
+to a generic `Label` without the bold / dim styling the rule
+provides.
+
+Replaced with a plain `Label:` carrying the styling inline
+(`color: T.RED`, `bold: True`, explicit `font_size` and
+`font_name`). The change is self-contained — works in every
+host that already loads the picker KV.
+
+## 0.50.18 — Picker hides identity-gated actions when contributor unset
+
+Per-user-request UX shape. When the contributor name isn't set,
+two of the picker's three "add a project" buttons are downstream-
+gated on identity:
+
+- **Clone Internet Repository** — private-repo clone needs the
+  authed user; git author falls back to ``@unknown`` and the
+  daemon's init path refuses with ``CONTRIBUTOR_UNSET``.
+- **Receive a project from another phone** — ``lan_pair_accept``
+  refuses up-front with ``CONTRIBUTOR_UNSET``; the QR scan
+  silently produces no pair (which is what shipped through
+  0.50.10/0.50.17 trying to handle after the fact).
+
+Cleanest UX is to **not offer the gesture at all** when it
+can't succeed. Implementation:
+
+- New KV ``BodyLabel id: contributor_notice`` at the top of
+  the action stack, hidden by default (height=0, opacity=0).
+- IDs added to ``clone_internet_btn`` and
+  ``receive_from_phone_btn``.
+- New ``ProjectPickerScreen._refresh_contributor_state`` reads
+  ``get_contributor()`` and toggles all three widgets per the
+  Kivy hide/show pattern in ``~/.claude-sil/CLAUDE.md`` —
+  height+opacity+disabled set together so the buttons have no
+  hit area and can't steal focus when hidden.
+- Called from ``on_enter`` so the user who set their name in
+  settings and came back sees the buttons reappear without
+  leaving the picker.
+
+Notice text: *"To clone from a private repo, or to get a project
+from a local phone, go to settings and add your name first."*
+French translation added.
+
+The 0.50.10/0.50.12/0.50.17 routing logic on the scan-flow side
+stays in place as a defense-in-depth — older builds, peers
+that haven't refreshed their KV, etc. Belt and suspenders.
+
+## 0.50.17 — Route `CONTRIBUTOR_UNSET` on QR scan to settings even when host is the server APK
+
+0.50.12 routed the `CONTRIBUTOR_UNSET` branch of
+`scan_to_pair._finish_on_main` to `open_server_ui()`, which on
+Android fires a launcher intent against the server APK package.
+That worked when the QR was scanned from a peer app
+(recorder, viewer) — the intent flipped to the server APK's
+picker_app with `launch_mode='internal'`, landing the user
+directly on the settings screen.
+
+Broken case: user scans the QR from the **server APK's own
+picker** (the unified `picker_app` since 0.41.22). Firing a
+launcher intent against the package the user is already in
+just brings the picker Activity to the front — Android doesn't
+restart it, so the `launch_mode='internal'` flag never gets a
+chance to route to settings. User lands back on the (empty)
+picker with no indication of what went wrong.
+
+Fix in `lan_popups._finish_on_main`: detect whether the
+current Kivy `App` has an in-process `go(name)` navigator + a
+registered 'settings' screen. If yes (server APK's
+`PickerApp`), call `app.go('settings')` to navigate within the
+same Activity. If no (peer apps), fall through to the
+cross-process `open_server_ui()` intent. The status toast
+("Set your name on the next screen, then scan the QR again.")
+fires either way.
+
+## 0.50.16 — Close out audit-doc open-low items as wontfix
+
+Doc-only. The four `[open-low]` items in
+`.scratch/audit-2026-05-29-comms-data-loss-convergence/findings.md`
+were evaluated for cost (project complexity) vs value: each
+fix introduces some shape of new complexity (tri-state listener
+state, persistent retry counters with UI surface, an Optional
+in a value used by the sync badge, a new lock-holding write
+site) for either zero value or value already covered by an
+existing self-healing mechanism. Two items
+(#10 `_count_commits_ahead` and #9 `_pending_resets` cap) also
+actively conflict with intentional design choices documented
+in memory and CLIENT_INTEGRATION.md.
+
+Moved to `[wontfix]` with per-item rationale: #8 apply_toggle
+async bind, #9 _pending_resets backoff, #10
+_count_commits_ahead lock-timeout, "Half-strip `.git/config`
+cleanup."
+
+Audit closed: 8 done + 4 wontfix, no open items. The doc
+stays as the historical record; if a future field report
+re-opens any item with new evidence, append a `Re-opened
+YYYY-MM-DD` line under the rationale and move it back to
+`[open-…]`.
+
 ## 0.50.15 — Audit open-medium burn-down: #3 + #4 + #5 + #6
 
 Closes the four open-medium items from

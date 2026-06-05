@@ -289,6 +289,27 @@ def set_peer_last_seen_main(peer_id, langcode, sha):
     return True
 
 
+def peers_sharing_project(langcode):
+    """Return the list of ``peer_id``s whose ``shared_projects`` list
+    contains *langcode*. Used by post-publish fan-out and other paths
+    that need to notify every paired peer who has this project on
+    their allow-list (e.g. a newly-set ``remote_url`` propagating
+    across the LAN so peer Publish doesn't create a duplicate github
+    repo). Empty list if no peer has shared this langcode.
+    """
+    if not langcode:
+        return []
+    langcode = str(langcode)
+    with _LOCK:
+        data = _load_raw()
+    out = []
+    for peer_id, entry in (data.get('peers') or {}).items():
+        norm = _normalize_entry(entry)
+        if langcode in norm['shared_projects']:
+            out.append(str(peer_id))
+    return out
+
+
 def peer_main_shas_for(langcode):
     """Return the list of paired peers' last-observed main SHAs
     for *langcode*. Used by ``_lan_unshared`` and ``_at_risk`` to

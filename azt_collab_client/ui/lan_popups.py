@@ -506,20 +506,52 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                     font_name)
             elif result.has(S.CONTRIBUTOR_UNSET):
                 # Daemon refused pair_accept because this device's
-                # contributor name isn't set. Same routing as the
-                # rest of the suite per CLIENT_INTEGRATION.md
-                # § 17 — toast + open_server_ui() — so the user
-                # lands directly on the settings page where they
-                # can type their name and come back to re-scan.
+                # contributor name isn't set. Route to the
+                # contributor-settings screen so the user can type
+                # their name and come back to re-scan.
+                #
+                # **Two host contexts** (0.50.17 fix):
+                # 1. Scanned from a peer app (recorder, viewer):
+                #    ``open_server_ui()`` fires a launcher intent
+                #    against the server APK, which lands the user
+                #    in PickerApp with ``launch_mode='internal'``
+                #    → settings screen.
+                # 2. Scanned from the server APK's own picker:
+                #    ``open_server_ui()`` fires a launcher intent
+                #    against the package we're already in →
+                #    Android brings the picker to the front, no
+                #    settings screen. User ends up back on the
+                #    empty picker, confused.
+                # Detect via ``hasattr(app, 'go')`` + the screen
+                # being registered — if we can navigate in-
+                # process, do so; otherwise fall through to the
+                # cross-process intent.
                 _emit_status(_tr(
                     'Set your name on the next screen, then scan '
                     'the QR again.'))
+                navigated = False
                 try:
-                    from .. import open_server_ui
-                    open_server_ui(on_status=_emit_status)
+                    from kivy.app import App
+                    app = App.get_running_app()
+                    if (app is not None
+                            and hasattr(app, 'go')
+                            and hasattr(app, 'sm')
+                            and getattr(app.sm, 'has_screen', None)
+                            and app.sm.has_screen('settings')):
+                        app.go('settings')
+                        navigated = True
                 except Exception as ex:
-                    print(f'[scan_to_pair] open_server_ui raised: '
-                          f'{ex!r}', file=sys.stderr, flush=True)
+                    print(f'[scan_to_pair] in-process settings '
+                          f'navigation raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+                if not navigated:
+                    try:
+                        from .. import open_server_ui
+                        open_server_ui(on_status=_emit_status)
+                    except Exception as ex:
+                        print(f'[scan_to_pair] open_server_ui '
+                              f'raised: {ex!r}',
+                              file=sys.stderr, flush=True)
             elif (not got_project
                     and result.has(S.LAN_PAIRED)
                     and not result.has(S.LAN_PROJECT_COLLISION_UNRELATED)):
@@ -735,31 +767,82 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
 
 
 def paired_phones_popup(font_name='Roboto'):
-    """List paired peers; tap any to open the manage-peer popup."""
-    from .. import lan_list_peers
+    """List paired peers + mDNS-discovered unpaired peers.
+
+    Two stacked sections:
+
+    - **Nearby (unpaired)** — mDNS-discovered devices not in our
+      ``peers.json``. Each row has a Pair button that fires
+      ``lan_pair_request_send``; the row then polls
+      ``lan_pair_request_status`` until accepted / declined /
+      timeout. On accept the peer moves into the Paired section
+      automatically on the next refresh.
+    - **Paired** — devices already in ``peers.json``. Tap Manage
+      for the per-peer settings, Unpair to remove.
+
+    Polling: each in-flight pair-request gets a Clock event
+    polling status every 2 s. Events are tracked in
+    ``_active_polls`` and cancelled on popup dismiss so we don't
+    leak Clock callbacks after the user closes the screen.
+    """
+    from .. import (
+        lan_list_peers, lan_nearby_unpaired,
+        lan_pair_request_send, lan_pair_request_status,
+        translate_result, S,
+    )
 
     container = BoxLayout(orientation='vertical', spacing=dp(8),
                           padding=dp(10))
     container.add_widget(Label(
-        text=_tr('Paired devices'),
+        text=_tr('Nearby & paired devices'),
         size_hint_y=None, height=dp(28), font_size=sp(15),
         bold=True, color=theme.ACCENT, font_name=font_name))
 
+    # Two list_boxes — one per section. Their headers are added
+    # by ``_refresh`` so they hide when their section is empty.
+    nearby_box = BoxLayout(orientation='vertical', size_hint_y=None,
+                           spacing=dp(4))
+    nearby_box.bind(minimum_height=nearby_box.setter('height'))
+    paired_box = BoxLayout(orientation='vertical', size_hint_y=None,
+                           spacing=dp(4))
+    paired_box.bind(minimum_height=paired_box.setter('height'))
+
     list_box = BoxLayout(orientation='vertical', size_hint_y=None,
-                         spacing=dp(4))
+                         spacing=dp(8))
     list_box.bind(minimum_height=list_box.setter('height'))
+    list_box.add_widget(nearby_box)
+    list_box.add_widget(paired_box)
     scroll = ScrollView()
     scroll.add_widget(list_box)
     container.add_widget(scroll)
 
-    close_btn = Button(
-        text=_tr('Close'), size_hint_y=None, height=dp(44),
+    btn_row = BoxLayout(orientation='horizontal', spacing=dp(8),
+                        size_hint_y=None, height=dp(44))
+    refresh_btn = Button(
+        text=_tr('Refresh'), size_hint_x=None, width=dp(120),
         font_size=sp(14), font_name=font_name)
-    container.add_widget(close_btn)
+    close_btn = Button(
+        text=_tr('Close'), font_size=sp(14), font_name=font_name)
+    btn_row.add_widget(refresh_btn)
+    btn_row.add_widget(close_btn)
+    container.add_widget(btn_row)
 
-    popup = Popup(title=_tr('Paired devices'),
+    popup = Popup(title=_tr('Nearby & paired devices'),
                   content=container, size_hint=(0.95, 0.9),
                   auto_dismiss=False)
+
+    # Per-peer Clock events tracking outbound pair-request polls.
+    # Mapped by peer_id → Kivy event handle; cancelled on popup
+    # dismiss so closing the screen mid-poll doesn't leak.
+    _active_polls = {}
+
+    def _cancel_all_polls():
+        for ev in list(_active_polls.values()):
+            try:
+                ev.cancel()
+            except Exception:
+                pass
+        _active_polls.clear()
 
     def _confirm_unpair(peer):
         """Confirm dialog before calling ``lan_unpair``.
@@ -767,9 +850,7 @@ def paired_phones_popup(font_name='Roboto'):
         cached endpoint, drops any shared-project allowlist
         entries for them. Re-pairing requires scanning a fresh
         QR."""
-        from .. import lan_unpair  # local import — same shape
-        # as ``_manage_peer_popup``, keeps the module-level
-        # imports lean.
+        from .. import lan_unpair
         pid = peer.get('peer_id', '') or ''
         name = peer.get('device_name') or _tr('Unnamed device')
         body = BoxLayout(orientation='vertical', spacing=dp(8),
@@ -782,14 +863,14 @@ def paired_phones_popup(font_name='Roboto'):
             font_size=sp(13), font_name=font_name,
             halign='center', valign='middle',
             text_size=(dp(280), None)))
-        btn_row = BoxLayout(orientation='horizontal',
-                            spacing=dp(8),
-                            size_hint_y=None, height=dp(44))
+        btn_row_ = BoxLayout(orientation='horizontal',
+                             spacing=dp(8),
+                             size_hint_y=None, height=dp(44))
         cancel_btn = Button(text=_tr('Cancel'), font_name=font_name)
         do_btn = Button(text=_tr('Unpair'), font_name=font_name)
-        btn_row.add_widget(cancel_btn)
-        btn_row.add_widget(do_btn)
-        body.add_widget(btn_row)
+        btn_row_.add_widget(cancel_btn)
+        btn_row_.add_widget(do_btn)
+        body.add_widget(btn_row_)
         confirm_popup = Popup(
             title=_tr('Confirm unpair'),
             content=body, size_hint=(0.85, None), height=dp(240),
@@ -800,7 +881,6 @@ def paired_phones_popup(font_name='Roboto'):
             try:
                 lan_unpair(pid)
             except Exception as ex:
-                import sys
                 print(f'[lan-unpair] {pid[:8]!r} failed: {ex!r}',
                       file=sys.stderr, flush=True)
             _refresh()
@@ -809,29 +889,158 @@ def paired_phones_popup(font_name='Roboto'):
         do_btn.bind(on_release=_do_it)
         confirm_popup.open()
 
+    def _build_nearby_row(entry):
+        """One row in the Nearby (unpaired) list: name/peer-id +
+        Pair button. The button mutates in place once tapped:
+        Pair → "Waiting…" while the poll runs."""
+        pid = entry.get('peer_id', '') or ''
+        device_name = entry.get('device_name') or ''
+        endpoint = entry.get('endpoint', '') or ''
+        row = BoxLayout(orientation='horizontal', size_hint_y=None,
+                        height=dp(56), spacing=dp(6), padding=dp(4))
+        label_box = BoxLayout(orientation='vertical')
+        primary = device_name or (
+            _tr('Device {id}…').format(id=pid[:8])
+            if pid else _tr('Unnamed device'))
+        label_box.add_widget(Label(
+            text=primary, halign='left', valign='middle',
+            size_hint_y=None, height=dp(28),
+            font_size=sp(13), bold=True, font_name=font_name,
+            text_size=(dp(190), dp(28))))
+        # Subline: peer_id prefix + endpoint for diagnostic
+        # visibility — same shape as ``_build_peer_row`` keeps
+        # the two sections visually consistent.
+        label_box.add_widget(Label(
+            text=f'{pid[:8]}… · {endpoint}',
+            halign='left', valign='middle',
+            size_hint_y=None, height=dp(22),
+            font_size=sp(10), color=theme.TEXT_DIM,
+            text_size=(dp(190), dp(22)),
+            font_name=font_name))
+        row.add_widget(label_box)
+
+        action_btn = Button(
+            text=_tr('Pair'),
+            size_hint=(None, None), width=dp(120), height=dp(40),
+            font_size=sp(12), font_name=font_name)
+        row.add_widget(action_btn)
+
+        def _set_waiting():
+            action_btn.text = _tr('Waiting…')
+            action_btn.disabled = True
+
+        def _set_pair():
+            action_btn.text = _tr('Pair')
+            action_btn.disabled = False
+
+        def _poll(_dt):
+            state = lan_pair_request_status(pid)
+            if state == 'pending':
+                return  # keep polling
+            ev = _active_polls.pop(pid, None)
+            if ev is not None:
+                try:
+                    ev.cancel()
+                except Exception:
+                    pass
+            if state == 'accepted':
+                # Peer moved to paired list — rebuild.
+                _refresh()
+                return
+            # declined / timeout / none — surface briefly, revert.
+            if state == 'declined':
+                msg = _tr(
+                    '{device_name} declined the pair request.'
+                ).format(device_name=primary)
+            elif state == 'timeout':
+                msg = _tr(
+                    'Pair request to {device_name} timed out.'
+                ).format(device_name=primary)
+            else:
+                msg = _tr('Pair request lost.')
+            action_btn.text = msg
+            action_btn.disabled = True
+            # Restore the Pair button after a short delay so the
+            # user has time to read the message.
+            Clock.schedule_once(lambda _t: _set_pair(), 3.0)
+
+        def _on_pair(*_):
+            if not pid:
+                return
+            _set_waiting()
+            result = lan_pair_request_send(pid, '')
+            if result.has(S.LAN_PAIR_REQUEST_PENDING):
+                # Poll every 2 s; daemon's outbound state clears on
+                # read after a terminal state, so we'll see
+                # accepted/declined/timeout exactly once.
+                ev = Clock.schedule_interval(_poll, 2.0)
+                _active_polls[pid] = ev
+                return
+            # Anything else is a failure to even send the request
+            # — show the translated reason and revert. Common cases:
+            # LAN_TOGGLE_OFF, LAN_PEER_UNREACHABLE, SERVER_*.
+            text = translate_result(result) or _tr(
+                'Could not send pair request.')
+            action_btn.text = text[:40]
+            Clock.schedule_once(lambda _t: _set_pair(), 3.0)
+
+        action_btn.bind(on_release=_on_pair)
+        return row
+
     def _refresh():
-        list_box.clear_widgets()
-        peers = lan_list_peers()
-        if not peers:
-            list_box.add_widget(Label(
-                text=_tr('No paired devices. Use "Pair a phone" '
-                         'to scan another phone\'s QR.'),
-                size_hint_y=None, height=dp(60),
+        # Cancel any in-flight polls before we wipe the rows
+        # holding their button refs.
+        _cancel_all_polls()
+        nearby_box.clear_widgets()
+        paired_box.clear_widgets()
+
+        nearby = lan_nearby_unpaired() or []
+        paired = lan_list_peers() or []
+
+        if nearby:
+            nearby_box.add_widget(Label(
+                text=_tr('Nearby (unpaired):'),
+                size_hint_y=None, height=dp(24),
+                font_size=sp(12), bold=True, halign='left',
+                valign='middle', font_name=font_name,
+                text_size=(dp(320), dp(24))))
+            for entry in nearby:
+                nearby_box.add_widget(_build_nearby_row(entry))
+
+        if paired:
+            paired_box.add_widget(Label(
+                text=_tr('Paired:'),
+                size_hint_y=None, height=dp(24),
+                font_size=sp(12), bold=True, halign='left',
+                valign='middle', font_name=font_name,
+                text_size=(dp(320), dp(24))))
+            for peer in paired:
+                paired_box.add_widget(_build_peer_row(
+                    peer,
+                    lambda p=peer: _manage_peer_popup(
+                        p, on_refresh=_refresh,
+                        font_name=font_name),
+                    _confirm_unpair,
+                    font_name=font_name))
+
+        if not nearby and not paired:
+            paired_box.add_widget(Label(
+                text=_tr('No nearby or paired devices yet. Tap '
+                         'Refresh after a few seconds, or use '
+                         '"Pair a phone" to scan another phone\'s '
+                         'QR.'),
+                size_hint_y=None, height=dp(80),
                 font_size=sp(12), color=theme.TEXT_DIM,
                 halign='center', valign='middle', font_name=font_name,
-                text_size=(dp(320), dp(60))))
-            return
-        for peer in peers:
-            list_box.add_widget(_build_peer_row(
-                peer,
-                lambda p=peer: _manage_peer_popup(
-                    p, on_refresh=_refresh,
-                    font_name=font_name),
-                _confirm_unpair,
-                font_name=font_name))
+                text_size=(dp(320), dp(80))))
+
+    def _on_close(*_):
+        _cancel_all_polls()
+        popup.dismiss()
 
     _refresh()
-    close_btn.bind(on_release=lambda *_: popup.dismiss())
+    refresh_btn.bind(on_release=lambda *_: _refresh())
+    close_btn.bind(on_release=_on_close)
     popup.open()
     return popup
 

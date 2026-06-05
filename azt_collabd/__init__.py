@@ -119,6 +119,13 @@ from azt_collab_client import __version__  # noqa: F401
 # kind and can't drive the slot picker.
 MIN_CLIENT_VERSION = "0.50.0"
 
+# Content fingerprint of the deployed daemon code — surfaces stale-
+# unpack issues that ``__version__`` alone can't detect. Imported
+# eagerly so the first-call print lands in the boot-trace log next
+# to the version line. See ``_fingerprint.py``.
+from ._fingerprint import daemon_fingerprint as _daemon_fingerprint
+__fingerprint__ = _daemon_fingerprint()
+
 from . import config
 from . import net
 from . import auth

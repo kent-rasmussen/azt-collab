@@ -16,6 +16,14 @@ documented as accepted tradeoffs (see memory `project_oom_followups_after_0.44.4
   when the surrounding area gets work.
 - `[open-low]` — defensive; leave as is unless a future change
   brings the file open.
+- `[wontfix]` — evaluated and closed; the cost in project
+  complexity exceeds the value. See per-item rationale.
+
+This audit was closed 2026-05-30: all items have terminal
+status (`[done]` or `[wontfix]`). If a future field report
+re-opens any wontfix item with new evidence, append a
+`Re-opened YYYY-MM-DD: <reason>` line under the rationale and
+move it back to `[open-…]`.
 
 ### Roll-up (as of 2026-05-30, audit-sweep pass through 0.50.14)
 
@@ -28,14 +36,14 @@ documented as accepted tradeoffs (see memory `project_oom_followups_after_0.44.4
 | 5 | Connectivity poll fixed 30 s | done (0.50.15) |
 | 6 | LAN endpoint cache no TTL | done (0.50.15) |
 | 7 | Slot-claim tiebreaker 1-s granularity | done (0.50.9) |
-| 8 | `apply_toggle` returns OK before bind | open-low |
-| 9 | `_pending_resets` no backoff | open-low |
-| 10 | `_count_commits_ahead` lock-timeout silent | open-low |
+| 8 | `apply_toggle` returns OK before bind | wontfix (2026-05-30) |
+| 9 | `_pending_resets` no backoff | wontfix (2026-05-30) |
+| 10 | `_count_commits_ahead` lock-timeout silent | wontfix (2026-05-30) |
 | 11 | LAN-shared CAWL cache (NOTES #3) | done (0.50.14) |
 | 12 | Fresh GUIDs from template (NOTES #4) | done (0.50.8) |
-| ↓ | Half-strip `.git/config` cleanup | open-low |
+| ↓ | Half-strip `.git/config` cleanup | wontfix (2026-05-30) |
 
-**Open items remaining**: 0 open-med + 4 open-low. No open-high.
+**Audit closed**: 8 done + 4 wontfix. No open items.
 
 ---
 
@@ -181,22 +189,28 @@ slot. Tests in `tests/test_slot_identity.py`.
 
 ### 8. `apply_toggle` returns OK before listener socket binds
 
-**Status:** `[open-low]`.
+**Status:** `[wontfix]` (closed 2026-05-30).
 
 `lan_listener.py:140-165`. Thread spawn is async; bind failure
 (port conflict, Android NSD permission) happens after the
 toggle handler returns success. UI shows "LAN on" while
 nothing is listening.
 
-Suggested: synchronous bind attempt in the handler; only return
-OK once the socket is bound. Push the listener loop to a
-post-bind thread.
+**Wontfix rationale**: the watcher's split-brain reconcile
+(scheduler.py:680, fires every probe tick) already catches
+"toggle=on, listener=down" within at most one tick and
+re-applies. User-visible lying window is bounded to ~30 s on
+the first probe after a toggle-flip. Sync-bind would introduce
+a tri-state (on / off / armed-but-not-bound) and bind-failure
+has several distinct causes (port conflict, NSD permission,
+FGS denial) each wanting different recovery — complexity not
+worth the bounded lying window.
 
 ---
 
 ### 9. `_pending_resets` queue has no backoff or age-out
 
-**Status:** `[open-low]`.
+**Status:** `[wontfix]` (closed 2026-05-30).
 
 `lan_listener.py:608-622`. Post-receive resets that hit
 `LockTimeout` get queued for the next drain tick (30 s). A
@@ -204,15 +218,20 @@ project deadlocked on `project_lock` produces forever-retries
 with no backoff; working tree stays ahead of HEAD; other peers
 keep pushing expecting integration.
 
-Suggested: per-entry retry counter + exponential backoff;
-after N retries surface a typed status (or log loudly) so the
-deadlock becomes visible.
+**Wontfix rationale**: the deadlock case is rare and
+self-clears when the lock holder releases. Forever-retry at
+30 s costs negligible work per tick. Capping retries requires
+deciding what to do at the cap — silently dropping is worse
+than the current state; surfacing requires plumbing through
+`project_status` with a new field + peer-side UI for "we gave
+up on this reset," which is bigger scope than the bug
+warrants.
 
 ---
 
 ### 10. `_count_commits_ahead` 5 s lock-timeout silently degrades
 
-**Status:** `[open-low]`.
+**Status:** `[wontfix]` (closed 2026-05-30).
 
 `lan_push.fan_out` calls `_count_commits_ahead` inside a 5 s
 `project_lock` timeout. If a concurrent merge holds the lock,
@@ -220,9 +239,15 @@ the call returns immediately with an indistinguishable "0 / no
 data" result. Caller doesn't tell timeout from success;
 badges can show stale counts.
 
-Suggested: return an Optional sentinel (`None`) on lock timeout
-and let the caller treat that as "unknown" (skip the badge
-update rather than render zero).
+**Wontfix rationale**: the "OK-on-uncertainty" contract is an
+intentional design choice — see memory
+`feedback_lanok_n_is_intentional_friction.md` and the
+0.46.x convergence-correctness chain. Under-reporting on
+uncertainty was field-validated as better UX than flicker.
+Surfacing "unknown" would require a new state in the 5-state
+sync badge (CLIENT_INTEGRATION.md § 17b), a UI design
+decision, not just a code change. The lock-timeout case
+clears within seconds; the next tick re-attempts.
 
 ---
 
@@ -256,7 +281,16 @@ pointing at a freshened guid. Called from
 
 ### Half-strip `.git/config` cleanup
 
-**Status:** `[open-low]` — cosmetic, documented in memory
-`project_lan_sync_0.45.x_field_state.md` as "harmless to
-`project_status` after 0.46.8. Future pass could write
-`.git/config` directly." Not load-bearing.
+**Status:** `[wontfix]` (closed 2026-05-30) — cosmetic only.
+
+Memory `project_lan_sync_0.45.x_field_state.md` documents this
+as "harmless to `project_status` after 0.46.8."
+
+**Wontfix rationale**: the empty-URL case is correctly handled
+in `_count_commits_ahead` (0.46.8), `_push_repo_locked`, and
+`_sync_repo_locked` — all branch on `not remote_url` and emit
+`NO_REMOTE`. The only thing the half-strip affects is what
+`cat .git/config` looks like to a human inspecting a project
+directory. Direct `.git/config` writes require holding
+`project_lock` per CLAUDE.md invariant 11; not worth the new
+seam for a pure cosmetic outcome.

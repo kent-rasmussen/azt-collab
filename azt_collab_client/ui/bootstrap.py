@@ -1258,12 +1258,30 @@ def _check_server(ctx, _warmup_attempt=0):
             # which a 60-second wait won't fix. Bail to the
             # unresponsive popup early so the user can act on the
             # actual problem (reinstall, sign matching).
-            if kind == 'null_bundle':
+            # Count both ``null_bundle`` (provider returned null —
+            # Python callbacks never installed) and
+            # ``transport_error`` (Java-side exception during the
+            # call — typically the provider's process died mid-
+            # call) toward the same streak. A daemon that's
+            # crash-looping on a missing python bundle can surface
+            # EITHER kind depending on whether the provider's Java
+            # side has registered yet when the call lands. 0.50.5
+            # only counted ``null_bundle`` exact, which made the
+            # auto-launch silently fail to trigger on devices
+            # where ``transport_error`` interleaved.
+            # ``daemon_not_ready`` is the deliberate "boot in
+            # progress" signal — reset.
+            if kind in ('null_bundle', 'transport_error'):
                 ctx.null_bundle_streak += 1
-            else:
-                # Any other kind (especially ``daemon_not_ready``)
-                # is a "boot in progress" signal — reset the streak.
+            elif kind == 'daemon_not_ready':
                 ctx.null_bundle_streak = 0
+            else:
+                # Unknown kind — neither advance nor reset.
+                # Conservative: don't reset (don't wipe earlier
+                # progress toward the streak); don't advance
+                # (don't fire auto-launch on a single unrecognised
+                # failure mode).
+                pass
             if ctx.null_bundle_streak >= _NULL_BUNDLE_FAIL_FAST:
                 print(f'[bootstrap] null-bundle fast-fail: streak='
                       f'{ctx.null_bundle_streak} attempt='
@@ -1757,23 +1775,90 @@ def _open_server_apk_launcher():
     Returns True on success, False otherwise. Android-15 process-
     freezer workaround: with the server APK foregrounded, its
     package's processes (including ``:provider``) un-freeze and
-    the peer's next ContentResolver call lands."""
+    the peer's next ContentResolver call lands.
+
+    Diagnostic logging at every failure seam — 0.50.5 field
+    smoke showed cases where this returned False but no peer-
+    side log explained which step bailed (``mActivity`` null vs
+    ``getLaunchIntentForPackage`` returning null vs the
+    ``startActivity`` call itself raising). A context fallback
+    via ``ActivityThread.currentApplication`` handles the case
+    where ``PythonActivity.mActivity`` is briefly null during
+    Activity recreation (verified field-observable on Android
+    14+ when the Activity is being torn down faster than the
+    peer's startup work).
+    """
     try:
         from jnius import autoclass
+    except ImportError as ex:
+        print(f'[bootstrap] _open_server_apk_launcher: jnius '
+              f'unavailable ({ex!r}); platform=non-android?',
+              file=sys.stderr, flush=True)
+        return False
+    try:
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
         Intent = autoclass('android.content.Intent')
+    except Exception as ex:
+        print(f'[bootstrap] _open_server_apk_launcher: autoclass '
+              f'failed: {ex!r}', file=sys.stderr, flush=True)
+        return False
+    # Primary: the peer's Activity. Has its own PackageManager and
+    # can fire intents.
+    activity = None
+    try:
         activity = PythonActivity.mActivity
-        if activity is None:
+    except Exception as ex:
+        print(f'[bootstrap] _open_server_apk_launcher: '
+              f'PythonActivity.mActivity raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    if activity is None:
+        print('[bootstrap] _open_server_apk_launcher: '
+              'PythonActivity.mActivity is None; falling back to '
+              'ActivityThread.currentApplication',
+              file=sys.stderr, flush=True)
+        # Fallback: use the Application context. startActivity from
+        # a non-Activity context requires FLAG_ACTIVITY_NEW_TASK,
+        # which we set anyway.
+        try:
+            ActivityThread = autoclass('android.app.ActivityThread')
+            app = ActivityThread.currentApplication()
+        except Exception as ex:
+            print(f'[bootstrap] _open_server_apk_launcher: '
+                  f'ActivityThread fallback failed: {ex!r}',
+                  file=sys.stderr, flush=True)
             return False
-        pm = activity.getPackageManager()
+        if app is None:
+            print('[bootstrap] _open_server_apk_launcher: '
+                  'currentApplication returned None too; bailing',
+                  file=sys.stderr, flush=True)
+            return False
+        ctx = app
+    else:
+        ctx = activity
+    try:
+        pm = ctx.getPackageManager()
         intent = pm.getLaunchIntentForPackage(_SERVER_PACKAGE_NAME)
-        if intent is None:
-            return False
+    except Exception as ex:
+        print(f'[bootstrap] _open_server_apk_launcher: '
+              f'getLaunchIntentForPackage raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+    if intent is None:
+        print(f'[bootstrap] _open_server_apk_launcher: '
+              f'getLaunchIntentForPackage({_SERVER_PACKAGE_NAME!r}) '
+              f'returned None — server APK might not be installed',
+              file=sys.stderr, flush=True)
+        return False
+    try:
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        activity.startActivity(intent)
+        ctx.startActivity(intent)
+        print(f'[bootstrap] _open_server_apk_launcher: launched '
+              f'{_SERVER_PACKAGE_NAME!r}',
+              file=sys.stderr, flush=True)
         return True
     except Exception as ex:
-        print(f'[bootstrap] _open_server_apk_launcher failed: {ex}',
+        print(f'[bootstrap] _open_server_apk_launcher: '
+              f'startActivity raised: {ex!r}',
               file=sys.stderr, flush=True)
         return False
 

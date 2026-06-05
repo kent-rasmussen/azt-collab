@@ -27,6 +27,7 @@ to your ScreenManager:
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.lang import Builder
+from kivy.metrics import dp
 from kivy.uix.screenmanager import Screen
 
 from .icons import icon_path
@@ -129,11 +130,44 @@ _KV_TEMPLATE = '''
                         text: _('I have one on my phone')
                         normal_color: T.ACCENT
                         on_release: app.open_file()
+                    # Notice shown when contributor is unset. Both
+                    # ``clone_dialog`` (for private repos that need
+                    # an authed user) and ``receive_from_phone``
+                    # (which goes through ``lan_pair_accept``, which
+                    # refuses on ``CONTRIBUTOR_UNSET``) require the
+                    # contributor field to be set first. Rather than
+                    # let the user tap into either path only to be
+                    # bounced silently, we hide both buttons (height
+                    # / opacity / disabled tri-set, per the Kivy
+                    # hide/show pattern) and surface a red notice
+                    # pointing the user at settings. Refreshed each
+                    # ``on_enter`` via ``_refresh_contributor_state``.
+                    #
+                    # Uses plain ``Label`` rather than ``BodyLabel``
+                    # so the rule resolves regardless of whether the
+                    # host has loaded app.py's settings KV first —
+                    # peer-app contexts (recorder, viewer) don't.
+                    Label:
+                        id: contributor_notice
+                        text: _('To clone from a private repo, or to get a project from a local phone, go to settings and add your name first.')
+                        color: T.RED
+                        bold: True
+                        font_size: sp(13)
+                        font_name: FONT
+                        halign: 'center'
+                        valign: 'middle'
+                        size_hint_y: None
+                        height: 0
+                        opacity: 0
+                        text_size: self.width, None
+                        padding: dp(8), dp(4)
                     RecBtn:
+                        id: clone_internet_btn
                         text: _('Clone Internet Repository')
                         normal_color: T.BTN_INACTIVE
                         on_release: app.clone_dialog()
                     RecBtn:
+                        id: receive_from_phone_btn
                         text: _('Receive a project from another phone')
                         normal_color: T.BTN_INACTIVE
                         # Opens the pending-offers chooser: shows
@@ -210,6 +244,73 @@ class ProjectPickerScreen(Screen):
         # was "previously cloned projects don't appear in the
         # existing-projects list". Same fix the settings UI uses.
         Clock.schedule_once(lambda *_: self._populate_projects(), 0)
+        Clock.schedule_once(
+            lambda *_: self._refresh_contributor_state(), 0)
+
+    def _refresh_contributor_state(self):
+        """Hide / show identity-gated actions based on whether a
+        usable contributor name is set. Scope (refined 2026-05-30):
+
+        - "Receive a project from another phone" — hidden when
+          unset. ``lan_pair_accept`` refuses with
+          ``CONTRIBUTOR_UNSET`` up-front, so the scan would
+          silently fail; cleanest UX is to not offer it.
+        - "Clone Internet Repository" — **stays visible**. Public
+          repos don't require an authed user, and the clone path
+          (init followed by ``git`` writes) can land without a
+          contributor — only the first commit needs one, and the
+          downstream sync flow surfaces ``CONTRIBUTOR_UNSET`` at
+          that point. Hiding it would block legitimate public-repo
+          clones.
+
+        The contributor counts as "set" only when
+        ``store.is_valid_contributor`` would return True — i.e. at
+        least one alphanumeric character. Junk values like ``)``
+        that satisfy a simple non-empty truthiness test (see
+        0.50.20 audit) are treated as unset here so the gate
+        doesn't unlock on garbage.
+
+        Called from ``on_enter`` so a user who set their name from
+        settings and came back sees the receive button re-appear
+        without leaving the picker."""
+        from .. import get_contributor
+        try:
+            contributor = get_contributor() or ''
+        except Exception:
+            contributor = ''
+        # Treat any value lacking an alphanumeric character as
+        # unset — same predicate as ``store.is_valid_contributor``
+        # on the daemon side, duplicated here so the picker stays
+        # platform-agnostic.
+        stripped = contributor.strip()
+        unset = not stripped or not any(c.isalnum() for c in stripped)
+        notice = self.ids.get('contributor_notice')
+        receive_btn = self.ids.get('receive_from_phone_btn')
+        if notice is not None:
+            if unset:
+                notice.opacity = 1
+                # Auto-grow to fit wrapped text. Set width first;
+                # measure required height; assign.
+                notice.text_size = (notice.width, None)
+                notice.texture_update()
+                notice.height = max(notice.texture_size[1] + dp(12),
+                                    dp(48))
+            else:
+                notice.opacity = 0
+                notice.height = 0
+        if receive_btn is not None:
+            if unset:
+                receive_btn.opacity = 0
+                receive_btn.height = 0
+                receive_btn.disabled = True
+            else:
+                receive_btn.opacity = 1
+                receive_btn.disabled = False
+                # RecBtn's KV rule sets ``height: dp(52)`` —
+                # match that here so the restored button is the
+                # same size as the always-visible "Start New" /
+                # project-list rows.
+                receive_btn.height = dp(52)
 
     def _populate_projects(self):
         from .._debug import first_try_log

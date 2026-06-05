@@ -59,6 +59,9 @@ from .status import Result, Status
 from . import status as S
 from . import __version__ as _VERSION
 from . import MIN_CLIENT_VERSION as _MIN_CLIENT_VERSION
+from . import __fingerprint__ as _FINGERPRINT
+from ._fingerprint import module_fingerprints as _module_fingerprints
+_MODULES = _module_fingerprints()
 
 # Kept alive for the server's lifetime so the flock on server.lock stays held.
 _server_lock_fd = None
@@ -258,6 +261,27 @@ def _h_health(_body):
     payload = {
         "ok": True, "version": _VERSION,
         "min_client_version": _MIN_CLIENT_VERSION,
+        # Content fingerprint of the deployed daemon code (.py
+        # contents under ``azt_collabd/`` + ``azt_collab_client/``,
+        # SHA-256, first 16 hex chars). Independent of
+        # ``__version__``: two bundles claiming the same version
+        # but built from different bytes have different
+        # fingerprints. Lets diagnosis distinguish "deploy didn't
+        # take" from "code is fine, behaviour is wrong". Compare
+        # against `python -m azt_collabd fingerprint` run from the
+        # source tree you expect to be deployed. Since 0.50.31.
+        "fingerprint": _FINGERPRINT,
+        # Per-module fingerprint breakdown — one hash per .py /
+        # .pyc file in the daemon's combined bundle. Diagnostic
+        # when the combined ``fingerprint`` shifts but only some
+        # files actually changed: compare modules dicts and the
+        # diverging entries point at the stale files. Since
+        # 0.50.34, after the 0.50.30 telemetry fix appeared
+        # deployed (overall fingerprint changed) but the bug
+        # behaviour persisted because cawl.py specifically was
+        # stale — overall hash can't reveal partial-staleness,
+        # per-module breakdown can.
+        "modules": _MODULES,
         "pid": os.getpid(),
         "started_at": _started_at,
     }
@@ -311,7 +335,20 @@ def _h_get_contributor(_body):
 
 def _h_set_contributor(body):
     name = body.get('contributor', '')
-    store.set_contributor(name)
+    ok = store.set_contributor(name)
+    if not ok:
+        # ``set_contributor`` refused — input failed
+        # ``is_valid_contributor`` (needs at least one
+        # alphanumeric character). Surface so the peer can
+        # render a clear error rather than silently leaving
+        # the user with the old value and no feedback.
+        return 200, {
+            "ok": False,
+            "error": "invalid_contributor",
+            "detail": "Contributor name must contain at least "
+                      "one letter or digit.",
+            "contributor": store.get_contributor(),
+        }
     return 200, {"ok": True, "contributor": store.get_contributor()}
 
 
@@ -655,21 +692,37 @@ def _h_lan_nearby_unpaired(_body):
     """
     from . import lan_discovery as _lan_discovery
     from . import peers as _peers
+    from . import peer_id as _peer_id
     paired_ids = {p['peer_id'] for p in _peers.list_peers()}
+    # Self-filter (0.50.39): the daemon advertises its own service
+    # on mDNS, and the discovery callbacks happily record it into
+    # ``known_endpoints``. Without explicitly skipping our own
+    # peer_id here, the Nearby-unpaired list shows the local
+    # device — confusing UX. Treat self as if already paired.
+    try:
+        self_peer_id = _peer_id.ensure().get('peer_id', '') or ''
+    except Exception:
+        self_peer_id = ''
+    if self_peer_id:
+        paired_ids = set(paired_ids) | {self_peer_id}
+    device_names = _lan_discovery.known_device_names()
     out = []
     for peer_id, (host, port) in _lan_discovery.known_endpoints().items():
         if peer_id in paired_ids:
             continue
         out.append({
             'peer_id': peer_id,
-            # fp and device_name aren't carried in the mDNS
-            # endpoint cache today (resolve callback writes only
-            # endpoint). UI shows device_name on the popup AFTER
-            # the receiver accepts (which carries it in
-            # pair_response → lan_pair_requests). Pre-pair, the
-            # UI displays the peer_id prefix.
+            # ``fp`` still empty pre-pair — TXT carries only
+            # ``peer_id`` / ``fp`` / ``v`` / ``device_name``; we
+            # could expose ``fp`` too but it's not the user-
+            # visible string. The peer record gets the cert
+            # fingerprint at pair-accept time.
             'fp': '',
-            'device_name': '',
+            # device_name surfaced from TXT since 0.50.39. Empty
+            # when the discovered peer is on pre-0.50.39 code
+            # and doesn't advertise the field; UI falls back to
+            # peer_id prefix.
+            'device_name': device_names.get(peer_id, '') or '',
             'endpoint': f'{host}:{int(port)}',
         })
     return 200, {"ok": True, "peers": out}
@@ -919,12 +972,29 @@ def _h_lan_adopt_origin(body):
         url = str(params.get('url', '') or '')
         try:
             projects.set_remote_url(langcode, url)
-            result.add(S.LAN_PROJECT_ADOPTED_REMOTE,
-                       langcode=langcode, url=url)
         except Exception as ex:
             result.add(S.SERVER_ERROR,
                        error=f'set_remote_url failed: {ex!r}')
             return 200, {"ok": True, "result": result.to_dict()}
+        # Mirror the adoption to ``.git/config``. Without this the
+        # registry says "remote_url=X" but the working tree's git
+        # config has no origin, so the next push has no remote to
+        # send to. Pre-0.50.27 the registry write alone was enough
+        # only because publish flowed through ``init_project`` which
+        # rewrote ``.git/config`` itself — silent adoption never
+        # touched the config and the push silently no-op'd.
+        try:
+            proj = projects.get(langcode)
+            wd = (proj.working_dir if proj is not None else '') or ''
+            if wd:
+                from . import repo as _repo
+                _repo.set_remote_origin_url(wd, url)
+        except Exception as ex:
+            print(f'[adopt-origin] set_remote_origin_url '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+        result.add(S.LAN_PROJECT_ADOPTED_REMOTE,
+                   langcode=langcode, url=url)
     _pending.remove(decision_id)
     return 200, {"ok": True, "result": result.to_dict()}
 
@@ -954,6 +1024,20 @@ def _h_lan_resolve_conflict(body):
         except Exception as ex:
             return 200, {"ok": False,
                          "error": f'set_remote_url failed: {ex!r}'}
+        # Mirror to ``.git/config`` — see ``_h_lan_adopt_origin``
+        # for rationale. Without this the registry says one thing
+        # and the working tree's origin says another, and the next
+        # push uses the old (or empty) URL. Since 0.50.27.
+        try:
+            proj = projects.get(langcode)
+            wd = (proj.working_dir if proj is not None else '') or ''
+            if wd:
+                from . import repo as _repo
+                _repo.set_remote_origin_url(wd, incoming_url)
+        except Exception as ex:
+            print(f'[resolve-conflict] set_remote_origin_url '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
     elif mode == 'dual_publish':
         # Record incoming as a secondary remote. The push paths
         # (``_push_repo_locked`` / ``_sync_repo_locked``) call
@@ -1371,7 +1455,7 @@ def _h_cawl_image_bytes(langcode, rel_path):
               file=sys.stderr, flush=True)
         return 404, 'application/json', \
             b'{"ok":false,"error":"no_image_repo_configured"}'
-    target = _cawl.get_image_path(repo, rel_path)
+    target, source = _cawl.get_image_path(repo, rel_path)
     if target is None:
         # ``get_image_path`` already logs ``[cawl] image fetch
         # failed`` when the network attempt fails. We log a
@@ -1383,6 +1467,15 @@ def _h_cawl_image_bytes(langcode, rel_path):
               file=sys.stderr, flush=True)
         return 404, 'application/json', \
             b'{"ok":false,"error":"image_unavailable"}'
+    # On-demand fetches during an active prefetch contribute to
+    # the source counters too (no-op outside any prefetch window
+    # via the silent ``state is None`` guard in
+    # ``_bump_source_counter``). 0.50.30: bumping moved out of
+    # ``get_image_path`` so the prefetch worker can guarantee
+    # "completed without source" is impossible; this preserves
+    # the pre-refactor behaviour for on-demand callers.
+    if source:
+        _cawl._bump_source_counter(repo, source)
     try:
         with open(target, 'rb') as f:
             data = f.read()
@@ -1949,10 +2042,12 @@ def _h_init_project(body):
     #   * ``set_last_commit`` on COMMITTED / COMMITTED_AND_PUSHED —
     #     same idea for the commit timestamp peers display alongside.
     codes = result.codes()
+    published_langcode = ''
     try:
         for p in projects.list_all():
             if os.path.abspath(p.working_dir) == os.path.abspath(working_dir):
                 _touch_project(p.langcode)
+                published_langcode = p.langcode
                 if remote_url and p.remote_url != remote_url:
                     projects.set_remote_url(p.langcode, remote_url)
                 if ('PUSHED' in codes
@@ -1966,6 +2061,47 @@ def _h_init_project(body):
                 break
     except Exception:
         pass
+    # Fan out the (possibly newly-set) remote_url to every paired peer
+    # who has this project on their allow-list, so peer-side
+    # ``_do_publish`` adopts the URL instead of inventing a duplicate
+    # github repo under their own namespace. Best-effort; per-peer
+    # failures don't block the response. The share-offer wire format
+    # already carried ``repo_url`` (since 0.45.0), so older peers see
+    # this as a familiar ``LAN_SHARE_OFFER`` arrival — they'll stash
+    # the URL as a pending decision the user can accept. New peers
+    # (0.50.27+) dispatch on local state per ``_handle_share_offer``.
+    #
+    # Run in a background daemon thread so unreachable peers (each
+    # with a 15 s urllib3 timeout in ``_https_post_to_peer``) don't
+    # block the publish RPC's response.
+    if published_langcode and remote_url:
+        def _fanout_worker(langcode_, url_):
+            try:
+                from . import peers as _peers
+                from . import lan_push as _lan_push
+                proj_after = projects.get(langcode_)
+                vernlang_ = (proj_after.effective_vernlang()
+                             if proj_after is not None
+                             else langcode_)
+                for peer_id in _peers.peers_sharing_project(langcode_):
+                    try:
+                        _lan_push.send_share_offer(
+                            peer_id, langcode_, url_,
+                            vernlang=vernlang_)
+                    except Exception as ex:
+                        print(f'[publish-fanout] send_share_offer '
+                              f'peer={peer_id[:8]!r} '
+                              f'lang={langcode_!r}: {ex!r}',
+                              file=sys.stderr, flush=True)
+            except Exception as ex:
+                print(f'[publish-fanout] worker failure '
+                      f'lang={langcode_!r}: {ex!r}',
+                      file=sys.stderr, flush=True)
+        threading.Thread(
+            target=_fanout_worker,
+            args=(published_langcode, remote_url),
+            daemon=True,
+            name=f'publish-fanout-{published_langcode}').start()
     return 200, {"ok": True, "result": result.to_dict()}
 
 
@@ -2949,6 +3085,100 @@ def _h_project_atomic_commit(langcode, body):
     return 200, {"ok": True, "result": res.to_dict()}
 
 
+def _h_set_audio(langcode, body):
+    """``POST /v1/projects/<lang>/set_audio``
+
+    Body: ``{guid, lang, filename}``. Surgically writes
+    ``<citation>/<form lang={lang}><text>{filename}</text></form>``
+    on the entry with the given guid, without round-tripping the
+    full LIFT through ElementTree peer-side. The "other forms left
+    intact" guarantee and byte-stable-outside-the-entry semantics
+    are documented in ``azt_collabd/lift_surgery.py``.
+
+    Auto-fires a debounced commit on success (mirrors the
+    ``_h_project_atomic_commit`` pattern), and a
+    ``notify_project_changed`` so ContentObserver peers wake fast.
+
+    Returns the typed ``Result`` from
+    ``lift_surgery.set_audio`` — ``S.AUDIO_SET`` /
+    ``S.AUDIO_SET_NO_CHANGE`` on success;
+    ``S.ENTRY_NOT_FOUND`` / ``S.LIFT_INVALID`` / ``S.BUSY`` on
+    failure. Since 0.50.29."""
+    from . import lift_surgery as _lift_surgery
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    guid = str(body.get('guid', '') or '').strip()
+    lang = str(body.get('lang', '') or '').strip()
+    filename = str(body.get('filename', '') or '').strip()
+    if not guid:
+        return 400, {"ok": False, "error": "missing_guid"}
+    if not lang:
+        return 400, {"ok": False, "error": "missing_lang"}
+    if not filename:
+        return 400, {"ok": False, "error": "missing_filename"}
+    if not p.lift_path:
+        return 400, {"ok": False, "error": "no_lift_path"}
+    _touch_project(langcode)
+    result = _lift_surgery.set_audio(
+        p.working_dir, p.lift_path, guid, lang, filename)
+    if result.has(S.AUDIO_SET):
+        try:
+            scheduler.commit_project(langcode)
+        except Exception as ex:
+            print(f'[set_audio] auto-commit schedule failed for '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+        try:
+            from .android_cp import notify as _notify
+            _notify.notify_project_changed(langcode)
+        except Exception:
+            pass
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _h_set_illustration(langcode, body):
+    """``POST /v1/projects/<lang>/set_illustration``
+
+    Body: ``{guid, href}``. Surgically writes
+    ``<sense>/<illustration href={href}/>`` on the first sense of
+    the entry with the given guid (creating ``<sense>`` if absent).
+    See ``_h_set_audio`` for the contract shape; this is the
+    sibling endpoint for image saves. Since 0.50.29."""
+    from . import lift_surgery as _lift_surgery
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    guid = str(body.get('guid', '') or '').strip()
+    href = str(body.get('href', '') or '').strip()
+    if not guid:
+        return 400, {"ok": False, "error": "missing_guid"}
+    if not href:
+        return 400, {"ok": False, "error": "missing_href"}
+    if not p.lift_path:
+        return 400, {"ok": False, "error": "no_lift_path"}
+    _touch_project(langcode)
+    result = _lift_surgery.set_illustration(
+        p.working_dir, p.lift_path, guid, href)
+    if result.has(S.ILLUSTRATION_SET):
+        try:
+            scheduler.commit_project(langcode)
+        except Exception as ex:
+            print(f'[set_illustration] auto-commit schedule failed '
+                  f'for {langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+        try:
+            from .android_cp import notify as _notify
+            _notify.notify_project_changed(langcode)
+        except Exception:
+            pass
+    return 200, {"ok": True, "result": result.to_dict()}
+
+
 def _h_cawl_prefetch(langcode, body):
     """``POST /v1/projects/<lang>/cawl/prefetch`` — start a
     daemon-driven prefetch of a working-set of CAWL image paths.
@@ -3536,6 +3766,10 @@ def dispatch(method, path, body):
                 return _h_project_atomic_commit(parts[3], body)
             if len(parts) == 5 and parts[4] == 'atomic_finalize':
                 return _h_project_atomic_finalize(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'set_audio':
+                return _h_set_audio(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'set_illustration':
+                return _h_set_illustration(parts[3], body)
             if len(parts) == 6 and parts[4] == 'cawl' \
                     and parts[5] == 'prefetch':
                 return _h_cawl_prefetch(parts[3], body)
@@ -3923,11 +4157,13 @@ def install_stdio_tee(truncate=False):
     _stdio_tee_installed = True
     if truncate:
         print(f'[daemon-log] mirroring stdio to {path!r} '
-              f'(fresh session, daemon {_VERSION})',
+              f'(fresh session, daemon {_VERSION} '
+              f'fingerprint={_FINGERPRINT})',
               file=sys.stderr, flush=True)
     else:
         print(f'[daemon-log] mirroring stdio to {path!r} '
-              f'(appending — daemon {_VERSION} respawn)',
+              f'(appending — daemon {_VERSION} '
+              f'fingerprint={_FINGERPRINT} respawn)',
               file=sys.stderr, flush=True)
     return True
 

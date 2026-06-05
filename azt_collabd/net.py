@@ -16,6 +16,13 @@ import time
 
 # Suppress dulwich debug/info logging (gitconfig path spam)
 logging.getLogger('dulwich').setLevel(logging.WARNING)
+# urllib3 emits DEBUG records on every HTTPS connection setup
+# ("Starting new HTTPS connection", "Converted retries value", …).
+# Kivy's root handler catches them, renders with the [DEBUG  ]
+# prefix and ships to logcat stderr — pure noise during routine
+# clone/fetch/push. INFO drops the DEBUG chatter while still
+# letting real WARN/ERROR records through.
+logging.getLogger('urllib3').setLevel(logging.INFO)
 
 
 # ── SSL fix for Android (missing CA bundle) ──────────────────────────────────

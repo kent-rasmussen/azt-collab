@@ -188,6 +188,20 @@ _HANDLERS = {
         {'host': (p.get('host') or '').capitalize() or 'GitHub'}),
     S.BRANCH_ERROR:           lambda p: _fmt(_tr('Branch error: {error}'), p),
     S.REMOTE_CREATE_FAILED:   lambda p: _fmt(_tr('Create repo failed: {error}'), p),
+    S.REMOTE_OWNER_MISMATCH_SKIP_CREATE: lambda p: _fmt(_tr(
+        "Pushing to {owner}'s repo at {url} as collaborator "
+        '(no new repo will be created under your account).'), p),
+    S.AUDIO_SET:                lambda p: _tr('Audio saved.'),
+    S.AUDIO_SET_NO_CHANGE:      lambda p: _tr(
+        'Audio already saved (no change).'),
+    S.ILLUSTRATION_SET:         lambda p: _tr('Illustration saved.'),
+    S.ILLUSTRATION_SET_NO_CHANGE: lambda p: _tr(
+        'Illustration already saved (no change).'),
+    S.ENTRY_NOT_FOUND:          lambda p: _fmt(_tr(
+        'Entry {guid} not found in this project.'), p),
+    S.LIFT_INVALID:             lambda p: _fmt(_tr(
+        'LIFT file rejected: {error}'),
+        {'error': p.get('error', 'invalid XML')}),
 
     S.AUTH_REQUIRED:          lambda p: _tr('Not connected to GitHub. Go to Setup > Connect to GitHub.'),
     S.CONTRIBUTOR_UNSET:      lambda p: _tr(

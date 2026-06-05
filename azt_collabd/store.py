@@ -429,12 +429,75 @@ def get_contributor():
     return (_load_config_file().get('collab') or {}).get('contributor', '')
 
 
+def is_valid_contributor(name):
+    """A "set" contributor must contain at least one alphanumeric
+    character (Unicode letter or digit) — protects against junk
+    values like ``)`` or ``!!!`` that pass a simple non-empty
+    check but are useless as a human display label.
+
+    Field-observed 2026-05-30: an empty-input touch on the
+    settings screen + an accidental keypress wrote ``)`` to the
+    contributor field, which then satisfied
+    ``get_contributor() and ...`` truthiness gates everywhere
+    while breaking the downstream git author email and the
+    user's mental model of "I haven't set my name yet."
+
+    Returns False for None, empty, whitespace-only, and
+    punctuation-only inputs. Returns True for any input that
+    has at least one alphanumeric character anywhere.
+    """
+    if not name:
+        return False
+    s = name.strip()
+    if not s:
+        return False
+    return any(c.isalnum() for c in s)
+
+
 def set_contributor(name):
     """Persist the user's display name. Strips whitespace; an empty
     string clears the field (commit ops then refuse with
-    ``S.CONTRIBUTOR_UNSET`` until a name is set again)."""
+    ``S.CONTRIBUTOR_UNSET`` until a name is set again).
+
+    Returns True on store; False if the input was rejected as
+    invalid (failed ``is_valid_contributor``) — caller surfaces
+    the refusal to the user. Empty / whitespace-only is the
+    deliberate "clear" path and stores successfully (returns
+    True; downstream ``CONTRIBUTOR_UNSET`` gating applies)."""
+    stripped = (name or '').strip()
+    if stripped and not is_valid_contributor(stripped):
+        return False
     cfg = _load_config_file()
-    cfg.setdefault('collab', {})['contributor'] = (name or '').strip()
+    cfg.setdefault('collab', {})['contributor'] = stripped
+    _save_config_file(cfg)
+    return True
+
+
+# ── boot-update-popup throttle ──────────────────────────────────────────────
+#
+# Suppresses the launcher-tap "newer release available" popup on
+# every settings-page open. Stores the latest tag we already
+# popped for; the next boot only re-pops if a strictly newer tag
+# is on GitHub. Doesn't affect the silent badge — that always
+# renders based on the current latest tag vs. running version.
+
+
+def get_last_popped_update_tag():
+    """Return the most-recent server-APK release tag we've already
+    surfaced as a boot popup, or ``''`` if we've never popped
+    one. Used by ``picker_app._kick_boot_update_check`` to
+    suppress repeat prompts on the same release."""
+    return ((_load_config_file().get('update') or {})
+            .get('last_popped_tag', '') or '')
+
+
+def set_last_popped_update_tag(tag):
+    """Record that we've popped the boot-update popup for ``tag``.
+    Subsequent boots skip the popup until a strictly newer tag
+    is published. Empty string clears the throttle (next boot
+    re-pops if an update is available)."""
+    cfg = _load_config_file()
+    cfg.setdefault('update', {})['last_popped_tag'] = (tag or '').strip()
     _save_config_file(cfg)
 
 

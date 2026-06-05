@@ -63,6 +63,15 @@ _STATE = {
 # restart-browse threshold tripped). See audit finding #6.
 _endpoints = {}
 
+# Per-peer device_name cache. Populated by the discovery callbacks
+# when a peer's mDNS TXT carries the ``device_name`` field (since
+# 0.50.39 — older peers don't advertise it, so older entries
+# remain empty here and the UI falls back to the peer_id prefix).
+# Keyed by peer_id, value is the decoded UTF-8 string. Separate
+# from ``_endpoints`` so the existing 3-tuple shape stays stable
+# for all the fan-out / scheduler code that depends on it.
+_device_names = {}
+
 # Endpoint cache TTL. Sized for the field workflow: an mDNS
 # responder re-announces every 30-120 s under standard zeroconf
 # defaults, so 5 min covers ~5 announce cycles of headroom before
@@ -106,6 +115,17 @@ def get_endpoint(peer_id_hex):
             del _endpoints[peer_id_hex]
             return None
         return (host, port)
+
+
+def known_device_names():
+    """Return a copy of the ``peer_id → device_name`` map populated
+    by the discovery callbacks from mDNS TXT. Empty dict if no
+    peer has advertised the field yet (pre-0.50.39 peers don't).
+    Used by ``_h_lan_nearby_unpaired`` so the UI can render a
+    real name for unpaired peers instead of falling back to the
+    peer_id prefix. Since 0.50.39."""
+    with _LOCK:
+        return dict(_device_names)
 
 
 def known_endpoints():
@@ -153,11 +173,18 @@ def _persist_resolved_endpoint(peer_id_hex, host, port):
     _peers.set_static_endpoints(peer_id_hex, updated)
 
 
-def _zc_props(peer_id_hex, fp_hex):
+def _zc_props(peer_id_hex, fp_hex, device_name=''):
+    """Build the TXT record dict for zeroconf advertisement.
+    ``device_name`` was added in 0.50.39 — peers running older
+    daemons won't advertise it, and discovery callbacks default
+    to empty when the key is missing. UTF-8 encoded so non-ASCII
+    device names (e.g., user-set names with diacritics) survive
+    the round trip."""
     return {
         b'peer_id': peer_id_hex.encode('ascii'),
         b'fp': fp_hex.encode('ascii'),
         b'v': str(PROTOCOL_VERSION).encode('ascii'),
+        b'device_name': (device_name or '').encode('utf-8'),
     }
 
 
@@ -176,7 +203,7 @@ def _start_advertise_zeroconf(peer_id_hex, fp_hex, port, device_name):
         type_=SERVICE_TYPE,
         name=instance,
         port=int(port),
-        properties=_zc_props(peer_id_hex, fp_hex),
+        properties=_zc_props(peer_id_hex, fp_hex, device_name),
         addresses=addrs,
     )
     try:
@@ -237,12 +264,17 @@ def _zc_listener_class():
                     continue
             if not host:
                 return
+            device_name = (props.get(b'device_name') or b'').decode(
+                'utf-8', 'ignore')
             import time as _time
             with _LOCK:
                 _endpoints[peer_id] = (host, int(info.port),
                                        _time.monotonic())
+                if device_name:
+                    _device_names[peer_id] = device_name
             print(f'[lan-discovery] add {peer_id[:8]!r} → '
-                  f'{host}:{info.port}',
+                  f'{host}:{info.port}'
+                  + (f' name={device_name!r}' if device_name else ''),
                   file=sys.stderr, flush=True)
 
         def _forget(self, name):
@@ -292,14 +324,22 @@ _nsd_discovery_listener = None    # strong ref
 _nsd_resolve_listeners = []       # one per pending resolve
 
 
-def _txt_props_for_nsd(serviceInfo, peer_id_hex, fp_hex):
+def _txt_props_for_nsd(serviceInfo, peer_id_hex, fp_hex,
+                       device_name=''):
     """Stamp TXT records onto a NsdServiceInfo via ``setAttribute``.
     The Java API accepts String values and stores them internally as
     UTF-8 bytes; the receiving side reads them back through
-    ``getAttributes()`` as ``Map<String, byte[]>``."""
+    ``getAttributes()`` as ``Map<String, byte[]>``.
+
+    ``device_name`` added in 0.50.39 so the "Nearby (unpaired)"
+    UI can show a real name instead of the peer_id prefix.
+    Pre-0.50.39 peers don't advertise it and the discovery side
+    defaults to empty."""
     serviceInfo.setAttribute('peer_id', peer_id_hex)
     serviceInfo.setAttribute('fp', fp_hex)
     serviceInfo.setAttribute('v', str(PROTOCOL_VERSION))
+    if device_name:
+        serviceInfo.setAttribute('device_name', device_name)
 
 
 def _decode_nsd_attr(attrs_map, key):
@@ -385,12 +425,17 @@ def _build_resolve_listener_class():
                     return
                 host = serviceInfo.getHost().getHostAddress()
                 port = int(serviceInfo.getPort())
+                device_name = _decode_nsd_attr(attrs, 'device_name')
                 import time as _time
                 with _LOCK:
                     _endpoints[peer_id] = (host, port,
                                            _time.monotonic())
+                    if device_name:
+                        _device_names[peer_id] = device_name
                 print(f'[lan-discovery] nsd resolved '
-                      f'{peer_id[:8]!r} → {host}:{port}',
+                      f'{peer_id[:8]!r} → {host}:{port}'
+                      + (f' name={device_name!r}'
+                         if device_name else ''),
                       file=sys.stderr, flush=True)
                 # Persist the freshly-resolved endpoint into the
                 # paired-peer record's ``static_endpoints``. Without
@@ -525,7 +570,7 @@ def _start_advertise_nsd(peer_id_hex, fp_hex, port, device_name):
         info.setServiceName(device_name or 'AZT device')
         info.setServiceType(SERVICE_TYPE_ANDROID)
         info.setPort(int(port))
-        _txt_props_for_nsd(info, peer_id_hex, fp_hex)
+        _txt_props_for_nsd(info, peer_id_hex, fp_hex, device_name)
         listener = _build_register_listener_class()()
         nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
         _nsd_register_listener = listener

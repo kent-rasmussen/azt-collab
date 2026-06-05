@@ -439,6 +439,33 @@ msgstr "Erreur de branche : {error}"
 msgid "Create repo failed: {error}"
 msgstr "Échec de la création du dépôt : {error}"
 
+msgid ""
+"Pushing to {owner}'s repo at {url} as collaborator (no new repo will be "
+"created under your account)."
+msgstr ""
+"Envoi vers le dépôt de {owner} à {url} en tant que collaborateur (aucun "
+"nouveau dépôt ne sera créé sous votre compte)."
+
+# ── lift_surgery: surgical audio + illustration set (0.50.29) ────────────
+
+msgid "Audio saved."
+msgstr "Audio enregistré."
+
+msgid "Audio already saved (no change)."
+msgstr "Audio déjà enregistré (aucun changement)."
+
+msgid "Illustration saved."
+msgstr "Illustration enregistrée."
+
+msgid "Illustration already saved (no change)."
+msgstr "Illustration déjà enregistrée (aucun changement)."
+
+msgid "Entry {guid} not found in this project."
+msgstr "L'entrée {guid} est introuvable dans ce projet."
+
+msgid "LIFT file rejected: {error}"
+msgstr "Fichier LIFT refusé : {error}"
+
 msgid "Not connected to GitHub. Go to Setup > Connect to GitHub."
 msgstr "Non connecté à GitHub. Allez dans Configuration > Se connecter à GitHub."
 
@@ -589,6 +616,12 @@ msgstr "Chargement..."
 
 msgid "Caching images: {cached} / {total} (network in use — please stay online)"
 msgstr "Mise en cache des images : {cached} / {total} (réseau utilisé — restez connecté)"
+
+msgid "Caching images: {cached} / {total} · via LAN"
+msgstr "Mise en cache des images : {cached} / {total} · via LAN"
+
+msgid "Caching images: {cached} / {total} · via Internet (please stay online)"
+msgstr "Mise en cache des images : {cached} / {total} · via Internet (restez connecté)"
 
 msgid "Diagnostic log"
 msgstr "Journal de diagnostic"
@@ -863,6 +896,9 @@ msgstr "Échec du test : {error}"
 
 msgid "Publish {langcode} data"
 msgstr "Publier les données {langcode}"
+
+msgid "Project {langcode} is already published at {url}."
+msgstr "Le projet {langcode} est déjà publié sur {url}."
 
 msgid "Connect to GitHub or GitLab first to enable publish."
 msgstr "Connectez-vous d'abord à GitHub ou GitLab pour activer la publication."
@@ -1170,6 +1206,28 @@ msgstr "Réception du projet"
 msgid "OK"
 msgstr "OK"
 
+# Boot-update confirm popup (0.50.23). Two-button "Update / Not
+# now" surfaced once per release when the picker_app boots and
+# finds a newer server APK on GitHub.
+msgid "Update available"
+msgstr "Mise à jour disponible"
+
+msgid ""
+"A newer version of AZT Collaboration is available: {version}\n"
+"\n"
+"Update now?"
+msgstr ""
+"Une nouvelle version d'AZT Collaboration est disponible : "
+"{version}\n"
+"\n"
+"Mettre à jour maintenant ?"
+
+msgid "Not now"
+msgstr "Pas maintenant"
+
+msgid "Update"
+msgstr "Mettre à jour"
+
 msgid "Could not finish receiving the project"
 msgstr "Impossible de terminer la réception du projet"
 
@@ -1220,6 +1278,14 @@ msgid "Set your name on the next screen, then scan the QR again."
 msgstr ""
 "Définissez votre nom sur l'écran suivant, puis scannez à "
 "nouveau le QR."
+
+msgid ""
+"To clone from a private repo, or to get a project from a local "
+"phone, go to settings and add your name first."
+msgstr ""
+"Pour cloner un dépôt privé, ou recevoir un projet d'un "
+"téléphone local, ouvrez les paramètres et ajoutez d'abord "
+"votre nom."
 
 msgid "Pairing failed"
 msgstr "Échec de l'appairage"
@@ -1355,6 +1421,43 @@ msgstr "Gérer l'appareil appairé"
 
 msgid "No paired devices. Use \"Pair a phone\" to scan another phone's QR."
 msgstr "Aucun appareil appairé. Utilisez « Appairer un téléphone » pour scanner le QR d'un autre téléphone."
+
+# ── lan_popups.paired_phones_popup — Nearby (unpaired) section ───────────
+
+msgid "Nearby & paired devices"
+msgstr "Appareils à proximité et appairés"
+
+msgid "Nearby (unpaired):"
+msgstr "À proximité (non appairés) :"
+
+msgid "Paired:"
+msgstr "Appairés :"
+
+msgid "Pair"
+msgstr "Appairer"
+
+msgid "Refresh"
+msgstr "Actualiser"
+
+msgid "Waiting…"
+msgstr "En attente…"
+
+msgid "Device {id}…"
+msgstr "Appareil {id}…"
+
+msgid "Pair request lost."
+msgstr "Demande d'association perdue."
+
+msgid "Could not send pair request."
+msgstr "Impossible d'envoyer la demande d'association."
+
+msgid ""
+"No nearby or paired devices yet. Tap Refresh after a few seconds, or use "
+"\"Pair a phone\" to scan another phone's QR."
+msgstr ""
+"Aucun appareil à proximité ou appairé pour le moment. Touchez Actualiser "
+"après quelques secondes, ou utilisez « Appairer un téléphone » pour scanner "
+"le QR d'un autre téléphone."
 
 # Settings labels — 0.45.0 wording polish.
 msgid "Servers (set up at least one)"
