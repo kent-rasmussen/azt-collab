@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paths exposed by the recorder's FileProvider (declared in the
+  recorder's AndroidManifest.xml at authority
+  org.atoznback.aztrecorder.fileprovider). Only the share-staging
+  subdirectory of cacheDir is served, so accidental misuse can't
+  leak audio recordings, LIFT data, etc.
+
+  Lives under android/ next to the existing android/src/main/java
+  source tree. Referenced from the <provider> element added via
+  the buildozer manifest hook (see setup_from_nuke.sh).
+-->
+<paths>
+    <cache-path name="shares" path="shares/" />
+</paths>

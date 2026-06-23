@@ -34,6 +34,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import secrets
 import signal
 import socketserver
@@ -1366,6 +1367,137 @@ def _h_sync_nudge(body):
     return 200, {"ok": True}
 
 
+def _h_lan_debug(langcode, _body):
+    """``GET /v1/projects/<lang>/lan_debug`` — diagnostic dump for
+    comparing what each phone sees for a given project. No side
+    effects, read-only. Added 0.50.45 specifically to chase the
+    WAN-302 vs WAN-17 disparity: when two phones report different
+    ``wan_unshared`` counts, hit this endpoint on each side and
+    compare the fields directly to find where they diverge
+    (HEAD SHA, branch name, ancestry depth, refs present).
+
+    Response::
+
+        {"ok": True,
+         "langcode": "<project>",
+         "head_branch": "main",
+         "head_sha": "abc123…",
+         "ancestor_count_from_head": 302,
+         "has_origin_url": false,
+         "origin_url": "",
+         "tracking_ref_sha": null,
+         "remote_refs_present": ["refs/remotes/origin/main", ...],
+         "branches_present": ["refs/heads/main", ...],
+         "wan_unshared": 302}
+
+    Errors return ``{"ok": False, "error": "..."}`` so any failed
+    field surfaces a reason rather than silently returning 0.
+    """
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found",
+                     "langcode": langcode}
+    if not p.working_dir or not os.path.isdir(
+            os.path.join(p.working_dir, '.git')):
+        return 200, {"ok": False, "error": "no_repo",
+                     "langcode": langcode}
+    try:
+        from dulwich.repo import Repo
+        repo_obj = Repo(p.working_dir)
+    except Exception as ex:
+        return 200, {"ok": False, "error": "repo_open_failed",
+                     "detail": repr(ex), "langcode": langcode}
+    out = {"ok": True, "langcode": langcode}
+    try:
+        # HEAD branch + SHA. ``read_ref(b'HEAD')`` follows
+        # symbolic refs and returns the resolved SHA — useless
+        # for getting the branch name back out. Use
+        # ``get_symrefs`` to get the symbolic-ref mapping; HEAD
+        # in there points at ``refs/heads/<branch>`` for an
+        # attached HEAD, or is missing for a detached HEAD.
+        head_branch = ''
+        head_sha = ''
+        try:
+            symrefs = repo_obj.refs.get_symrefs()
+            target = symrefs.get(b'HEAD')
+            if target and target.startswith(b'refs/heads/'):
+                head_branch = target[len(b'refs/heads/'):] \
+                    .decode('utf-8', 'replace')
+        except Exception:
+            pass
+        try:
+            head_sha_b = repo_obj.refs[b'HEAD']
+            head_sha = head_sha_b.decode('ascii', 'replace')
+        except Exception:
+            pass
+        out['head_branch'] = head_branch
+        out['head_sha'] = head_sha
+        # Ancestor count
+        ancestor_count = 0
+        if head_sha:
+            try:
+                walker = repo_obj.get_walker(
+                    include=[head_sha.encode('ascii')])
+                ancestor_count = sum(1 for _ in walker)
+            except Exception as ex:
+                out['ancestor_count_error'] = repr(ex)
+        out['ancestor_count_from_head'] = ancestor_count
+        # Origin URL
+        origin_url = ''
+        try:
+            url = repo_obj.get_config().get(
+                (b'remote', b'origin'), b'url')
+            try:
+                origin_url = url.decode('utf-8', 'replace').strip()
+            except Exception:
+                origin_url = ''
+        except KeyError:
+            origin_url = ''
+        out['origin_url'] = origin_url
+        out['has_origin_url'] = bool(origin_url)
+        # Tracking ref
+        tracking_sha = None
+        if head_branch:
+            ref_name = (b'refs/remotes/origin/'
+                        + head_branch.encode('ascii'))
+            try:
+                tracking_sha = repo_obj.refs[ref_name].decode(
+                    'ascii', 'replace')
+            except KeyError:
+                pass
+            except Exception as ex:
+                out['tracking_ref_error'] = repr(ex)
+        out['tracking_ref_sha'] = tracking_sha
+        # All refs present (for spotting orphaned branches)
+        remote_refs = []
+        branches = []
+        try:
+            for ref in repo_obj.refs.allkeys():
+                ref_s = ref.decode('utf-8', 'replace')
+                if ref_s.startswith('refs/heads/'):
+                    branches.append(ref_s)
+                elif ref_s.startswith('refs/remotes/'):
+                    remote_refs.append(ref_s)
+        except Exception as ex:
+            out['refs_walk_error'] = repr(ex)
+        out['branches_present'] = sorted(branches)
+        out['remote_refs_present'] = sorted(remote_refs)
+        # The current wan_unshared reading for cross-check.
+        try:
+            from . import repo as _repo_mod
+            out['wan_unshared'] = int(
+                _repo_mod._wan_unshared(
+                    repo_obj, head_branch or 'main'))
+        except Exception as ex:
+            out['wan_unshared_error'] = repr(ex)
+    finally:
+        try:
+            repo_obj.close()
+        except Exception:
+            pass
+    return 200, out
+
+
 def _h_lan_burst(_body):
     """``POST /v1/lan/burst`` — bring the LAN radio up for a 30s
     discovery burst without firing WAN drain or fan-out. The peer
@@ -2100,20 +2232,37 @@ def _h_init_project(body):
     # name before any commit lands.
     contributor = store.get_contributor()
     if not contributor:
+        print(f'[publish] init_project refused: CONTRIBUTOR_UNSET '
+              f'(working_dir={working_dir!r} remote={remote_url!r})',
+              file=sys.stderr, flush=True)
         return 200, {"ok": True,
                      "result": Result().add(
                          S.CONTRIBUTOR_UNSET).to_dict()}
     if not working_dir or not remote_url:
+        print(f'[publish] init_project bad request: '
+              f'working_dir={working_dir!r} remote={remote_url!r}',
+              file=sys.stderr, flush=True)
         return 400, {"ok": False,
                      "error": "missing_working_dir_or_remote_url"}
     git_user, token = store.get_sync_credentials(remote_url)
     if not token:
+        # AUTH_REQUIRED pre-check: no stored token for this remote's
+        # host. Without this log line a tester sharing daemon-log
+        # sees absolutely nothing about the publish click — same
+        # blind spot the 0.50.52 ``_ensure_remote_repo`` fix
+        # closed at the github-API layer, but one level higher.
+        print(f'[publish] init_project AUTH_REQUIRED: no stored '
+              f'token for remote={remote_url!r} '
+              f'(git_user={git_user!r})',
+              file=sys.stderr, flush=True)
         return 200, {"ok": True,
                      "result": Result().add(S.AUTH_REQUIRED).to_dict()}
     try:
         result = _init_repo(working_dir, remote_url, git_user, token,
                             branch, contributor)
     except Exception as ex:
+        print(f'[publish] init_project raised: {type(ex).__name__}: {ex}',
+              file=sys.stderr, flush=True)
         return 500, {"ok": False, "error": str(ex)}
     # On success update the registry to reflect the new state:
     #
@@ -2131,13 +2280,24 @@ def _h_init_project(body):
     #   * ``set_last_commit`` on COMMITTED / COMMITTED_AND_PUSHED —
     #     same idea for the commit timestamp peers display alongside.
     codes = result.codes()
+    # Publish-rollback signal: if ``_ensure_remote_repo`` failed, the
+    # daemon side has already stripped ``.git/config``'s
+    # ``[remote "origin"]`` section. Mirror that in the registry so
+    # the picker's ``_refresh_publish_row`` gate (which prefers
+    # ``project_status.remote_url`` but falls back to
+    # ``Project.remote_url``) sees an empty URL on both sides and
+    # shows the Publish button again for a retry. See 0.50.52.
+    remote_create_failed = 'REMOTE_CREATE_FAILED' in codes
     published_langcode = ''
     try:
         for p in projects.list_all():
             if os.path.abspath(p.working_dir) == os.path.abspath(working_dir):
                 _touch_project(p.langcode)
                 published_langcode = p.langcode
-                if remote_url and p.remote_url != remote_url:
+                if remote_create_failed:
+                    if p.remote_url:
+                        projects.set_remote_url(p.langcode, '')
+                elif remote_url and p.remote_url != remote_url:
                     projects.set_remote_url(p.langcode, remote_url)
                 if ('PUSHED' in codes
                         or 'COMMITTED_AND_PUSHED' in codes):
@@ -2163,35 +2323,65 @@ def _h_init_project(body):
     # Run in a background daemon thread so unreachable peers (each
     # with a 15 s urllib3 timeout in ``_https_post_to_peer``) don't
     # block the publish RPC's response.
-    if published_langcode and remote_url:
-        def _fanout_worker(langcode_, url_):
-            try:
-                from . import peers as _peers
-                from . import lan_push as _lan_push
-                proj_after = projects.get(langcode_)
-                vernlang_ = (proj_after.effective_vernlang()
-                             if proj_after is not None
-                             else langcode_)
-                for peer_id in _peers.peers_sharing_project(langcode_):
-                    try:
-                        _lan_push.send_share_offer(
-                            peer_id, langcode_, url_,
-                            vernlang=vernlang_)
-                    except Exception as ex:
-                        print(f'[publish-fanout] send_share_offer '
-                              f'peer={peer_id[:8]!r} '
-                              f'lang={langcode_!r}: {ex!r}',
-                              file=sys.stderr, flush=True)
-            except Exception as ex:
-                print(f'[publish-fanout] worker failure '
-                      f'lang={langcode_!r}: {ex!r}',
-                      file=sys.stderr, flush=True)
-        threading.Thread(
-            target=_fanout_worker,
-            args=(published_langcode, remote_url),
-            daemon=True,
-            name=f'publish-fanout-{published_langcode}').start()
+    #
+    # Gate on ``PUSHED`` (0.50.52): pre-0.50.52 this fired whenever
+    # the project existed and the peer supplied a non-empty
+    # ``remote_url``, regardless of whether ``_init_repo`` actually
+    # got data onto the remote. The result was peers adopting URLs
+    # for repos that didn't exist (``REMOTE_CREATE_FAILED``) or
+    # were empty (``PUSH_FAILED``), then hitting
+    # ``NotGitRepository()`` on every drain forever — the same
+    # stuck state the user reported. ``PUSHED`` is the minimum
+    # signal that the github repo is real and carries the project's
+    # data; peers adopting that URL will get a working clone.
+    publish_landed = ('PUSHED' in codes
+                      or 'COMMITTED_AND_PUSHED' in codes)
+    if published_langcode and remote_url and publish_landed:
+        _spawn_publish_fanout(published_langcode, remote_url)
     return 200, {"ok": True, "result": result.to_dict()}
+
+
+def _spawn_publish_fanout(langcode, url):
+    """Background fan-out of a successful publish to every paired
+    peer that has *langcode* on its share allow-list. Sends a
+    ``share_offer`` carrying *url* so peers can adopt the github
+    URL instead of inventing a duplicate repo under their own
+    namespace.
+
+    Called from ``_h_init_project`` on PUSHED, and from
+    ``reconcile_publish_state_on_startup``'s auto-retry success
+    path. Gated callers: only invoke on a publish that
+    definitively landed on the remote.
+
+    Best-effort: per-peer failures log and continue. Runs in a
+    daemon thread so unreachable peers (15 s urllib3 timeout per
+    peer) don't block the caller."""
+    def _worker(langcode_, url_):
+        try:
+            from . import peers as _peers
+            from . import lan_push as _lan_push
+            proj_after = projects.get(langcode_)
+            vernlang_ = (proj_after.effective_vernlang()
+                         if proj_after is not None
+                         else langcode_)
+            for peer_id in _peers.peers_sharing_project(langcode_):
+                try:
+                    _lan_push.send_share_offer(
+                        peer_id, langcode_, url_,
+                        vernlang=vernlang_)
+                except Exception as ex:
+                    print(f'[publish-fanout] send_share_offer '
+                          f'peer={peer_id[:8]!r} '
+                          f'lang={langcode_!r}: {ex!r}',
+                          file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[publish-fanout] worker failure '
+                  f'lang={langcode_!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+    threading.Thread(
+        target=_worker, args=(langcode, url),
+        daemon=True,
+        name=f'publish-fanout-{langcode}').start()
 
 
 # Clone is run as a job so the peer can poll progress lines without the
@@ -3159,15 +3349,20 @@ def _h_project_atomic_commit(langcode, body):
         except Exception:
             pass
         return 500, {"ok": False, "error": str(ex)}
-    # Auto-fire a debounced commit. Same race + same fix as the
-    # sibling ``_h_project_atomic_finalize`` — see the comment
-    # there for the rationale.
-    try:
-        scheduler.commit_project(langcode)
-    except Exception as ex:
-        print(f'[atomic_commit] auto-commit schedule failed for '
-              f'{langcode!r}: {ex!r}',
-              file=sys.stderr, flush=True)
+    # Auto-fire a debounced commit (default behaviour). Same race
+    # + same fix as the sibling ``_h_project_atomic_finalize``.
+    # Peer may pass ``commit_after: false`` (0.50.51) to suppress
+    # the auto-commit when they own the commit boundary
+    # themselves (e.g. recorder swipe = "I accept this take";
+    # writes during playback / re-record should NOT commit). See
+    # CLIENT_INTEGRATION § 11 step 6 + NOTES history.
+    if body.get('commit_after', True):
+        try:
+            scheduler.commit_project(langcode)
+        except Exception as ex:
+            print(f'[atomic_commit] auto-commit schedule failed for '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
     res = Result().add(S.ATOMIC_COMMITTED,
                        bytes_written=len(data),
                        sha256=hashlib.sha256(data).hexdigest())
@@ -3214,12 +3409,18 @@ def _h_set_audio(langcode, body):
     result = _lift_surgery.set_audio(
         p.working_dir, p.lift_path, guid, lang, filename)
     if result.has(S.AUDIO_SET):
-        try:
-            scheduler.commit_project(langcode)
-        except Exception as ex:
-            print(f'[set_audio] auto-commit schedule failed for '
-                  f'{langcode!r}: {ex!r}',
-                  file=sys.stderr, flush=True)
+        # ``commit_after=False`` suppresses the auto-commit (since
+        # 0.50.51) so peers with explicit commit boundaries (e.g.
+        # recorder's swipe = "I accept this take") can keep
+        # buffered edits out of git history until the boundary
+        # fires.
+        if body.get('commit_after', True):
+            try:
+                scheduler.commit_project(langcode)
+            except Exception as ex:
+                print(f'[set_audio] auto-commit schedule failed for '
+                      f'{langcode!r}: {ex!r}',
+                      file=sys.stderr, flush=True)
         try:
             from .android_cp import notify as _notify
             _notify.notify_project_changed(langcode)
@@ -3254,12 +3455,15 @@ def _h_set_illustration(langcode, body):
     result = _lift_surgery.set_illustration(
         p.working_dir, p.lift_path, guid, href)
     if result.has(S.ILLUSTRATION_SET):
-        try:
-            scheduler.commit_project(langcode)
-        except Exception as ex:
-            print(f'[set_illustration] auto-commit schedule failed '
-                  f'for {langcode!r}: {ex!r}',
-                  file=sys.stderr, flush=True)
+        # See ``_h_set_audio`` for the rationale on
+        # ``commit_after`` (0.50.51 opt-out).
+        if body.get('commit_after', True):
+            try:
+                scheduler.commit_project(langcode)
+            except Exception as ex:
+                print(f'[set_illustration] auto-commit schedule failed '
+                      f'for {langcode!r}: {ex!r}',
+                      file=sys.stderr, flush=True)
         try:
             from .android_cp import notify as _notify
             _notify.notify_project_changed(langcode)
@@ -3366,37 +3570,441 @@ def _h_cawl_cache_status(langcode, _body):
     return 200, {"ok": True, "image_repo": repo, **status}
 
 
-def _h_set_daemon_log_to_file(body):
-    """``POST /v1/logging/daemon_log_to_file`` — flip the
-    stderr-to-file mirror live.
+_SHARE_BUNDLE_TTL_S = 3600  # 1 hour
+_SHARE_BUNDLE_FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
 
-    Body: ``{"enabled": true|false}``. Persists the toggle to
-    ``$AZT_HOME/config.json`` AND installs / removes the tee in
-    the running daemon process, so the change takes effect
-    immediately without a daemon restart. Idempotent in both
-    directions.
 
-    Returns ``{"ok": True, "enabled": <bool>, "log_path":
-    "<path>"}``. ``log_path`` is the absolute path of the file
-    being written to (useful for desktop hosts that want to
-    open the directory)."""
+def _h_prepare_share_bundle(_body):
+    """``POST /v1/diagnostics/prepare_share_bundle`` — stage the
+    snapshot + per-day daemon logs at
+    ``$AZT_HOME/.shares/<token>/<filename>`` so the picker /
+    settings ``Share diagnostics`` button can ship URIs under
+    THIS APK's authority (``content://org.atoznback.aztcollab/
+    _shares/<token>/<filename>``) instead of MediaStore
+    Downloads URIs.
+
+    Why this exists: Signal refuses MediaStore Downloads URIs
+    (its receive-side security policy whitelist) but accepts
+    URIs from the sender's own ContentProvider authority.
+    Field-diagnosed via 0.52.12 logcat 2026-06-22: Gmail
+    accepted the bundle, Signal flashed-and-back. Migrating
+    the share to URIs under ``org.atoznback.aztcollab``
+    bypasses Signal's policy refusal because the URIs come
+    from the same APK initiating the share.
+
+    Body: ``{}`` (no input).
+
+    Returns ``{"ok": True, "token": "<hex>", "items":
+    [{"display_name": "<basename>",
+      "uri_path": "_shares/<token>/<basename>"}, ...]}``.
+    Items order: snapshot first, then per-day logs
+    oldest-first (matches ``get_daemon_log_files`` order).
+
+    Cleans up stale share bundles (>1h old) on every call so a
+    user who taps Share diagnostics and never picks a target
+    doesn't leak. The TTL is generous because some receivers
+    (e.g. Signal) hold the URI in the compose draft and don't
+    read the file until the message is actually sent — minutes
+    later. 1h is enough for plausible compose-and-send flows.
+
+    Since 0.52.13."""
+    import secrets
+    import shutil
+    home = azt_home()
+    shares_root = os.path.join(home, '.shares')
+    os.makedirs(shares_root, exist_ok=True)
+
+    # Sweep stale bundles BEFORE creating the new one so a
+    # stuck-or-abandoned share doesn't accumulate forever.
+    now = _time.time()
+    try:
+        for name in os.listdir(shares_root):
+            sub = os.path.join(shares_root, name)
+            if not os.path.isdir(sub):
+                continue
+            try:
+                age = now - os.path.getmtime(sub)
+            except OSError:
+                continue
+            if age > _SHARE_BUNDLE_TTL_S:
+                try:
+                    shutil.rmtree(sub, ignore_errors=True)
+                    print(f'[share-bundle] swept stale '
+                          f'{name!r} (age={int(age)}s)',
+                          file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+    except OSError as ex:
+        print(f'[share-bundle] sweep listdir raised: {ex!r}',
+              file=sys.stderr, flush=True)
+
+    token = secrets.token_hex(16)
+    bundle_dir = os.path.join(shares_root, token)
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    # Single zip archive (since 0.52.19). Signal's
+    # ACTION_SEND_MULTIPLE resolver filters URIs to image and
+    # video MIME types only — every text/log URI gets
+    # rejected silently regardless of intent-filter
+    # advertisements. Source confirmed verbatim from
+    # ``ShareRepository.kt``:
+    #
+    #     .filterValues {
+    #       MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
+    #     }
+    #
+    # Empirically verified 2026-06-22 by sharing two .txt
+    # files from a third-party file manager → same flash-and-
+    # back. The bug is Signal-side, independent of our app.
+    #
+    # Signal's ACTION_SEND (single attachment) resolver has
+    # no such filter. Its intent-filter accepts
+    # ``application/*`` (and ``*/*``) so ``application/zip``
+    # works. We bundle the snapshot + per-day daemon logs
+    # into one .zip and ship that single file via
+    # ACTION_SEND. Files stay separate inside the archive,
+    # so triage is one grep per file, and large text logs
+    # compress well.
+    import zipfile
+    stamp = _time.strftime('%Y%m%d_%H%M%S')
+    archive_name = f'azt_diagnostics_{stamp}.zip'
+    if not _SHARE_BUNDLE_FILENAME_RE.match(archive_name):
+        archive_name = 'azt_diagnostics.zip'
+    archive_path = os.path.join(bundle_dir, archive_name)
+
+    # 1. Snapshot.
+    try:
+        snapshot = _build_diagnostic_snapshot()
+    except Exception as ex:
+        print(f'[share-bundle] snapshot build raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        snapshot = ''
+
+    # 2. Per-day daemon logs inside the retention window.
+    import datetime as _dt
+    try:
+        retention = _settings.log_retention_days()
+    except Exception:
+        retention = 3
+    try:
+        today_d = _dt.date.fromisoformat(_today_str())
+    except ValueError:
+        today_d = None
+    keep_dates = set()
+    if today_d is not None:
+        for k in range(retention):
+            keep_dates.add(
+                (today_d - _dt.timedelta(days=k)).isoformat())
+
+    log_entries = 0
+    try:
+        with zipfile.ZipFile(archive_path, 'w',
+                             compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=6) as zf:
+            if snapshot:
+                zf.writestr(f'azt_snapshot_{stamp}.txt', snapshot)
+            for date_str, src_path in _iter_daemon_log_files():
+                if keep_dates and date_str not in keep_dates:
+                    continue
+                try:
+                    zf.write(src_path,
+                             arcname=os.path.basename(src_path))
+                    log_entries += 1
+                except OSError as ex:
+                    print(f'[share-bundle] zip-add {src_path!r} '
+                          f'raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+    except OSError as ex:
+        print(f'[share-bundle] archive write raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 500, {"ok": False, "error": "share_write_failed"}
+
+    items = [{
+        'display_name': archive_name,
+        'uri_path': f'_shares/{token}/{archive_name}',
+    }]
+
+    archive_bytes = 0
+    try:
+        archive_bytes = os.path.getsize(archive_path)
+    except OSError:
+        pass
+    print(f'[share-bundle] prepared token={token!r} '
+          f'archive={archive_name!r} '
+          f'entries=snapshot:{1 if snapshot else 0}+'
+          f'logs:{log_entries} '
+          f'size={archive_bytes}',
+          file=sys.stderr, flush=True)
+    return 200, {"ok": True, "token": token, "items": items}
+
+
+def _h_append_log(body):
+    """``POST /v1/logging/append`` — write a one-line trace from
+    a peer process (picker UI, recorder app, etc.) into the
+    always-on daemon log so a remote tester's diagnostic share
+    captures behaviour from BOTH sides of the daemon /
+    UI-process boundary.
+
+    Body: ``{"tag": str, "line": str}``. ``tag`` is a short
+    bracketed prefix (typically ``share_files`` /
+    ``picker.on_enter`` etc.) so the bundled log groups peer
+    traces by subsystem. ``line`` is the human-readable
+    payload — kept under a few hundred chars by the caller.
+
+    Since 0.52.11. Born from the field-debug session where
+    Signal's flash-and-return symptom couldn't be diagnosed
+    without seeing the picker process's share-time decisions:
+    its ``print()`` calls land in logcat which is invisible
+    on testers' devices without adb. Routing through this
+    endpoint puts them in the daemon log, which is shareable
+    via the picker's ``Share diagnostics`` button (or via
+    ``adb pull`` from the daemon's filesDir).
+
+    Bounded length: each line is capped at 1024 chars
+    server-side (longer payloads silently truncated with an
+    explicit ``…[truncated]`` suffix) so a misbehaving peer
+    can't fill the log with one call. Best-effort: any write
+    failure is logged to the original stderr (which on the
+    daemon process IS the on-disk log) and the RPC still
+    returns ok=True so the peer's diagnostic path isn't
+    derailed by a stalled write."""
     if not isinstance(body, dict):
         return 400, {"ok": False, "error": "invalid_body"}
-    enabled = bool(body.get('enabled'))
-    store.set_daemon_log_to_file(enabled)
-    if enabled:
-        # Explicit user gesture — start a fresh log session.
-        # Truncate any prior content so the captured window
-        # starts at "the user just turned this on" rather than
-        # carrying state from a previous debugging session.
-        ok = install_stdio_tee(truncate=True)
-        if not ok:
-            return 500, {"ok": False,
-                         "error": "stdio_tee_install_failed"}
+    tag = str(body.get('tag') or 'peer')[:64]
+    raw_line = str(body.get('line') or '')
+    MAX = 1024
+    if len(raw_line) > MAX:
+        raw_line = raw_line[:MAX] + '…[truncated]'
+    try:
+        print(f'[{tag}] {raw_line}',
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    return 200, {"ok": True}
+
+
+def _h_set_daemon_log_to_file(_body):
+    """``POST /v1/logging/daemon_log_to_file`` — removed in 0.52.7.
+
+    Pre-0.52.7 this flipped the stderr-to-file mirror on/off.
+    Logging is now always-on (per-day file in ``$AZT_HOME`` with
+    3-day retention; see CHANGELOG 0.52.5 / 0.52.6 / 0.52.7),
+    so the endpoint has nothing to toggle.
+
+    Returns HTTP 410 Gone with a typed body so any pre-0.52.7
+    peer that calls it gets an explicit "this is gone, your
+    code is out of date" response instead of a silent
+    misbehaviour. Scheduled for outright deletion in a later
+    release once peer apps have caught up."""
+    return 410, {"ok": False,
+                 "error": "endpoint_removed",
+                 "message": "Logging is always-on since 0.52.7. "
+                            "Update the peer app to drop this call."}
+
+
+def _dump_lan_debug_snapshot():
+    """Emit one ``[lan-debug]`` log line per registered project
+    with the full ``lan_debug`` payload (HEAD branch / SHA,
+    ancestor count, origin URL, tracking ref, all local branches,
+    all remote refs, current ``wan_unshared`` reading). Since
+    0.52.7, fired once per daily log file: on the initial install
+    when today's file is empty, and on each midnight rotation
+    after the new day's file is opened. This anchors every
+    per-day file with a "state of the world at start of day"
+    snapshot a triager can read top-to-bottom — no separate
+    button required, since logging is always-on."""
+    import json as _json
+    try:
+        data = projects._load_raw()
+    except Exception as ex:
+        print(f'[lan-debug] _load_raw raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    langs = sorted(data.keys())
+    print(f'[lan-debug] snapshot start: {len(langs)} project(s)',
+          file=sys.stderr, flush=True)
+    for langcode in langs:
+        try:
+            _, resp = _h_lan_debug(langcode, {})
+        except Exception as ex:
+            print(f'[lan-debug] {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            continue
+        print(f'[lan-debug] {langcode!r} '
+              + _json.dumps(resp, sort_keys=True),
+              file=sys.stderr, flush=True)
+    print('[lan-debug] snapshot end',
+          file=sys.stderr, flush=True)
+
+
+def _build_diagnostic_snapshot():
+    """Multi-line text describing the daemon's view of ``$AZT_HOME``
+    state. Used by the picker's "Share diagnostics" button so a user
+    stuck on an empty picker can ship a snapshot for remote support
+    without having to first navigate into a project (the existing
+    Share-daemon-log path is reachable only via the daemon settings
+    UI, which on the recorder side is unreachable from the picker).
+
+    Surfaces:
+
+    - daemon version
+    - ``$AZT_HOME`` path
+    - ``projects.json`` state (size, mtime, parsed entries)
+    - on-disk subdirectories with ``.git`` / LIFT / audio presence
+    - which subdirs are registered vs orphan (the "registry says
+      no projects, but bytes on disk" case lands here)
+    - relevant config (lan.allow_sync)
+    - short peer-id tag
+
+    Plain text suitable for embedding in the shared daemon log.
+    Never raises — every section catches its own exceptions and
+    emits an inline error marker rather than failing the whole
+    snapshot.
+    """
+    lines = ['=== AZT Collab diagnostic snapshot ===',
+             f'daemon_version: {_VERSION}']
+    try:
+        home = azt_home()
+        lines.append(f'AZT_HOME: {home}')
+    except Exception as ex:
+        lines.append(f'AZT_HOME: <error: {ex!r}>')
+        lines.append('=== end snapshot ===')
+        return '\n'.join(lines) + '\n'
+
+    registered_dirs = set()
+    pj_path = projects.projects_path()
+    try:
+        pj_size = os.path.getsize(pj_path)
+    except OSError:
+        pj_size = -1
+    if pj_size >= 0:
+        try:
+            pj_mtime = _time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                _time.localtime(os.path.getmtime(pj_path)))
+        except OSError:
+            pj_mtime = '<unknown>'
     else:
-        uninstall_stdio_tee()
-    return 200, {"ok": True, "enabled": enabled,
-                 "log_path": daemon_log_path()}
+        pj_mtime = '<missing>'
+    lines.append(
+        f'projects.json: path={pj_path} size={pj_size} mtime={pj_mtime}')
+    if pj_size > 0:
+        try:
+            with open(pj_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            entries = (list(data.keys())
+                       if isinstance(data, dict) else [])
+            lines.append(f'projects.json entries: {len(entries)}')
+            for k in entries:
+                ent = data.get(k) or {}
+                wd = ent.get('working_dir', '')
+                lp = ent.get('lift_path', '')
+                ru = ent.get('remote_url', '')
+                wd_ok = bool(wd) and os.path.isdir(wd)
+                lp_ok = bool(lp) and os.path.isfile(lp)
+                lines.append(
+                    f'  [{k}] working_dir={wd!r} exists={wd_ok} '
+                    f'lift_path={lp!r} exists={lp_ok} '
+                    f'remote_url={ru!r}')
+                if wd:
+                    try:
+                        registered_dirs.add(os.path.realpath(wd))
+                    except Exception:
+                        pass
+        except (OSError, ValueError) as ex:
+            lines.append(f'projects.json: PARSE_ERROR {ex!r}')
+    elif pj_size == 0:
+        lines.append('projects.json: EMPTY (zero bytes)')
+    else:
+        lines.append('projects.json: MISSING')
+
+    # Projects live under ``$AZT_HOME/projects/<langcode>/`` (see
+    # ``lan_clone._project_dir`` — the daemon-side canonical
+    # convention). Listing the home root is useful only for
+    # context (CAWL dir, peer.crt, etc.), not for project scan.
+    lines.append('AZT_HOME root listing (context only):')
+    try:
+        for n in sorted(os.listdir(home)):
+            p = os.path.join(home, n)
+            if os.path.isdir(p):
+                lines.append(f'  {n}/')
+            else:
+                try:
+                    sz = os.path.getsize(p)
+                except OSError:
+                    sz = -1
+                lines.append(f'  {n} ({sz} bytes)')
+    except OSError as ex:
+        lines.append(f'  <listdir error: {ex!r}>')
+
+    projects_dir = os.path.join(home, 'projects')
+    lines.append(f'projects directory: {projects_dir}')
+    if not os.path.isdir(projects_dir):
+        lines.append('  <missing — no projects dir on disk>')
+    else:
+        try:
+            names = sorted(os.listdir(projects_dir))
+        except OSError as ex:
+            names = []
+            lines.append(f'  <listdir error: {ex!r}>')
+        if not names:
+            lines.append('  <empty>')
+        for n in names:
+            p = os.path.join(projects_dir, n)
+            if not os.path.isdir(p) or n.startswith('.'):
+                continue
+            has_git = os.path.isdir(os.path.join(p, '.git'))
+            lift_files = []
+            try:
+                for fn in os.listdir(p):
+                    if fn.lower().endswith('.lift'):
+                        lift_files.append(fn)
+            except OSError:
+                pass
+            audio_count = 0
+            try:
+                adir = os.path.join(p, 'audio')
+                if os.path.isdir(adir):
+                    audio_count = sum(1 for _ in os.listdir(adir))
+            except OSError:
+                pass
+            try:
+                registered = os.path.realpath(p) in registered_dirs
+            except Exception:
+                registered = False
+            lines.append(
+                f'  [{n}] has_git={has_git} lift={lift_files} '
+                f'audio_count={audio_count} registered={registered}')
+
+    try:
+        lines.append(
+            f'config.lan.allow_sync: {_settings.lan_allow_sync()}')
+    except Exception as ex:
+        lines.append(f'config.lan.allow_sync: <error: {ex!r}>')
+
+    try:
+        info = _peer_id.ensure()
+        pid = (info or {}).get('peer_id') or ''
+        lines.append(f'peer_id: {pid[:8] if pid else "<unset>"}')
+    except Exception as ex:
+        lines.append(f'peer_id: <error: {ex!r}>')
+
+    lines.append('=== end snapshot ===')
+    return '\n'.join(lines) + '\n'
+
+
+def _h_get_diagnostic_snapshot(_body):
+    """``GET /v1/diagnostics/snapshot`` — registry / filesystem state
+    for remote-support diagnostics. Always succeeds (each section
+    in ``_build_diagnostic_snapshot`` catches its own errors).
+    Surfaced by the picker's Share-diagnostics button so a user
+    stuck on an empty picker can ship a snapshot without first
+    selecting a project."""
+    try:
+        text = _build_diagnostic_snapshot()
+    except Exception as ex:
+        text = f'=== snapshot generation failed: {ex!r} ===\n'
+    return 200, {'ok': True, 'text': text}
 
 
 def _h_get_daemon_log(_body):
@@ -3434,7 +4042,84 @@ def _h_get_daemon_log(_body):
         return 500, {"ok": False, "error": str(ex)}
     return 200, {"ok": True, "log": text, "log_path": path,
                  "bytes": size,
-                 "enabled": store.get_daemon_log_to_file()}
+                 "enabled": True}
+
+
+def _h_get_daemon_log_files(_body):
+    """``GET /v1/logging/daemon_log_files`` — read the per-day
+    daemon log files inside the retention window
+    (``logging.retention_days``, default 3). Used by the
+    multi-file share path (since 0.52.6) so the picker can ship
+    today's log alongside the prior days in a single
+    ``ACTION_SEND_MULTIPLE`` dispatch.
+
+    Returns ``{"ok": True, "files": [...], "retention_days":
+    <int>, "enabled": <bool>}`` where each ``files`` entry is
+    ``{"date": "YYYY-MM-DD", "filename": "<basename>",
+    "content": "<text>", "bytes": <int>}``. Order: oldest first
+    so a tester reading top-to-bottom gets chronological flow.
+
+    Each ``content`` is tail-truncated to 256 KB (matching the
+    legacy single-file ``_h_get_daemon_log`` cap). The truncation
+    header is identical so existing log-reader tooling needs no
+    changes.
+
+    Bootstrap behaviours:
+    - Files matching a non-tagged basename
+      (``daemon-YYYY-MM-DD.log`` — written before the peer_id
+      was readable) ARE included; the date is what matters for
+      retention bundling.
+    - Cross-tag boundary on a single device (peer_id changed
+      across releases) IS included — same reason.
+    - Files outside the retention window are NOT returned even
+      if still on disk (covers the case where retention was
+      lowered between the prune sweep and this call)."""
+    try:
+        retention = _settings.log_retention_days()
+    except Exception:
+        retention = 3
+    MAX = 256 * 1024
+    import datetime as _dt
+    try:
+        today_d = _dt.date.fromisoformat(_today_str())
+    except ValueError:
+        today_d = None
+    keep = set()
+    if today_d is not None:
+        for k in range(retention):
+            keep.add((today_d - _dt.timedelta(days=k)).isoformat())
+    files = []
+    for date_str, path in _iter_daemon_log_files():
+        if keep and date_str not in keep:
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8',
+                      errors='replace') as f:
+                if size > MAX:
+                    f.seek(size - MAX)
+                    f.readline()
+                    head_note = (f'[log truncated: showing last '
+                                 f'{MAX} bytes of {size}-byte file]\n')
+                    text = head_note + f.read()
+                else:
+                    text = f.read()
+        except OSError as ex:
+            print(f'[daemon-log] read failed for {path!r}: {ex}',
+                  file=sys.stderr, flush=True)
+            continue
+        files.append({
+            'date': date_str,
+            'filename': os.path.basename(path),
+            'content': text,
+            'bytes': size,
+        })
+    return 200, {"ok": True, "files": files,
+                 "retention_days": retention,
+                 "enabled": True}
 
 
 def _h_admin_restart(_body):
@@ -3624,12 +4309,15 @@ def _h_project_atomic_finalize(langcode, body):
     # a 500 ms timer) and side-effect-free if there's nothing to
     # commit (the next ``_stage_all`` sees a clean index and the
     # job returns ``NOTHING_TO_COMMIT``).
-    try:
-        scheduler.commit_project(langcode)
-    except Exception as ex:
-        print(f'[atomic_finalize] auto-commit schedule failed for '
-              f'{langcode!r}: {ex!r}',
-              file=sys.stderr, flush=True)
+    # Peer can suppress the auto-commit via ``commit_after=false``
+    # (0.50.51) when they own the commit boundary themselves.
+    if body.get('commit_after', True):
+        try:
+            scheduler.commit_project(langcode)
+        except Exception as ex:
+            print(f'[atomic_finalize] auto-commit schedule failed for '
+                  f'{langcode!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
     res = Result().add(S.ATOMIC_COMMITTED,
                        bytes_written=bytes_written,
                        sha256=h.hexdigest())
@@ -3715,6 +4403,10 @@ def dispatch(method, path, body):
             return _h_get_last_project(body)
         if path == '/v1/logging/daemon_log':
             return _h_get_daemon_log(body)
+        if path == '/v1/logging/daemon_log_files':
+            return _h_get_daemon_log_files(body)
+        if path == '/v1/diagnostics/snapshot':
+            return _h_get_diagnostic_snapshot(body)
         if path == '/v1/config/ui_language':
             return _h_get_ui_language(body)
         if path == '/v1/config/cawl_prefetch_all_variants':
@@ -3745,6 +4437,8 @@ def dispatch(method, path, body):
             if len(parts) == 6 and parts[4] == 'cawl' \
                     and parts[5] == 'cache_status':
                 return _h_cawl_cache_status(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'lan_debug':
+                return _h_lan_debug(parts[3], body)
             if len(parts) == 5 and parts[4] == 'kv':
                 return _h_project_kv_list(parts[3], body)
             if len(parts) == 6 and parts[4] == 'kv':
@@ -3816,6 +4510,10 @@ def dispatch(method, path, body):
             return _h_migrate_from_prefs(body)
         if path == '/v1/logging/daemon_log_to_file':
             return _h_set_daemon_log_to_file(body)
+        if path == '/v1/logging/append':
+            return _h_append_log(body)
+        if path == '/v1/diagnostics/prepare_share_bundle':
+            return _h_prepare_share_bundle(body)
         if path == '/v1/admin/restart':
             return _h_admin_restart(body)
         if path == '/v1/sync/nudge':
@@ -4005,22 +4703,130 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn,
 
 
 def daemon_log_path():
-    """Absolute path to the daemon's persisted stderr log when the
-    "Save daemon log to file" toggle is enabled. Used by the
-    settings-UI share button to attach / dump the log.
+    """Absolute path to **today's** daemon log file (since 0.52.5).
+    Used by the picker / settings-UI Share buttons to attach the
+    current-day log, and by the read RPC to serve the recent tail.
 
-    Filename includes the device's short peer-id tag (e.g.
-    ``daemon-07c089f2.log``) so a tester collecting logs from
-    several phones into one folder — email attachment, shared
-    drive — gets distinct filenames per device instead of one
-    ``daemon.log`` clobbering another. Falls back to plain
-    ``daemon.log`` if the peer-id isn't readable yet (bootstrap
-    on a fresh install where ed25519 cert generation hasn't
-    completed). The ``.prev`` rotation path appends the same
-    suffix uniformly."""
+    Daily-rotation naming: ``daemon-<tag>-YYYY-MM-DD.log`` (or
+    ``daemon-YYYY-MM-DD.log`` when the peer_id tag isn't readable
+    yet on a bootstrap-fresh install). The date is the local-clock
+    date at call time — at 23:59:59 this returns yesterday's path
+    and at 00:00:00 it returns today's, which is the same property
+    ``_StdioTee`` uses to rotate lazily on the first write past
+    midnight.
+
+    Pre-0.52.5 this returned a single ``daemon-<tag>.log`` that
+    grew without bound across daemon respawns; the field log
+    showed 40+ MB files spanning weeks. The per-day filename plus
+    ``settings.log_retention_days()`` together bound the on-disk
+    cost to ``retention × ~daily-volume``."""
+    return _daemon_log_path_for(_today_str())
+
+
+def _today_str():
+    return _time.strftime('%Y-%m-%d')
+
+
+def _daemon_log_path_for(date_str):
+    """Path to the daemon log file for a specific YYYY-MM-DD date.
+    Used by ``daemon_log_path()`` for today and by retention /
+    multi-day-read helpers for other days. Same filename shape
+    in both cases so the matching glob / parsing logic in
+    ``_iter_daemon_log_files`` is single-source.
+
+    Suffix is ``_log.txt`` (since 0.52.20) rather than the
+    pre-0.52.20 ``.log`` so that text editors with extension-
+    based syntax detection treat the file as text. Reception-
+    side this matters when a support engineer opens the file
+    from the diagnostic zip — some editors (e.g. Sublime,
+    several Android text viewers) skip ``.log`` files entirely
+    or treat them as binary. ``_log.txt`` keeps the "log"
+    signal in the basename for grep / triage while making the
+    actual extension ``.txt``."""
     tag = _log_peer_tag_str()
-    name = f'daemon-{tag}.log' if tag else 'daemon.log'
+    if tag:
+        name = f'daemon-{tag}-{date_str}_log.txt'
+    else:
+        name = f'daemon-{date_str}_log.txt'
     return os.path.join(azt_home(), name)
+
+
+# Matches both the 0.52.20+ ``_log.txt`` suffix and the
+# pre-0.52.20 ``.log`` suffix so retention sweeps stranded
+# files from an upgrade without needing a one-shot migration
+# pass. Each form independently captures the date in group(1).
+_DAEMON_LOG_DATE_RE = re.compile(
+    r'^daemon-(?:[0-9a-f]{8}-)?(\d{4}-\d{2}-\d{2})'
+    r'(?:_log\.txt|\.log)$')
+
+
+def _iter_daemon_log_files():
+    """Yield ``(date_str, abspath)`` for every per-day daemon log
+    in ``$AZT_HOME``, sorted oldest-first. Used by retention
+    pruning and by the (Phase 2) multi-day read RPC.
+
+    Matches both tagged (``daemon-<8hex>-<date>_log.txt``) and
+    untagged (``daemon-<date>_log.txt``) forms, plus the
+    pre-0.52.20 ``.log`` extension for upgrade continuity.
+    Other files in ``$AZT_HOME`` are skipped — the regex anchors
+    on the full basename so a stray ``daemon-foo.log`` from an
+    earlier release doesn't get picked up by retention."""
+    home = azt_home()
+    try:
+        names = os.listdir(home)
+    except OSError:
+        return
+    matches = []
+    for name in names:
+        m = _DAEMON_LOG_DATE_RE.match(name)
+        if m:
+            matches.append((m.group(1), os.path.join(home, name)))
+    matches.sort()
+    for date_str, path in matches:
+        yield date_str, path
+
+
+def _prune_daemon_log_retention():
+    """Delete daily log files older than
+    ``settings.log_retention_days()``. Called on every tee install
+    (cheap — one ``listdir`` + bounded ``unlink``) and lazily after
+    each midnight rotation inside ``_StdioTee``.
+
+    Today's file is never pruned regardless of how the math works
+    out — the retention setter is min-clamped to 1, but the
+    explicit ``date_str == today`` guard belt-and-suspenders that
+    so a clock-skew edge case can't wipe the live file."""
+    try:
+        retention = _settings.log_retention_days()
+    except Exception:
+        retention = 3
+    today = _today_str()
+    keep = set()
+    # Build the keep set forward from today so a local-clock
+    # change doesn't accidentally widen retention; we always keep
+    # the last `retention` distinct on-disk dates rather than a
+    # window relative to today.
+    import datetime as _dt
+    try:
+        today_d = _dt.date.fromisoformat(today)
+    except ValueError:
+        return
+    for k in range(retention):
+        keep.add((today_d - _dt.timedelta(days=k)).isoformat())
+    for date_str, path in _iter_daemon_log_files():
+        if date_str == today:
+            continue
+        if date_str in keep:
+            continue
+        try:
+            os.unlink(path)
+            print(f'[daemon-log] retention prune: {path!r} '
+                  f'(date={date_str}, keep={sorted(keep)})',
+                  file=sys.__stderr__, flush=True)
+        except OSError as ex:
+            print(f'[daemon-log] retention prune failed for '
+                  f'{path!r}: {ex}',
+                  file=sys.__stderr__, flush=True)
 
 
 # Cache: the first 8 hex chars of the daemon's ed25519 peer_id,
@@ -4059,49 +4865,228 @@ def _log_peer_tag_str():
     return _log_peer_tag
 
 
+class _LogSession:
+    """Shared writer behind both ``_StdioTee`` instances. Owns the
+    open file handle for *today's* log and rotates lazily when the
+    local-clock date changes (since 0.52.5).
+
+    Rotation is checked on every write rather than on a wall-clock
+    timer because the daemon can sit idle for hours at a time —
+    a timer would fire midnight rotation only if the process was
+    awake to receive it. Lazy check makes the rotation cost zero
+    when nothing's being logged and a single ``stat``-equivalent
+    cost (``_time.strftime``) per write batch otherwise. Concurrent
+    writes from stdout/stderr tees serialise through the lock so
+    two threads can't both observe a date change and both rotate.
+
+    The session also serves as the shared SOL (start-of-line) flag
+    used by the per-line stamp prefix — same role as the ``_sol_state``
+    list pre-0.52.5, now stored as a single attribute since the
+    session is the natural place for "next byte begins a new line"
+    state."""
+
+    def __init__(self):
+        # Reentrant lock so the post-rotation start-of-day
+        # diagnostic dump (which calls back into ``print`` →
+        # ``_StdioTee.write`` → ``_LogSession.write``) can run
+        # while ``_rotate_locked`` still holds the lock without
+        # deadlocking. Pre-0.52.7 there was no dump call inside
+        # the lock and a plain ``threading.Lock`` sufficed.
+        self._lock = threading.RLock()
+        self._current_date = None
+        self._file = None
+        self._sol = True
+
+    def open(self):
+        """Open today's log file. Idempotent — multiple calls
+        across install paths just re-target the current handle."""
+        with self._lock:
+            date_str = _today_str()
+            path = _daemon_log_path_for(date_str)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            except OSError as ex:
+                print(f'[daemon-log] cannot mkdir for {path!r}: {ex}',
+                      file=sys.__stderr__, flush=True)
+                return False
+            try:
+                fh = open(path, 'a', buffering=1, encoding='utf-8',
+                          errors='replace')
+            except OSError as ex:
+                print(f'[daemon-log] cannot open {path!r}: {ex}',
+                      file=sys.__stderr__, flush=True)
+                return False
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+            self._file = fh
+            self._current_date = date_str
+            self._sol = True
+            return True
+
+    def close(self):
+        with self._lock:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+            self._file = None
+            self._current_date = None
+            self._sol = True
+
+    def current_path(self):
+        with self._lock:
+            if self._current_date is None:
+                return None
+            return _daemon_log_path_for(self._current_date)
+
+    def write(self, data):
+        """Write a possibly-multi-line text payload to the session
+        file with per-line stamp prefix
+        ``[YYYY-MM-DD HH:MM:SS,mmm <peer_id_short>] `` (since
+        0.52.5; pre-0.52.5 was ``[HH:MM:SS <tag>] ``). Rotates the
+        file if the local-clock date changed since the last
+        write."""
+        if not data:
+            return
+        with self._lock:
+            if self._file is None:
+                # Tee uninstall in flight or open() failed; drop.
+                return
+            today = _today_str()
+            if today != self._current_date:
+                self._rotate_locked(today)
+            if not isinstance(data, str):
+                try:
+                    self._file.write(data)
+                except Exception:
+                    pass
+                return
+            stamp = _format_log_stamp()
+            pieces = data.split('\n')
+            at_sol = self._sol
+            out = []
+            for k, piece in enumerate(pieces):
+                has_newline_after = k < len(pieces) - 1
+                if at_sol and piece:
+                    out.append(stamp)
+                out.append(piece)
+                if has_newline_after:
+                    out.append('\n')
+                    at_sol = True
+                elif piece:
+                    at_sol = False
+            self._sol = at_sol
+            try:
+                self._file.write(''.join(out))
+            except Exception:
+                pass
+
+    def _rotate_locked(self, new_date):
+        """Caller holds ``self._lock``. Close today's file, open
+        tomorrow's, and prune older-than-retention files. Logged
+        on both sides of the rotation so a tester reading the
+        bundle sees the cutover explicitly."""
+        old_date = self._current_date
+        try:
+            self._file.write(
+                f'[daemon-log] rotating: {old_date!r} → {new_date!r}\n')
+        except Exception:
+            pass
+        try:
+            self._file.close()
+        except Exception:
+            pass
+        new_path = _daemon_log_path_for(new_date)
+        try:
+            self._file = open(new_path, 'a', buffering=1,
+                              encoding='utf-8', errors='replace')
+            self._current_date = new_date
+            self._sol = True
+            self._file.write(
+                f'[daemon-log] rotated from {old_date!r}\n')
+        except OSError as ex:
+            print(f'[daemon-log] rotation open failed '
+                  f'({new_path!r}): {ex}',
+                  file=sys.__stderr__, flush=True)
+            self._file = None
+            self._current_date = None
+            self._sol = True
+        # Retention prune off the lock would race a concurrent
+        # write attempting to rotate; doing it here under the lock
+        # is fine since prune is bounded ``listdir`` + a few
+        # ``unlink``s.
+        try:
+            _prune_daemon_log_retention()
+        except Exception as ex:
+            print(f'[daemon-log] post-rotation prune raised: {ex!r}',
+                  file=sys.__stderr__, flush=True)
+        # Anchor the fresh day's file with a start-of-day
+        # diagnostic snapshot (same content the install path
+        # emits for a fresh-of-day install). Lock is reentrant
+        # so the dump's ``print`` calls re-acquire safely.
+        try:
+            _dump_lan_debug_snapshot()
+        except Exception as ex:
+            print(f'[lan-debug-dump] post-rotation snapshot '
+                  f'raised: {ex!r}',
+                  file=sys.__stderr__, flush=True)
+
+    def flush(self):
+        with self._lock:
+            if self._file is not None:
+                try:
+                    self._file.flush()
+                except Exception:
+                    pass
+
+
+def _format_log_stamp():
+    """Format the per-line stamp prefix:
+    ``[YYYY-MM-DD HH:MM:SS,mmm <peer_id_short>] ``. Matches Python
+    ``logging``'s default ``,mmm`` for the fractional second so a
+    grep across recorder + daemon logs is one expression.
+
+    The tag is appended when available; absent on a bootstrap-
+    fresh install before peer_id is generated, in which case the
+    stamp falls back to ``[YYYY-MM-DD HH:MM:SS,mmm] ``."""
+    now = _time.time()
+    ms = int((now - int(now)) * 1000)
+    base = _time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(now))
+    tag = _log_peer_tag_str()
+    if tag:
+        return f'[{base},{ms:03d} {tag}] '
+    return f'[{base},{ms:03d}] '
+
+
+# Process-wide shared log session. Both stdout and stderr tees
+# delegate writes here so they target the same file with one
+# consistent SOL state.
+_log_session = _LogSession()
+
+
 class _StdioTee:
     """File-like that mirrors writes to the original stream (logcat /
-    terminal) AND to a shared on-disk log file. One instance wraps
-    ``sys.stdout``, another wraps ``sys.stderr``, both pointing at
-    the same file so daemon code can use whichever stream is
-    idiomatic for the call site without the tester losing output.
+    terminal) AND to the shared ``_LogSession`` (since 0.52.5;
+    pre-0.52.5 the tee held its own file handle and the SOL flag
+    was a shared list — the session encapsulates both now to make
+    lazy midnight rotation safe across the stdout+stderr pair).
 
     Boot-trace prints (``print(f'[boot-trace-daemon] phase=…',
     flush=True)`` in ``service.py`` and ``server.py``) go to
     ``sys.stdout``; the bulk of structured diagnostics
     (``[recent] _touch_project``, ``[cawl]``, ``[commit-*]``) use
-    ``print(..., file=sys.stderr)``. Pre-0.43.15 the tee only
-    captured ``sys.stderr``, so the on-disk daemon log lost every
-    boot trace and the user-facing symptom was "the log only has
-    the banner line": prints that went via ``sys.stdout`` reached
-    logcat but not the file the tester could share.
-
-    File-side writes are timestamped per line (``[HH:MM:SS] ``) so
-    the on-disk log doubles as a passage-of-time signal — the bulk
-    of ``[recent] _touch_project`` heartbeat lines collapsed away
-    in 0.43.8, and without timestamps the remaining traffic
-    couldn't tell a tester whether the gap between two lines was
-    50 ms or 5 minutes. logcat / terminal output is left untouched
-    (logcat already supplies its own time column).
-
-    The stdout and stderr instances share a single SOL (start-of-
-    line) flag via ``_sol_state[0]`` so concurrent writes from the
-    two streams don't break the per-line stamp prefix when they
-    interleave at the file. Both writes still go through best-
-    effort — a failure to write to the file (rotated, disk full)
-    doesn't break the original stream path.
+    ``print(..., file=sys.stderr)``. Both ends route through one
+    session so a tester sharing the file gets ordered output
+    regardless of which stream emitted any given line.
     """
 
-    def __init__(self, original, file_obj, sol_state):
+    def __init__(self, original, session):
         self._orig = original
-        self._file = file_obj
-        # Shared mutable list ``[bool]`` rather than per-instance
-        # attribute: both the stdout and stderr tees write to the
-        # same file, so the "next byte begins a new line" property
-        # belongs to the file, not the stream. A list of one bool
-        # is the simplest way to share mutable state between two
-        # Python objects without introducing a third.
-        self._sol_state = sol_state
+        self._session = session
 
     def write(self, data):
         try:
@@ -4109,39 +5094,10 @@ class _StdioTee:
         except Exception:
             pass
         try:
-            self._write_to_file(data)
+            self._session.write(data)
         except Exception:
             pass
         return len(data) if isinstance(data, str) else 0
-
-    def _write_to_file(self, data):
-        if not data:
-            return
-        if not isinstance(data, str):
-            self._file.write(data)
-            self._file.flush()
-            return
-        tag = _log_peer_tag_str()
-        if tag:
-            stamp = _time.strftime(f'[%H:%M:%S {tag}] ')
-        else:
-            stamp = _time.strftime('[%H:%M:%S] ')
-        pieces = data.split('\n')
-        at_sol = self._sol_state[0]
-        out = []
-        for k, piece in enumerate(pieces):
-            has_newline_after = k < len(pieces) - 1
-            if at_sol and piece:
-                out.append(stamp)
-            out.append(piece)
-            if has_newline_after:
-                out.append('\n')
-                at_sol = True
-            elif piece:
-                at_sol = False
-        self._sol_state[0] = at_sol
-        self._file.write(''.join(out))
-        self._file.flush()
 
     def flush(self):
         try:
@@ -4149,7 +5105,7 @@ class _StdioTee:
         except Exception:
             pass
         try:
-            self._file.flush()
+            self._session.flush()
         except Exception:
             pass
 
@@ -4164,98 +5120,78 @@ class _StdioTee:
 _stdio_tee_installed = False
 _stdio_tee_stdout_original = None
 _stdio_tee_stderr_original = None
-_stdio_tee_file = None
 
 
 def install_stdio_tee(truncate=False):
     """Begin mirroring BOTH ``sys.stdout`` and ``sys.stderr`` to
-    ``daemon_log_path()``. Idempotent: a second call while a tee
-    is already installed is a no-op.
+    today's daemon log file. Idempotent: a second call while a
+    tee is already installed is a no-op.
 
-    *truncate*: when True, the log file is opened in write mode
-    (prior content discarded). When False (the default), the file
-    is opened in append mode so a daemon respawn after an idle
-    auto-stop / OOM-kill preserves the prior session's captured
-    output. Without this distinction the field symptom was "I
-    turned the log on, did some work, hit Share — got only the
-    ``[daemon-log] mirroring stdio to …`` line": the server
-    APK's ``:provider`` process auto-stops after 5 min idle (or
-    earlier under memory pressure), and the next peer RPC
-    lazy-respawns it, which re-runs the startup
-    ``maybe_install_stdio_tee`` path; if it opened the file
-    ``'w'`` there it'd silently wipe the prior session.
+    Since 0.52.5 the file is per-day
+    (``daemon-<tag>-YYYY-MM-DD.log``) and the underlying
+    ``_LogSession`` rotates lazily on the first write past
+    midnight, so this function no longer needs an explicit "fresh
+    session" rotation step. The *truncate* parameter is kept for
+    backwards compatibility with the existing toggle-on RPC but
+    is now effectively informational — the only behaviour
+    difference is the banner line written on install (``fresh
+    session`` vs ``respawn``). Pre-0.52.5 ``truncate=True`` moved
+    the previous file to ``<path>.prev``; that mechanism is
+    obsolete now that per-day rotation bounds file growth by
+    retention.
 
-    The explicit toggle-on path (user just enabled "Log server
-    activity" in Settings) passes ``truncate=True`` to start a
-    clean session — testers sharing "the log around the crash I
-    just had" want exactly that. The respawn path
-    (``maybe_install_stdio_tee`` at process boot) leaves
-    ``truncate=False`` so the prior session survives.
-    ``_h_get_daemon_log`` already caps reads to the last 256 KB,
-    so unbounded growth across many respawns is a non-issue.
+    Retention pruning runs on every install — cheap (one
+    ``listdir`` + bounded ``unlink``) and the right place to
+    catch stale files left behind by a release that bumped the
+    retention window down.
 
     Safe to call from outside the daemon's main thread — replaces
     the global ``sys.stdout`` and ``sys.stderr`` references, and
     concurrent writes end up on the original-stream branch of the
     tee (best-effort write-through) until the swap completes."""
     global _stdio_tee_installed, _stdio_tee_stdout_original
-    global _stdio_tee_stderr_original, _stdio_tee_file
+    global _stdio_tee_stderr_original
     if _stdio_tee_installed:
         return True
-    path = daemon_log_path()
-    mode = 'w' if truncate else 'a'
+    # Capture today's file pre-existing size BEFORE the open so
+    # we can tell "fresh-of-day file (fire start-of-day snapshot)"
+    # apart from "respawn-within-day appending to existing file
+    # (don't repeat the snapshot)". A missing file is treated as
+    # size 0 — same outcome.
+    pre_path = _daemon_log_path_for(_today_str())
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError as ex:
-        print(f'[daemon-log] cannot mkdir for {path!r}: {ex}',
-              file=sys.__stderr__, flush=True)
+        pre_size = os.path.getsize(pre_path)
+    except OSError:
+        pre_size = 0
+    if not _log_session.open():
         return False
-    # On the truncate (fresh-session) path, rotate the existing log
-    # to ``<path>.prev`` before opening so the previous investigation
-    # isn't lost when the user flips the toggle to start a new one.
-    # Matches the peer's rotate-on-launch pattern and lets
-    # ``share_log_file`` ship both files under
-    # ``=== previous session === / === current session ===``
-    # headers. Rotation only happens here (not on the respawn
-    # ``truncate=False`` path) because daemon respawns can fire
-    # every few minutes during normal idle-stop churn and rotating
-    # on each would wipe ``.prev`` faster than a remote tester can
-    # grab it.
-    if truncate:
-        prev_path = path + '.prev'
-        try:
-            if os.path.exists(path):
-                os.replace(path, prev_path)
-        except OSError as ex:
-            print(f'[daemon-log] rotation {path!r} -> {prev_path!r} '
-                  f'failed: {ex} (continuing without rotation)',
-                  file=sys.__stderr__, flush=True)
     try:
-        log_file = open(path, mode, buffering=1, encoding='utf-8',
-                        errors='replace')
-    except OSError as ex:
-        print(f'[daemon-log] cannot open {path!r}: {ex}',
+        _prune_daemon_log_retention()
+    except Exception as ex:
+        print(f'[daemon-log] retention prune raised on install: '
+              f'{ex!r}',
               file=sys.__stderr__, flush=True)
-        return False
-    sol_state = [True]
     _stdio_tee_stdout_original = sys.stdout
     _stdio_tee_stderr_original = sys.stderr
-    _stdio_tee_file = log_file
-    sys.stdout = _StdioTee(_stdio_tee_stdout_original,
-                           log_file, sol_state)
-    sys.stderr = _StdioTee(_stdio_tee_stderr_original,
-                           log_file, sol_state)
+    sys.stdout = _StdioTee(_stdio_tee_stdout_original, _log_session)
+    sys.stderr = _StdioTee(_stdio_tee_stderr_original, _log_session)
     _stdio_tee_installed = True
-    if truncate:
-        print(f'[daemon-log] mirroring stdio to {path!r} '
-              f'(fresh session, daemon {_VERSION} '
-              f'fingerprint={_FINGERPRINT})',
-              file=sys.stderr, flush=True)
-    else:
-        print(f'[daemon-log] mirroring stdio to {path!r} '
-              f'(appending — daemon {_VERSION} '
-              f'fingerprint={_FINGERPRINT} respawn)',
-              file=sys.stderr, flush=True)
+    path = _log_session.current_path() or daemon_log_path()
+    print(f'[daemon-log] mirroring stdio to {path!r} '
+          f'(daemon {_VERSION} fingerprint={_FINGERPRINT})',
+          file=sys.stderr, flush=True)
+    if pre_size == 0:
+        # First write into today's file. Anchor the day with a
+        # start-of-day diagnostic snapshot so a tester reading
+        # the bundle top-to-bottom has the baseline state. Pre-
+        # 0.52.7 this fired only from the (now-removed) toggle-on
+        # gesture; with always-on logging the equivalent moment
+        # is "we just opened a fresh per-day file."
+        try:
+            _dump_lan_debug_snapshot()
+        except Exception as ex:
+            print(f'[lan-debug-dump] snapshot raised: {ex!r}',
+                  file=sys.stderr, flush=True)
     return True
 
 
@@ -4263,40 +5199,40 @@ def uninstall_stdio_tee():
     """Stop mirroring stdio to the daemon log file. Restores the
     original ``sys.stdout`` and ``sys.stderr``. Idempotent."""
     global _stdio_tee_installed, _stdio_tee_stdout_original
-    global _stdio_tee_stderr_original, _stdio_tee_file
+    global _stdio_tee_stderr_original
     if not _stdio_tee_installed:
         return
     print('[daemon-log] stopping stdio mirror',
           file=sys.stderr, flush=True)
     sys.stdout = _stdio_tee_stdout_original
     sys.stderr = _stdio_tee_stderr_original
-    try:
-        if _stdio_tee_file is not None:
-            _stdio_tee_file.close()
-    except Exception:
-        pass
+    _log_session.close()
     _stdio_tee_stdout_original = None
     _stdio_tee_stderr_original = None
-    _stdio_tee_file = None
     _stdio_tee_installed = False
 
 
 def maybe_install_stdio_tee():
     """Called at daemon process startup (loopback ``run()`` on
     desktop, and ``server_apk/service.py`` on Android). Installs
-    the tee iff the user's persisted toggle is on. No-op when off.
-    The toggle can be flipped live without a daemon restart via
-    the ``/v1/logging/daemon_log_to_file`` endpoint.
+    the tee unconditionally since 0.52.7 — logging is always-on
+    (per-day rotation + 3-day retention bound disk cost). Failure
+    to open the log file (read-only filesystem, disk full,
+    permissions) is swallowed: the daemon still runs, the
+    original stdout / stderr still carry diagnostics in the
+    parent process / logcat, only the on-disk capture is missing.
 
-    Public (no leading underscore) so the Android service body in
-    ``server_apk/service.py`` can call it from outside this
-    package without reaching into a private name."""
+    The function name is retained for ABI compatibility with
+    ``server_apk/service.py`` and out-of-tree desktop launchers
+    that call it by name; the ``maybe_`` prefix is now historical
+    (always-on means "yes, install"). Public (no leading
+    underscore) for the same reason."""
     try:
-        if store.get_daemon_log_to_file():
-            install_stdio_tee()
-    except Exception:
-        # store might not be initialised yet — bail quietly.
-        return
+        install_stdio_tee()
+    except Exception as ex:
+        print(f'[daemon-log] install_stdio_tee raised on '
+              f'startup: {ex!r}',
+              file=sys.__stderr__, flush=True)
 
 
 def run(host='127.0.0.1', port=0):
@@ -4353,6 +5289,36 @@ def run(host='127.0.0.1', port=0):
     # Must run BEFORE start_watcher so the watcher sees a consistent
     # job table.
     scheduler.reconcile_on_startup()
+
+    # One-shot retroactive cleanup for the pre-0.50.52 Publish bug.
+    # Strips ``.git/config`` origin when the registry has no URL — a
+    # mismatch fingerprint that's unreachable from any post-0.50.52
+    # code path, so it can only be left over from an older daemon's
+    # silent publish failure. After this runs, the picker's
+    # publish-row gate sees both sides empty and shows the Publish
+    # button so the user can re-click. See
+    # ``docs/Publish_errors.md``.
+    try:
+        from . import repo as _repo
+        _repo.reconcile_publish_state_on_startup()
+    except Exception as ex:
+        print(f'[azt_collabd] reconcile_publish_state failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+
+    # Boot-time diagnostic snapshot + orphan-working-dir auto-repair.
+    # Logs the picker's Share-diagnostics text into the daemon log
+    # (so every startup leaves a snapshot trail) and re-registers
+    # any subdir of $AZT_HOME that looks like a project (has .git
+    # + LIFT) but isn't keyed in projects.json. Repair is one-way:
+    # never removes entries, never alters working-tree contents.
+    # Belongs after reconcile so the post-reconcile registry state
+    # is what gets snapshotted.
+    try:
+        from . import repo as _repo
+        _repo.diagnose_and_repair_registry_on_startup()
+    except Exception as ex:
+        print(f'[azt_collabd] diagnose_and_repair_registry failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
 
     # Start the connectivity watcher so projects with pending_push get
     # drained on offline→online transitions.

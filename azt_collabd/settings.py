@@ -292,6 +292,16 @@ def commit_pack_byte_budget():
     return max(0, int(get('sync.commit_pack_byte_budget', 3 * 1024 * 1024)))
 
 
+def log_retention_days():
+    """Retention window for daily daemon log files (since 0.52.5).
+    Files older than this are pruned on every daemon-startup tee
+    install AND on every midnight rotation. Default 3 — matches
+    the peer-recorder team's retention so a cross-process bundle
+    has parallel coverage. Tune via ``logging.retention_days``.
+    Minimum 1 (today's file is never pruned)."""
+    return max(1, int(get('logging.retention_days', 3)))
+
+
 def set_work_offline(value: bool):
     """Persist the work-offline toggle. Triggering an immediate
     drain on transition OFF is the scheduler's responsibility —

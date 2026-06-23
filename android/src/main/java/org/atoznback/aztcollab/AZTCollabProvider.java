@@ -4,9 +4,11 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.provider.OpenableColumns;
 import android.util.Log;
 
 import java.io.File;
@@ -212,32 +214,149 @@ public class AZTCollabProvider extends ContentProvider {
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode)
             throws FileNotFoundException {
+        Log.i(TAG, "openFile() uri=" + uri + " mode=" + mode);
         OpenFileCallback cb = awaitOpenFile();
         if (cb == null) {
+            Log.i(TAG, "openFile() cb=null, daemon_not_ready");
             throw new FileNotFoundException("daemon_not_ready");
         }
         String rel = uri.getPath();
         if (rel == null || rel.isEmpty()) {
+            Log.i(TAG, "openFile() missing path");
             throw new FileNotFoundException("missing_path");
         }
         String abs = cb.resolveAbsPath(rel, mode);
         if (abs == null) {
+            Log.i(TAG, "openFile() forbidden: " + rel);
             throw new FileNotFoundException("forbidden: " + rel);
         }
         int flags = ParcelFileDescriptor.parseMode(mode);
+        Log.i(TAG, "openFile() returning FD for " + abs);
         return ParcelFileDescriptor.open(new File(abs), flags);
     }
 
-    // --- ContentProvider methods we don't use ---
+    // --- ContentProvider metadata methods ---
+    //
+    // Receivers like Signal validate attachment URIs by calling
+    // getContentResolver().getType(uri) and .query(uri, ...) BEFORE
+    // reading. A null return for either signals "unknown" and the
+    // receiver silently rejects (Signal's ShareActivity opens then
+    // self-finishes within ~300ms — field-diagnosed 2026-06-22).
+    // Both implementations route through the same resolveAbsPath
+    // callback openFile uses, so a URI either has full metadata
+    // and is openable, or both fail consistently.
 
-    @Override
-    public Cursor query(Uri uri, String[] proj, String sel, String[] args,
-                        String order) {
+    /** Extension-based MIME lookup for the files this provider
+     *  serves. Returns null for unrecognised extensions — caller
+     *  treats null as "unknown" the same way it would for a
+     *  missing URI.
+     *
+     *  Diagnostic share files (.log, .txt) return
+     *  ``application/octet-stream`` since 0.52.17 rather than
+     *  ``text/plain``. Field-diagnosed via 0.52.15-0.52.16
+     *  logcat captures: Signal's ``ShareActivity`` for
+     *  ACTION_SEND_MULTIPLE calls ``getType`` on each URI,
+     *  sees ``text/plain``, routes to its text-snippet path
+     *  (which expects ``EXTRA_TEXT`` strings, not
+     *  ``EXTRA_STREAM`` URIs), finds no text, and bails. The
+     *  files are share-attachments, not in-message text
+     *  snippets — ``application/octet-stream`` puts them in
+     *  Signal's binary-attachment path. Receivers that want
+     *  to preview as text still can; the MIME hint is for
+     *  routing, not capability. */
+    private String mimeForPath(String path) {
+        if (path == null) return null;
+        String lower = path.toLowerCase();
+        int dot = lower.lastIndexOf('.');
+        if (dot < 0 || dot == lower.length() - 1) return null;
+        String ext = lower.substring(dot + 1);
+        if (ext.equals("txt")) return "text/plain";
+        if (ext.equals("log")) return "text/plain";
+        if (ext.equals("json")) return "application/json";
+        if (ext.equals("lift")) return "application/xml";
+        if (ext.equals("xml")) return "application/xml";
+        if (ext.equals("zip")) return "application/zip";
+        if (ext.equals("png")) return "image/png";
+        if (ext.equals("jpg") || ext.equals("jpeg")) return "image/jpeg";
+        if (ext.equals("webp")) return "image/webp";
+        if (ext.equals("gif")) return "image/gif";
+        if (ext.equals("wav")) return "audio/wav";
+        if (ext.equals("mp3")) return "audio/mpeg";
+        if (ext.equals("ogg")) return "audio/ogg";
+        if (ext.equals("m4a") || ext.equals("mp4")) return "audio/mp4";
+        if (ext.equals("opus")) return "audio/opus";
         return null;
     }
 
     @Override
-    public String getType(Uri uri) { return null; }
+    public Cursor query(Uri uri, String[] proj, String sel, String[] args,
+                        String order) {
+        Log.i(TAG, "query() uri=" + uri + " proj=" +
+              (proj == null ? "null" : java.util.Arrays.toString(proj)));
+        OpenFileCallback cb = awaitOpenFile();
+        if (cb == null) {
+            Log.i(TAG, "query() cb=null, returning null");
+            return null;
+        }
+        String rel = uri.getPath();
+        if (rel == null || rel.isEmpty()) {
+            Log.i(TAG, "query() empty path, returning null");
+            return null;
+        }
+        String abs = cb.resolveAbsPath(rel, "r");
+        if (abs == null) {
+            Log.i(TAG, "query() resolveAbsPath returned null for "
+                  + rel);
+            return null;
+        }
+        File f = new File(abs);
+        if (!f.exists()) {
+            Log.i(TAG, "query() file does not exist: " + abs);
+            return null;
+        }
+        // Honour the requested projection; default to OpenableColumns
+        // when the caller asked for "everything".
+        String[] cols = proj;
+        if (cols == null) {
+            cols = new String[] {
+                OpenableColumns.DISPLAY_NAME,
+                OpenableColumns.SIZE,
+            };
+        }
+        MatrixCursor cursor = new MatrixCursor(cols, 1);
+        Object[] row = new Object[cols.length];
+        for (int i = 0; i < cols.length; i++) {
+            if (OpenableColumns.DISPLAY_NAME.equals(cols[i])) {
+                row[i] = f.getName();
+            } else if (OpenableColumns.SIZE.equals(cols[i])) {
+                row[i] = f.length();
+            } else {
+                row[i] = null;
+            }
+        }
+        cursor.addRow(row);
+        Log.i(TAG, "query() returning cursor for " + f.getName()
+              + " size=" + f.length());
+        return cursor;
+    }
+
+    @Override
+    public String getType(Uri uri) {
+        if (uri == null) {
+            Log.i(TAG, "getType() uri=null, returning null");
+            return null;
+        }
+        String path = uri.getPath();
+        if (path == null) {
+            Log.i(TAG, "getType() empty path, returning null");
+            return null;
+        }
+        String mime = mimeForPath(path);
+        Log.i(TAG, "getType() uri=" + uri + " mime=" + mime);
+        return mime;
+    }
+
+    // --- ContentProvider methods we don't use ---
 
     @Override
     public Uri insert(Uri uri, ContentValues v) { return null; }

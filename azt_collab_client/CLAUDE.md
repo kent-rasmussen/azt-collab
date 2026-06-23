@@ -115,7 +115,47 @@ into here; this package owns:
    placeholders. See the next section for the table and the four
    daemon-side obligations that flow from this.
 
-9. **Rules live here; rationale lives in `docs/rationale/`.** This
+9. **Share intents follow the constraints in
+   `CLIENT_INTEGRATION.md` § 14b.** Two load-bearing
+   constraints peer code MUST honor:
+
+   - **URI authority.** Peer code that ships URIs in a share
+     intent MUST use URIs from `AZTCollabProvider`
+     (authority `org.atoznback.aztcollab`), not MediaStore
+     (`content://media/...`). MediaStore URIs are accepted by
+     some receivers (Gmail) but rejected silently by others
+     (Signal's privacy policy whitelist). The
+     `prepare_share_bundle` RPC stages files at
+     `_shares/<token>/` for exactly this reason.
+
+   - **Action choice by content type.** Signal's
+     `ACTION_SEND_MULTIPLE` resolver runtime-filters per-URI
+     MIMEs to image-or-video only — anything else (text,
+     application/zip, audio outside of music-share contexts)
+     is silently dropped, regardless of what Signal's
+     manifest claims to accept. Manifest says `text/*`
+     SEND_MULTIPLE is fine; runtime says no. Source-verified
+     against Signal's `ShareRepository.kt` 2026-06-22. For
+     non-image/non-video content destined for any receiver
+     where Signal is a possibility, use `ACTION_SEND` with a
+     single attachment (zip the bundle if you have several
+     files). `share_files(items=[…])` does this routing
+     automatically — single item → `ACTION_SEND`, multi-item
+     → `ACTION_SEND_MULTIPLE`. Peer code that wants
+     Signal-compatible multi-file share MUST hand
+     `share_files` a single item (typically a zip URI). The
+     daemon's `prepare_share_bundle` returns exactly one zip
+     URI for this reason.
+
+   The legacy `share_log_file` helper still uses MediaStore
+   for its single-blob path; new code should prefer
+   `share_diagnostics_action` (the canonical composer) or
+   `share_files` directly with URIs from `prepare_share_bundle`.
+   See `CLIENT_INTEGRATION.md` § 14b and the 0.52.13–0.52.20
+   CHANGELOG arc for the field repros and source citations
+   that established these constraints.
+
+10. **Rules live here; rationale lives in `docs/rationale/`.** This
    file is the contract; `docs/rationale/<topic>.md` is the *why*
    behind each rule. **Do not put rules into rationale files.** If a
    "do X / don't do Y" emerges from a why-discussion, it goes here
@@ -150,6 +190,8 @@ on transient I/O failure manifests as user-visible data loss.
 | LAN peer identity (per-device ed25519 keypair + X.509 cert + sha256 fingerprint) | `lan_peer_id` (`GET /v1/lan/peer_id`) | Pairing QR can't be generated; peers can't authenticate against this daemon's LAN listener. **Since 0.50.9 the daemon eager-inits this on startup** (was: lazy on first LAN op) so slot claims always have a stable identity to anchor on. Persisted as `$AZT_HOME/peer_id` + `$AZT_HOME/peer.crt`; survives daemon respawn but NOT an app-data wipe. Builds without the `cryptography` package fall back to empty peer_id with a logged warning. Since 0.45.0, eager-init since 0.50.9. |
 | Paired peers (`peers.json`) | `lan_list_peers`, `lan_pair_accept`, `lan_share_project`, `lan_unshare_project`, `lan_unpair`, `lan_set_static_endpoints` | Listener accepts a previously-paired phone or rejects with 403; share allowlist determines which projects each peer can fetch; static endpoints carry the hotspot-host fallback. Since 0.45.0. |
 | LAN-sync toggle (daemon-wide) | `lan_toggle` / `lan_set_toggle` (`GET/POST /v1/lan/toggle`) | Listener thread + (Android) FGS promotion + WifiLock are hot-applied to this bit. Wrong value: LAN sync silently doesn't happen, or the FGS notification stays up draining battery. Since 0.45.0. |
+| Per-day daemon log files | `get_daemon_log` (current day, last 256 KB) / `get_daemon_log_files` (full retention window, each tail-truncated to 256 KB). Always-on writer; no toggle. Retention window via `logging.retention_days` (default 3). On-disk filenames `daemon-<peer>-YYYY-MM-DD_log.txt` (since 0.52.20; pre-0.52.20 `.log`). | Diagnostic share has nothing to ship; remote-support triage is blind. Since 0.52.5 (rotation) / 0.52.6 (multi-day RPC) / 0.52.7 (always-on) / 0.52.20 (text-editor-recognised suffix). |
+| Share-bundle staging (per-call cache) | `prepare_share_bundle` (`POST /v1/diagnostics/prepare_share_bundle`) writes a single zip containing the snapshot + per-day daemon logs as `$AZT_HOME/.shares/<token>/azt_diagnostics_<stamp>.zip`; `AZTCollabProvider.openFile` serves the URI (`content://org.atoznback.aztcollab/_shares/<token>/<archive>`). Returns one item with one `uri_path` (zip MIME `application/zip`). Stale tokens >1h pruned on every call. | Without daemon-staged URIs from our own authority, share intents get silently rejected by Signal. Without zipping into one ACTION_SEND-shaped file, Signal's SEND_MULTIPLE runtime filter (image/video only) drops the URIs. Either fault loses the diagnostic. Since 0.52.13 (URI staging) / 0.52.19 (zip + ACTION_SEND). |
 
 ### Daemon obligations (load-bearing)
 
@@ -296,7 +338,7 @@ contract every peer follows.
 
 Rules live in this file; rationale lives in `docs/rationale/`.
 Each file is the historical context behind one subsystem's rules;
-none of them contain rules themselves (per hard rule #9).
+none of them contain rules themselves (per hard rule #10).
 
 - [`docs/rationale/sync.md`](docs/rationale/sync.md) — commit/push
   split, stuck-commit retry, auto-sync silence routing.

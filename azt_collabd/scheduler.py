@@ -271,6 +271,36 @@ def reconcile_on_startup():
     # Run outside the scheduler lock — touches the filesystem, not
     # the jobs registry. Best-effort; never raises.
     _sweep_legacy_orphans()
+    # Daemon-startup orphan-tracking-ref sweep (0.50.49). Walk
+    # every registered project and fire
+    # ``strip_lan_origin_if_present(scope_to_paired_peers=True)``
+    # to clean any stale ``refs/remotes/origin/*`` left over from
+    # earlier daemons that stripped the URL but not the refs (the
+    # half-stripped state that misled ``_wan_unshared`` pre-
+    # 0.50.48). Without this, orphans persist on projects the
+    # user doesn't currently open — visible in lan_debug as
+    # nonzero ``remote_refs_present`` despite ``has_origin_url:
+    # false``. Cleanup runs once per startup; subsequent
+    # ``_h_project_status`` polls handle steady state.
+    try:
+        from . import projects as _proj
+        from . import repo as _repo
+        data = _proj._load_raw()
+        for langcode in sorted(data.keys()):
+            entry = data.get(langcode) or {}
+            wd = entry.get('working_dir', '') or ''
+            if not wd:
+                continue
+            try:
+                _repo.strip_lan_origin_if_present(
+                    wd, scope_to_paired_peers=True)
+            except Exception as ex:
+                print(f'[scheduler] startup orphan sweep '
+                      f'{langcode!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[scheduler] startup orphan-sweep dispatch '
+              f'raised: {ex!r}', file=sys.stderr, flush=True)
     # Re-populate the deferred post-receive-reset queue from disk so
     # a daemon restart while a reset was pending doesn't lose track.
     # The next watcher tick will drain whatever was queued; in the
@@ -926,6 +956,48 @@ def _drain_stuck_commits():
             _set_pending_push(langcode, True)
 
 
+_drain_skip_last_logged = {}
+
+
+def _log_drain_skip_due_to_backoff(langcode):
+    """Rate-limited '[scheduler] drain skipped: <lang> wan_backoff
+    next=… (in …)' emission for the case where the curve is
+    actively suppressing an attempt. Without this, ``drain
+    pushes: ['x']`` is followed by silence and an observer can't
+    tell whether the daemon is throttling deliberately, is stuck,
+    or never actually fired the push.
+
+    Keyed on (langcode, next_due_at) so a stable backoff state
+    logs once and re-logs only when the next-due time moves
+    (a record_failure or a record_success since the last skip)."""
+    try:
+        next_due = wan_backoff.next_due_at(langcode)
+        failures = wan_backoff.consecutive_failures(langcode)
+    except Exception:
+        return
+    cache_key = (langcode, int(next_due))
+    if _drain_skip_last_logged.get(langcode) == cache_key:
+        return
+    _drain_skip_last_logged[langcode] = cache_key
+    try:
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(
+            next_due, tz=timezone.utc).isoformat(timespec='seconds')
+    except Exception:
+        when = f'+{int(next_due)}s'
+    remaining_s = max(0, int(next_due - time.time()))
+    if remaining_s >= 3600:
+        remaining = f'{remaining_s // 3600}h{(remaining_s % 3600) // 60}m'
+    elif remaining_s >= 60:
+        remaining = f'{remaining_s // 60}m{remaining_s % 60}s'
+    else:
+        remaining = f'{remaining_s}s'
+    print(f'[scheduler] drain skipped: {langcode!r} '
+          f'wan_backoff next={when} (in {remaining}, '
+          f'{failures} consecutive failure(s))',
+          file=sys.stderr, flush=True)
+
+
 def _drain_pending_push(ignore_backoff=False):
     """Push any project flagged ``pending_push``. WAN attempts are
     gated by ``wan_backoff.is_due(langcode)`` so an offline-for-
@@ -956,6 +1028,13 @@ def _drain_pending_push(ignore_backoff=False):
         if not ignore_backoff and not wan_backoff.is_due(langcode):
             # Curve says wait. Don't bother probing credentials or
             # the network — that's the whole point of the curve.
+            # Rate-limited diagnostic so "drain pushes: ['nml']"
+            # without a subsequent sync-trace stops looking like
+            # the daemon doing nothing — last drain skip is cached
+            # per langcode and only re-emitted when the next-due
+            # time changes (e.g., after a record_failure shifts
+            # the curve out further).
+            _log_drain_skip_due_to_backoff(langcode)
             continue
         git_user, token = get_sync_credentials(p.remote_url)
         if not token:

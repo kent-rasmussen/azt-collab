@@ -162,13 +162,497 @@ def share_text(text, subject='', chooser_title='', on_error=None):
         return False
 
 
+def share_files(items, on_error=None, chooser_title=None,
+                mime_type='text/plain'):
+    """Share multiple files in one Android share dispatch via
+    ``ACTION_SEND_MULTIPLE`` (since 0.52.6). Inserts each item
+    into MediaStore Downloads to get a ``content://`` URI, then
+    dispatches an ``Intent.ACTION_SEND_MULTIPLE`` with an
+    ``ArrayList<Uri>`` in ``EXTRA_STREAM``. Email + messaging
+    apps that accept ``text/plain`` accept this cleanly; the
+    receiver gets each item as a distinct attachment.
+
+    Replaces the bespoke "two-file blob" path in
+    ``share_log_file`` for callers that ship a known set of
+    daily-rotated log files plus a snapshot. ``share_log_file``
+    remains as a thin shim that builds the items list from its
+    legacy ``log_path`` + ``prev_path`` + ``prefix_text``
+    arguments — peers can migrate to ``share_files`` directly
+    when they're ready.
+
+    Parameters
+    ----------
+    items : list[dict]
+        Each item is one attachment, shaped as either::
+
+            {'path': '/abs/path/to.file',
+             'display_name': 'human-name.ext'}
+
+        or::
+
+            {'content': <str or bytes>,
+             'display_name': 'human-name.ext'}
+
+        ``path`` reads from disk (streamed in 64 KB chunks);
+        ``content`` writes the in-memory blob (str is
+        UTF-8-encoded). ``display_name`` is the MediaStore
+        ``_display_name`` and the filename the receiver sees.
+        Items missing both ``path`` and ``content`` are skipped
+        with a logged warning; items with ``path`` pointing at
+        a nonexistent file are likewise skipped (a stale
+        retention sweep racing the share is the common case).
+    on_error : callable(str) | None
+        Invoked with a translated, user-visible message on any
+        failure (non-Android, all-items-skipped, JNI exception,
+        intent dispatch refused).
+    chooser_title : str | None
+        Title shown above the share sheet. Defaults to a
+        translated "Share".
+    mime_type : str
+        MIME type for both each MediaStore entry and the share
+        intent. Default ``text/plain`` covers log bundles; pass
+        e.g. ``'application/octet-stream'`` for binary payloads.
+
+    Returns
+    -------
+    bool
+        True if the intent was dispatched (at least one item
+        landed in MediaStore and the chooser opened); False
+        otherwise. Failure to insert one item is non-fatal as
+        long as at least one item succeeds — diagnostic-bundle
+        callers want partial coverage over nothing.
+    """
+    # Best-effort diagnostic logging on two channels (since
+    # 0.52.12):
+    #   1. ``print()`` to stderr — captured by logcat, so a
+    #      developer on the device with adb sees the trace in
+    #      real time as the share dispatches. Sub-ms cost.
+    #   2. ``log_diagnostic`` RPC into the daemon's always-on
+    #      log — visible in the *next* successful ``Share
+    #      diagnostics`` bundle (the current attempt's bundle
+    #      can't include traces from the current attempt
+    #      itself, since the bundle is built BEFORE the trace
+    #      lines are written). Sub-100ms cost per call.
+    # Both channels are best-effort with swallowed exceptions
+    # so a stalled write never derails the share path.
+    try:
+        from .. import log_diagnostic as _log
+    except Exception:
+        _log = lambda *a, **k: False
+
+    def _dlog(line):
+        try:
+            print(f'[share_files] {line}', flush=True)
+        except Exception:
+            pass
+        try:
+            _log('share_files', line)
+        except Exception:
+            pass
+
+    item_count = len(items or [])
+    _dlog(f'entry: item_count={item_count} mime_type={mime_type!r} '
+          f'chooser_title={chooser_title!r}')
+
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    _dlog(f'platform check: platform={platform!r}')
+    if platform != 'android':
+        if on_error is not None:
+            # Build a short description for desktop / test runs so
+            # the operator can see what would have been shared.
+            descs = []
+            for it in items or []:
+                dn = (it or {}).get('display_name') or '?'
+                if 'path' in (it or {}):
+                    descs.append(f'{dn} ({it["path"]})')
+                else:
+                    descs.append(dn)
+            on_error(_tr(
+                'Files: {names}').format(names=', '.join(descs)))
+        return False
+    import os as _os
+    try:
+        from jnius import autoclass, cast
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Intent = autoclass('android.content.Intent')
+        ContentValues = autoclass('android.content.ContentValues')
+        MediaStoreDownloads = autoclass(
+            'android.provider.MediaStore$Downloads')
+        ArrayList = autoclass('java.util.ArrayList')
+        ClipData = autoclass('android.content.ClipData')
+        ClipDataItem = autoclass('android.content.ClipData$Item')
+        PackageManager = autoclass('android.content.pm.PackageManager')
+        Uri = autoclass('android.net.Uri')
+        Integer = autoclass('java.lang.Integer')
+        String = autoclass('java.lang.String')
+        activity = PythonActivity.mActivity
+        context = cast('android.content.Context', activity)
+        resolver = context.getContentResolver()
+        pkg_manager = context.getPackageManager()
+        _dlog('jnius autoclasses loaded; activity + resolver + '
+              'pkg_manager ready')
+
+        uris = ArrayList()
+        raw_uris = []  # Python-side handles for ClipData below
+        landed = 0
+        for idx, it in enumerate(items or []):
+            it = it or {}
+            display_name = it.get('display_name') or 'attachment'
+            has_path = bool(it.get('path'))
+            has_content = ('content' in it
+                           and it.get('content') is not None)
+            has_uri = bool(it.get('uri'))
+            content_bytes = 0
+            if has_content:
+                body_probe = it.get('content')
+                if isinstance(body_probe, str):
+                    content_bytes = len(body_probe.encode(
+                        'utf-8', errors='replace'))
+                elif isinstance(body_probe, (bytes, bytearray)):
+                    content_bytes = len(body_probe)
+            if not has_path and not has_content and not has_uri:
+                _dlog(f'item[{idx}] skip: no path/content/uri '
+                      f'display={display_name!r}')
+                continue
+            # URI items: the caller already has a content:// URI
+            # (typically from ``prepare_share_bundle`` —
+            # files staged under our own ContentProvider
+            # authority since 0.52.13 so receivers like Signal
+            # accept them). Skip MediaStore entirely.
+            if has_uri:
+                _dlog(f'item[{idx}] using pre-staged uri={it["uri"]!r} '
+                      f'display={display_name!r}')
+                try:
+                    uri = Uri.parse(it['uri'])
+                except Exception as ex:
+                    _dlog(f'item[{idx}] Uri.parse raised: {ex!r}')
+                    continue
+                # Add the native Uri without a Parcelable cast.
+                # Signal's getParcelableArrayListExtraCompat on
+                # Android 13+ does a runtime class check against
+                # Uri; if the parcel records the items as
+                # Parcelable (via our cast) the typed read filters
+                # them out and Signal bails with
+                # IntentError.SEND_MULTIPLE_STREAM. The underlying
+                # Java object IS Uri either way — the cast was a
+                # jnius dispatching hint, not a Java-type change —
+                # but removing the cast makes the dispatch decide
+                # the correct ArrayList<Uri> shape. 0.52.15.
+                uris.add(uri)
+                raw_uris.append(uri)
+                landed += 1
+                _dlog(f'item[{idx}] landed via pre-staged uri')
+                continue
+            if has_path and not _os.path.isfile(it['path']):
+                _dlog(f'item[{idx}] skip: missing path '
+                      f'{it["path"]!r} display={display_name!r}')
+                continue
+            _dlog(f'item[{idx}] inserting: display={display_name!r} '
+                  f'has_path={has_path} content_bytes={content_bytes}')
+            values = ContentValues()
+            values.put('_display_name', display_name)
+            values.put('mime_type', mime_type)
+            uri = resolver.insert(
+                MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+            if not uri:
+                _dlog(f'item[{idx}] MediaStore insert returned null '
+                      f'display={display_name!r}')
+                continue
+            _dlog(f'item[{idx}] MediaStore uri={str(uri.toString())}')
+            try:
+                fos = resolver.openOutputStream(uri)
+            except Exception as ex:
+                _dlog(f'item[{idx}] openOutputStream raised: {ex!r}')
+                continue
+            written = 0
+            try:
+                if has_path:
+                    with open(it['path'], 'rb') as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            fos.write(chunk)
+                            written += len(chunk)
+                else:
+                    body = it['content']
+                    if isinstance(body, str):
+                        body = body.encode('utf-8', errors='replace')
+                    fos.write(body)
+                    written = len(body)
+            except Exception as ex:
+                _dlog(f'item[{idx}] write raised after {written} '
+                      f'bytes: {ex!r}')
+            finally:
+                try:
+                    fos.close()
+                except Exception:
+                    pass
+            # Clear IS_PENDING so other apps can read the URI.
+            # On Android Q+ MediaStore.Downloads inserts default
+            # to ``is_pending=1`` ("owned by inserter, invisible
+            # to others"). The receiver — Signal, Gmail, whatever
+            # the user picked — sees the URI in EXTRA_STREAM but
+            # ContentResolver returns null/exception when it tries
+            # to read, so the receiver flashes its compose screen
+            # and bails. Field-diagnosed via 0.52.11 logcat
+            # 2026-06-22. The canonical Android-docs fix is a
+            # post-write ``update(uri, {is_pending: 0}, ...)``.
+            try:
+                update_values = ContentValues()
+                # jnius needs explicit Java Integer wrapping —
+                # Python int doesn't auto-box to
+                # ``java.lang.Integer`` and put(String, int) isn't
+                # one of the ContentValues overloads. 0.52.12
+                # field log showed the silent failure:
+                # ``No methods called put in ContentValues matching
+                # your arguments, requested: ('is_pending', 0)``.
+                update_values.put('is_pending', Integer(0))
+                rows = resolver.update(uri, update_values,
+                                       None, None)
+                _dlog(f'item[{idx}] is_pending cleared (rows={rows})')
+            except Exception as ex:
+                _dlog(f'item[{idx}] is_pending clear raised: {ex!r}')
+            # Same no-cast rule as the URI branch above (see
+            # 0.52.15 comment). Uri stays Uri in the parcel, so
+            # receivers' typed getParcelableArrayListExtra reads
+            # don't filter it out.
+            uris.add(uri)
+            raw_uris.append(uri)
+            landed += 1
+            _dlog(f'item[{idx}] landed: written={written} bytes')
+
+        _dlog(f'insert phase done: landed={landed} of {item_count}')
+
+        if landed == 0:
+            _dlog('bail: landed=0; on_error sent, returning False')
+            if on_error is not None:
+                on_error(_tr('No files to share.'))
+            return False
+
+        # Route by item count: a single-URI share uses
+        # ACTION_SEND (broader receiver compatibility — Signal's
+        # ACTION_SEND_MULTIPLE resolver filters URIs to
+        # image/video MIMEs only, so text content can't go
+        # multi-attachment regardless of the manifest's claim);
+        # multi-URI shares use ACTION_SEND_MULTIPLE. Field-
+        # diagnosed via Signal's ShareRepository.kt source on
+        # 2026-06-22.
+        if landed == 1:
+            intent = Intent(Intent.ACTION_SEND)
+            intent.setType(mime_type)
+            intent.putExtra(
+                Intent.EXTRA_STREAM,
+                cast('android.os.Parcelable', raw_uris[0]))
+            _dlog('intent: ACTION_SEND (single) built, type + '
+                  'extras set')
+        else:
+            intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+            intent.setType(mime_type)
+            intent.putParcelableArrayListExtra(
+                Intent.EXTRA_STREAM, uris)
+            _dlog('intent: ACTION_SEND_MULTIPLE built, type + '
+                  'extras set')
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        intent.putExtra(Intent.EXTRA_SUBJECT,
+                        String(_tr('AZT diagnostics')))
+        # ACTION_SEND_MULTIPLE + Intent.createChooser drops URI
+        # grants for many receivers (Signal, modern Gmail) unless
+        # the URIs are ALSO attached as ClipData AND the
+        # FLAG_GRANT_READ_URI_PERMISSION is propagated to the
+        # chooser wrapper. 0.52.9 set ClipData on the inner
+        # intent only — Signal still rejected on the field
+        # report. 0.52.10 belt-and-suspenders:
+        #   (a) ClipData on inner intent (was already there).
+        #   (b) ClipData on the chooser wrapper too.
+        #   (c) FLAG_GRANT_READ_URI_PERMISSION on the chooser.
+        #   (d) Explicit per-package ``grantUriPermission`` to
+        #       every Activity matching the inner intent's
+        #       intent-filter (the canonical workaround
+        #       documented at developer.android.com for the
+        #       chooser-+-multi-URI case).
+        # The ClipData label is a chooser-side hint and doesn't
+        # reach the receiver. MIME type stays as ``mime_type``
+        # so per-file metadata is preserved.
+        try:
+            clip = ClipData.newUri(
+                resolver, String('AZT diagnostics'), raw_uris[0])
+            for extra_uri in raw_uris[1:]:
+                clip.addItem(ClipDataItem(extra_uri))
+            intent.setClipData(clip)
+            _dlog(f'clipdata: built {len(raw_uris)}-item ClipData '
+                  f'and attached to inner intent')
+        except Exception as ex:
+            _dlog(f'clipdata: build/attach raised: {ex!r}')
+            clip = None
+        # Pre-grant the URIs to every package that can handle
+        # the intent. Bounded scope (only the URIs we created,
+        # only read permission, only packages whose
+        # intent-filter accepts ACTION_SEND_MULTIPLE for
+        # ``mime_type``). Catches receivers that ignore the
+        # chooser-forwarded ClipData grant — Signal on some
+        # Android builds appears to be one.
+        granted_pkgs = []
+        try:
+            match_default = PackageManager.MATCH_DEFAULT_ONLY
+            res_list = pkg_manager.queryIntentActivities(
+                intent, match_default)
+            n_targets = res_list.size()
+            _dlog(f'pre-grant: queryIntentActivities returned '
+                  f'n_targets={n_targets}')
+            for i in range(n_targets):
+                res_info = res_list.get(i)
+                pkg_name = res_info.activityInfo.packageName
+                granted_pkgs.append(str(pkg_name))
+                for raw_uri in raw_uris:
+                    context.grantUriPermission(
+                        pkg_name, raw_uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            # Limit log line size — long target lists get
+            # truncated server-side anyway, but keep it tidy.
+            pkg_summary = ','.join(granted_pkgs[:16])
+            if len(granted_pkgs) > 16:
+                pkg_summary += f',… +{len(granted_pkgs) - 16} more'
+            _dlog(f'pre-grant: granted to {len(granted_pkgs)} '
+                  f'packages: {pkg_summary}')
+        except Exception as ex:
+            # Non-fatal — the ClipData + flag path may still
+            # work for cooperating receivers. Log so a later
+            # diagnostic share captures the failure mode.
+            _dlog(f'pre-grant raised: {ex!r}')
+        title = chooser_title or _tr('Share')
+        try:
+            chooser = Intent.createChooser(intent, String(title))
+            chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if clip is not None:
+                chooser.setClipData(clip)
+            _dlog('chooser: built; ClipData + grant flag attached')
+            activity.startActivity(chooser)
+            _dlog('startActivity returned (chooser dispatched)')
+        except Exception as ex:
+            _dlog(f'chooser/startActivity raised: {ex!r}')
+            raise
+        return True
+    except Exception as ex:
+        _dlog(f'OUTER catch: {ex!r}')
+        if on_error is not None:
+            on_error(_tr(
+                'Could not share files:\n{error}').format(error=ex))
+        return False
+
+
+def share_diagnostics_action(on_error=None):
+    """Canonical "share diagnostics" composition. One source of
+    truth so the picker's ``Share diagnostics`` button and the
+    daemon-settings ``Share diagnostics`` button dispatch
+    identical bundles — same label, same underlying action,
+    two affordances (one per UI surface).
+
+    Sequence (since 0.52.13 — pre-0.52.13 was MediaStore-based,
+    which Signal refused as a receiver-side security policy):
+
+    1. Ask the daemon to stage the bundle via
+       ``prepare_share_bundle``. The daemon writes snapshot +
+       per-day daemon logs into ``$AZT_HOME/.shares/<token>/``,
+       returns the URI paths.
+    2. Build content URIs of the form
+       ``content://org.atoznback.aztcollab/<uri_path>`` — our
+       own ContentProvider authority, served via
+       ``AZTCollabProvider.openFile``.
+    3. Dispatch via ``share_files`` (``ACTION_SEND_MULTIPLE``).
+       Each item is a URI item; share_files attaches them via
+       ClipData and ``EXTRA_STREAM`` ArrayList without going
+       through MediaStore.
+
+    Two fallback paths:
+
+    - **Daemon unreachable** (``prepare_share_bundle``
+      returned None): send a ``share_text`` with an
+      operator-actionable "confirm the AZT Collaboration app
+      is installed" message.
+    - **Empty bundle** (daemon reachable but nothing staged):
+      send a ``share_text`` with "reproduce the issue first,
+      then tap Share diagnostics again."
+
+    Parameters
+    ----------
+    on_error : callable(str) | None
+        Invoked with a translated, user-visible message on
+        any failure. Both surfaces pass their own
+        status-display callback — popup for the picker
+        (it has no inline status area), label text for the
+        daemon-settings UI (it has a status line below the
+        button).
+
+    Returns
+    -------
+    bool
+        True if the share sheet (or the fallback share-text
+        intent) was dispatched; False otherwise.
+    """
+    from .. import prepare_share_bundle
+    from ..translate import tr as _tr
+    from ..transports.android_cp import CANONICAL_AUTHORITY
+
+    bundle = prepare_share_bundle()
+
+    if bundle is None:
+        return share_text(
+            text=_tr(
+                'Could not reach the AZT Collab daemon. '
+                'Please confirm the AZT Collaboration app is '
+                'installed and re-open this app.'),
+            on_error=on_error)
+
+    items = []
+    for entry in bundle.get('items') or []:
+        uri_path = entry.get('uri_path') or ''
+        display_name = entry.get('display_name') or ''
+        if not uri_path or not display_name:
+            continue
+        # Reuse the same authority the RPC transport uses.
+        # That guarantees we point at the provider that's
+        # actually serving these paths via openFile —
+        # ``AZTCollabProvider`` declared at authority
+        # ``org.atoznback.aztcollab``.
+        items.append({
+            'uri': f'content://{CANONICAL_AUTHORITY}/{uri_path}',
+            'display_name': display_name,
+        })
+
+    if not items:
+        return share_text(
+            text=_tr(
+                'No diagnostics available yet. Reproduce the '
+                'issue first, then tap Share diagnostics '
+                'again.'),
+            on_error=on_error)
+
+    # Diagnostic bundle is a zip archive since 0.52.19; intent-
+    # level MIME has to match (``application/zip``) so Signal's
+    # ACTION_SEND filter accepts it (its ``application/*``
+    # mimeType entry in the manifest covers this) and other
+    # receivers' attachment pickers route the file correctly.
+    return share_files(items, on_error=on_error,
+                       mime_type='application/zip')
+
+
 def share_log_file(log_path, prev_path=None, on_error=None,
-                   display_name=None):
+                   display_name=None, prefix_text=''):
     """Share a log file via Android's share sheet. Bundles
     ``log_path`` and (optionally) ``prev_path`` into one
     ``text/plain`` blob, inserts into MediaStore Downloads to
     get a ``content://`` URI, and dispatches an
     ``Intent.ACTION_SEND`` with the URI attached.
+
+    ``prefix_text`` is prepended (with its own section break) — the
+    picker's Share-diagnostics button uses this to ship a daemon-
+    side registry snapshot alongside the log file even when the
+    daemon-log-to-file toggle has never been enabled (the snapshot
+    alone is the diagnostic payload in that case). Empty by default.
 
     Differences from ``share_text``: file-based source (reads
     from disk), bundles two files when ``prev_path`` is set, and
@@ -225,6 +709,14 @@ def share_log_file(log_path, prev_path=None, on_error=None,
     # Read both files into a single blob. Empty / missing prev
     # is fine — we just skip the section.
     blob = _bundle_log_blob(log_path, prev_path)
+    if prefix_text:
+        # Prepend a diagnostic block ahead of the log sections so a
+        # reader scrolling from the top hits state-of-the-world
+        # before timeline. Section header matches the log-bundle
+        # style for visual consistency.
+        prefix_block = (f'=== diagnostic snapshot ===\n'
+                        f'{prefix_text}\n')
+        blob = prefix_block + (blob if blob else '')
     if not blob:
         if on_error is not None:
             on_error(_tr('Log file is empty.'))

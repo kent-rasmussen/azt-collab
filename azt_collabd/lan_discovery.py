@@ -85,10 +85,61 @@ def _fire_arrival(peer_id_hex):
     def _worker():
         try:
             from . import peers as _peers
-            if _peers.get_peer(peer_id_hex) is None:
+            entry = _peers.get_peer(peer_id_hex)
+            if entry is None:
                 return
             from . import lan_push as _lan_push
+            from . import projects as _projects
+            # Clear the fast-fail gate before sweeping (0.50.49):
+            # mDNS arrival is a strong signal the peer is up
+            # again. Without this, an arrival sweep would
+            # short-circuit through ``_recently_unreachable`` and
+            # never even try the now-fresh endpoint.
+            _lan_push._record_reachable(peer_id_hex)
             _lan_push.sweep_peer(peer_id_hex)
+            # Announce remote_url for every shared project to the
+            # just-arrived peer (0.50.60). Closes the fanout-vs-
+            # mDNS race: ``_spawn_publish_fanout`` fires on PUSHED
+            # which often runs before mDNS has resolved peers to
+            # their current endpoint (especially right after a
+            # daemon respawn). Stale static_endpoints don't match
+            # the peer's current bind → POST to share_offer fails
+            # → URL never reaches the peer. Arrival is the moment
+            # we *know* the endpoint is current; piggybacking the
+            # share_offer here makes URL convergence reliable.
+            # Peer-side ``_handle_share_offer`` dedups
+            # (URLs-match → no-op; auto-adopts on URL-empty per
+            # 0.50.59), so re-firing is harmless.
+            shared = list(entry.get('shared_projects') or [])
+            announced = 0
+            for langcode in shared:
+                try:
+                    project = _projects.get(langcode)
+                except Exception:
+                    project = None
+                if project is None:
+                    continue
+                url = (project.remote_url or '').strip()
+                if not url:
+                    continue
+                try:
+                    vernlang = project.effective_vernlang()
+                except Exception:
+                    vernlang = langcode
+                try:
+                    _lan_push.send_share_offer(
+                        peer_id_hex, langcode, url,
+                        vernlang=vernlang)
+                    announced += 1
+                except Exception as ex:
+                    print(f'[lan-discovery] arrival share_offer '
+                          f'{peer_id_hex[:8]!r} {langcode!r} '
+                          f'raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+            if announced:
+                print(f'[lan-discovery] arrival announced '
+                      f'{announced} URL(s) to {peer_id_hex[:8]!r}',
+                      file=sys.stderr, flush=True)
         except Exception as ex:
             print(f'[lan-discovery] arrival sweep '
                   f'{peer_id_hex[:8]!r} raised: {ex!r}',

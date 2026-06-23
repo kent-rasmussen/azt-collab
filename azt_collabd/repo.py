@@ -1031,18 +1031,37 @@ def _strip_lan_origin_locked(working_dir, scope_to_paired_peers):
         # already URL-less + tracking refs orphaned). The orphan
         # check covers projects stripped by earlier daemon
         # versions that left the refs behind.
+        # Read the URL value, not just key existence (0.50.48).
+        # Pre-0.50.48 we treated "url key exists" as
+        # has_url_now=True even if the value was empty (``url = ``
+        # in config) — which is the half-stripped state left
+        # behind by older daemons that hit the
+        # ``config.remove_section`` AttributeError fallback above.
+        # That state blocked the orphan-tracking-ref cleanup
+        # because has_url_now stayed True. Field repro 2026-06-05:
+        # phone had `[remote "origin"]\n\turl = ` plus three
+        # orphan ``refs/remotes/origin/*`` refs that no cleanup
+        # pass ever removed because has_url_now read True every
+        # time. Treat empty URL value as no URL.
+        url_now_value = ''
         try:
             try:
-                config.get((b'remote', b'origin'), b'url')
-                has_url_now = True
+                raw = config.get((b'remote', b'origin'), b'url')
+                try:
+                    url_now_value = raw.decode(
+                        'utf-8', errors='replace').strip()
+                except Exception:
+                    url_now_value = ''
             except KeyError:
-                has_url_now = False
+                url_now_value = ''
         except Exception:
-            has_url_now = False
+            url_now_value = ''
+        has_url_now = bool(url_now_value)
         # If we just stripped, URL is gone. If URL was already
-        # absent, this is an orphan-cleanup pass. In either case
-        # tracking refs under ``refs/remotes/origin/`` shouldn't
-        # exist on a properly-cleaned LAN-cloned project.
+        # absent (or empty), this is an orphan-cleanup pass. In
+        # either case tracking refs under
+        # ``refs/remotes/origin/`` shouldn't exist on a properly-
+        # cleaned LAN-cloned project.
         if not has_url_now:
             prefix = b'refs/remotes/origin/'
             removed = []
@@ -1077,6 +1096,376 @@ def _strip_lan_origin_locked(working_dir, scope_to_paired_peers):
             repo.close()
         except Exception:
             pass
+
+
+def reconcile_publish_state_on_startup():
+    """One-shot auto-retry for the pre-0.50.52 Publish bug.
+
+    Walks every registered project and looks for the specific
+    fingerprint of the bug: ``.git/config`` has
+    ``remote.origin.url`` set but the registry's
+    ``Project.remote_url`` is empty. That combination can only
+    arise from the pre-0.50.52 silent-failure path, where
+    ``_init_repo_locked`` wrote the URL into ``.git/config`` but
+    the subsequent registry update in ``_h_init_project`` didn't
+    land (older daemon serving the RPC, or the for-loop missed
+    the project). Post-0.50.52 paths keep both sides in sync:
+    both-set on success, both-empty on REMOTE_CREATE_FAILED.
+
+    For each project that matches, re-fire the publish the user
+    already committed to — call ``init_repo`` with the captured
+    URL (and ``rollback_origin_on_create_fail=False`` so a
+    transient offline / outage / missing-creds boot doesn't
+    expose a phantom Publish button on a project the user has
+    already chosen to publish). State transitions only on a
+    successful PUSHED:
+
+    - PUSHED → registry gets ``remote_url`` / ``last_sync`` /
+      ``last_commit`` populated; next boot finds no mismatch;
+      publish-fanout fires so paired peers learn the URL.
+    - Anything else (REMOTE_CREATE_FAILED on outage, AUTH_REQUIRED
+      on missing creds, BUSY on lock contention, etc.) → log
+      and move on; the next daemon startup retries silently.
+
+    Safety: the mismatch fingerprint is unreachable from any
+    post-0.50.52 code path, so this never runs against a healthy
+    project. A transient github outage during a manual Publish
+    produces REMOTE_CREATE_FAILED, which the picker-initiated
+    rollback clears *both* sides — leaving both-empty, not
+    ``.git/config``-set + registry-empty. So this reconciliation
+    can't accidentally fire on outage-cleanup.
+
+    Called from the daemon's ``serve()`` startup right after
+    ``scheduler.reconcile_on_startup()``."""
+    from . import projects as _projects_mod
+    from . import store as _store
+    succeeded = []
+    skipped = []
+    n_walked = 0
+    n_mismatch = 0
+    for p in _list_projects_safely(_projects_mod):
+        n_walked += 1
+        working_dir = (p.working_dir or '').strip()
+        registry_url = (p.remote_url or '').strip()
+        if not working_dir or registry_url:
+            continue
+        captured_url = _read_origin_url(working_dir)
+        if not captured_url:
+            continue
+        # Mismatch fingerprint hit. Auto-retry the publish.
+        n_mismatch += 1
+        git_user, token = _store.get_sync_credentials(captured_url)
+        contributor = _store.get_contributor()
+        if not token:
+            skipped.append((p.langcode, 'no_credentials'))
+            continue
+        if not contributor:
+            skipped.append((p.langcode, 'no_contributor'))
+            continue
+        try:
+            result = init_repo(
+                working_dir, captured_url, git_user, token,
+                branch='main', contributor_name=contributor,
+                rollback_origin_on_create_fail=False)
+        except Exception as ex:
+            skipped.append((p.langcode, f'init_repo raised: {ex!r}'))
+            continue
+        codes = result.codes()
+        if 'PUSHED' in codes or 'COMMITTED_AND_PUSHED' in codes:
+            try:
+                _projects_mod.set_remote_url(p.langcode, captured_url)
+                _projects_mod.set_last_sync(p.langcode)
+                _projects_mod.set_last_commit(p.langcode)
+            except Exception as ex:
+                # Registry write failed but the github push
+                # succeeded. Log and move on — next boot will
+                # see the mismatch again and re-fire publish,
+                # which will hit ``REMOTE_UNCHANGED`` and the
+                # 422 "already exists" path on github,
+                # eventually re-PUSH and write the registry.
+                print(f'[publish-reconcile] {p.langcode!r}: '
+                      f'PUSHED but registry write raised {ex!r}',
+                      file=sys.stderr, flush=True)
+            succeeded.append((p.langcode, captured_url, list(codes)))
+            # Fan out the URL to paired peers (deferred to
+            # avoid circular import: ``server`` imports ``repo``).
+            try:
+                from . import server as _server
+                _server._spawn_publish_fanout(p.langcode, captured_url)
+            except Exception as ex:
+                print(f'[publish-reconcile] {p.langcode!r}: '
+                      f'fanout spawn raised {ex!r}',
+                      file=sys.stderr, flush=True)
+        else:
+            skipped.append((p.langcode, list(codes)))
+    # Always emit a summary so the daemon log shows proof this
+    # function ran, even when there's nothing to do. Without this,
+    # the all-healthy-projects case is indistinguishable from
+    # "function silently didn't fire" in the log — which is
+    # exactly the diagnostic gap that hid the missing Android
+    # callsite for two iterations of 0.50.x.
+    print(f'[publish-reconcile] walked={n_walked} '
+          f'mismatch={n_mismatch} succeeded={len(succeeded)} '
+          f'deferred={len(skipped)}',
+          file=sys.stderr, flush=True)
+    if succeeded:
+        print(f'[publish-reconcile] auto-retry SUCCEEDED for '
+              f'{len(succeeded)} project(s): {succeeded!r}',
+              file=sys.stderr, flush=True)
+    if skipped:
+        print(f'[publish-reconcile] auto-retry deferred for '
+              f'{len(skipped)} project(s) (state unchanged, '
+              f'next boot will retry): {skipped!r}',
+              file=sys.stderr, flush=True)
+
+
+def diagnose_and_repair_registry_on_startup():
+    """Boot-time diagnostic + auto-repair pass.
+
+    Two things happen here, in order:
+
+    1. **Log a registry/filesystem snapshot.** Every line of the
+       text produced by ``server._build_diagnostic_snapshot`` is
+       written to stderr (so it ends up in the daemon log if
+       file-logging is enabled). Captures ``projects.json`` state,
+       on-disk subdirs, ``.git`` / LIFT presence per subdir, and
+       which subdirs are registered. The snapshot is what the
+       picker's Share-diagnostics button ships when the user is
+       stuck on an empty picker; including it in the boot log
+       means we have a record from every startup even when the
+       user never thinks to grab it manually.
+
+    2. **Re-register orphan working_dirs.** A subdir of
+       ``$AZT_HOME`` is an "orphan" if it contains both ``.git/``
+       and a ``*.lift`` file but is not keyed in ``projects.json``.
+       Common causes: ``projects.json`` zeroed by a crash mid-write;
+       partial restore that recovered the working tree but not
+       the index; daemon respawn after a registry write was
+       refused by ``_LoadFailed``. Each orphan is passed to
+       ``projects.register`` with the directory name as langcode,
+       the first ``*.lift`` file found as ``lift_path``, and
+       ``remote.origin.url`` from ``.git/config`` as ``remote_url``.
+
+    **Safety.** Never removes registry entries; never alters
+    working-tree contents; never overwrites a corrupt non-empty
+    ``projects.json`` (``projects.register`` refuses with
+    ``RuntimeError`` when ``_LoadFailed`` is in play, so a parse
+    failure halts the repair pass rather than clobbering the file).
+
+    Always emits a summary line, even on the no-orphans-found
+    path (per ``feedback_always_emit_summary``). Called from both
+    desktop ``serve()`` and Android ``server_apk/service.py:main()``
+    startup (per ``feedback_dual_entry_path_startup_hooks``).
+    """
+    from . import projects as _projects_mod
+    from .paths import azt_home as _azt_home
+
+    try:
+        from . import server as _server
+        snap = _server._build_diagnostic_snapshot()
+        for line in snap.splitlines():
+            print(f'[diag] {line}', file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[diag] snapshot generation raised {ex!r}',
+              file=sys.stderr, flush=True)
+
+    try:
+        home = _azt_home()
+    except Exception as ex:
+        print(f'[diag-repair] azt_home() raised {ex!r}; '
+              f'skipping repair pass',
+              file=sys.stderr, flush=True)
+        return
+
+    # ``projects.json`` corruption blocks the repair pass before it
+    # starts: ``_load_raw`` returns ``_LoadFailed``, every
+    # ``register()`` raises ``RuntimeError``. Detection is "does the
+    # file parse?" rather than "is it zero bytes?" — field repro
+    # (db033cd4 device, 0.52.1 boot log) showed an 839-byte file
+    # whose first byte was non-JSON (almost certainly the ext4
+    # power-fail / write-fail pattern: inode size landed, data
+    # blocks didn't, file looks the right size but is full of null
+    # bytes). 0.52.1's zero-byte-only guard didn't catch it.
+    #
+    # Rescue strategy: move the corrupt file aside to a
+    # ``.corrupt-<timestamp>`` sibling. The next ``_load_raw``
+    # returns ``{}`` (file is missing) and the orphan-scan below
+    # re-seeds from the on-disk working_dirs. The forensic copy
+    # preserves the original content for manual inspection — if
+    # something WAS salvageable, support can recover it; nothing
+    # is destroyed silently.
+    #
+    # Safety: this is reachable only when ``json.load`` already
+    # failed. A healthy ``projects.json`` flows through ``list_all``
+    # → ``registered_dirs`` populated → repair pass adds only what
+    # genuinely isn't registered. No risk of moving aside a
+    # readable-but-stale registry.
+    pj_path = _projects_mod.projects_path()
+    try:
+        if os.path.exists(pj_path):
+            with open(pj_path, 'r', encoding='utf-8') as _pj:
+                import json as _json
+                _json.load(_pj)
+            registry_parseable = True
+        else:
+            registry_parseable = True
+    except Exception as ex:
+        registry_parseable = False
+        try:
+            import time as _t
+            stamp = _t.strftime('%Y%m%d_%H%M%S', _t.localtime())
+            backup = f'{pj_path}.corrupt-{stamp}'
+            os.rename(pj_path, backup)
+            print(f'[diag-repair] projects.json failed to parse '
+                  f'({ex!r}); moved aside to {backup!r} so '
+                  f'register() can re-seed. Original preserved for '
+                  f'forensic inspection — do NOT delete unless you '
+                  f'have verified there is nothing salvageable.',
+                  file=sys.stderr, flush=True)
+        except OSError as mv_ex:
+            print(f'[diag-repair] projects.json unparseable AND could '
+                  f'not be moved aside ({mv_ex!r}); halting repair. '
+                  f'Manual recovery needed.',
+                  file=sys.stderr, flush=True)
+            return
+
+    registered_dirs = set()
+    try:
+        for p in _projects_mod.list_all():
+            wd = (p.working_dir or '').strip()
+            if wd:
+                try:
+                    registered_dirs.add(os.path.realpath(wd))
+                except Exception:
+                    pass
+    except Exception as ex:
+        print(f'[diag-repair] list_all raised {ex!r}; skipping repair '
+              f'(treat as corrupt registry — manual recovery required)',
+              file=sys.stderr, flush=True)
+        return
+
+    # Project working_dirs live under ``$AZT_HOME/projects/<langcode>/``
+    # (see ``lan_clone._project_dir`` for the canonical convention,
+    # and ``server._h_list_projects`` for the existing empty-registry
+    # diagnostic that scans the same directory). Older layouts that
+    # put working_dirs directly under ``$AZT_HOME`` are not in use
+    # in the field — scanning only the canonical location avoids
+    # false positives (CAWL repos, logs dirs, peer.crt directories,
+    # etc. sitting at the home root).
+    projects_dir = os.path.join(home, 'projects')
+    if not os.path.isdir(projects_dir):
+        print(f'[diag-repair] no projects directory at '
+              f'{projects_dir!r}; nothing to scan',
+              file=sys.stderr, flush=True)
+        print(f'[diag-repair] scanned=0 candidates=0 '
+              f'repaired=0 failed=0',
+              file=sys.stderr, flush=True)
+        return
+
+    try:
+        names = sorted(os.listdir(projects_dir))
+    except OSError as ex:
+        print(f'[diag-repair] listdir({projects_dir}) raised {ex!r}; '
+              f'skipping repair',
+              file=sys.stderr, flush=True)
+        return
+
+    candidates = []
+    for n in names:
+        p = os.path.join(projects_dir, n)
+        if not os.path.isdir(p) or n.startswith('.'):
+            continue
+        try:
+            real_p = os.path.realpath(p)
+        except Exception:
+            continue
+        if real_p in registered_dirs:
+            continue
+        if not os.path.isdir(os.path.join(p, '.git')):
+            continue
+        lift_path = ''
+        try:
+            for fn in sorted(os.listdir(p)):
+                if fn.lower().endswith('.lift'):
+                    lift_path = os.path.join(p, fn)
+                    break
+        except OSError:
+            continue
+        if not lift_path:
+            continue
+        remote_url = _read_origin_url(p)
+        candidates.append((n, p, lift_path, remote_url))
+
+    repaired = []
+    failed = []
+    for (langcode, working_dir, lift_path, remote_url) in candidates:
+        try:
+            _projects_mod.register(
+                langcode=langcode,
+                working_dir=working_dir,
+                lift_path=lift_path,
+                remote_url=remote_url,
+            )
+            repaired.append((langcode, working_dir, remote_url))
+            print(f'[diag-repair] registered orphan {langcode!r} '
+                  f'working_dir={working_dir!r} '
+                  f'lift_path={lift_path!r} '
+                  f'remote_url={remote_url!r}',
+                  file=sys.stderr, flush=True)
+        except RuntimeError as ex:
+            failed.append((langcode, str(ex)))
+            print(f'[diag-repair] {langcode!r}: register refused '
+                  f'({ex}); halting repair pass — manual recovery '
+                  f'of projects.json needed',
+                  file=sys.stderr, flush=True)
+            break
+        except Exception as ex:
+            failed.append((langcode, repr(ex)))
+            print(f'[diag-repair] {langcode!r}: register raised {ex!r}',
+                  file=sys.stderr, flush=True)
+
+    print(f'[diag-repair] scanned={len(names)} '
+          f'candidates={len(candidates)} '
+          f'repaired={len(repaired)} failed={len(failed)}',
+          file=sys.stderr, flush=True)
+
+
+def _list_projects_safely(projects_mod):
+    """Wrap ``projects_mod.list_all()`` so a registry-read
+    failure in the reconciliation pass doesn't take down the
+    daemon's startup."""
+    try:
+        return list(projects_mod.list_all())
+    except Exception as ex:
+        print(f'[publish-reconcile] list_all failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return []
+
+
+def _read_origin_url(working_dir):
+    """Return the ``remote.origin.url`` value from
+    ``<working_dir>/.git/config``, or ``''`` if the repo isn't
+    initialized or the key is absent. Caller doesn't need the
+    project_lock for this — it's a stale read used only to
+    decide whether to take the lock and act."""
+    try:
+        repo = _get_repo(working_dir)
+        if repo is None:
+            return ''
+        try:
+            config = repo.get_config()
+            try:
+                raw = config.get((b'remote', b'origin'), b'url')
+                return raw.decode('utf-8', errors='replace').strip()
+            except KeyError:
+                return ''
+        finally:
+            try:
+                repo.close()
+            except Exception:
+                pass
+    except Exception:
+        return ''
 
 
 def _ensure_atomic_pending_self_heal(repo, project_dir):
@@ -1274,6 +1663,9 @@ def _ensure_remote_repo(remote_url, username, token):
     is_known_host = 'github.com' in host or 'gitlab' in host
     if len(parts) < 2:
         if is_known_host:
+            print(f'[publish] remote-create FAILED: cannot parse '
+                  f'owner/repo from {remote_url!r}',
+                  file=sys.stderr, flush=True)
             return False, Status(S.REMOTE_CREATE_FAILED,
                                  {'error': f'cannot parse owner/repo from {remote_url}'})
         # Unknown host (gitea / forgejo / local dulwich.web / LAN
@@ -1282,6 +1674,9 @@ def _ensure_remote_repo(remote_url, username, token):
         # returned REMOTE_CREATE_FAILED unconditionally, which
         # blocked every non-github sync against a flat-root URL
         # (every test_local_git_remote case).
+        print(f'[publish] skip remote-create: unknown host, flat '
+              f'path host={host!r} url={remote_url!r}',
+              file=sys.stderr, flush=True)
         return True, None
     owner, repo_name = parts[0], parts[1]
 
@@ -1292,14 +1687,36 @@ def _ensure_remote_repo(remote_url, username, token):
     # of what owner the URL says, producing an orphan ``B/<repo>``
     # repo when B publishes to ``A/<repo>``. Skip create and let the
     # push reveal the real outcome: 200 if we're a collaborator,
-    # 403 if not. See plan doc for context (added 0.50.27).
+    # 403 if not. Added 0.50.27.
+    #
+    # 0.50.55: skip this heuristic entirely when using GitHub App
+    # auth (``username == 'x-access-token'``, the literal
+    # placeholder GitHub uses for HTTP basic-auth with installation
+    # tokens). The check was designed for PAT auth where
+    # ``username`` is the user's GitHub login; with App auth the
+    # username is always ``x-access-token``, which never matches
+    # any URL owner, so the heuristic was firing a false positive
+    # on every App-authenticated publish and blocking the POST.
+    # POST /user/repos with an installation token is scoped to the
+    # installation's account — there's no risk of wrong-namespace
+    # creation, so the protection isn't needed. If the
+    # installation isn't on the URL's owner, github returns 403/422
+    # and ``[publish] remote-create FAILED owner/repo: <code>``
+    # surfaces the real cause.
+    is_github_app_auth = (str(username or '').lower() == 'x-access-token')
     if (is_known_host
             and username
+            and not is_github_app_auth
             and owner.lower() != str(username).lower()):
-        return True, Status(S.REMOTE_OWNER_MISMATCH_SKIP_CREATE,
-                            owner=owner,
-                            username=username,
-                            url=remote_url)
+        print(f'[publish] skip remote-create: owner mismatch '
+              f'owner={owner!r} username={username!r} '
+              f'url={remote_url!r}',
+              file=sys.stderr, flush=True)
+        return True, Status(
+            S.REMOTE_OWNER_MISMATCH_SKIP_CREATE,
+            {'owner': owner,
+             'username': username,
+             'url': remote_url})
 
     if 'github.com' in host:
         api_url = 'https://api.github.com/user/repos'
@@ -1325,31 +1742,61 @@ def _ensure_remote_repo(remote_url, username, token):
             'Content-Type': 'application/json',
         }
     else:
+        print(f'[publish] skip remote-create: unknown host '
+              f'host={host!r} url={remote_url!r}',
+              file=sys.stderr, flush=True)
         return True, None   # Unknown host — assume repo exists, let push fail
 
+    print(f'[publish] POST {api_url} owner={owner!r} repo={repo_name!r}',
+          file=sys.stderr, flush=True)
     created = False
     try:
         req = Request(api_url, data=payload, headers=headers, method='POST')
         urlopen(req, timeout=30)
         created = True
+        print(f'[publish] remote-create OK: created {owner}/{repo_name}',
+              file=sys.stderr, flush=True)
     except HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
         # 422 = already exists (GitHub), 400 = already exists (GitLab)
         if e.code in (422, 400) and 'already' in body.lower():
+            print(f'[publish] remote-create: {owner}/{repo_name} '
+                  f'already exists ({e.code})',
+                  file=sys.stderr, flush=True)
             pass   # Already exists — fine
         else:
+            print(f'[publish] remote-create FAILED '
+                  f'{owner}/{repo_name}: {e.code} {body[:200]!r}',
+                  file=sys.stderr, flush=True)
             return False, Status(S.REMOTE_CREATE_FAILED,
                                  {'error': f'{e.code}: {body[:200]}'})
     except (URLError, OSError) as e:
+        print(f'[publish] remote-create FAILED '
+              f'{owner}/{repo_name}: {e!r}',
+              file=sys.stderr, flush=True)
         return False, Status(S.REMOTE_CREATE_FAILED, {'error': str(e)})
 
-    # Add collaborator on GitHub repos
+    # Add collaborator on GitHub repos. Always log the outcome
+    # (success or failure) so the daemon trail carries proof the
+    # call was attempted — same always-emit-summary lesson as
+    # the publish-reconcile fix in 0.50.55. ``add_collaborator``
+    # returns 'invited' (201) or 'already' (204 / 422 / owner
+    # adding themselves), and raises on real failures.
     collaborator = _config.get()['collaborator']
     if 'github.com' in host and collaborator:
         try:
-            add_collaborator(owner, repo_name, collaborator, token)
+            outcome = add_collaborator(
+                owner, repo_name, collaborator, token)
+            print(f'[collab] add_collaborator owner={owner!r} '
+                  f'repo={repo_name!r} '
+                  f'collaborator={collaborator!r} → {outcome}',
+                  file=sys.stderr, flush=True)
         except Exception as ex:
-            print(f'[collab] add collaborator warning: {ex}')
+            print(f'[collab] add_collaborator owner={owner!r} '
+                  f'repo={repo_name!r} '
+                  f'collaborator={collaborator!r} '
+                  f'FAILED: {ex!r}',
+                  file=sys.stderr, flush=True)
 
     if created:
         return True, Status(S.REMOTE_REPO_CREATED,
@@ -1502,10 +1949,12 @@ def _wan_unshared(repo, branch):
     The "no origin remote" branch is distinguishable from "origin
     configured but never pushed" by reading ``.git/config``: if
     ``remote.origin.url`` is absent (or empty), we know there's
-    nowhere to push, so HEAD ancestry IS the count. If the url
-    exists but the tracking ref doesn't (never-pushed-but-publish-
-    configured), we still return 0 to avoid double-counting the
-    unpushed initial commit as "behind."
+    nowhere to push, so HEAD ancestry IS the count. Since 0.52.3,
+    the "url exists but tracking ref doesn't" case also walks from
+    HEAD — pre-0.52.3 it returned 0 (OK-on-uncertainty), which
+    masked the "every fetch fails (404 / auth missing)" subcase as
+    "all caught up" on the picker even when every commit was at
+    risk via github.
 
     Renamed from ``_count_commits_ahead`` in v0.47.0 to match the
     new wire field name. Semantics unchanged.
@@ -1523,50 +1972,81 @@ def _wan_unshared(repo, branch):
             _walk_count_log(repo, 'wan-unshared',
                 f'branch={branch!r}: no local ref → 0')
             return 0
+        # URL check first (0.50.48). Pre-0.50.48 we branched on the
+        # tracking-ref existence and only checked the URL when the
+        # tracking ref was absent. That misclassified the orphan-
+        # tracking-ref case: a project that previously had origin
+        # configured, had the URL stripped (e.g., by
+        # ``strip_lan_origin_if_present``), but kept its
+        # ``refs/remotes/origin/<branch>`` ref. Without an origin
+        # URL the tracking ref is meaningless — it points at where
+        # the origin USED to be — yet ``_wan_unshared`` would walk
+        # excluding it and report a low count, making a LAN-only
+        # project look "mostly synced to github" when github isn't
+        # configured at all. Field-reported 2026-06-05: tablet
+        # said WAN-302, phone said WAN-17 for the same SHA on the
+        # same project because phone had an orphan
+        # ``refs/remotes/origin/main`` from a previous LAN clone.
+        # Read URL first; empty URL = case (b) regardless of
+        # what tracking refs are lying around.
+        url_str = ''
         try:
-            remote_sha = repo.refs[remote_ref]
-        except KeyError:
-            # No tracking ref. Two possibilities:
-            #   (a) origin configured + url set, but no push yet
-            #       → stick with "OK on uncertainty"; return 0.
-            #   (b) no origin remote at all (LAN-only project)
-            #       → count every commit reachable from HEAD;
-            #         each IS unpublished by definition.
-            # Treat empty URL value as case (b): older dulwich's
-            # ``strip_lan_origin_if_present`` fallback leaves the
-            # ``[remote "origin"]`` section with ``url = ``
-            # (empty string) when ``config.remove_section`` raises.
-            # An empty URL is semantically the same as no URL —
-            # there's nowhere to push to. Pre-0.46.8 we treated
-            # this as (a), masking the LAN-only walk and producing
-            # the asymmetric badge the field surfaced 2026-05-26.
-            url_str = ''
+            url = repo.get_config().get(
+                (b'remote', b'origin'), b'url')
             try:
-                url = repo.get_config().get(
-                    (b'remote', b'origin'), b'url')
-                try:
-                    url_str = url.decode('utf-8', 'replace').strip()
-                except Exception:
-                    url_str = ''
-            except KeyError:
+                url_str = url.decode('utf-8', 'replace').strip()
+            except Exception:
                 url_str = ''
-            if url_str:
-                # Case (a): origin actually configured.
-                _walk_count_log(repo, 'wan-unshared',
-                    f'branch={branch!r} local={local_sha[:12]!r}: '
-                    f'no tracking ref + origin URL configured '
-                    f'({url_str[:48]}…) → 0 (OK-on-uncertainty)')
-                return 0
-            # Case (b): no origin (or empty URL = "half-stripped",
-            # treat the same). Count from HEAD.
+        except KeyError:
+            url_str = ''
+        if not url_str:
+            # Case (b): no origin URL (or empty URL = "half-
+            # stripped", treat the same). Count from HEAD. Any
+            # ``refs/remotes/origin/*`` refs present are orphans
+            # of a previously-configured origin and must be
+            # ignored — see ``strip_lan_origin_if_present`` for
+            # the cleanup that prevents future accumulation.
             try:
                 walker = repo.get_walker(include=[local_sha])
                 n = sum(1 for _ in walker)
                 _walk_count_log(repo, 'wan-unshared',
                     f'branch={branch!r} '
                     f'local={local_sha[:12]!r}: '
-                    f'no tracking ref + no origin URL '
-                    f'(LAN-only) → walk-from-HEAD = {n}')
+                    f'no origin URL (LAN-only) → '
+                    f'walk-from-HEAD = {n}')
+                return n
+            except Exception as ex:
+                _walk_count_log(repo, 'wan-unshared',
+                    f'branch={branch!r} '
+                    f'local={local_sha[:12]!r}: '
+                    f'walk-from-HEAD raised {ex!r} → 0')
+                return 0
+        # Origin URL exists — tracking ref is meaningful when present.
+        try:
+            remote_sha = repo.refs[remote_ref]
+        except KeyError:
+            # Case (a): origin configured but no tracking ref. Two
+            # ways this happens, both load-bearing: never-fetched
+            # (transient, self-corrects on first success) OR every
+            # fetch always fails (404, auth missing — e.g. github
+            # app on wrong account; entire history at risk via
+            # github). Pre-0.52.3 collapsed both to 0
+            # (OK-on-uncertainty), masking the always-failing case
+            # as "OK +N" on the picker. Walk from HEAD instead —
+            # the count is the honest "not known to be on github"
+            # answer, and the transient case self-heals on the first
+            # successful fetch (tracking ref appears, next call
+            # falls through to the walk-excluding-tracking branch).
+            try:
+                walker = repo.get_walker(include=[local_sha])
+                n = sum(1 for _ in walker)
+                _walk_count_log(repo, 'wan-unshared',
+                    f'branch={branch!r} '
+                    f'local={local_sha[:12]!r}: '
+                    f'origin URL configured ({url_str[:48]}…) + '
+                    f'no tracking ref (never-fetched or '
+                    f'fetch-always-failed) → '
+                    f'walk-from-HEAD = {n}')
                 return n
             except Exception as ex:
                 _walk_count_log(repo, 'wan-unshared',
@@ -1738,7 +2218,8 @@ def _at_risk(repo, branch, langcode):
 
 
 def init_repo(project_dir, remote_url, username, token,
-              branch='main', contributor_name=''):
+              branch='main', contributor_name='',
+              rollback_origin_on_create_fail=True):
     """Initialize a git repo, commit everything, set remote, push.
     Returns a Result.
 
@@ -1748,20 +2229,77 @@ def init_repo(project_dir, remote_url, username, token,
     endpoints refuse the call upstream when contributor is unset
     (``S.CONTRIBUTOR_UNSET``); the default here is empty for
     test convenience but production callers always pass a real
-    name."""
+    name.
+
+    *rollback_origin_on_create_fail* (default True): when
+    ``_ensure_remote_repo`` fails, strip
+    ``[remote "origin"]`` from ``.git/config`` so the picker's
+    publish-row gate sees no remote and shows the Publish button
+    for a manual retry. The picker-initiated path keeps this on
+    (the user clicking Publish wants the button to come back if
+    the attempt fails). The auto-retry path
+    (``reconcile_publish_state_on_startup``) passes ``False`` so
+    a transient offline / outage / missing-creds situation at
+    boot doesn't expose a phantom Publish button on a project
+    the user already committed to. State changes only on a
+    successful ``PUSHED``; otherwise the working tree is left
+    exactly as the user last saw it, and the next daemon
+    startup retries silently. See ``docs/Publish_errors.md`` for
+    the rationale."""
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _init_repo_locked(project_dir, remote_url, username,
-                                     token, branch, contributor_name)
+            return _init_repo_locked(
+                project_dir, remote_url, username, token,
+                branch, contributor_name,
+                rollback_origin_on_create_fail=rollback_origin_on_create_fail)
     except LockTimeout:
+        print(f'[publish] init_repo BUSY: project_lock timeout on '
+              f'{project_dir!r} — another writer (sync drain, lan '
+              f'merge) holds the lock; peer will see BUSY result',
+              file=sys.stderr, flush=True)
         return _busy_result(project_dir)
 
 
+def _strip_origin_section(repo, project_dir):
+    """Remove ``[remote "origin"]`` from ``<project_dir>/.git/config``
+    on a publish that aborted before push. Caller holds
+    ``project_lock``. Idempotent — no-op when there's no origin.
+
+    Mirror of the post-failure rollback in ``_init_repo_locked``:
+    keeps the picker's ``_refresh_publish_row`` gate honest by
+    reverting the local-side mutation that happens just before
+    the failing ``_ensure_remote_repo`` call. See 0.50.52."""
+    config = repo.get_config()
+    try:
+        config.get((b'remote', b'origin'), b'url')
+    except KeyError:
+        return
+    try:
+        config.remove_section((b'remote', b'origin'))
+    except (KeyError, AttributeError):
+        # Older dulwich: no remove_section. Clearing the URL is
+        # enough for the picker gate, which reads the URL value.
+        try:
+            config.set((b'remote', b'origin'), b'url', b'')
+        except Exception:
+            return
+    config.write_to_path()
+    print(f'[publish] stripped .git/config [remote "origin"] '
+          f'from {project_dir!r}',
+          file=sys.stderr, flush=True)
+
+
 def _init_repo_locked(project_dir, remote_url, username, token,
-                      branch, contributor_name):
+                      branch, contributor_name,
+                      rollback_origin_on_create_fail=True):
     from dulwich import porcelain
     result = Result()
+
+    print(f'[publish] init_repo begin dir={project_dir!r} '
+          f'remote={remote_url!r} branch={branch!r} '
+          f'username={username!r}',
+          file=sys.stderr, flush=True)
 
     repo = _get_repo(project_dir)
     if repo is None:
@@ -1779,19 +2317,33 @@ def _init_repo_locked(project_dir, remote_url, username, token,
         result.add(S.GITIGNORE_CREATED)
 
     _stage_all(repo, project_dir)
-    author = _default_author(contributor_name)
-    committer = _app_committer()
-    try:
-        sha = porcelain.commit(
-            repo,
-            message=_enc(f'Initial commit by {contributor_name}'),
-            author=author, committer=committer,
-        )
-        sha_str = sha[:8].decode() if isinstance(sha, bytes) else str(sha)[:8]
-        result.add(S.COMMITTED, sha=sha_str)
-        _clear_commit_failure_count(project_dir)
-    except Exception as exc:
-        _surface_commit_failure(result, project_dir, exc)
+    # Mirror ``_commit_step_locked``'s has_staged guard so re-clicking
+    # Publish on a quiescent project (everything already committed
+    # via the normal commit flow) doesn't trip ``porcelain.commit``'s
+    # "nothing to commit" exception, route through
+    # ``_surface_commit_failure``, and falsely bump the persistent
+    # ``commit_failure_count`` (eventually surfacing a misleading
+    # ``COMMIT_REPEATEDLY_FAILED`` data-loss-class toast). Publish
+    # has to be safely re-runnable for the user-clicks-again retry
+    # path to work — see 0.50.52 rationale.
+    st = porcelain.status(repo)
+    has_staged = any(st.staged.get(k) for k in ('add', 'modify', 'delete'))
+    if has_staged:
+        author = _default_author(contributor_name)
+        committer = _app_committer()
+        try:
+            sha = porcelain.commit(
+                repo,
+                message=_enc(f'Initial commit by {contributor_name}'),
+                author=author, committer=committer,
+            )
+            sha_str = sha[:8].decode() if isinstance(sha, bytes) else str(sha)[:8]
+            result.add(S.COMMITTED, sha=sha_str)
+            _clear_commit_failure_count(project_dir)
+        except Exception as exc:
+            _surface_commit_failure(result, project_dir, exc)
+    else:
+        result.add(S.NOTHING_TO_COMMIT)
 
     try:
         existing = repo.get_config().get((b'remote', b'origin'), b'url').decode()
@@ -1820,6 +2372,43 @@ def _init_repo_locked(project_dir, remote_url, username, token,
     if create_status is not None:
         result.statuses.append(create_status)
     if not ok:
+        # Rollback: the github-side create failed, so we have no
+        # remote — but ``.git/config`` got an ``[remote "origin"]``
+        # section pointing at a non-existent URL. Leave it in place
+        # and ``project_status.remote_url`` reads non-empty, the
+        # picker's ``_refresh_publish_row`` gate hides Publish, and
+        # the user can't retry. Strip the section so the next
+        # picker poll sees no remote and shows Publish again. The
+        # registry mirror is cleared by ``_h_init_project`` on the
+        # same REMOTE_CREATE_FAILED signal. Only on hard create
+        # failure — on OWNER_MISMATCH (bet on collaborator access)
+        # or push failure (remote exists, scheduler drain will
+        # retry) we keep the URL.
+        #
+        # Auto-retry mode (``rollback_origin_on_create_fail=False``,
+        # set by ``reconcile_publish_state_on_startup``) skips the
+        # strip. The rationale: an offline / outage / missing-creds
+        # boot would otherwise expose a phantom Publish button on a
+        # project the user already committed to. Leaving the
+        # working tree unchanged means the next daemon startup
+        # retries the publish silently; only a successful PUSHED
+        # transitions the project out of the mismatch state.
+        if rollback_origin_on_create_fail:
+            try:
+                _strip_origin_section(repo, project_dir)
+            except Exception as ex:
+                print(f'[publish] origin-strip after create-fail '
+                      f'raised {ex!r}',
+                      file=sys.stderr, flush=True)
+            print(f'[publish] init_repo aborting before push: '
+                  f'codes={result.codes()}; stripped .git/config '
+                  f'origin for retry',
+                  file=sys.stderr, flush=True)
+        else:
+            print(f'[publish] init_repo aborting before push: '
+                  f'codes={result.codes()}; .git/config origin '
+                  f'preserved (auto-retry mode)',
+                  file=sys.stderr, flush=True)
         return result
 
     try:
@@ -1830,8 +2419,12 @@ def _init_repo_locked(project_dir, remote_url, username, token,
         )
         result.add(S.PUSHED, url=remote_url, branch=branch)
     except Exception as exc:
+        print(f'[publish] push to {remote_url!r} failed: {exc!r}',
+              file=sys.stderr, flush=True)
         _add_push_failure(result, exc)
 
+    print(f'[publish] init_repo done: codes={result.codes()}',
+          file=sys.stderr, flush=True)
     return result
 
 
@@ -2531,16 +3124,30 @@ def _commit_step_locked(repo, project_dir, contributor_name, result):
                     _notify.notify_project_changed(langcode)
             except Exception:
                 pass
-            # Data-quality flag: oversize files in the just-made
-            # commit. Recorder is for word-list elicitation; multi-MB
-            # files probably mean someone recorded a phrase/text by
-            # mistake. Trace + typed status. Doesn't block the commit
-            # (file's already in history) — just surfaces for review.
+            # Data-quality flag: oversize **audio** files in the
+            # just-made commit. Recorder is for word-list elicitation;
+            # multi-MB audio files probably mean someone recorded a
+            # phrase/text by mistake. Trace + typed status. Doesn't
+            # block the commit (file's already in history) — just
+            # surfaces for review.
+            #
+            # Restricted to ``audio/`` (0.50.63) because CAWL ships
+            # photographic images in the 1–2 MB range that match the
+            # audio threshold but are legitimate content, not user
+            # error. Pre-0.50.63 the check fired on any large file in
+            # the commit and surfaced ``LARGE_AUDIO_FILE_DETECTED`` for
+            # normal CAWL images — misleading and noisy. The image
+            # case has no analogous user-error mode worth flagging
+            # (peers consume CAWL, don't create it), so there's no
+            # corresponding image check; we just gate this one to
+            # audio.
             threshold = _settings.large_audio_byte_threshold()
             large = _check_large_files_in_commit(repo, sha, threshold)
             for path, size in large:
+                if not path.startswith('audio/'):
+                    continue
                 sha_str = _sha_str(sha)[:8]
-                print(f'[data-quality] large file in commit '
+                print(f'[data-quality] large audio in commit '
                       f'{sha_str}: {path!r} '
                       f'({size:,} bytes; threshold {threshold:,})',
                       file=sys.stderr, flush=True)
@@ -3097,6 +3704,338 @@ def _maybe_run_janitor(
         repo, project_dir, username, token, remote_url, branch)
 
 
+_PRESEED_REF_PREFIX = 'azt-blob-seed-'
+_PRESEED_TRACK_PREFIX = b'refs/remotes/origin/' + _PRESEED_REF_PREFIX.encode()
+_PRESEED_OVERHEAD_PER_BLOB = 64  # tree entry + pack obj overhead
+_PRESEED_OVERHEAD_PER_COMMIT = 300  # commit obj + empty tree skeleton
+_PRESEED_FILL_RATIO = 0.7  # conservative — leaves headroom for compression variance
+
+
+def _enumerate_new_blobs(repo, chunk_base_sha, target_sha):
+    """Return list of ``(sha, size)`` for every blob reachable from
+    *target_sha* but not from *chunk_base_sha* OR from any local
+    ``refs/remotes/origin/azt-blob-seed-*`` tracking ref (our prior
+    pre-seed runs that already landed on the server).
+
+    Mirrors ``_estimate_delta_size``'s reachability walk but
+    filters to blob objects only — those dominate the pack on
+    audio-heavy commits, and they're the objects pre-seeding can
+    relocate to side refs.
+    """
+    if not target_sha:
+        return []
+    try:
+        from dulwich.object_store import MissingObjectFinder
+        haves = []
+        if chunk_base_sha:
+            haves.append(chunk_base_sha)
+        for ref in list(repo.refs.allkeys()):
+            if ref.startswith(_PRESEED_TRACK_PREFIX):
+                try:
+                    haves.append(repo.refs[ref])
+                except Exception:
+                    continue
+        finder = MissingObjectFinder(
+            repo.object_store,
+            haves=haves,
+            wants=[target_sha],
+        )
+        out = []
+        for sha, _hint in finder:
+            try:
+                obj = repo.object_store[sha]
+                if obj.type_name == b'blob':
+                    out.append((sha, obj.raw_length()))
+            except Exception:
+                continue
+        return out
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] preseed: blob enumeration failed: {exc!r}')
+        return []
+
+
+def _preseed_oversize_blobs(
+    repo, chunk_base_sha, target_sha, remote_url,
+    username, token, budget_bytes,
+):
+    """Pre-seed blobs reachable from *target_sha* (but not from
+    *chunk_base_sha* or any prior side ref) onto the server via
+    synthetic-commit side refs at
+    ``refs/heads/azt-blob-seed-<synthetic-sha-16>``. After this
+    returns ``(True, None)`` the subsequent push of *target_sha*
+    needs only commit + tree in the pack — the server already has
+    every blob the commit references, and the pack-builder
+    deduplicates against the side-ref tracking refs we just
+    updated locally.
+
+    Batched: greedy-fills batches until the estimated pack size
+    approaches ``budget_bytes * _PRESEED_FILL_RATIO``. Each batch
+    is one synthetic commit + one synthetic tree + the batch's
+    blobs in one push.
+
+    Deterministic: blobs are sorted by SHA before batching, and
+    the synthetic commit's author / timestamp / message are
+    fixed. A re-run after partial completion (daemon respawn,
+    network drop mid-batch) computes the same batches → same
+    synthetic-commit SHAs → same side-ref names → idempotent
+    against github (pushing a ref the server already has at the
+    same SHA is a zero-byte no-op).
+
+    Returns ``(success: bool, status: Status | None)``:
+
+    - ``(True, None)``: all blobs are on the server. Caller
+      should retry the original chunk-push (pack will now be
+      tiny).
+    - ``(False, Status(BLOB_EXCEEDS_BUDGET, …))``: a single blob
+      is larger than *budget_bytes*. Terminal — no batching can
+      reach it. Surface upward.
+    - ``(False, Status(AUTH_REQUIRED) | 403-diagnosis)``:
+      authentication failed. Terminal.
+    - ``(False, None)``: transient network failure on a batch
+      push. Caller falls through to the existing
+      ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` bail; next drain's
+      topic-push re-enters pre-seeding and the deterministic
+      batching + side-ref tracking ensure already-landed batches
+      are skipped.
+    """
+    from dulwich import porcelain
+    from dulwich.objects import Tree, Commit
+
+    blobs = _enumerate_new_blobs(repo, chunk_base_sha, target_sha)
+    if not blobs:
+        lift_merge.trace(
+            '[sync-trace] preseed: nothing to seed '
+            '(all referenced blobs already reachable from server refs)')
+        return True, None
+
+    # Determinism: sort by SHA so batching shape is identical
+    # across runs.
+    blobs.sort(key=lambda t: t[0])
+
+    # Refuse early on any single blob > budget. Without this we'd
+    # still terminate (the 1-blob batch would push, succeed under
+    # github's compression, or fail), but surfacing the specific
+    # offending blob up front is more diagnosable than waiting
+    # for the batch to fail.
+    for sha, size in blobs:
+        per_blob_floor = (
+            size + _PRESEED_OVERHEAD_PER_BLOB +
+            _PRESEED_OVERHEAD_PER_COMMIT)
+        if budget_bytes > 0 and per_blob_floor > budget_bytes:
+            sha_str = sha.decode() if isinstance(sha, bytes) else str(sha)
+            lift_merge.trace(
+                f'[sync-trace] preseed: blob {sha_str[:12]} is '
+                f'{size:,} bytes; alone exceeds budget '
+                f'{budget_bytes:,}')
+            return False, Status(
+                S.BLOB_EXCEEDS_BUDGET,
+                {'blob_sha': sha_str[:12],
+                 'blob_bytes': size,
+                 'budget_bytes': budget_bytes},
+            )
+
+    # Greedy-fill batches up to a conservative fraction of budget
+    # so post-compression variance doesn't push any batch over the
+    # wire-receive timeout window.
+    fill_target = max(
+        int(budget_bytes * _PRESEED_FILL_RATIO),
+        _PRESEED_OVERHEAD_PER_COMMIT + 1024)
+    batches = []
+    cur = []
+    cur_bytes = _PRESEED_OVERHEAD_PER_COMMIT
+    for sha, size in blobs:
+        item_bytes = size + _PRESEED_OVERHEAD_PER_BLOB
+        if cur and (cur_bytes + item_bytes) > fill_target:
+            batches.append(cur)
+            cur = []
+            cur_bytes = _PRESEED_OVERHEAD_PER_COMMIT
+        cur.append(sha)
+        cur_bytes += item_bytes
+    if cur:
+        batches.append(cur)
+
+    total_bytes = sum(s for _, s in blobs)
+    lift_merge.trace(
+        f'[sync-trace] preseed: {len(blobs)} blob(s), '
+        f'{total_bytes:,} bytes → {len(batches)} batch(es) '
+        f'(budget={budget_bytes:,}, fill_target={fill_target:,})')
+
+    TEMP_REF = b'refs/azt-collab/preseed_temp'
+
+    def _cleanup_temp_ref():
+        try:
+            del repo.refs[TEMP_REF]
+        except KeyError:
+            pass
+
+    for batch_i, batch in enumerate(batches):
+        # Synthesise tree: filename = blob SHA (deterministic,
+        # collision-free).
+        tree = Tree()
+        for sha in batch:
+            tree.add(sha, 0o100644, sha)
+        repo.object_store.add_object(tree)
+
+        # Synthesise commit: fixed author / timestamp so re-running
+        # produces the same commit SHA → same side-ref name.
+        commit = Commit()
+        commit.tree = tree.id
+        commit.parents = []
+        commit.author = b'AZT blob-seed <noreply@aztcollab.invalid>'
+        commit.committer = commit.author
+        commit.author_time = 0
+        commit.commit_time = 0
+        commit.author_timezone = 0
+        commit.commit_timezone = 0
+        commit.encoding = b'UTF-8'
+        commit.message = b'azt-collab pre-seed'
+        repo.object_store.add_object(commit)
+
+        # 16 hex chars from the synthetic commit SHA gives 2**64
+        # name space — collision-free at any plausible scale and
+        # keeps the github branch list tidy.
+        suffix = _PRESEED_REF_PREFIX.encode() + commit.id[:16]
+        server_ref = b'refs/heads/' + suffix
+        tracking_ref = b'refs/remotes/origin/' + suffix
+
+        _cleanup_temp_ref()
+        repo.refs[TEMP_REF] = commit.id
+        refspec = TEMP_REF + b':' + server_ref
+
+        batch_blob_bytes = sum(
+            repo.object_store[sha].raw_length() for sha in batch)
+        lift_merge.trace(
+            f'[sync-trace] preseed batch {batch_i + 1}/'
+            f'{len(batches)}: {len(batch)} blob(s) '
+            f'~{batch_blob_bytes + _PRESEED_OVERHEAD_PER_COMMIT + len(batch) * _PRESEED_OVERHEAD_PER_BLOB:,} bytes '
+            f'→ {commit.id[:8].decode()}')
+
+        try:
+            with _socket_timeout(_PUSH_TIMEOUT_S):
+                porcelain.push(
+                    repo, remote_url, refspec,
+                    username=username, password=token,
+                    errstream=io.BytesIO(),
+                )
+            try:
+                repo.refs[tracking_ref] = commit.id
+            except Exception as ex:
+                lift_merge.trace(
+                    f'[sync-trace] preseed: tracking ref update '
+                    f'failed (non-fatal): {ex!r}')
+        except Exception as exc:
+            _cleanup_temp_ref()
+            lift_merge.trace(
+                f'[sync-trace] preseed batch {batch_i + 1} push '
+                f'failed: {exc!r}')
+            if _is_http_403(exc):
+                return False, diagnose_403(token, remote_url)
+            if _is_http_401(exc):
+                return False, Status(S.AUTH_REQUIRED)
+            return False, None
+
+    _cleanup_temp_ref()
+    lift_merge.trace(
+        f'[sync-trace] preseed: all {len(batches)} batch(es) landed; '
+        f'ready to retry main push')
+    return True, None
+
+
+def _sweep_orphan_preseed_refs(
+    repo, remote_url, username, token, branch,
+):
+    """Delete ``refs/heads/azt-blob-seed-*`` on the server when
+    every blob the side ref references is also reachable from
+    ``refs/remotes/origin/<branch>`` (i.e., main caught up and the
+    side ref is now garbage).
+
+    Lazy crash-tolerant cleanup model: each topic-push call sweeps
+    orphans from prior runs before doing anything else. If a prior
+    Phase A pre-seeded blobs and Phase C succeeded, the side refs
+    are orphaned on the server until this sweep — but they're
+    harmless until then, and this scheme survives daemon kills
+    between Phase C and any eager-cleanup attempt.
+
+    Conservative: a side ref whose blobs are NOT all in main's
+    tree is kept (it's still useful as a "have" for the current
+    Phase A's pre-seed enumeration). Best-effort: any delete that
+    raises is logged and the next sweep retries.
+    """
+    from dulwich import porcelain
+    from dulwich.object_store import iter_tree_contents
+
+    candidates = [
+        r for r in list(repo.refs.allkeys())
+        if r.startswith(_PRESEED_TRACK_PREFIX)
+    ]
+    if not candidates:
+        return
+
+    main_ref = _enc(f'refs/remotes/origin/{branch}')
+    try:
+        main_sha = repo.refs[main_ref]
+        main_tree = repo.object_store[main_sha].tree
+        # We rely on the AZT invariant that audio blobs are
+        # additive (never deleted from history) — every blob in
+        # main's HEAD tree IS reachable from main, so the HEAD
+        # tree walk is a sufficient proof of reachability without
+        # walking every ancestor commit.
+        main_blobs = set()
+        for entry in iter_tree_contents(
+                repo.object_store, main_tree):
+            main_blobs.add(entry.sha)
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: collect main blobs '
+            f'failed (skipping sweep): {exc!r}')
+        return
+
+    deletable = []
+    for tracking_ref in candidates:
+        try:
+            side_commit_sha = repo.refs[tracking_ref]
+            side_commit = repo.object_store[side_commit_sha]
+            side_tree = side_commit.tree
+            all_in_main = True
+            for entry in iter_tree_contents(
+                    repo.object_store, side_tree):
+                if entry.sha not in main_blobs:
+                    all_in_main = False
+                    break
+            if all_in_main:
+                deletable.append(tracking_ref)
+        except Exception:
+            continue
+
+    if not deletable:
+        return
+
+    lift_merge.trace(
+        f'[sync-trace] preseed-sweep: {len(deletable)}/'
+        f'{len(candidates)} side ref(s) orphaned by main; deleting')
+    for tracking_ref in deletable:
+        suffix = tracking_ref[len(b'refs/remotes/origin/'):]
+        server_ref = b'refs/heads/' + suffix
+        refspec = b':' + server_ref
+        try:
+            with _socket_timeout(_PUSH_TIMEOUT_S):
+                porcelain.push(
+                    repo, remote_url, refspec,
+                    username=username, password=token,
+                    errstream=io.BytesIO(),
+                )
+            try:
+                del repo.refs[tracking_ref]
+            except Exception:
+                pass
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] preseed-sweep: delete '
+                f'{tracking_ref!r} failed (non-fatal, will retry '
+                f'next sweep): {exc!r}')
+
+
 def _topic_branch_name(langcode, device_name):
     """Return the topic-branch ref name (without ``refs/heads/`` prefix)
     for chunked uploads from this device of this project. Format:
@@ -3156,6 +4095,13 @@ def _push_chunked_to_ref(
             del repo.refs[TEMP_REF]
         except KeyError:
             pass
+
+    # 0. Lazy sweep of orphaned side refs from prior runs. Per the
+    # crash-tolerance model (see ``_sweep_orphan_preseed_refs``),
+    # every topic-push call cleans up first. Cheap when nothing's
+    # orphaned; bounded delete work when something is.
+    _sweep_orphan_preseed_refs(
+        repo, remote_url, username, token, branch_for_main)
 
     # 1. Probe server-side state via the local mirror that ``fetch``
     # populated earlier in ``_push_step_locked``. ``KeyError`` means
@@ -3221,6 +4167,12 @@ def _push_chunked_to_ref(
     # be a network blip; second is a pattern. (The size-based gate
     # bails on the first failure when bytes > budget — see below.)
     chunk_n_1_failures = 0
+    # One pre-seed attempt per topic-push call. If pre-seed runs
+    # and the subsequent chunk_n=1 push still fails (size or
+    # network), bail rather than loop — the next drain re-enters
+    # this function and the deterministic-batch / side-ref-aware
+    # enumeration in pre-seed picks up where we left off.
+    preseed_attempted = False
     backoff_s = 1.0
     initial_n = _settings.topic_branch_chunk_size()
     working_n = None
@@ -3326,6 +4278,50 @@ def _push_chunked_to_ref(
                 chunk_n == 1 and budget > 0 and raw_bytes > budget)
             exhausted = (chunk_n == 1 and chunk_n_1_failures >= 2)
             if oversize or exhausted:
+                # Before bailing, try pre-seeding the commit's
+                # blobs onto the server via side refs. Once
+                # they're there, the chunk_n=1 push's pack
+                # contains only commit + tree (KB, not MB) and
+                # should fit any network window. Only one attempt
+                # per topic-push call — if the post-pre-seed push
+                # still fails, fall through to bail and let the
+                # next drain re-enter (deterministic batching
+                # makes that idempotent).
+                if not preseed_attempted:
+                    preseed_attempted = True
+                    lift_merge.trace(
+                        f'[sync-trace] topic-push: chunk_n=1 bail '
+                        f'imminent ({"oversize" if oversize else "exhausted"}); '
+                        f'attempting blob pre-seed before surfacing failure')
+                    seed_ok, seed_status = _preseed_oversize_blobs(
+                        repo, chunk_base, intermediate,
+                        remote_url, username, token, budget,
+                    )
+                    if seed_ok:
+                        lift_merge.trace(
+                            '[sync-trace] topic-push: pre-seed '
+                            'complete; retrying chunk_n=1 push '
+                            '(pack should now be tiny — blobs on server)')
+                        # Don't increment consecutive_failures or
+                        # chunk_n_1_failures here — pre-seed was
+                        # extra work, not a failed push attempt
+                        # at this chunk size. Reset chunk_n_1_failures
+                        # so the retry has both bail-counters reset.
+                        chunk_n_1_failures = 0
+                        backoff_s = 1.0
+                        continue
+                    if seed_status is not None:
+                        _cleanup_temp_ref()
+                        lift_merge.trace(
+                            f'[sync-trace] topic-push: pre-seed '
+                            f'surfaced terminal status '
+                            f'{seed_status.code!r}; bailing')
+                        return False, seed_status, chunk_base
+                    lift_merge.trace(
+                        '[sync-trace] topic-push: pre-seed had '
+                        'transient failure; falling through to '
+                        'bail (next drain will retry)')
+
                 _cleanup_temp_ref()
                 reason = 'oversize' if oversize else 'exhausted'
                 lift_merge.trace(
@@ -3856,6 +4852,18 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                         S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET:
                     result.add(S.PUSH_FAILED,
                                error='single-commit pack exceeds '
+                                     'per-attempt budget')
+                elif conflict_status.code == \
+                        S.BLOB_EXCEEDS_BUDGET:
+                    # Pre-seeding bottomed out: one blob alone is
+                    # bigger than the budget. Same PUSH_FAILED
+                    # routing as the commit-pack case so existing
+                    # peer code paths handle it uniformly; the
+                    # specific blob_sha / blob_bytes are in the
+                    # accompanying BLOB_EXCEEDS_BUDGET status's
+                    # params for the UI to render.
+                    result.add(S.PUSH_FAILED,
+                               error='single blob exceeds '
                                      'per-attempt budget')
                 return result
             else:

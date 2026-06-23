@@ -193,15 +193,43 @@ _KV_TEMPLATE = '''
                         size_hint_y: None
                         height: self.minimum_height
                         spacing: dp(6)
-            Label:
-                text: app.version_string
-                font_size: sp(13)
-                font_name: FONT
-                color: T.TEXT_DIM
+            BoxLayout:
+                orientation: 'vertical'
                 size_hint_y: None
-                height: dp(22)
-                halign: 'center'
-                text_size: self.size
+                height: dp(56)
+                spacing: dp(2)
+                Label:
+                    text: app.version_string
+                    font_size: sp(13)
+                    font_name: FONT
+                    color: T.TEXT_DIM
+                    size_hint_y: None
+                    height: dp(22)
+                    halign: 'center'
+                    text_size: self.size
+                Button:
+                    # Diagnostic affordance. Always visible — the
+                    # user we're targeting here is the one stuck on
+                    # an empty picker who can't reach the gear-→
+                    # settings → Share-daemon-log path (recorder
+                    # picker's gear navigates to the recorder's own
+                    # settings, which doesn't host that button; the
+                    # server-APK picker's gear does but only if the
+                    # daemon-log-to-file toggle is already on). This
+                    # button ships a daemon-built registry/filesystem
+                    # snapshot every time, plus the log file when
+                    # it exists.
+                    id: share_diag_btn
+                    text: _('Share diagnostics')
+                    size_hint_y: None
+                    height: dp(28)
+                    font_size: sp(12)
+                    font_name: FONT
+                    background_normal: ''
+                    background_down: ''
+                    background_color: T.TRANSPARENT
+                    color: T.TEXT_DIM
+                    on_release: root.share_diagnostics()
 '''
 
 
@@ -400,6 +428,38 @@ class ProjectPickerScreen(Screen):
                   flush=True)
             btn.bind(on_release=_on_release)
             box.add_widget(btn)
+
+    def share_diagnostics(self):
+        """Picker affordance for the canonical share-diagnostics
+        action. Always visible — the user we're targeting here is
+        one who can't navigate past the picker, so we can't gate
+        the affordance on selecting a project.
+
+        The bundle composition + share dispatch lives in
+        ``azt_collab_client.ui.share.share_diagnostics_action``
+        so this surface and the daemon-settings ``Share
+        diagnostics`` button are guaranteed to ship the same
+        payload."""
+        from .share import share_diagnostics_action
+        from ..translate import tr as _tr
+        share_diagnostics_action(
+            on_error=lambda msg: self._show_popup(
+                _tr('Diagnostics'), msg))
+
+    def _show_popup(self, title, msg):
+        """Minimal popup for share-diagnostics error feedback. The
+        picker doesn't have a shared error modal (popups.py is the
+        normal channel but expects a host-app reference); keeping
+        this inline avoids a host-app dependency for what is
+        essentially a one-shot error toast."""
+        from kivy.uix.popup import Popup
+        from kivy.uix.label import Label
+        p = Popup(title=title,
+                  content=Label(text=msg or '', halign='center',
+                                valign='middle'),
+                  size_hint=(0.8, 0.4))
+        p.open()
+        return p
 
     def receive_from_phone(self):
         """Open the pending-offers popup with an ``on_done`` that

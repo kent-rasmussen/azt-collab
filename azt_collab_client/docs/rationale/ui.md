@@ -60,42 +60,98 @@ because the helper doesn't know the caller's payload semantics
 (truncate head? tail? sample?). The daemon-log producer
 truncates at source (`_h_get_daemon_log`).
 
-## Diagnostic-log capture — `daemon_log_to_file`
+## Diagnostic-log capture — always-on, per-day, retained
 
 The daemon's stderr goes to logcat by default. Logcat is
 fine for local development but useless when a remote tester
-reproduces a bug on a device the developer doesn't have
-adb access to — the diagnostic output is lost.
+reproduces a bug on a device the developer doesn't have adb
+access to — the diagnostic output is lost.
 
-`set_daemon_log_to_file(True)` (POST
-`/v1/logging/daemon_log_to_file`) flips a config toggle AND
-installs a `sys.stderr` tee in the running daemon process.
-Stderr now goes to BOTH logcat AND
-`$AZT_HOME/daemon.log`. `get_daemon_log()` (GET
-`/v1/logging/daemon_log`) returns the file contents, the
-current toggle state, and the file path.
+Since 0.52.7, the daemon's `sys.stdout` and `sys.stderr` are
+always teed to a per-day file at `$AZT_HOME/daemon-<tag>-
+YYYY-MM-DD_log.txt` (since 0.52.20; pre-0.52.20 the suffix
+was `.log` — renamed because some text editors don't
+auto-recognise `.log` as text). `_LogSession` (in
+`azt_collabd/server.py`) owns the file handle, rotates lazily
+on the first write past local midnight, and
+`_prune_daemon_log_retention` removes files older than
+`settings.log_retention_days()` (default 3, min 1).
+`get_daemon_log_files()` (GET
+`/v1/logging/daemon_log_files`) returns the entire window in
+one RPC; the picker's `Share diagnostics` ships a single
+zip archive containing the snapshot plus every per-day log
+inside the window (see "Why single-file ACTION_SEND" below).
 
-**Hot-toggle.** The original draft of this feature required a
-daemon restart for the tee to take effect. That's the wrong
-shape when the user just enabled the toggle because they
-want to capture the *next* event — they don't want to also
-restart the daemon and lose the state they were
-investigating. Module-level state
-(`_stderr_tee_installed`, `_stderr_tee_original`,
-`_stderr_tee_file`) holds the swap so the toggle can flip
-either way without restart.
+**Why always-on.** Pre-0.52.7 the daemon had a user-facing
+"Log server activity" toggle. Support asks for the log
+*after* a failure — with a toggle, the diagnostic is gone
+exactly when it would have been useful. Half of all testers
+leave the toggle off; the other half leave it on and
+accumulate single-file logs that grew without bound (field
+log 2026-06-20 caught a 40 MB file spanning weeks). Always-
+on plus retention bounds disk cost AND guarantees the next
+crash is captured.
 
-**Truncation policy.** `open(path, 'w')` truncates on each
-install — one log file per "session" the user opens. Trade:
-shorter capture window vs. file-size growth without bounds.
-Testers typically want "the log around the crash I just had",
-which is the truncate-on-enable shape. If a longer history
-becomes needed, the seam to add periodic rotation is the
-file open in `install_stderr_tee`.
+**Privacy.** The on-disk log lives in the daemon's private
+filesDir on Android (peer apps cannot read it across UIDs).
+The only way for content to leave the device is the explicit
+`Share diagnostics` gesture the user already controls. No
+external exposure without consent.
 
-**Off by default.** No daemon.log is created until the user
-flips the toggle. Most installs never want this — it's a
-diagnostic-only surface, opt-in.
+**Lazy rotation.** A wall-clock timer would fire only if the
+daemon process was awake at midnight. Lazy rotation —
+"check today's date at every write, swap the file if it
+changed" — works regardless of whether the daemon was idle
+across the boundary. Reentrant lock so the post-rotation
+`_dump_lan_debug_snapshot()` (which calls `print` → tee →
+session.write) can re-enter the section without deadlocking.
+
+**Start-of-day anchoring.** Every per-day file opens with
+the `lan_debug` snapshot (registry, HEAD SHAs, tracking refs,
+all per-project state) so a triager reading the bundle top-
+to-bottom has the baseline before the day's events. Fires on
+the first install when the file is empty (fresh-of-day or
+fresh install) and after each midnight rotation.
+
+**Why single-file ACTION_SEND (zip), not
+ACTION_SEND_MULTIPLE.** 0.52.6 through 0.52.17 shipped the
+diagnostic bundle as separate URIs via
+`ACTION_SEND_MULTIPLE` — one per per-day log plus the
+snapshot. Field-tested against Signal in early 0.52.x;
+Signal silently rejected the share. Multiple debugging
+rounds (0.52.10 pre-grants, 0.52.13 ContentProvider
+authority migration, 0.52.14 getType/query Java
+implementations) eliminated every plausible upstream cause
+without fixing the rejection. The actual cause turned out
+to be inside Signal: `ShareRepository.kt` for
+`ACTION_SEND_MULTIPLE` runtime-filters per-URI MIMEs to
+image-or-video only, regardless of what the manifest claims
+to accept. Verbatim, from `main` 2026-06-22:
+
+```kotlin
+.filterValues {
+  MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
+}
+```
+
+`ACTION_SEND` (single attachment) has no such filter — any
+URI goes through to the blob path. So 0.52.19 switched the
+diagnostic bundle to a single zip archive
+(`azt_diagnostics_<stamp>.zip` containing the snapshot +
+per-day logs as separate zip entries) dispatched via
+`ACTION_SEND` with MIME `application/zip`. Files stay
+separate inside the archive, so support triage is
+`unzip && grep` rather than scrolling through a
+concatenated text blob (the 0.52.18 intermediate). APKs
+already travel through Signal this way (single
+`application/*` URI), which is the precedent.
+
+`share_files` retains the multi-item path for peer apps
+that ship image/video bundles — `len(items) > 1` routes to
+`ACTION_SEND_MULTIPLE`. Only the diagnostic-share composer
+downshifts to single + zip. Peer apps doing
+Signal-compatible multi-text shares should pre-zip on their
+side.
 
 ## Self-update — `check_for_update`
 

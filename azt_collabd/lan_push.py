@@ -47,6 +47,49 @@ from .locks import LockTimeout, project_lock
 _consec_failures = {}   # peer_id_hex → int
 _RESTART_DISCOVERY_THRESHOLD = 3
 
+# Per-peer "we just saw this one unreachable" timestamp (monotonic).
+# Set by ``_record_unreachable``; checked by
+# ``_recently_unreachable`` at the top of every push / signalling
+# helper to short-circuit before any urllib3 retry storm. Cleared
+# on observed success. The cooldown window (default 60s) is sized
+# to "skip an entire burst's worth of fan-out / sweep attempts
+# without waiting on retries" — a peer that actually comes back
+# within the window will be re-tried on the next mDNS arrival
+# (which clears the gate by going through ``_record_reachable``).
+#
+# Pre-0.50.49 a paired-but-absent peer cost ~23 seconds per
+# burst (3 urllib3 retries × ~2.3s connect timeout × multiple
+# projects in the sweep). With this gate, the first attempt logs
+# the failure and every subsequent attempt within the cooldown
+# returns False in microseconds.
+_unreachable_at = {}    # peer_id_hex → monotonic timestamp
+_UNREACHABLE_COOLDOWN_S = 60.0
+
+
+def _recently_unreachable(peer_id):
+    """Return True iff ``peer_id`` was observed unreachable within
+    the cooldown window. Caller should short-circuit (return False
+    for push helpers, etc.) when this returns True."""
+    import time as _time
+    ts = _unreachable_at.get(peer_id)
+    if ts is None:
+        return False
+    return (_time.monotonic() - ts) < _UNREACHABLE_COOLDOWN_S
+
+
+def _record_unreachable(peer_id):
+    """Mark *peer_id* as unreachable. Called from the network-
+    error paths in ``_push_to_peer`` / ``_https_post_to_peer``."""
+    import time as _time
+    _unreachable_at[peer_id] = _time.monotonic()
+
+
+def _record_reachable(peer_id):
+    """Clear the unreachable gate for *peer_id*. Called from the
+    successful-contact paths (push 2xx, no-op confirmation,
+    share-offer round-trip)."""
+    _unreachable_at.pop(peer_id, None)
+
 
 def _resolve_endpoint(peer_entry):
     """Endpoint resolution order per the spec: mDNS-cached → static
@@ -121,6 +164,15 @@ def _push_to_peer(project, peer_entry):
     from dulwich import porcelain
     pid = peer_entry.get('peer_id', '')
     expected_fp = peer_entry.get('fp', '')
+    # Fast-fail gate (0.50.49): skip the connect attempt entirely
+    # if this peer was unreachable within the cooldown window.
+    # Saves ~7s per attempt (3 urllib3 retries × 2.3s connect
+    # timeout) when the peer is genuinely absent.
+    if _recently_unreachable(pid):
+        print(f'[lan-push] {pid[:8]!r} recently unreachable; '
+              f'skipping (fast-fail)',
+              file=sys.stderr, flush=True)
+        return False
     endpoint = _resolve_endpoint(peer_entry)
     if endpoint is None:
         print(f'[lan-push] no endpoint for {pid[:8]!r}; skipping',
@@ -201,6 +253,7 @@ def _push_to_peer(project, peer_entry):
         except Exception:
             pass
         _consec_failures.pop(pid, None)  # success: reset counter
+        _record_reachable(pid)  # clear fast-fail gate
         return True
 
     # Pre-flight fast-forward check (since 0.46.4). dulwich's
@@ -301,6 +354,10 @@ def _push_to_peer(project, peer_entry):
                   f'refused / unreachable: {cause} — invalidated '
                   f'mDNS cache for re-resolve',
                   file=sys.stderr, flush=True)
+            # Fast-fail gate (0.50.49): record the observation so
+            # subsequent push / sweep / signalling calls within
+            # the cooldown skip without re-paying the retry storm.
+            _record_unreachable(pid)
             # Track consecutive failures; after the threshold, do
             # what manually toggling LAN off+on would do — restart
             # discovery to clear NsdManager's internal stale-
@@ -494,6 +551,67 @@ def _peer_is_ancestor_of_local(project, peer_sha_hex):
                 pass
     except Exception:
         return False
+
+
+def peek_peer_head(peer_id, langcode):
+    """Public peek-only helper (0.50.50). Resolves *peer_id*'s
+    endpoint, builds a TLS-pinned pool, ls-remotes their main
+    branch on *langcode*. Returns the SHA (hex string) or None.
+
+    Cheaper than ``_push_to_peer`` — no push attempt, no
+    post-flight, just one ls-remote round-trip. Used by the
+    receiver-side ``_refresh_peer_last_seen_after_receive`` flow
+    (0.50.50): after our listener accepts a push, we don't know
+    which paired peer originated it from the smart-protocol
+    metadata alone, so we peek each candidate peer's main and
+    update ``last_seen_main`` for the ones at our new HEAD.
+
+    Honors the fast-fail gate — a recently-unreachable peer
+    returns None without paying connect timeouts. On observed
+    success, also clears the gate."""
+    if not peer_id or not langcode:
+        return None
+    if _recently_unreachable(peer_id):
+        return None
+    entry = _peers.get_peer(peer_id)
+    if entry is None:
+        return None
+    expected_fp = entry.get('fp', '')
+    if not expected_fp:
+        return None
+    endpoint = _resolve_endpoint(entry)
+    if endpoint is None:
+        return None
+    host, port = endpoint
+    try:
+        ctx = _build_ssl_context(expected_fp)
+    except Exception as ex:
+        print(f'[lan-peek] context build failed for '
+              f'{peer_id[:8]!r}: {ex!r}',
+              file=sys.stderr, flush=True)
+        return None
+    try:
+        import urllib3
+        pm = urllib3.PoolManager(
+            ssl_context=ctx,
+            assert_hostname=False,
+            assert_fingerprint=expected_fp,
+            cert_reqs='CERT_NONE',
+        )
+    except Exception as ex:
+        print(f'[lan-peek] pool build failed for '
+              f'{peer_id[:8]!r}: {ex!r}',
+              file=sys.stderr, flush=True)
+        return None
+    url = f'https://{host}:{int(port)}/{langcode}.git'
+    sha = _peek_peer_main(url, pm, peer_id)
+    if sha:
+        _record_reachable(peer_id)
+    else:
+        # ls-remote failure usually means connect failure; record
+        # so subsequent attempts skip via fast-fail.
+        _record_unreachable(peer_id)
+    return sha
 
 
 def _peek_peer_main(url, pm, pid):
@@ -987,6 +1105,12 @@ def _https_post_to_peer(peer_id, path, payload):
     expected_fp = entry.get('fp', '')
     if not expected_fp:
         return 0, b''
+    # Fast-fail gate (0.50.49): same as ``_push_to_peer``. A
+    # signalling POST (share_offer / hello / share_unshared) to a
+    # peer that's currently unreachable would otherwise pay the
+    # 5s connect timeout. Skip when we've seen them down recently.
+    if _recently_unreachable(peer_id):
+        return 0, b''
     endpoint = _resolve_endpoint(entry)
     if endpoint is None:
         print(f'[lan-push] no endpoint for {peer_id[:8]!r}; '
@@ -1024,7 +1148,10 @@ def _https_post_to_peer(peer_id, path, payload):
     except Exception as ex:
         print(f'[lan-push] POST {url} failed: {ex!r}',
               file=sys.stderr, flush=True)
+        _record_unreachable(peer_id)
         return 0, b''
+    if 200 <= resp.status < 300:
+        _record_reachable(peer_id)
     return resp.status, resp.data
 
 

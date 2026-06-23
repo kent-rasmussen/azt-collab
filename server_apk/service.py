@@ -592,21 +592,19 @@ def main():
     import azt_collabd
     _boot_trace('after_import_azt_collabd')
 
-    # Install the daemon-log-to-file tee here on the Android side.
-    # The desktop loopback path covers itself via ``server.run()``
-    # which calls ``maybe_install_stdio_tee`` directly, but on
-    # Android the daemon lives in ``:provider`` and ``server.run()``
-    # never executes — so without this call, the user's persisted
-    # "Save daemon log to file" toggle would only ever take effect
-    # via the runtime POST endpoint (which patches the running
-    # process), and a daemon respawn after an idle-stop would lose
-    # the mirror until the user re-touched the toggle. Calling here
-    # rather than at module load lets us reach
-    # ``azt_collabd.store.get_daemon_log_to_file`` (the import
-    # above just landed) and means subsequent ``_boot_trace`` lines
-    # (``configured``, ``before_install_callbacks``, …) and every
-    # ``[recent]`` / ``[cawl]`` / ``[commit-*]`` print from the
-    # running daemon both land in the on-disk log.
+    # Install the daemon-log-to-file tee on the Android side.
+    # Always-on since 0.52.7 (no user toggle). The desktop
+    # loopback path covers itself via ``server.run()`` which
+    # calls ``maybe_install_stdio_tee`` directly, but on Android
+    # the daemon lives in ``:provider`` and ``server.run()``
+    # never executes — without this call, the per-day log file
+    # would never get written on Android. Calling here (rather
+    # than at module load) lets the previous ``_boot_trace``
+    # banner survive on the parent process's stderr only and
+    # means subsequent ``_boot_trace`` lines (``configured``,
+    # ``before_install_callbacks``, …) plus every
+    # ``[recent]`` / ``[cawl]`` / ``[commit-*]`` print land in
+    # the on-disk log too.
     try:
         from azt_collabd.server import maybe_install_stdio_tee
         maybe_install_stdio_tee()
@@ -637,6 +635,39 @@ def main():
     _boot_trace('before_reconcile')
     scheduler.reconcile_on_startup()
     _boot_trace('after_reconcile')
+
+    # One-shot retroactive auto-fire for the pre-0.50.52 Publish
+    # bug. Walks projects.json, finds the (.git/config has URL +
+    # registry remote_url empty) mismatch, and re-fires the
+    # publish the user already committed to. See
+    # ``azt_collabd/repo.py::reconcile_publish_state_on_startup``
+    # and ``docs/Publish_errors.md`` for the rationale. Wired here
+    # in the Android entry path because the desktop entry point
+    # (``azt_collabd.server.serve``) has its own copy; both daemon
+    # startups need this call. (Missed in 0.50.53–0.50.54 — only
+    # the desktop callsite was added. Field-confirmed via the 1ms
+    # gap between ``after_reconcile`` and ``before_lan_listener``
+    # on Android with no ``[publish-reconcile]`` lines.)
+    try:
+        from azt_collabd import repo as _repo
+        _repo.reconcile_publish_state_on_startup()
+    except Exception as ex:
+        print(f'[service] reconcile_publish_state failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+
+    # Boot-time diagnostic snapshot + orphan-working-dir auto-repair.
+    # Wired here in addition to the desktop ``serve()`` callsite
+    # per ``feedback_dual_entry_path_startup_hooks`` — Android and
+    # desktop are separate daemon startup paths and both need every
+    # boot-time hook.
+    _boot_trace('before_diag_repair')
+    try:
+        from azt_collabd import repo as _repo
+        _repo.diagnose_and_repair_registry_on_startup()
+    except Exception as ex:
+        print(f'[service] diagnose_and_repair_registry failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+    _boot_trace('after_diag_repair')
 
     # Start the connectivity watcher so the push-drain loop runs.
     # Without this, the Android daemon commits locally on every

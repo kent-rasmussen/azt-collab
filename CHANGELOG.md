@@ -9,6 +9,2255 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.52.20 — daemon log filename uses _log.txt suffix for text-editor recognition
+
+Field feedback 2026-06-22: when the support engineer unzips a
+diagnostic share and opens the daemon log files, some text
+editors don't auto-recognise ``.log`` as a text format —
+syntax-highlighting falls back to "plain bytes", some viewers
+refuse to open the file at all. Renaming the suffix to
+``_log.txt`` keeps "log" in the basename (so ``ls`` /
+filename-grep still finds them by the "log" token) while
+making the actual extension ``.txt``, which every text editor
+on every platform recognises.
+
+**Filename pattern change** in
+``azt_collabd/server.py:_daemon_log_path_for``:
+
+Before: ``daemon-<8hex>-YYYY-MM-DD.log``
+After:  ``daemon-<8hex>-YYYY-MM-DD_log.txt``
+
+Both tagged (with peer_id prefix) and untagged
+(bootstrap-fresh) forms get the new suffix.
+
+**Retention regex updated** in
+``_DAEMON_LOG_DATE_RE`` to match BOTH the new ``_log.txt``
+suffix and the legacy ``.log`` suffix:
+
+```python
+re.compile(
+    r'^daemon-(?:[0-9a-f]{8}-)?(\d{4}-\d{2}-\d{2})'
+    r'(?:_log\.txt|\.log)$')
+```
+
+Side effects:
+
+- **Upgrade continuity**: pre-0.52.20 ``.log`` files on disk
+  continue to participate in retention (still get pruned
+  after the retention window, still get included in
+  ``get_daemon_log_files`` / share-bundle responses if
+  they're inside the window) until they naturally age out.
+  No one-shot migration pass required.
+- **Cross-format coexistence**: a device upgraded mid-day
+  will have today's ``.log`` AND today's ``_log.txt`` if the
+  daemon respawned at the version boundary. Retention treats
+  them as separate days only if their date strings differ —
+  same-day files both pass through with their distinct
+  content. Edge case is cosmetic.
+
+**Java provider unchanged.** ``AZTCollabProvider.mimeForPath``
+already maps ``.txt`` → ``text/plain``; the new filenames'
+extension is ``.txt`` so the existing rule applies. No
+``.log`` extension handler needed; the entry is kept for
+files explicitly named with that extension (none in the
+suite today).
+
+Build: daemon Python change only — no Java change, no
+server-APK rebuild required if 0.52.19's Java is already
+installed.
+
+## 0.52.19 — diagnostic share is a zip archive (files stay separate) via ACTION_SEND
+
+Refining 0.52.18's "single combined file" approach. APKs
+travel via Android share intents fine — they're a single
+file of MIME ``application/vnd.android.package-archive``
+that's a zip under the hood. The same shape works for the
+diagnostic bundle: zip up the snapshot + per-day daemon
+logs into one ``application/zip`` and dispatch via
+ACTION_SEND. Files stay separate inside the archive so
+triage is one-grep-per-file, and large text logs compress
+well (~5–10× for typical daemon log content).
+
+**Daemon-side** (``_h_prepare_share_bundle``): replaces the
+0.52.18 text concatenation. Writes a single
+``azt_diagnostics_<stamp>.zip`` to
+``$AZT_HOME/.shares/<token>/`` using ``zipfile.ZipFile`` +
+``ZIP_DEFLATED`` (level 6). Archive contains:
+
+- ``azt_snapshot_<stamp>.txt`` — the diagnostic snapshot.
+- ``daemon-<tag>-YYYY-MM-DD.log`` — one entry per per-day
+  log inside the retention window.
+
+Returns ``{token, items:[{display_name, uri_path}]}`` with a
+single item pointing at the .zip.
+
+**Provider** (``AZTCollabProvider.mimeForPath``): adds
+``.zip`` → ``application/zip``. Other extensions unchanged.
+
+**Client** (``share_diagnostics_action``): now passes
+``mime_type='application/zip'`` to ``share_files``. Signal's
+ACTION_SEND filter advertises ``application/*`` in the
+manifest, which covers ``application/zip``.
+
+**Why ACTION_SEND, not ACTION_SEND_MULTIPLE.** Signal's
+``ShareRepository.kt`` runtime resolver for SEND_MULTIPLE
+hard-filters URIs to image/video MIMEs only — text and
+zip are silently dropped. ACTION_SEND has no such filter.
+Source verbatim-confirmed 2026-06-22:
+
+```kotlin
+.filterValues {
+  MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
+}
+```
+
+The single-vs-multi item routing in ``share_files`` (added
+in 0.52.18) stays — single-item passes through ACTION_SEND,
+multi-item through ACTION_SEND_MULTIPLE. Peer apps that ship
+image/video bundles via SEND_MULTIPLE still get that path;
+only the diagnostic-share composer downshifts to single +
+zip.
+
+**Trade-off vs 0.52.18's concat-text approach.** Concat-
+text was opened inline by the receiver (text viewer); zip
+requires a download + extract step. The win is that files
+stay separate, so the support engineer's first action is
+``unzip && grep`` instead of ``grep <section header>``. For
+long retention windows (3+ days of logs) the zip is also
+materially smaller on the wire.
+
+**Build**: daemon Python change + AZTCollabProvider Java
+change (one extension added). Java change needs server-APK
+rebuild; Python rides incremental install.
+
+## 0.52.18 — diagnostic share is one concatenated file via ACTION_SEND
+
+Field-diagnosed via Signal's source code on 2026-06-22. The
+0.52.13–0.52.17 thrash through URI authority, MIME types,
+ClipData, pre-grants, and Java provider metadata was chasing
+the wrong layer. The actual reason Signal kept rejecting the
+share is in ``ShareRepository.kt``:
+
+```kotlin
+.filterValues {
+  MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
+}
+```
+
+**Signal's ``ACTION_SEND_MULTIPLE`` resolver filters per-URI
+MIME types to images and videos only**, regardless of what
+its manifest's intent-filter advertises (manifest says
+``text/*`` SEND_MULTIPLE is fine, runtime says no). Every
+diagnostic ``.log`` / ``.txt`` URI we ship via SEND_MULTIPLE
+is silently dropped at this filter. Empty list →
+``ResolvedShareData.Failure`` → ``ShareActivity.finish()``.
+No amount of fiddling with our URI authority, MIME hints, or
+ClipData shape can change this — the filter operates on the
+receiver side after our intent is in their process.
+
+Signal's ``ACTION_SEND`` (single attachment) resolver has
+NO such filter; it accepts any URI as a generic file
+attachment. So the fix is:
+
+**Daemon-side**: ``_h_prepare_share_bundle`` now produces a
+single combined ``azt_diagnostics_<stamp>.txt`` file that
+concatenates the snapshot + per-day daemon logs with
+``=== section ===`` headers (same shape the legacy
+``share_log_file`` used). One file per share, served from
+the same ``_shares/<token>/`` ContentProvider path.
+
+**Client-side**: ``share_files`` now uses ``ACTION_SEND``
+when ``items`` has exactly one entry, ``ACTION_SEND_MULTIPLE``
+when more. ``share_diagnostics_action`` passes the single
+combined URI → lands in ACTION_SEND branch.
+
+**Reverted from 0.52.17**:
+
+- ``AZTCollabProvider.getType`` returns ``text/plain`` again
+  for ``.log`` / ``.txt`` (was speculative
+  ``application/octet-stream``). The single-file route works
+  fine with text/plain.
+- ``share_diagnostics_action`` no longer passes
+  ``mime_type='*/*'`` — defaults to text/plain which is what
+  the single file actually is.
+
+**Trade-off**: receivers (Gmail, etc.) that previously got
+N distinct attachments now get one concatenated file. The
+content is identical; triage requires scrolling to the right
+``=== section ===`` header instead of opening a specific
+attachment. For diagnostic-bundle use this is fine — a
+support engineer typically greps the whole thing anyway.
+
+The multi-attachment path (``share_files`` with >1 item) is
+preserved in the code for peer apps that want to ship
+image/video bundles where the SEND_MULTIPLE filter is
+honoured.
+
+**Sources** (from web research before this change):
+- [signalapp/Signal-Android `app/src/main/AndroidManifest.xml`](https://github.com/signalapp/Signal-Android)
+  — ShareActivity SEND_MULTIPLE filter advertises ``image/*``,
+  ``video/*``, ``text/*``.
+- [signalapp/Signal-Android `app/src/main/java/org/thoughtcrime/securesms/sharing/v2/ShareRepository.kt`](https://github.com/signalapp/Signal-Android)
+  — the ``filterValues { isImageType || isVideoType }``
+  runtime filter that rejects everything else.
+
+## 0.52.17 — share-diagnostics MIME tuned for Signal's classifier
+
+Field log 2026-06-22 17:58:44 on 0.52.16: Signal received our
+ACTION_SEND_MULTIPLE with content URIs from
+``AZTCollabProvider``, called ``getType`` on each URI, got
+``text/plain`` back, then ``finish()``-ed without ever
+calling ``query`` or ``openFile``. Pattern matches "Signal
+routes per-URI text/plain to its in-message-text-snippet
+branch, finds no EXTRA_TEXT, bails." Confirms the issue is
+how Signal's classifier interprets ``text/plain`` content
+URIs in a multi-file share, not anything about our URI
+authority or grant chain.
+
+Two co-ordinated tweaks for receivers (Signal) that classify
+ACTION_SEND_MULTIPLE attachments by per-URI MIME:
+
+**`AZTCollabProvider.getType` returns
+``application/octet-stream`` for `.log` and `.txt`**
+extensions (was `text/plain`). Other extensions unchanged
+— JSON, XML, LIFT, images, audio still report their proper
+text/structured/binary MIME. The diagnostic share files
+benefit from being classified as "generic binary
+attachments" so receivers' attachment-pipelines route them
+correctly. Receivers that want to preview the files as text
+still can (the bytes are valid UTF-8); the MIME hint
+controls routing, not capability.
+
+**``share_diagnostics_action`` dispatches with
+``mime_type='*/*'`` at the intent level** (was
+``text/plain`` by default). Mixed-attachment bundles
+conventionally use ``*/*`` for the intent type;
+per-attachment MIMEs come from ``ContentResolver.getType``
+on each URI separately. Without this, receivers can route
+the entire bundle to a "text-share" handler based on the
+intent-level type, ignoring per-URI specifics.
+
+**Java change requires a server-APK rebuild.** The
+``getType`` change is in ``AZTCollabProvider.java``;
+``adb install -r`` of a Python-only updated APK won't pick
+it up. ``share_diagnostics_action`` is Python and rides the
+normal install.
+
+Expected behaviour after the rebuild + install lands:
+
+- ``[share_files] entry: ... mime_type='*/*'`` instead of
+  ``text/plain``.
+- ``AZTCollabProvider: getType() ... mime=application/octet-stream``
+  for both files.
+- Signal accepts the share and shows the attachments in its
+  compose draft.
+
+If Signal STILL flashes-and-back with these new values, the
+hypothesis is wrong and we need to look at what other
+classifier checks Signal does — likely each per-URI's
+extension or the URI path shape.
+
+## 0.52.16 — debug bump (no code change)
+
+Version bump only — forces a fresh rebuild + install so the
+0.52.15 Java instrumentation (Log.i in
+``AZTCollabProvider.getType / query / openFile``) is
+guaranteed to be in the running APK for the next diagnostic
+capture. No behaviour change beyond that.
+
+## 0.52.15 — drop the Parcelable cast on EXTRA_STREAM URIs; instrument the Java provider
+
+Two-part diagnostic patch on top of 0.52.14, after the field
+log on 2026-06-22 16:24 showed Signal's ``ShareActivity``
+opening and ``finish()``-ing itself within ~210-310ms before
+displaying the compose UI. Per Signal source research:
+
+> ``getUnresolvedShareData()`` for ``ACTION_SEND_MULTIPLE``
+> calls ``intent.getParcelableArrayListExtraCompat(EXTRA_STREAM,
+> Uri::class.java)`` and bails with ``IntentError.SEND_MULTIPLE_STREAM``
+> when the result is null. The activity then ``finish()``-es
+> from ``onCreate``. ShareActivity does NOT query our
+> ContentProvider — it rejects the intent before getting to
+> the file-loading stage.
+
+That's the *exact* symptom we see. So 0.52.14's
+``getType`` / ``query`` Java implementations may never have
+been called — the failure is upstream of them, in how
+``EXTRA_STREAM`` round-trips through the intent.
+
+**Drop the Parcelable cast on ArrayList.add().** Pre-0.52.15
+``share_files`` did:
+
+```python
+uris.add(cast('android.os.Parcelable', uri))
+```
+
+The ``cast`` was a jnius dispatching hint — the underlying
+Java object is still ``Uri``, but the cast affects how jnius
+records the apparent type for subsequent dispatch decisions.
+On Android 13+, ``getParcelableArrayListExtraCompat(name,
+Uri::class.java)`` does a runtime class check against the
+parcel's recorded element type. If the parcel recorded the
+items as ``Parcelable`` (via our cast) rather than ``Uri``,
+the typed read filters them out and returns null — which is
+exactly the IntentError.SEND_MULTIPLE_STREAM trigger.
+
+Fix: just ``uris.add(uri)``. ArrayList.add(Object) accepts
+the native Uri, the parcel records it as Uri, Signal's
+typed read accepts it. Applied to both the URI-item branch
+(the ``share_diagnostics_action`` path) and the legacy
+MediaStore branch.
+
+**Add ``Log.i`` lines to AZTCollabProvider.** ``getType``,
+``query``, and ``openFile`` now each log their entry,
+arguments, and outcome. Three things this confirms on the
+next field test:
+
+1. **Does Signal actually call our provider?** If we see
+   ``[AZTCollabProvider] getType() uri=…`` after the share
+   dispatch, Signal got past the EXTRA_STREAM parsing and
+   reached the URI-validation stage. If we see *no*
+   AZTCollabProvider logs, Signal bailed in
+   ``ShareActivity.onCreate`` and never touched us.
+2. **Does our getType return the right MIME?** The log
+   includes the returned MIME so we can verify ``text/plain``
+   for the .log and .txt files.
+3. **Does Signal proceed to openFile?** If ``openFile`` is
+   called, the URI grant chain is fully working and Signal
+   has accepted everything up to and including our file
+   metadata.
+
+**Expected outcome on 0.52.15:**
+
+- If the cast was the (only) problem: Signal's ShareActivity
+  stays open with the two attachments displayed in the
+  compose draft. AZTCollabProvider logs will show getType +
+  query + openFile being called.
+- If something else is also wrong: Signal still
+  flashes-and-back, but now we know whether to investigate
+  upstream (Signal didn't query provider — EXTRA_STREAM still
+  broken) or downstream (Signal queried but rejected what
+  we returned).
+
+**Diagnostic command for next test:**
+
+```
+adb -s ZY22HFZR78 logcat | grep -iE \
+  'share_files|share-bundle|AZTCollabProvider|securesms|IntentError'
+```
+
+Java change requires a server-APK rebuild for the Log.i lines
++ the cast-removal to land. Python change in ``share_files``
+goes out via the normal incremental install.
+
+## 0.52.14 — AZTCollabProvider implements getType + query so Signal validates the URIs
+
+Field log 2026-06-22 on 0.52.13 (device ``3a0285ec``):
+
+```
+[share-bundle] prepared token='0c9ddd…' items=2
+[share_files] item[0] using pre-staged uri='content://org.atoznback.aztcollab/_shares/…/azt_snapshot_…txt'
+[share_files] item[0] landed via pre-staged uri
+…
+[share_files] startActivity returned (chooser dispatched)
+```
+
+Same Signal flash-and-back. URIs from our own authority, but
+still rejected. 0.52.13's hypothesis ("same-authority is
+sufficient") was wrong — Signal does more than authority
+checking. It calls ``ContentResolver.getType(uri)`` and
+``.query(uri, OpenableColumns, …)`` to validate the
+attachment's MIME type and metadata before opening it.
+``AZTCollabProvider`` returned null for both. Null type =
+"unknown file" = Signal silent reject.
+
+**Java fix in ``AZTCollabProvider.java``**: implement
+``getType()`` and ``query()`` properly. Both route through
+the same ``resolveAbsPath`` callback ``openFile`` already
+uses, so a URI either has full metadata + is openable, or
+all three fail consistently.
+
+- ``getType(uri)`` maps the URI's path extension to a MIME
+  type. Covers the file types this provider serves: text
+  (``.txt`` / ``.log`` → ``text/plain``), structured data
+  (``.json``, ``.lift``, ``.xml``), images (``.png``,
+  ``.jpg``, ``.webp``, ``.gif``), and audio (``.wav``,
+  ``.mp3``, ``.ogg``, ``.m4a``, ``.opus``). Unrecognised
+  extensions still return null.
+- ``query(uri, projection, …)`` resolves the URI's abs
+  path, then returns a one-row ``MatrixCursor`` with
+  ``OpenableColumns.DISPLAY_NAME`` and
+  ``OpenableColumns.SIZE``. Honours the requested
+  projection; defaults to ``[DISPLAY_NAME, SIZE]`` when the
+  caller asks for "everything".
+
+**Imports added**: ``android.database.MatrixCursor``,
+``android.provider.OpenableColumns``.
+
+**Requires a server-APK rebuild.** This is a Java change, not
+a Python change — incremental Python install (``adb install
+-r``) doesn't pick it up. Peer APKs are unaffected (they
+don't host the provider).
+
+**Expected behaviour on 0.52.14:**
+
+- Tap Share diagnostics → Signal → recipient picker → Signal
+  reads the metadata, queries getType, gets ``text/plain``,
+  queries query, gets ``{display_name, size}``, opens the
+  file via ``openFile``, attaches it to the compose draft.
+- No flash-and-back.
+
+**If Signal still rejects on 0.52.14**, the trace is
+unchanged but the relevant logcat now includes Signal's own
+validation logs — grep for ``MimeTypeMap`` or
+``securesms`` around the share dispatch to see what it's
+checking for next.
+
+## 0.52.13 — Share diagnostics ships URIs from our own ContentProvider so Signal accepts them
+
+Field log 2026-06-22 on 0.52.12 (device ``3a0285ec``) localised
+the Signal flash-and-back precisely:
+
+```
+START u0 {act=android.intent.action.SEND_MULTIPLE typ=text/plain
+  flg=0xb080001 cmp=org.thoughtcrime.securesms/.sharing.v2.ShareActivity
+  clip={text/plain hasLabel(15) 2 items: {U(content)} {U(content)}}
+  (has extras)} with LAUNCH_MULTIPLE from uid 10613
+Displayed org.thoughtcrime.securesms/.sharing.v2.ShareActivity
+  for user 0: +285ms
+RestartModeController: determineRescueAppAfterAppFinishItself@1
+  null pkgName=org.thoughtcrime.securesms
+```
+
+Signal's ``ShareActivity`` launched cleanly with our ClipData,
+displayed for 285 ms, then ``finish()``-ed itself without
+reading the URIs and without logging a permission error. This
+is Signal's documented receiver-side security policy: its
+attachment subsystem refuses MediaStore Downloads URIs and
+only accepts URIs from the sender's own ContentProvider
+authority (so a malicious app can't trick Signal into sending
+arbitrary files via shared URIs). Gmail accepts MediaStore
+URIs (different security model); Signal refuses them — that's
+why ``Gmail accepts the bundle, Signal doesn't`` was the
+diagnostic signal.
+
+The fix re-routes share files through our own
+``AZTCollabProvider`` (which already serves the daemon's LIFT
++ audio + CAWL files to peer apps via ``openFile``) so the
+URIs the chooser dispatches carry the same authority that
+initiated the share.
+
+**New daemon RPC** ``POST /v1/diagnostics/prepare_share_bundle``:
+- Creates ``$AZT_HOME/.shares/<token>/`` (token = 32-hex from
+  ``secrets.token_hex(16)``).
+- Writes the diagnostic snapshot as
+  ``azt_snapshot_<stamp>.txt``.
+- Copies each per-day daemon log inside the retention window
+  (oldest-first ordering, matches ``get_daemon_log_files``).
+- Sweeps stale share dirs (>1 h old) on every call.
+- Returns ``{token, items:[{display_name, uri_path}]}``.
+
+**``AZTCollabProvider`` route**: ``_resolve_share_path`` in
+``android_cp/service.py`` accepts
+``_shares/<token>/<filename>``  paths and maps them to
+``$AZT_HOME/.shares/<token>/<filename>``. Read-only (peers
+consuming the share intent only need to read). Token validated
+with the same regex used for atomic-commit tokens; filename
+validated to ``[A-Za-z0-9._-]{1,128}`` so a daemon bug can't
+let a hostile filename slip through.
+
+**``share_files`` extended** to accept items of shape
+``{'uri': str, 'display_name': str}`` (in addition to the
+existing ``path`` and ``content`` shapes). URI items skip
+MediaStore entirely: the URI is parsed into a Java ``Uri``
+and added directly to the intent's ``EXTRA_STREAM``
+ArrayList and ClipData.
+
+**``share_diagnostics_action`` rewired**: instead of building
+``content`` items from ``get_diagnostic_snapshot`` +
+``get_daemon_log_files`` (the 0.52.6–0.52.12 path), now calls
+``prepare_share_bundle`` and builds URI items pointing at
+``content://org.atoznback.aztcollab/_shares/<token>/...``.
+``AZTCollabProvider`` is already declared with
+``android:grantUriPermissions="true"`` in the server APK's
+manifest (via ``p4a_hook.py:_inject_aztcollab_provider``), so
+URI grants propagate correctly to the receiver.
+
+**Defensive cleanups**:
+
+- **``is_pending`` clear now works.** 0.52.12's
+  ``values.put('is_pending', 0)`` silently failed with
+  ``JavaException: No methods called put matching your
+  arguments`` — Python ``int`` doesn't auto-box to
+  ``java.lang.Integer``. Fixed with explicit
+  ``Integer(0)``. The MediaStore path is no longer the
+  default for share-diagnostics (URI items skip it), but
+  callers using the legacy ``path``/``content`` shapes now
+  get the proper clear.
+- **``share_files`` instrumentation extended.** A new
+  ``item[idx] using pre-staged uri=...`` line covers the
+  URI branch end-to-end.
+
+**Why this works for both surfaces.** ``share_files`` is the
+single underlying function. The server-APK settings ``Share
+diagnostics`` button, the picker's ``Share diagnostics``
+button, AND any peer app's share helper all funnel through
+the same code path. Fixing once fixes all three.
+
+**Receiver compatibility expectations**:
+
+- Signal: should accept (URIs from sender's own provider).
+- Gmail: continues to accept (it accepts URIs broadly).
+- WhatsApp / Telegram / etc.: should accept (same model).
+- Bluetooth / Files / Drive: should accept (all read via
+  ContentResolver; the provider serves the file just like
+  MediaStore would).
+
+If a future receiver rejects too, the next debugging step is
+to look at the receiver-side logs around the time the URI
+read fires. The ``[share_files]`` and ``[share-bundle]``
+trace lines are end-to-end so the daemon log captures
+everything from prep through dispatch.
+
+## 0.52.12 — share_files clears MediaStore is_pending; _dlog also prints to logcat
+
+Field log 2026-06-22 (device ``3a0285ec``, logcat capture of
+the 0.52.11 instrumentation) localised the Signal flash-and-
+back:
+
+```
+[share_files] item[0] MediaStore uri=content://media/external/downloads/1000017469
+[share_files] item[0] landed: written=2389 bytes
+[share_files] item[1] MediaStore uri=content://media/external/downloads/1000017470
+[share_files] item[1] landed: written=87113 bytes
+[share_files] insert phase done: landed=2 of 2
+[share_files] pre-grant: queryIntentActivities returned n_targets=2
+[share_files] pre-grant: granted to 2 packages: com.android.bluetooth,com.google.android.gms
+[share_files] chooser: built; ClipData + grant flag attached
+[share_files] startActivity returned (chooser dispatched)
+```
+
+Our side ran clean end-to-end. The flash-and-back happened
+*after* ``startActivity returned`` — on Signal's process,
+where we can't see. Two findings:
+
+1. **``queryIntentActivities`` returned only 2 packages
+   (Bluetooth + Google Play Services).** Signal isn't visible
+   to our APK because we don't declare a ``<queries>`` block
+   for ``ACTION_SEND_MULTIPLE``. The system chooser bypasses
+   that visibility restriction (which is why Signal still
+   appears in the chooser sheet), but our pre-grant pass
+   never reaches Signal's package. That's a separate
+   long-tail issue — see "Follow-up" below.
+
+2. **Receiver-side silent read failure.** MediaStore Downloads
+   URIs on Android Q+ default to ``is_pending=1`` —
+   "owned by inserter, invisible to others." Until the writer
+   clears the flag via ``resolver.update(uri, {is_pending:
+   0}, ...)``, any other app's
+   ``ContentResolver.openInputStream(uri)`` returns null /
+   throws. Signal received the URI in ``EXTRA_STREAM``, tried
+   to read, got nothing, flashed-and-back. This is the
+   primary fix.
+
+**Fix in ``share_files``.** Post-write per-item
+``resolver.update(uri, {is_pending: 0}, null, null)`` with a
+``_dlog`` trace line so the next bundle confirms the clear
+landed. Canonical Android-docs pattern; matches the way every
+MediaStore-write sample under
+``developer.android.com/training/data-storage/shared/media``
+ends the write.
+
+**``_dlog`` also prints to logcat.** Previously
+``_dlog`` only fired the ``log_diagnostic`` RPC (visible to
+testers without adb after the next successful share). Now it
+*also* calls ``print(..., flush=True)`` so a developer with
+adb sees the trace in real time as the share dispatches — no
+need to wait for a successful share to capture it. Sub-ms
+cost per call; failure of either channel is swallowed.
+
+**Follow-up to consider** (not in this patch): adding a
+``<queries>`` block to the server APK's manifest_extras for
+``ACTION_SEND`` and ``ACTION_SEND_MULTIPLE``, so
+``queryIntentActivities`` returns the real share-target list
+and the per-package pre-grant actually covers Signal /
+Gmail / WhatsApp / etc. Bounded scope: declare what we
+might share with, not "see all apps." Worth doing if the
+IS_PENDING fix alone doesn't get us to a working share —
+which the next field test will tell us.
+
+## 0.52.11 — peer→daemon-log RPC + share_files trace instrumentation
+
+Two field reports in a row (0.52.9, 0.52.10) showed
+``Share diagnostics`` → Signal still flashing-and-back with no
+visible explanation. The picker's ``print()`` calls land in
+logcat, which is invisible on testers' devices without adb;
+the always-on daemon log only captures the daemon process's
+own output. So when the share path silently fails in the
+picker process, there's nothing to look at.
+
+**New RPC ``POST /v1/logging/append``.** Body ``{"tag": str,
+"line": str}``. Server-side handler appends
+``[<tag>] <line>`` to the daemon log via the existing
+always-on tee. Lines capped at 1024 chars; longer payloads
+truncated with a ``…[truncated]`` marker. Always returns
+``ok=True`` so peer code paths aren't derailed by a stalled
+write.
+
+**New client wrapper ``log_diagnostic(tag, line)``** in
+``azt_collab_client/__init__.py``. Wraps the RPC with
+swallow-on-failure semantics — best-effort by design;
+``ServerUnavailable`` returns ``False`` without raising.
+
+**``share_files`` instrumented end-to-end.** ~14 ``_dlog``
+call sites cover:
+
+- entry (``item_count``, ``mime_type``, ``chooser_title``)
+- platform check result
+- jnius autoclass + activity + resolver readiness
+- per-item insert outcome (display_name, has_path,
+  content_bytes, MediaStore URI string, written byte count)
+- bail when ``landed=0``
+- intent built / extras attached
+- ClipData build + attach outcome
+- ``queryIntentActivities`` n_targets + per-package grant
+  summary (first 16 listed, count of extras appended)
+- chooser build + dispatch / startActivity return
+- outer catch with the raising exception
+
+Trace lines land in the daemon log alongside every other
+``[<tag>]`` line. A tester's next successful share — or an
+``adb pull`` of the daemon log — surfaces exactly where the
+share path stalled or what receiver list / URI grants
+actually happened.
+
+No user-facing change. The instrumentation adds ~14 RPC calls
+per ``Share diagnostics`` tap; each RPC is a loopback HTTP /
+ContentProvider call (~sub-100ms), so total added latency on
+the tap is roughly one second on Android — acceptable for a
+debug build that immediately tells us what's wrong. If the
+share fix actually works in 0.52.11 + later, the
+instrumentation stays; it's cheap and the diagnostic value
+is high.
+
+**``log_diagnostic`` is general-purpose.** Anywhere in
+``azt_collab_client`` (or sibling app code) that wants a
+trace line in the daemon log can call it. Subsystem tag
+goes in ``tag``, payload in ``line``. Replaces the
+``_debug.first_try_log`` pattern when the trace needs to be
+visible without adb.
+
+## 0.52.10 — share_files: belt-and-suspenders URI-grant propagation for chooser + multi-URI
+
+Field report 2026-06-22 on top of 0.52.9: tapping Share
+diagnostics → Signal still flashed Signal's recipient picker
+and returned to AZT immediately, with no draft created. The
+0.52.9 ClipData-on-inner-intent fix wasn't enough on this
+Android build — Signal's URI grant still didn't propagate
+through ``Intent.createChooser`` to the receiver.
+
+0.52.10 layers in the canonical Android-documented workaround
+on top of the 0.52.9 ClipData fix:
+
+1. **ClipData on the chooser wrapper** (in addition to the
+   inner intent). Some Android builds don't forward the inner
+   intent's ClipData to the wrapper.
+2. **``FLAG_GRANT_READ_URI_PERMISSION`` on the chooser
+   wrapper** (in addition to the inner intent). Same reason.
+3. **Explicit per-package
+   ``context.grantUriPermission(...)``** to every Activity
+   whose intent-filter accepts the inner intent. Catches
+   receivers that ignore the chooser-forwarded ClipData grant
+   entirely. Bounded scope: only the URIs we created, only
+   read permission, only packages whose filter matches the
+   intent's MIME type — so this isn't a broad-spectrum grant.
+
+The pre-grant query goes through
+``PackageManager.queryIntentActivities(intent,
+MATCH_DEFAULT_ONLY)`` so packages without DEFAULT category
+support don't get spurious grants. Failure of any of these
+defensive steps is non-fatal — the ClipData + flag chain may
+still work for cooperating receivers, and a print to stderr
+captures the failure mode for the next diagnostic share.
+
+If after 0.52.10 the share-to-Signal flow still flashes-and-
+back without a draft, the next debugging step is to add a
+daemon-side ``POST /v1/logging/append`` RPC so the picker can
+record its share-time trace into the always-on daemon log
+(currently the picker's stderr → logcat → invisible to
+testers without adb). Out of scope for this patch.
+
+## 0.52.9 — share_files now attaches ClipData so multi-attachment shares actually reach the receiver
+
+Field report 2026-06-22: tapping ``Share diagnostics`` →
+``Signal`` flashed Signal's recipient picker and returned to
+AZT immediately. No draft created. No daemon-log entry —
+because the dispatch itself succeeded; the failure was on
+the receiver side.
+
+Root cause: ``Intent.ACTION_SEND_MULTIPLE`` wrapped in
+``Intent.createChooser`` drops URI grants for many receivers
+(Signal, modern Gmail) unless the URIs are also attached as
+``ClipData``. The ``FLAG_GRANT_READ_URI_PERMISSION`` flag
+covers ``EXTRA_STREAM`` URIs for some receivers but not all —
+ClipData carrying the same URIs makes the grant propagate
+through the chooser to the chosen target. Documented Android
+quirk; affects multi-URI shares more than single-URI ones,
+which is why the legacy single-blob ``share_log_file`` was
+unaffected and the 0.52.6 multi-attachment ``share_files``
+hit it.
+
+Fix in ``azt_collab_client/ui/share.py:share_files``: track
+the Python-side raw URI handles in a parallel list, build a
+``ClipData`` from them (``ClipData.newUri`` for the first +
+``ClipData.Item`` for each subsequent URI), set it on the
+intent before wrapping in the chooser. Same MIME type as the
+intent; label is a chooser-side hint and doesn't reach the
+receiver.
+
+No call-site change required — picker's ``Share diagnostics``
+and daemon-settings's ``Share diagnostics`` both delegate to
+``share_diagnostics_action`` which dispatches via
+``share_files``. After this fix, Signal accepts the bundle
+and shows N attachments in the compose draft as expected.
+
+## 0.52.8 — Share diagnostics button restored to daemon settings (one action, two affordances)
+
+0.52.7 removed the daemon-settings ``Share daemon log`` button
+along with the logging toggle, on the argument that the
+picker's ``Share diagnostics`` already covers the case. Field
+review immediately caught the gap: when the user is already in
+settings (just changed credentials, just toggled work-offline,
+investigating something they configured here) and wants to
+share what just happened, having to back out to the picker is
+two extra taps and a context switch. The picker button is the
+right always-visible affordance; ``the picker is the *only*
+way`` is weaker.
+
+0.52.8 puts a ``Share diagnostics`` button back into daemon
+settings — same label as the picker's button, same
+underlying action — and collapses the implementation so
+"same label" actually means "same code path" instead of
+"two functions that happen to look similar today and could
+drift apart tomorrow."
+
+**New helper.** ``azt_collab_client.ui.share.share_diagnostics_action(
+on_error=…)`` owns the entire share-diagnostics composition:
+
+1. Pull the snapshot (``get_diagnostic_snapshot``).
+2. Pull the per-day daemon-log retention bundle
+   (``get_daemon_log_files``).
+3. Build the items list (snapshot first, then per-day logs
+   with the daemon-supplied filename as ``display_name``).
+4. Dispatch via ``share_files`` (``ACTION_SEND_MULTIPLE``).
+5. Fallbacks: ``share_text`` for "daemon unreachable" (no
+   snapshot AND no bundle) and "empty bundle" (daemon
+   reachable but no log files yet).
+
+The caller is just an ``on_error`` callback so each surface
+can route the user-facing message to its own display channel
+(popup for the picker, status label for daemon settings).
+
+**Picker change.** ``ProjectPickerScreen.share_diagnostics``
+now delegates to ``share_diagnostics_action`` — ~10 lines
+instead of ~70, and structurally guaranteed to ship the same
+payload as the daemon-settings button. No user-visible
+behaviour change.
+
+**Daemon-settings change.** A new ``RecBtn`` ``id:
+share_diagnostics_btn`` sits below ``Restart server`` in the
+``Collaboration AZT — Settings`` view, with
+``SettingsScreen.share_diagnostics`` as a one-line delegation
+to the same helper. Errors land in the existing
+``service_status`` label (already used for restart feedback).
+
+**KV comment refreshed.** The block introducing the
+service-control row now reads "Service-control row… Share
+diagnostics ships the same multi-attachment bundle the
+picker's button ships — same label, same underlying
+``share_files`` action, two affordances." instead of the
+0.52.7 wording that argued for the button's removal.
+
+No wire format change. No status code change. Picker users
+see exactly the same payload as before. Settings users gain
+the affordance back without the toggle (which stays gone).
+
+## 0.52.7 — always-on logging; toggle and Share-daemon-log button removed
+
+Phase 3 of the logging consolidation (closes the umbrella
+``NOTES_TO_DAEMON.md`` 2026-06-20 from the recorder team).
+The user-facing "Log server activity" toggle is gone — daemon
+log capture is unconditional, anchored by the per-day rotation
++ 3-day retention from 0.52.5 and the multi-file Share path
+from 0.52.6.
+
+**Why the toggle was anti-diagnostic by design.** Support asks
+for the daemon log *after* a failure. With a toggle, the
+diagnostic is gone exactly when it would have been useful. The
+privacy argument (don't accumulate a log file on devices that
+don't need it) was mitigated by the explicit Share gesture
+under the user's control. The disk-cost argument is now
+mitigated by the 3-day retention. Field-validated cost: the
+40 MB ``daemon-<tag>.log`` filed 2026-06-20 existed because
+the user happened to leave the toggle on; half of all testers
+do not.
+
+**Daemon side (``azt_collabd/server.py``).**
+
+- ``maybe_install_stdio_tee`` now installs unconditionally
+  (the ``maybe_`` prefix is historical; preserved for ABI
+  compatibility with ``server_apk/service.py`` and out-of-tree
+  desktop launchers that call it by name).
+- ``install_stdio_tee`` fires the start-of-day
+  ``_dump_lan_debug_snapshot()`` when the file is empty pre-
+  open (fresh-of-day or fresh install). ``_LogSession._rotate
+  _locked`` fires it post-rotation on the new day's file.
+  Together: every per-day file is anchored with a baseline-
+  state snapshot. The lock becomes ``threading.RLock`` so the
+  snapshot's ``print`` calls can re-enter the session safely.
+- ``POST /v1/logging/daemon_log_to_file`` returns HTTP 410
+  Gone with a typed body
+  (``{"error": "endpoint_removed", ...}``) so any pre-0.52.7
+  peer that calls it gets an explicit signal rather than a
+  silent misbehaviour. Scheduled for outright deletion in a
+  later release once peer apps have caught up.
+- ``store.get_daemon_log_to_file`` / ``set_daemon_log_to_file``
+  deleted — no remaining callers in-repo.
+- ``_h_get_daemon_log`` / ``_h_get_daemon_log_files`` continue
+  to return an ``"enabled": true`` field for client-wrapper
+  shape compatibility; the value is now hard-coded since
+  logging is always on.
+
+**Client side (``azt_collab_client/__init__.py``).**
+
+- ``set_daemon_log_to_file`` wrapper deleted from the public
+  surface (also dropped from ``__all__``). Pre-0.52.7 callers
+  hitting the 410 daemon endpoint will see ``None`` returned
+  from any stale wrapper they have bundled — same shape as a
+  transport failure, which their existing error path already
+  handles.
+
+**Settings UI (``azt_collabd/ui/app.py``).**
+
+- "Diagnostic log" SectionLabel, "Log server activity:
+  yes/no" buttons, "Share daemon log" button all removed.
+  The picker's "Share diagnostics" supersedes the latter
+  (full retention bundle as distinct attachments, vs the old
+  single-blob with section breaks).
+- The status label below "Restart server" survives (renamed
+  ``daemon_log_status`` → ``service_status``) — restart
+  feedback still uses it.
+- Five orphaned methods deleted (``set_daemon_log_mode``,
+  ``_daemon_log_enabled_state``, ``_refresh_daemon_log_state``,
+  ``_refresh_daemon_log_buttons``, ``share_daemon_log``) plus
+  the ``_refresh_daemon_log_state()`` call from ``refresh()``.
+
+**Status-code help strings updated.** Two auto-sync help
+strings in ``translate.py`` pointed users at the now-removed
+``Settings → Diagnostic log → Log server activity = yes,
+then Share daemon log`` path. Rewritten to ``Please tap
+Share diagnostics on the project picker``. French
+translations in ``fr.po`` updated to match. Affected codes:
+
+- ``S.DATA_LOSS_RISK`` — peer wrote a file that won't be
+  backed up.
+- ``S.COMMIT_REPEATEDLY_FAILED`` — commit failed N times in a
+  row.
+
+Both target the same triage flow (user shares diagnostics so
+support can investigate); the picker route is shorter
+(2 taps vs. 4) and works the moment the failure happens
+(no preceding toggle gesture required, since logging is
+always-on).
+
+**Recorder team integration.** The legacy
+``azt_collab_client.ui.share.share_log_file`` shim is kept for
+the recorder peer's existing share button. Recorder can
+migrate to ``share_files`` at their leisure — the symlinked
+client path makes the call site swap mechanical. Once the
+recorder is on ``share_files``, the shim becomes deletable in
+a future release.
+
+**Unified logging umbrella closed.** All six sub-items of the
+recorder team's 2026-06-20 ``NOTES_TO_DAEMON.md`` request now
+shipped (prefix format + ms in 0.52.5, daily rotation +
+retention in 0.52.5, multi-day fetch RPC in 0.52.6, multi-file
+share dispatcher in 0.52.6, picker-button consolidation in
+0.52.6, always-on logging + toggle removal in 0.52.7). The
+``NOTES_TO_DAEMON.md`` queue is empty.
+
+## 0.52.6 — multi-day daemon log RPC + multi-file share dispatcher; picker ships the full retention bundle
+
+Phase 2 of the logging consolidation (continued from
+``CHANGELOG`` 0.52.5 and the recorder team's
+``NOTES_TO_DAEMON.md`` 2026-06-20). 0.52.5 made the daemon
+write per-day files inside a retention window; 0.52.6 makes
+peers able to *bundle and ship* the whole window in one
+gesture.
+
+**New RPC** ``GET /v1/logging/daemon_log_files`` returns the
+per-day daemon logs inside the retention window:
+
+```json
+{
+  "ok": true,
+  "files": [
+    {"date": "2026-06-18", "filename": "daemon-7aeb3fac-2026-06-18.log",
+     "content": "…", "bytes": 4880736},
+    {"date": "2026-06-19", "filename": "daemon-7aeb3fac-2026-06-19.log",
+     "content": "…", "bytes": 6112048},
+    {"date": "2026-06-20", "filename": "daemon-7aeb3fac-2026-06-20.log",
+     "content": "…", "bytes": 1024}
+  ],
+  "retention_days": 3,
+  "enabled": true
+}
+```
+
+Ordered oldest-first so a tester reading top-to-bottom gets
+chronological flow. Each ``content`` is daemon-side
+tail-truncated to the last 256 KB (same cap as the legacy
+single-file ``GET /v1/logging/daemon_log``). Files outside the
+retention window are dropped from the response even if still on
+disk (covers a race where retention was lowered between the
+prune sweep and the call).
+
+**New client wrapper** ``get_daemon_log_files()`` in
+``azt_collab_client/__init__.py``. Same shape, ``None`` on
+transport failure. Empty ``files`` list when the toggle has
+never been enabled / no per-day file exists yet.
+
+**New share helper** ``share_files(items, …)`` in
+``azt_collab_client/ui/share.py``. Inserts each item into
+MediaStore Downloads, gathers the resulting URIs into a
+``java.util.ArrayList<Uri>``, and dispatches an
+``Intent.ACTION_SEND_MULTIPLE``. Items can carry either
+``{'path': str, 'display_name': str}`` (streamed in 64 KB
+chunks from disk) or ``{'content': str|bytes, 'display_name':
+str}``. Partial coverage is fine — a single missing path /
+MediaStore-insert failure logs a warning and the share
+continues with the remaining items, so a stale retention sweep
+racing the share doesn't lose the rest of the bundle.
+
+**Picker rewires.** ``ProjectPickerScreen.share_diagnostics``
+now:
+
+1. Pulls the diagnostic snapshot (``get_diagnostic_snapshot``).
+2. Pulls the retention bundle (``get_daemon_log_files``).
+3. Builds the items list: one item per snapshot + one item per
+   per-day log file with the daemon's basename
+   (``daemon-<tag>-YYYY-MM-DD.log``) as the display name.
+4. ``share_files(items)`` — single ``ACTION_SEND_MULTIPLE``
+   dispatch with one attachment per file.
+
+User-visible benefit: a tester sharing the bundle now gets N
+distinct attachments instead of one mega-blob with section
+breaks. Email and Signal both handle ``ACTION_SEND_MULTIPLE``
+cleanly — opening the bundle is "tap each attachment" instead
+of "find the section marker."
+
+Daemon-unreachable fallback path stays — if the snapshot AND
+``get_daemon_log_files`` both fail, the same ``share_text``
+operator message fires as before. New empty-bundle path
+("daemon reachable, but no files inside the window yet") emits
+a typed "reproduce the issue first" message instead of silently
+opening a zero-attachment chooser.
+
+**``share_log_file`` is kept** as a legacy entry point for the
+daemon-settings ``Share daemon log`` button. Behaviour
+unchanged; it still bundles the single concatenated blob with
+``=== current session ===`` headers, still skips the now-
+nonexistent ``<path>.prev`` silently. Phase 3 removes the
+settings button (along with the toggle); at that point the
+shim can be deleted.
+
+**Recorder-team integration.** The new ``share_files`` and
+``get_daemon_log_files`` are the API surface the recorder team
+asked for in ``NOTES_TO_DAEMON.md``. Recorder's
+peer-side bundle can now call ``get_daemon_log_files`` from
+this client (already symlinked into their tree) and assemble a
+combined recorder + daemon items list passed to
+``share_files``.
+
+**Translation coverage.** Five new msgids added to ``translate.py``
+and the French ``.po`` (``Files: {names}``, ``No files to share.``,
+``Could not share files:\n{error}``, ``AZT diagnostics``, and
+``No diagnostics available yet. …``). The translation-coverage
+test continues to pass for these — preexisting drift on other
+strings is tracked separately.
+
+## 0.52.5 — daemon log files rotate daily, retained for 3 days, with ISO-ms line prefix
+
+Field log nml 2026-06-20 caught a 40 MB daemon log file —
+``daemon-<tag>.log`` had been growing without bound across
+weeks of daemon respawns. Single-file naming + append-on-respawn
++ a user-controlled "Log server activity" toggle that nobody
+remembered to turn off meant the file accumulated as long as
+the toggle stayed on. Even the existing ``.prev`` rotation only
+fired on a toggle-on gesture, which never happens in a long
+collection trip.
+
+Phase 1 of the logging consolidation (per peer recorder team's
+``NOTES_TO_DAEMON.md`` 2026-06-20):
+
+**Per-day filename.** The daemon log file is now
+``daemon-<tag>-YYYY-MM-DD.log`` (or ``daemon-YYYY-MM-DD.log``
+when peer_id isn't readable yet). The date is resolved at write
+time from the local clock, so a write at 23:59:59 lands on
+yesterday's file and the next write at 00:00:00 lands on
+today's. Rotation is lazy — checked on every write, costs one
+``_time.strftime`` per write batch when no rotation is needed,
+one ``close`` + ``open`` + retention sweep when the date
+changed.
+
+**3-day retention** (configurable via ``logging.retention_days``,
+default 3, min 1). On every daemon-startup tee install AND on
+every midnight rotation, files older than the window are
+unlinked. Today's file is never pruned — the retention math
+keeps the last *N* distinct dates including today, with a
+belt-and-suspenders explicit guard so a clock-skew edge case
+can't wipe the live file.
+
+**ISO-with-ms line prefix.** Per-line stamp format changes
+from ``[HH:MM:SS <tag>] `` to
+``[YYYY-MM-DD HH:MM:SS,mmm <tag>] `` — matches Python
+``logging``'s default fractional-second format, and aligns with
+the recorder team's parallel format change so a unified
+``grep`` across recorder + daemon files in a triage bundle
+takes one expression instead of two.
+
+**``.prev`` rotation mechanism gone.** Per-day naming
+supersedes it. The picker / settings UI Share buttons still
+pass ``log_path + '.prev'`` to ``share_log_file``; that file
+won't exist, but ``_bundle_log_blob`` silently skips a missing
+``prev_path``. Phase 2 will replace those calls with a
+multi-day bundle helper.
+
+**Code shape change.** ``_StdioTee`` no longer owns the file
+handle directly. A process-wide ``_LogSession`` owns it, both
+stdio tees delegate writes through the session, and the
+session handles rotation under its own lock so concurrent
+stdout+stderr writes can't both observe a date change and both
+rotate. The shared start-of-line state (formerly a list-of-one
+``sol_state``) becomes a single session attribute.
+
+What this **doesn't** touch (deferred to Phase 2 / Phase 3):
+
+- The user-facing toggle is still here. ``install_stdio_tee``
+  still respects ``truncate=`` (now informational only — the
+  truncation step is obsolete) and ``_h_set_daemon_log_to_file``
+  still works.
+- ``daemon_log_path()`` still returns *today's* path, so the
+  read RPC and the existing Share buttons keep working
+  unchanged. Phase 2 adds ``get_daemon_log_files()`` for the
+  multi-day case.
+- Stranded pre-0.52.5 ``daemon-<tag>.log`` / ``.log.prev``
+  files from previous releases are NOT auto-deleted —
+  conservative: those may contain diagnostic content a user
+  wants; manual removal is fine.
+
+## 0.52.4 — topic-push pre-seeds oversize blobs to side refs; scheduler logs wan_backoff skips
+
+Field log nml 2026-06-18 (both REDMI phones, sha
+``fcd30318c03b`` LAN-converged) showed the topic-push reaching
+its architectural floor: 2035 commits ahead of github, chunk
+ladder going 50 → 25 → 12 → 6 → 3 → 1 commits, every rung 408ing,
+and the ``chunk_n=1`` rung's pack at 4.3 MB — bigger than the
+3 MB ``sync.commit_pack_byte_budget``. Existing code surfaced
+``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` and gave up because the
+ladder has no rung below "one commit." For an audio-heavy
+project a single recording-burst commit can dwarf the budget
+indefinitely, and a faster connection / LFS migration aren't
+always available to the field worker.
+
+Fix: extend the ladder by one tier *below* the commit. When the
+``chunk_n=1`` bail is about to trip, the topic-push now
+pre-seeds the commit's blobs onto the server via synthetic
+single-purpose commits at
+``refs/heads/azt-blob-seed-<sha-prefix>``, sized-gated against
+the same budget. Once the blobs are on the server, the original
+``chunk_n=1`` push only needs to carry the commit + tree in its
+pack (KB, not MB) — git's pack negotiation deduplicates against
+any reachable server ref, so updating
+``refs/remotes/origin/azt-blob-seed-*`` locally after each
+batch push automatically excludes those blobs from the next
+pack.
+
+Properties of the new sub-commit tier:
+
+- **Deterministic batching.** Blobs sorted by SHA, then
+  greedy-packed against ``budget × 0.7`` per batch (leaves
+  headroom for compression variance). The synthetic commit's
+  author / committer / timestamp / message are all fixed
+  constants, so a re-run after partial completion (daemon
+  respawn, mid-batch network drop) produces the same commit
+  SHAs → same side-ref names. Re-pushing a ref the server
+  already has at the same SHA is a zero-byte no-op on github,
+  so the partial state on the server is a feature: idempotent
+  recovery without external state.
+- **One pre-seed attempt per topic-push call.** If pre-seed
+  succeeds and the subsequent ``chunk_n=1`` push still fails,
+  the call bails — the next drain re-enters the topic-push and
+  the side-ref-aware blob enumeration picks up where we left
+  off (already-uploaded blobs are excluded). No infinite loop
+  when the network is fundamentally too slow even for tiny
+  packs.
+- **Lazy crash-tolerant cleanup.** Side refs are not deleted
+  inside the same sync RPC. At the top of every topic-push
+  call, ``_sweep_orphan_preseed_refs`` walks
+  ``refs/remotes/origin/azt-blob-seed-*`` and deletes server-side
+  any side ref whose blobs are all reachable from main's tree
+  (the audio-files-are-additive invariant makes "in HEAD's
+  tree" sufficient — no ancestor walk needed). If the daemon
+  is killed between Phase C success and the cleanup sweep, the
+  next topic-push run sweeps any orphans on its way in. Net
+  effect: side refs accumulate at most until the next push,
+  then drop out; the steady-state github branch list stays
+  clean.
+- **New terminal status ``BLOB_EXCEEDS_BUDGET``.** Fires only
+  when an individual blob (uncompressed) is larger than the
+  budget — pre-seeding can't split a single blob across batches.
+  Params: ``blob_sha`` (hex prefix), ``blob_bytes``,
+  ``budget_bytes``. Routes to ``PUSH_FAILED`` like the
+  whole-commit case, so peers without specific routing for the
+  new code handle it uniformly; the specific offending file
+  surfaces in the daemon log and the picker translation for
+  the rare case where it does fire.
+
+The existing ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` becomes
+much rarer — it now only fires when pre-seeding had a
+transient network failure (so we fall through to bail and
+retry next drain), or when the post-pre-seed ``chunk_n=1``
+push exhausts its persistence budget. The audio-overcommit
+case that motivated this work is structurally fixed.
+
+### Companion: ``[scheduler] drain skipped`` log line
+
+The same field log showed the other side of the same problem:
+``7aeb3fac``'s drain loop fired ``[scheduler] drain pushes:
+['nml']`` every few minutes for two hours, but no
+``sync-trace`` lines followed any of them, because that
+device's ``wan_backoff`` curve (from earlier-day
+``NotGitRepository`` failures) was suppressing the actual
+push attempts. The drain loop was silently doing the right
+thing; the silence made it look broken.
+
+``scheduler.py`` now emits a rate-limited ``[scheduler] drain
+skipped: <lang> wan_backoff next=<iso> (in <duration>,
+<n> consecutive failure(s))`` line for each project the curve
+suppresses, cached on ``(langcode, next_due_at)`` so a stable
+backoff state logs once and re-logs only when the curve moves.
+Brings drain-loop diagnostics in line with the existing
+``[wan-unshared]`` / ``[lan-unshared]`` rate-limited emissions.
+
+No wire-format change for either: new ``BLOB_EXCEEDS_BUDGET``
+is opt-in (peers without routing for it fall through to
+``PUSH_FAILED``), and the scheduler log line is daemon-side
+only.
+
+## 0.52.3 — wan_unshared walks from HEAD when origin is set but never reachable
+
+Field log nml 2026-06-18 (devices ``7aeb3fac`` aztobt1-sudo and
+``db033cd4`` aztobt2-ui, both LAN-converged at SHA
+``fcd30318c03b``) exposed the
+[masking sync-indicator follow-up](docs/Publish_errors.md) that
+was deferred out of the 0.50.x sync rebuild. ``7aeb3fac``'s
+GitHub App is installed on ``aztobt1-sudo``, not ``aztobt2-ui``,
+so every fetch against the ``aztobt2-ui/nml.git`` origin returns
+``NotGitRepository`` — no tracking ref ever lands. Pre-0.52.3,
+``_wan_unshared`` hit ``KeyError`` on the missing tracking ref
+and returned ``0 (OK-on-uncertainty)``, so the picker rendered
+"OK +2" while 2035 commits were stuck on the device with no
+github backup possible.
+
+Fix in ``azt_collabd/repo.py``: when the origin URL is configured
+but no tracking ref exists, walk the local tree from HEAD and
+return the real count — the same answer the LAN-only branch
+already gave. The honest reading of "no tracking ref despite
+configured origin" is "we have no evidence anything reached
+github." Two subcases collapse to the same answer and that's
+fine: a never-fetched-yet project self-corrects on the first
+successful fetch (the tracking ref appears and the next call
+falls through to the existing walk-excluding-tracking branch),
+and a never-can-fetch project (wrong-account App install,
+revoked credentials) keeps reporting the real backlog until the
+user fixes the access problem.
+
+The diagnostic line also changes — the new ``[wan-unshared]``
+emission distinguishes itself from the LAN-only / no-origin case
+by reporting both the URL and the never-fetched-or-fetch-always-
+failed condition:
+
+```
+[wan-unshared] '/…/nml': branch='main' local='fcd30318c03b':
+  origin URL configured (https://github.com/aztobt2-ui/nml.git…) +
+  no tracking ref (never-fetched or fetch-always-failed) →
+  walk-from-HEAD = 2035
+```
+
+so picker support can still tell "all caught up" (returns 0
+through the tracking-ref-equals-local branch) from "no github
+backup" (returns N via this new branch) just by reading the log.
+
+No wire-format change; ``project_status.wan_unshared`` is still
+an int. Picker rendering is unchanged — the same "+N" / "OK"
+contract that already worked for LAN-only projects now also
+works for github-configured-but-unreachable projects.
+
+Resolves the not-yet-shipped follow-up tracked in
+[``docs/Publish_errors.md``](docs/Publish_errors.md) §
+"Related follow-ups" and the deferred fix noted in the 0.50.x
+CHANGELOG under "The masking sync-indicator
+(OK-on-uncertainty firing on NotGitRepository) is a separate
+fix to plan."
+
+## 0.52.2 — corrupt projects.json moves aside (not just zero-byte)
+
+0.52.1 cleared **zero-byte** ``projects.json`` so ``register()``
+could re-seed it. Field repro on 0.52.1 (db033cd4, boot
+2026-06-17 17:47) caught the next failure mode: an **839-byte**
+``projects.json`` whose first byte is non-JSON — almost
+certainly the ext4 power-fail / write-fail pattern where the
+inode size update lands but the data blocks don't (file is the
+right size, contents are zero bytes or garbage). 0.52.1's
+size-only guard skipped this case, the repair pass hit
+``register refused — projects.json could not be parsed`` and
+halted with ``scanned=2 candidates=2 repaired=0 failed=1``.
+User's two on-disk projects (``baf`` with 1670 audio files,
+``nml`` with 71) stayed orphaned despite intact working trees.
+
+Fix: detect corruption by **attempting the parse**, not by
+inspecting the byte count. When ``json.load`` raises, move the
+corrupt file aside to ``projects.json.corrupt-<YYYYMMDD_HHMMSS>``
+and let the next ``_load_raw`` return ``{}`` (file missing →
+safe empty-dict baseline). The orphan re-registration below
+then re-seeds ``projects.json`` from the on-disk working_dirs.
+
+The move-aside (instead of delete) preserves the original
+content for forensic inspection — if anything WAS salvageable
+in the 839 bytes (it almost certainly isn't, for ext4 power-
+fail patterns, but the option is there), support can recover
+it from the ``.corrupt-*`` sibling. The new file is built
+purely from the filesystem scan, so per-project metadata that
+lived only in the registry (last_sync, last_commit, repo_slug,
+vernlang) is lost — fields default per ``projects.Project``,
+and the user's first sync will repopulate ``last_sync`` /
+``last_commit`` from the actual git state.
+
+## 0.52.1 — orphan-repair scans the right directory + clears zero-byte projects.json
+
+Field log baf 2026-06-17 (device ``db033cd4``, AZT Collab 0.51.0)
+caught two flaws in the 0.52.0 repair pass before it ever ran in
+production:
+
+1. **Wrong scan directory.** 0.52.0 scanned ``$AZT_HOME/*/`` and
+   explicitly skipped ``projects/`` as a "system dir". But
+   working_dirs live under ``$AZT_HOME/projects/<langcode>/``
+   (per ``lan_clone._project_dir``; confirmed by the existing
+   ``[server] list_projects: registry empty;
+   projects_dir=...``  diagnostic). On the canonical layout the
+   0.52.0 scan would find zero orphans even when there were
+   two right there. Fix: scan ``$AZT_HOME/projects/`` instead;
+   home-root listing is preserved in the diagnostic snapshot as
+   context but no longer scanned for orphans (avoids false
+   positives on ``cawl/``, ``peer.crt``, etc.).
+
+2. **Zero-byte projects.json blocks register().** The
+   ``[collab.projects] load failed: Expecting value: line 1
+   column 1 (char 0)`` line in the field log = ``json.load`` on
+   an empty file → ``_load_raw`` returns ``_LoadFailed`` →
+   ``projects.register`` refuses with ``RuntimeError``. The
+   repair pass would crash out at the first orphan. Fix: delete
+   a zero-byte ``projects.json`` at the start of the repair
+   pass — that's unambiguously a crash-mid-write artifact (no
+   daemon code path ever writes an empty file deliberately;
+   ``_save_raw`` atomically renames a fully serialised dict),
+   so removing it lets the next ``_load_raw`` return ``{}`` and
+   ``register()`` re-seed the file from the orphan scan.
+
+   Non-zero corrupt ``projects.json`` files are still left
+   untouched — those could be truncated-but-recoverable, and
+   the repair halts loudly with ``manual recovery needed``
+   rather than risk destroying salvageable content.
+
+Same field log also documents the use case: zero-byte
+``projects.json``, two on-disk working_dirs (``baf``, ``nml``),
+``[collab.projects] load failed`` lines repeating ~25 / minute
+as every status poll re-hits the same parse failure. After
+0.52.1 boot: the empty file is removed, both projects get
+re-registered with their langcode + lift_path + `.git/config`
+remote_url, the spam stops, the picker shows two projects, and
+the user's collected data is reachable again.
+
+## 0.52.0 — picker diagnostics + boot-time orphan-project auto-repair
+
+Field report: a user ends up on the picker (recorder OR server APK)
+with no projects to choose from, while the AZT Collab APK reports
+2.7 GB of storage in use and the user is certain they had a
+project with collected data. The existing Share-daemon-log
+affordance is gated behind project selection on the recorder side
+(its gear navigates to recorder settings, which doesn't host the
+button) and on the server-APK side requires a daemon-log-to-file
+toggle that's typically off until support has walked the user
+through enabling it. Net: the diagnostic path is unreachable
+exactly when it's most needed.
+
+Two surfaces address this:
+
+**Picker "Share diagnostics" button.** Always-visible affordance
+at the bottom of ``ProjectPickerScreen`` (lands in every host via
+the symlinked client). Ships a daemon-built registry/filesystem
+snapshot — ``$AZT_HOME`` path, ``projects.json`` size / mtime /
+parsed entries (per-entry: ``working_dir`` exists, ``lift_path``
+exists, ``remote_url``), on-disk subdir scan with ``.git`` / LIFT
+/ audio presence per dir, which subdirs are registered vs orphan,
+``lan.allow_sync`` setting, peer-id short tag. Backed by a new
+``GET /v1/diagnostics/snapshot`` endpoint (text response, always
+succeeds — per-section try/except so a daemon issue surfaces as
+an inline marker rather than a 500). The snapshot prepends
+whatever's in the daemon log file via a new ``prefix_text``
+parameter on ``share_log_file``, so the snapshot is the
+diagnostic payload even when the log-to-file toggle was never
+enabled.
+
+**Boot-time auto-repair of orphan working directories.** New
+``diagnose_and_repair_registry_on_startup`` (in ``repo.py``,
+wired into both desktop ``serve()`` and Android
+``server_apk/service.py:main()`` startup paths per the
+dual-entry-path lesson). Two passes:
+
+1. Log the diagnostic snapshot to stderr — ``[diag]``-prefixed
+   line per snapshot line. Every daemon startup now leaves a
+   snapshot trail in the log, so we have a record even when the
+   user never grabs one manually.
+
+2. Scan ``$AZT_HOME`` for subdirectories that contain both
+   ``.git/`` and a ``*.lift`` file but aren't keyed in
+   ``projects.json``. Each orphan is auto-registered via
+   ``projects.register`` with the directory name as langcode,
+   the first ``.lift`` file as ``lift_path``, and
+   ``remote.origin.url`` from ``.git/config`` as ``remote_url``.
+   The orphan working tree is untouched.
+
+**Strict no-removal invariant.** Repair is append-only — the
+boot pass *adds* missing registry entries; it never removes,
+relocates, or rewrites existing ones. A corrupt non-empty
+``projects.json`` halts the repair pass (``projects.register``
+already refuses with ``RuntimeError`` when ``_LoadFailed`` is
+in play, so we can't clobber recoverable corruption), and the
+function logs a loud ``manual recovery needed`` line so the
+user/support has a clear pointer for next-step recovery. The
+``[diag-repair]`` summary line always emits per
+``feedback_always_emit_summary``.
+
+Client surface (``azt_collab_client.get_diagnostic_snapshot``)
+re-exports through ``__all__``. French msgstrs land for the new
+button + error strings so the picker doesn't render blank
+labels in fr locale.
+
+## 0.51.0 — bloated-m4a anomaly traced to recorder MOOV-duplication bug
+
+Field investigation of 42 audio files clustering at exactly
+1,944,633 bytes traced the cause to a malformed MP4 container,
+not a runaway recording or a collab-side write path. ffprobe on
+a representative file (`0633_spill.m4a`):
+
+```
+[mov,mp4,m4a,3gp,3g2,mj2 ...] Found duplicated MOOV Atom. Skipped it
+Duration: 00:00:01.64, … bitrate: 9470 kb/s
+Stream #0:0[0x1](eng): Audio: aac (LC) (...), 48000 Hz, mono, fltp, 255 kb/s
+```
+
+The actual audio stream is ~52 KB (255 kb/s × 1.64 s); the
+remaining ~1.9 MB is duplicated container metadata. The bug
+affects both mono and stereo recordings — same byte-exact
+footprint — which points at a **shared file-finalization path**
+in `azt_recorder` writing MOOV twice (or flushing a fixed-size
+pre-allocation buffer verbatim regardless of audio length).
+
+Not an `azt-collab` fix; flagged on the recorder backlog. The
+0.50.63 `LARGE_AUDIO_FILE_DETECTED` (now gated to `audio/`)
+remains the right collab-side safety net — it will continue to
+flag any new instances as they appear in commits.
+
+Bulk cleanup is `ffmpeg -c copy -map 0:a` per file, which
+re-muxes the audio stream into a fresh container, dropping the
+duplicated MOOV and any padding (1.94 MB → ~52 KB per file).
+
+No code change in this release; version stamp closes out the
+diagnostic session.
+
+## 0.50.63 — LARGE_AUDIO_FILE_DETECTED gated to audio/ paths
+
+The data-quality check in `_commit_step_locked` fires
+`LARGE_AUDIO_FILE_DETECTED` for any file in the just-made commit
+above `data_quality.large_audio_byte_threshold` (default 512 KB).
+The threshold is sized for audio — designed to catch "user
+recorded a phrase by mistake" in a word-list-elicitation context
+where typical recordings top out around 250 KB.
+
+Field repro: `images/0607_smoked.png` (1.6 MB) tripped the
+warning. That's a perfectly normal CAWL photograph — CAWL ships
+~110 files in the 1–1.5 MB range and ~35 in the 1.5–2 MB range,
+all legitimate content. The status code firing on them was
+misleading (it's not an audio file, and there's nothing wrong
+with the image) and noisy in the daemon log.
+
+Fix: gate the check on `path.startswith('audio/')`. Status code
+keeps its name (`LARGE_AUDIO_FILE_DETECTED` is now accurate; pre-
+0.50.63 it was a misnomer). Image-side check intentionally not
+added — there's no analogous user-error mode for images because
+peers consume CAWL rather than create it on the device.
+
+Log line also relabeled from `[data-quality] large file in
+commit` to `[data-quality] large audio in commit` for symmetry.
+
+## 0.50.62 — notify on auto-adopt so settings UI refreshes
+
+Field repro of 0.50.59 + 0.50.60 working end-to-end revealed a
+UI-refresh gap: the daemon's `_handle_share_offer` synchronously
+updated `Project.remote_url` (registry) and `.git/config`'s
+`[remote "origin"]` (working tree), but the settings UI on the
+peer device kept showing the cached `publish candidate:
+remote_url=''` until the user closed and reopened the app.
+
+Cause: the settings UI's `_refresh_publish_row` reads `Project`
+and `project_status` snapshots from its own cache. Daemon-side
+changes are only visible after the UI re-polls — which the
+picker does on a notify-status-changed event or on
+screen-navigation. The auto-adopt path didn't fire any
+notification.
+
+Fix: after a successful synchronous adopt-origin, fire
+`android_cp.notify.notify_project_changed(langcode)`. Matches
+the existing pattern in `lan_listener`'s post-receive path
+(line 1293) and `_commit_step_locked`. Observers re-poll
+immediately; the settings UI shows the adopted URL within one
+poll cycle.
+
+## 0.50.61 — revert 0.50.58's PUSHED-fanout (superseded by 0.50.60)
+
+URL sharing belongs to two events, not three:
+
+- **URL creation/change** → Publish (`_h_init_project` PUSHED, since 0.50.52)
+- **Peer becomes reachable** → mDNS arrival (`_fire_arrival`, since 0.50.60)
+
+0.50.58 also fired `_spawn_publish_fanout` from `_h_project_sync`
+and the scheduler drain on PUSHED, on the theory that "every
+successful push is a fresh opportunity to broadcast the URL."
+That was wrong — the URL doesn't change between publishes, so
+re-firing on every push duplicates whatever publish-fanout
+already accomplished (or didn't):
+
+| Case | Publish (0.50.52) | Arrival (0.50.60) | Sync/drain push (0.50.58) |
+|---|---|---|---|
+| Publish, peer online & arrived | ✅ delivers | (no transition) | duplicate of publish-fanout |
+| Publish, peer offline | misfires | ✅ delivers on reconnect | also misfires |
+| Sync (URL unchanged), peer online | (URL unchanged) | (no transition) | redundant "ping" |
+| Daemon respawn race | misfires | ✅ recovers | misfires (same root cause) |
+
+In the steady-state happy path the URL was already announced at
+publish time; nothing has changed to re-announce. In the missed-
+publish case arrival-fanout already handles the recovery. The
+only marginal value of sync/drain-fanout is the
+brief-network-glitch-during-publish case where mDNS didn't
+register a departure (sub-TTL blip) — and even there, clicking
+Publish again is a working recovery path.
+
+The cost wasn't free: on every daemon respawn, the scheduler's
+first drain hits PUSHED before mDNS has refreshed
+`static_endpoints`, the fanout misfires against stale entries,
+and the log gets a flurry of `[lan-push] POST https://<stale_ip>
+share_offer failed` lines that aren't actionable. Removing those
+clears the log noise without losing functionality.
+
+Removes:
+- `_spawn_publish_fanout` call in `_h_project_sync` (server.py)
+- `_spawn_publish_fanout` call in scheduler drain success path
+  (scheduler.py)
+
+Kept:
+- `_h_init_project`'s call (Publish fanout — the URL-creation
+  event)
+- `_fire_arrival`'s call (arrival fanout — the peer-becomes-
+  reachable event)
+
+## 0.50.60 — share_offer on peer arrival (fanout-vs-mDNS race)
+
+0.50.58 made `_spawn_publish_fanout` fire on every successful
+push; 0.50.59 made the receiver auto-adopt. Field repro today
+showed those are necessary but not sufficient — there's a race
+between fanout timing and mDNS resolution:
+
+```
+[scheduler] drain push 'en-TH-x-anna' codes=['PUSHED']                 ← fanout fires
+[lan-push] POST https://192.168.150.159:40025/v1/lan/share_offer        ← stale port
+           failed: Connection refused
+                  ─── 3 seconds later ───
+[lan-discovery] nsd resolved '841d43a8' → 192.168.150.159:42503 [arrival]
+[lan-push] '841d43a8' already at '5368e45b96e9' — no-op                 ← endpoint fresh now
+                                                                          but fanout already gave up
+```
+
+On a daemon respawn, the scheduler drain hits PUSHED immediately,
+fanout fires against `static_endpoints` loaded from disk (which
+hold the peer's *previous* bind), every POST 404s/refuses, and
+no retry is queued. mDNS catches up seconds later, `_record`
+updates `static_endpoints` to the current port — but the
+share_offer is already lost. The git-object sweep that fires on
+arrival (`_fire_arrival` → `sweep_peer`) works correctly with
+the now-fresh endpoint, but git objects don't carry URL
+metadata.
+
+Fix: extend `_fire_arrival` to send a `share_offer` for every
+shared project that has a `remote_url`, immediately after
+`sweep_peer`. Arrival is the precise moment we *know* the
+endpoint is current — piggybacking the share_offer there makes
+URL convergence reliable.
+
+```python
+# _fire_arrival worker (new tail after sweep_peer):
+for langcode in entry.shared_projects:
+    project = projects.get(langcode)
+    if project and project.remote_url:
+        send_share_offer(peer_id, langcode, project.remote_url,
+                         vernlang=project.effective_vernlang())
+```
+
+Peer-side dedup keeps this cheap: `_handle_share_offer` no-ops
+when URLs match (already-known fact), so a peer that already has
+the URL just logs `dispatch='noop'`. A peer that doesn't (the
+case this fixes) auto-adopts via the 0.50.59 logic. Either way,
+no user-visible churn from the extra announcements.
+
+Log line confirming on the sender side:
+
+```
+[lan-discovery] arrival announced N URL(s) to <peer_id>
+```
+
+## 0.50.59 — auto-accept ADOPT_ORIGIN
+
+Pairs with 0.50.58. Now that `send_share_offer` re-fires on every
+successful push, paired peers receive the URL more reliably — but
+the receive side still stashed a `KIND_ADOPT_ORIGIN` pending
+decision and waited for the user to tap "accept" in the picker.
+For the **unambiguous case** (peer has the project locally via
+LAN clone, has no `remote_url`, and an incoming offer carries
+one), that's pointless friction: the user already consented to
+the share by pairing, and the URL is the only natural completion
+of that pairing.
+
+Fix: `_handle_share_offer`'s "local has project, local URL
+empty, incoming URL present" branch now applies the adopt-origin
+synchronously — `set_remote_url(langcode, url)` plus
+`set_remote_origin_url(working_dir, url)` — and reports back
+`dispatch='adopted'` to the sender. Logs as:
+
+```
+[lan-listener] share-offer from <peer> for <langcode> auto-adopted origin <url>
+```
+
+If the apply fails (registry write error, lock contention,
+working_dir missing), falls back to the pre-0.50.59 stash so the
+user has a manual recovery path via the picker's pending-decision
+flow.
+
+**`KIND_REMOTE_CONFLICT` stays a user decision.** When the local
+project has a *different* URL than the incoming one (two
+devices each published independently while apart, now
+reconverging on LAN), the daemon genuinely can't tell which
+github repo is canonical — only the user knows. The
+three-button picker (`Keep mine` / `Use both` / `Switch to
+theirs`, with `Use both` highlighted as the data-preserving
+default) handles this case. `Use both` engages
+`dual_publish` mode, which adds the incoming URL to
+`Project.extra_remotes`; every sync then pushes to both
+upstreams.
+
+## 0.50.58 — share_offer re-fires on every successful push, not just publish
+
+Closes the follow-up flagged in 0.50.53's CHANGELOG: until now
+`_spawn_publish_fanout` was only called from `_h_init_project`
+on `PUSHED`. If a paired peer was offline / not-yet-discovered at
+the moment the user clicked Publish, the share_offer failed
+silently and **the URL never reached that peer** — there was no
+other code path that carried `remote_url` between peers
+(per-commit LAN fan-out moves git objects only, not metadata).
+
+Field repro this morning: tablet has en-TH-x-anna content via
+LAN clone (LAN sync between phone and tablet is fully working —
+commits, three-way merges, all converging). But tablet's
+`.git/config` has no origin URL and registry says
+`remote_url=''`. Result: tablet can sync over LAN but every WAN
+drain hits `NO_REMOTE`. The publish-fanout had fired yesterday
+when the phone auto-recovered; the tablet just wasn't reachable
+at that exact moment.
+
+Fix: also fire `_spawn_publish_fanout(langcode, remote_url)` from:
+
+- **`_h_project_sync`** on `PUSHED` / `COMMITTED_AND_PUSHED` — every
+  user-clicked Sync that lands on github now re-announces the
+  URL to paired peers. Includes the zero-commit case (just a
+  push ack), which is exactly the pattern when a user clicks
+  Sync to "force a refresh."
+- **`scheduler._drain_pending_push`** on `PUSHED` — every successful
+  background drain re-announces too. Lazy import to avoid the
+  `server ← scheduler` circular dependency.
+
+`_spawn_publish_fanout` itself is unchanged. Receiver side
+(`_handle_share_offer`) already dedupes: peers that already have
+the URL no-op; peers that don't get a `KIND_ADOPT_ORIGIN`
+pending decision for the user to accept via the picker. So
+firing on every successful push is harmless spam at worst,
+and the URL converges naturally.
+
+Open: peer-side auto-accept of `KIND_ADOPT_ORIGIN` when the
+project is already paired and has local content but no URL.
+The current flow requires the user to tap "accept" in the
+picker — which is correct for "first-encounter" share offers
+but unnecessary friction for "URL drift" cases where the peer
+clearly already wants this project. Not in this version.
+
+## 0.50.57 — [collab] success log + lessons captured
+
+Closing out the 0.50.52–0.50.56 publish journey:
+
+**`[collab] add_collaborator` success-path log.** Was logging
+only on exception, so a daemon-log post-mortem couldn't tell
+whether the call ran at all on a successful publish. Same
+always-emit-summary lesson as the publish-reconcile fix.
+Now logs every invocation:
+
+```
+[collab] add_collaborator owner='kent-rasmussen' repo='en-TH-x-anna' collaborator='kent-rasmussen' → already
+[collab] add_collaborator owner='aztobt2-ui' repo='baf' collaborator='kent-rasmussen' → invited
+[collab] add_collaborator owner='…' repo='…' collaborator='…' FAILED: <exception>
+```
+
+For Kent's own publishes the call is a no-op (you can't add
+yourself as a collaborator on your own repo — github returns
+422 which `add_collaborator` maps to `'already'`). For other
+users' daemons, it sends an invitation to `kent-rasmussen` (or
+whatever `AZT_GITHUB_COLLABORATOR` / `configure(collaborator=…)`
+overrides). The log line is the only proof in the daemon trail
+that this happened.
+
+**`docs/Publish_errors.md` — Lessons section.** Captures three
+patterns from this journey for future reference:
+
+1. Always emit a summary line, even on no-op paths
+2. Dual-entry-path startup hooks (`serve()` *and*
+   `server_apk/service.py:main()`)
+3. GitHub App auth ≠ PAT auth on the `username` field
+   (`'x-access-token'` is github's placeholder, never a real
+   login — don't compare against it)
+
+Memory entries also saved for cross-session continuity.
+
+## 0.50.56 — owner-mismatch heuristic broken for GitHub App auth
+
+0.50.55 finally got the reconciliation running on Android, which
+exposed two bugs in `_ensure_remote_repo`'s owner-mismatch path
+that the earlier silent-failure days had hidden:
+
+**1. Crash on construction.** The owner-mismatch return path
+built `Status(S.REMOTE_OWNER_MISMATCH_SKIP_CREATE, owner=…,
+username=…, url=…)` — passing kwargs. But `Status` is a
+dataclass with exactly two fields (`code`, `params: dict`); it
+doesn't accept `**kwargs`. Any time the heuristic fired, the
+publish raised `TypeError: Status.__init__() got an unexpected
+keyword argument 'owner'`. Fix: pass a dict as the second
+positional, matching the convention used everywhere else in
+`_ensure_remote_repo`.
+
+**2. False positive on every GitHub App publish.** The check
+compared the URL's owner against the credentials store's
+`username`. For PAT auth, `username` is the user's GitHub login,
+so the comparison is meaningful. For **GitHub App auth**,
+`username` is the literal string `x-access-token` — the
+placeholder GitHub uses for HTTP basic-auth with installation
+tokens. `'x-access-token' != 'kent-rasmussen'` (or any other URL
+owner), so the heuristic fires every time, blocks the POST, and
+falls through to `S.REMOTE_OWNER_MISMATCH_SKIP_CREATE`. Result:
+no github publish via App auth has ever worked through this code
+path. The protection was designed for the duplicate-namespace
+problem when authenticating as user A but pushing to URL owned by
+user B; with App auth, POST `/user/repos` is already scoped to
+the installation's account, so there's no risk of
+wrong-namespace creation and the heuristic isn't needed.
+
+Fix: skip the heuristic when `username.lower() == 'x-access-token'`.
+If the installation isn't on the URL's owner, github returns
+403/422 and `[publish] remote-create FAILED owner/repo: <code>`
+surfaces the real cause via the HTTPError branch.
+
+Combined effect for the user with stale `en-TH-x-anna`: next
+daemon respawn (0.50.55 still got bug 2; 0.50.56 needed) should
+show `[publish] POST https://api.github.com/user/repos
+owner='kent-rasmussen' repo='en-TH-x-anna'` followed by either
+`remote-create OK: created kent-rasmussen/en-TH-x-anna` (if the
+App installation has the right permissions) or `remote-create
+FAILED ... 403/422 <body>` (telling us exactly what permission
+is missing).
+
+## 0.50.55 — reconciliation actually wired into the Android entry path
+
+0.50.53 and 0.50.54 added `reconcile_publish_state_on_startup` and
+its call site — but only in `azt_collabd.server.serve()`, which is
+the **desktop** daemon entry path. On Android the daemon is
+launched by `server_apk/service.py`, which has its own startup
+sequence and doesn't call `serve()`. Result: the reconciliation
+never ran on Android, and any user with the pre-0.50.52 stale
+state stayed stuck. Field-confirmed by a 1ms gap between
+`_boot_trace('after_reconcile')` and `_boot_trace('before_lan_listener')`
+in the daemon log with zero `[publish-reconcile]` lines anywhere.
+
+Fix: add the same `_repo.reconcile_publish_state_on_startup()`
+call to `server_apk/service.py`, between `_boot_trace('after_reconcile')`
+and `_boot_trace('before_lan_listener')` — the exact gap the
+desktop callsite occupies. Both daemon startup paths now invoke
+the auto-fire.
+
+Also: `reconcile_publish_state_on_startup` now emits an
+unconditional summary line on every run, even when there's
+nothing to do:
+
+```
+[publish-reconcile] walked=N mismatch=M succeeded=S deferred=D
+```
+
+Previously the function only logged when `succeeded` or `skipped`
+had entries — which made the all-healthy-projects case
+indistinguishable from "function didn't fire" in the daemon log.
+That diagnostic gap is exactly what hid the missing Android
+callsite for two iterations of 0.50.x.
+
+## 0.50.54 — reconciliation switched from strip-only to auto-fire
+
+Revision of 0.50.53's `repo.reconcile_publish_state_on_startup`.
+The originally-shipped 0.50.53 design stripped `[remote "origin"]`
+from `.git/config` so the picker's `_refresh_publish_row` would
+show the Publish button for a manual retry. That had a defect on
+field devices: an offline / outage / missing-creds boot would
+strip state and expose a phantom Publish button on a project the
+user already chose to publish — wrong UX.
+
+0.50.54 keeps `.git/config` intact and instead **auto-fires the
+publish the user already committed to**:
+
+1. Find projects with the mismatch (`.git/config` URL set,
+   registry empty).
+2. Look up credentials + contributor; if either missing, log
+   `auto-retry deferred …(no_credentials | no_contributor)` and
+   move on — state untouched.
+3. Call `init_repo(captured_url, …,
+   rollback_origin_on_create_fail=False)`. The new kwarg
+   disables 0.50.52's picker-path rollback that would otherwise
+   strip `.git/config` on `REMOTE_CREATE_FAILED` — in auto-retry
+   mode we want to leave the working tree alone on failure so
+   the next daemon startup retries silently.
+4. On `PUSHED`: write `set_remote_url` / `set_last_sync` /
+   `set_last_commit` directly, then fire
+   `server._spawn_publish_fanout` (extracted from
+   `_h_init_project`'s inline `_fanout_worker` so reconciliation
+   can reuse it) to tell paired peers about the now-working URL.
+5. On anything else: log `auto-retry deferred …(codes=[…])` and
+   move on — state untouched.
+
+Behaviour summary by boot scenario:
+
+| At-boot condition | 0.50.53 strip-only | 0.50.54 auto-fire |
+|---|---|---|
+| Online + valid creds | Strip, user clicks Publish | Auto-pushes, project recovered |
+| Offline | Strip, **phantom button** | No-op, next boot retries |
+| Github outage | Strip, **phantom button** | No-op, next boot retries |
+| Missing creds | Strip, **phantom button** | No-op, next boot retries |
+| User changed mind | Strip, button appears | Auto-publishes anyway (consent argument: they already pressed Publish) |
+
+`init_repo` / `_init_repo_locked` gained the
+`rollback_origin_on_create_fail=True` kwarg (default unchanged
+for picker callers). Picker manual-click path keeps the rollback
+so a failed click still surfaces the button for a deliberate
+retry; the difference is purely in the auto-retry callsite.
+
+## 0.50.53 — retroactive cleanup + publish-fanout gate
+
+Follow-up to 0.50.52, addressing two situations its forward path
+couldn't:
+
+### Stale publish state from pre-0.50.52 daemons
+
+A user upgrading from `<0.50.52` may have a project where
+`.git/config` has an origin URL pointing at a github repo that
+doesn't exist, while the registry's `Project.remote_url` is empty.
+That fingerprint isn't reachable from any 0.50.52+ code path —
+post-0.50.52 the rollback paths keep both sides in sync
+(both-set on `PUSHED`, both-empty on `REMOTE_CREATE_FAILED`). But
+during the upgrade window itself, an install of a new server APK
+doesn't kill the running daemon (the recurring suite issue, see
+[[project_client_server_version_drift]] /
+[[feedback_restart_must_work_against_old_daemon]]), so clicks
+that land while the OLD daemon is still serving RPCs hit the
+legacy silent failure and leave the mismatch behind.
+
+In that stuck state the picker's `_refresh_publish_row` hides
+Publish (live `.git/config` URL is non-empty), so the idempotent
+Publish button is out of reach and the scheduler hammers
+`NotGitRepository()` on every drain.
+
+Fix: `repo.reconcile_publish_state_on_startup()` walks
+`projects.list_all()` on every daemon startup. For each project
+with the mismatch fingerprint, it **auto-fires the publish the
+user already committed to** rather than stripping `.git/config`
+to make the Publish button reappear. The strip-and-show-button
+approach (briefly implemented earlier in this version) had a
+defect: an offline / outage / missing-creds boot would strip
+state and expose a phantom Publish button on a project the user
+had already chosen to publish, which is wrong UX. Auto-fire keeps
+state untouched on failure so those boots are silent no-ops.
+
+Auto-fire flow:
+
+1. Mismatch detected (`.git/config` URL set, registry empty).
+2. Look up credentials + contributor from the store. If either
+   is missing, log the skip and move on — no state change.
+3. Call `init_repo(working_dir, captured_url, …,
+   rollback_origin_on_create_fail=False)`. The new kwarg
+   disables the 0.50.52 picker-path rollback that would
+   normally strip `.git/config` on `REMOTE_CREATE_FAILED`. In
+   auto-retry mode we *want* to leave the working tree alone
+   on failure — next daemon startup retries silently.
+4. On `PUSHED`: write the registry side-effects
+   (`set_remote_url`, `set_last_sync`, `set_last_commit`) and
+   spawn the publish-fanout to paired peers (extracted into
+   `server._spawn_publish_fanout` so the reconciliation can
+   reuse it).
+5. On anything else: log
+   `[publish-reconcile] auto-retry deferred for N project(s)
+   (state unchanged, next boot will retry): [...]` and move on.
+
+Safety arguments:
+
+- The mismatch fingerprint is unreachable from any post-0.50.52
+  code path, so the reconciliation never runs against a healthy
+  project. A transient github outage during a *manual* Publish
+  produces `REMOTE_CREATE_FAILED` and the picker-initiated
+  rollback clears *both* sides — leaving both-empty, not the
+  half-state this reconciliation targets.
+- Per the user's framing: if they pressed Publish in the past,
+  re-firing it now is a no-op confirmation of the same intent.
+  No new judgment call required from the user.
+- Offline / outage / missing-creds at boot is a normal
+  occurrence and must not produce a Publish button on a project
+  the user already committed to publish. Auto-fire achieves this
+  by leaving state unchanged on failure.
+
+### Publish-fanout fired regardless of success
+
+`_h_init_project`'s `_fanout_worker` (which sends `share_offer`
+to every paired peer who has the project on their allow-list,
+carrying the `remote_url`) was gated only on
+`if published_langcode and remote_url:` — both of which are
+populated the moment the RPC arrives, before `_init_repo` even
+runs. So a publish that failed at `_ensure_remote_repo` or `push`
+would *still* tell peers about the URL, and peers accepting the
+share offer would adopt a URL pointing at a non-existent or
+empty github repo. They'd then hit `NotGitRepository()` on every
+drain, propagating the stuck state.
+
+Fix: add `publish_landed = 'PUSHED' in codes or 'COMMITTED_AND_PUSHED' in codes`
+and gate the thread spawn on it. Peers only learn about working
+remotes.
+
+Open: the scheduler's WAN-drain doesn't fire `send_share_offer`
+after a successful retry-push, so if the *first* publish fails
+but a *later* drain succeeds, paired peers won't auto-learn the
+URL. That's a 0.50.x sync-rebuild design decision (per CLAUDE.md
+"LAN fan-out per-commit, WAN drain WAN-only") and needs a
+follow-up to surface a share-offer on drain success. Tracked
+separately; not in this version.
+
+## 0.50.52 — publish trail in daemon log + idempotent Publish
+
+Field repro (today): user clicked Publish in the picker, the local-side
+mutations of `_init_repo_locked` (rename `master` → `main`, set
+`remote.origin.url`) all ran, the `publish-fanout` worker even fired a
+share-offer to a paired peer — but the project never appeared on
+github.com. Every subsequent `[sync-trace] fetch` returned dulwich's
+`NotGitRepository()` (GitHub serving the 404 page rather than a git
+response). The daemon log had no trace of what happened inside
+`_ensure_remote_repo` — every branch in there was silent:
+
+- success (created): no log
+- already-exists 422/400: no log
+- HTTPError create-failed: no log (Result-only)
+- URL/OSError network failure: no log (Result-only)
+- skip-create owner-mismatch: no log
+- unknown-host skip: no log
+
+The peer received a typed `Result` carrying the failure status, but
+when the user can't or won't share a logcat / daemon-log screenshot,
+diagnosis is blind — and the picker's "OK-on-uncertainty" sync
+indicator masked the failure too (rendered `wan_unshared=0` while
+every commit was at risk because the remote didn't exist).
+
+Fix: instrument `_init_repo_locked` and `_ensure_remote_repo` so the
+daemon log carries the full publish trail. New lines, all tagged
+`[publish]`:
+
+- `init_repo begin dir=… remote=… branch=… username=…` — every entry
+- `POST <api_url> owner=… repo=…` — every github/gitlab create attempt
+- `remote-create OK: created owner/repo` — on success
+- `remote-create: owner/repo already exists (422/400)` — idempotent path
+- `remote-create FAILED owner/repo: <code> <body>` — HTTPError path
+- `remote-create FAILED owner/repo: <urlerror>` — URL/OS error path
+- `skip remote-create: owner mismatch …` — adopted-URL path
+- `skip remote-create: unknown host …` — gitea / forgejo / LAN
+- `push to <url> failed: <exc>` — when the post-create push raises
+- `init_repo aborting before push: codes=[…]` — when create gates push
+- `init_repo done: codes=[…]` — every exit
+
+Paired with the existing `[publish-fanout]` thread tag (server.py:2312),
+"the user clicked Publish" is now a self-contained trail a tester can
+quote from a Share-daemon-log file.
+
+`_h_init_project`'s four pre-check early-outs (`CONTRIBUTOR_UNSET`,
+`missing_working_dir_or_remote_url`, `AUTH_REQUIRED` for no stored
+token, and the catch-all `_init_repo raised`) used to return their
+typed `Result` to the peer without logging anything daemon-side —
+same blind spot as the github-API layer, one level up. All four now
+emit a `[publish]` line so a daemon-log share covers the no-token
+case (where `_init_repo_locked` is never reached and would otherwise
+leave zero `[publish]` traces).
+
+### Idempotent Publish
+
+Once we knew the user had clicked Publish, the secondary question was
+"why can't they just click it again to retry?" Two reasons:
+
+1. **`_init_repo_locked`'s commit step would falsely bump the persistent
+   `commit_failure_count`.** On the re-click, the working tree has no
+   pending staged changes (the original Publish's initial commit is
+   already in history). `porcelain.commit` raised "nothing to commit"
+   → `_surface_commit_failure` → counter +=1 → eventually surfaces
+   `COMMIT_REPEATEDLY_FAILED` as a data-loss-class toast for a
+   non-failure. Mirror of `_commit_step_locked`'s has_staged guard:
+   inspect `porcelain.status(repo)` first, only call `porcelain.commit`
+   when something's actually staged, otherwise add `S.NOTHING_TO_COMMIT`.
+
+2. **The picker hid the Publish button entirely.** `_refresh_publish_row`
+   gates on `live_remote_url` non-empty, and the failed Publish left a
+   stale `remote.origin.url` in `.git/config` pointing at a non-existent
+   github repo. Fix: roll back the local-side mutation on
+   `_ensure_remote_repo` failure (`ok=False`) — strip the
+   `[remote "origin"]` section via the new `_strip_origin_section`
+   helper, and mirror the rollback in the registry by clearing
+   `projects.set_remote_url(langcode, '')` in `_h_init_project` when
+   the result carries `REMOTE_CREATE_FAILED`. Only on hard
+   create-failure — `REMOTE_OWNER_MISMATCH_SKIP_CREATE` (collaborator
+   bet) and push failure (remote exists, scheduler drain will retry)
+   both keep the URL.
+
+After both fixes, the Publish button is fully safe to re-click:
+- nothing changed on the working tree → no spurious commit, no counter
+  bump, no `COMMITTED` line
+- existing origin URL matches → `REMOTE_UNCHANGED`
+- HEAD already on `main` → no-op
+- `_ensure_remote_repo` retries the github-API call (422 if the repo
+  appeared between attempts)
+- `porcelain.push` retries naturally
+
+The masking sync-indicator (OK-on-uncertainty firing on
+`NotGitRepository`) is a separate fix to plan — `_wan_unshared` should
+distinguish "fetch hit a 404 page" from "fetch never ran" before
+collapsing both to `wan_unshared=0`. Not in this version.
+
+## 0.50.51 — commit_after opt-out + lan_peer_id guarantee documented; NOTES queue cleared
+
+Both items closed from `azt_collab_client/NOTES_TO_DAEMON.md`.
+
+### `commit_after` opt-out on write RPCs (Option A from NOTE #2)
+
+Filed by azt-recorder 1.55.21 (2026-06-06). The atomic_commit /
+set_audio / set_illustration / atomic_finalize endpoints schedule
+a debounced commit on every successful write with no opt-out,
+which breaks the recorder's commit-boundary model (commits land
+before the user accepts the take; re-records ship every bad
+take into history).
+
+Fix: all four write endpoints now accept an optional
+`commit_after: bool = True` body parameter. Default `True`
+preserves current behavior. When `False`, the daemon performs
+the atomic write + `notify_project_changed` exactly as before
+but skips the `commit_project` scheduling. The peer is then
+responsible for calling `commit_project(langcode)` at its own
+boundary.
+
+Client wrappers updated to surface the flag:
+- `atomic_commit_bytes(langcode, rel_path, data, commit_after=True)`
+- `set_audio(langcode, guid, lang, filename, commit_after=True)`
+- `set_illustration(langcode, guid, href, commit_after=True)`
+- `atomic_finalize_pending(langcode, rel_path, token, commit_after=True)`
+
+`CLIENT_INTEGRATION.md` § 9a (Targets + step 6) and § 21
+updated with the opt-out contract.
+
+### `MIN_SERVER_VERSION` 0.49.1 → 0.50.51
+
+Forced floor bump (same pattern as 0.47.0). Older daemons
+silently ignore unknown body fields, so a 0.50.51+ peer passing
+`commit_after=False` to a pre-0.50.51 daemon would have the
+auto-commit fire anyway with no signal back to the peer — the
+silent-failure case version floors exist to prevent. With the
+bump in place, any 0.50.51+ peer client refuses to talk to a
+pre-0.50.51 daemon and the bootstrap install/update popup
+prompts the user to refresh the server APK before the peer
+trusts the opt-out.
+
+`MIN_CLIENT_VERSION` (daemon-side floor on clients) stays at
+0.50.0 — the new feature is purely additive on the daemon, so
+old clients that don't pass the field still work correctly
+(the daemon's default of `True` matches their assumption).
+
+### `lan_peer_id()` non-empty guarantee documented (NOTE #1)
+
+Filed by azt-recorder before 1.50.2. Daemon eager-initialises
+the per-device ed25519 keypair on every startup since 0.50.9,
+so `lan_peer_id()` is guaranteed non-empty on any 0.50.9+
+daemon with the `cryptography` package present (suite APKs
+ship cryptography unconditionally). No daemon code change —
+the guarantee has been in place for releases; what was missing
+was the explicit statement in CLIENT_INTEGRATION's locked
+semantics. Now added to Locked Semantic #2.
+
+Peers may safely drop legacy `device_name` fallbacks for
+peer-identity matching against a 0.50.9+ daemon. Pre-0.50.9
+instances are end-user upgrade prompts, not peer-side
+workaround territory.
+
+## 0.50.50 — Receiver-side last_seen_main refresh after receive-pack (LAN-1 phantom fix)
+
+User reported: A commits, A fan-outs to B. A shows LANOK (its
+sweep updated `last_seen_main[B][lang]` to the new SHA). But B
+shows LAN-1 even though B just received that commit from the
+only paired peer.
+
+Root cause: when A's push lands on B's listener, the smart-
+protocol receive-pack advances B's `refs/heads/main` and B's
+`_reset_working_tree_after_receive` syncs the working tree, but
+**nothing on B's side updates `last_seen_main` for the paired
+peer who pushed**. So B's `_lan_unshared` walks excluding stale
+peer SHAs (or no peer SHAs at all on a first push) and reports
+the just-received commit as "unshared." LAN-1 on a project the
+two phones are actually in sync on.
+
+### Fix
+
+New `lan_push.peek_peer_head(peer_id, langcode)` — peek-only
+ls-remote against a peer's listener. Resolves endpoint + builds
+TLS-pinned pool + reads peer's main SHA. Returns hex string or
+None. Honors the 0.50.49 fast-fail gate.
+
+New `lan_listener._refresh_peer_last_seen_after_receive(langcode,
+new_head_sha_hex)` — fires from
+`_reset_working_tree_after_receive` after the successful hard
+reset, in a background thread off the WSGI worker path. Walks
+every paired peer whose `shared_projects` contains *langcode*,
+peeks their main, and updates `last_seen_main` for those at our
+new HEAD. The pusher is guaranteed to match (they couldn't push
+a SHA they don't have); other paired peers may or may not.
+
+After this lands:
+
+- A commits → A pushes to B → A updates `last_seen_main[B][lang]`
+  (existing behaviour) → A shows LANOK.
+- B's listener accepts the push → B resets working tree → B
+  peeks A's main → A is at the same SHA → B updates
+  `last_seen_main[A][lang]` → B shows LANOK too.
+
+Cost: one ls-remote per paired peer sharing the project on each
+incoming push. Cheap (protocol round-trip only, no packfile),
+and the fast-fail gate makes recently-unreachable peers a free
+skip.
+
+### Why we don't update peers whose main is behind our HEAD
+
+A paired peer whose ls-remote returns a SHA earlier than our new
+HEAD might genuinely be behind, OR they may simply not have
+observed our push yet. "OK on uncertainty" says leave their
+`last_seen_main` alone — the next sweep that successfully pushes
+to them will update it.
+
+## 0.50.49 — Daemon-startup orphan sweep + fast-fail for unreachable peers
+
+### Startup orphan-tracking-ref sweep
+
+0.50.48 fixed the orphan-cleanup logic (`has_url_now` checks the
+decoded URL value, not just key existence) but cleanup still only
+ran when `_h_project_status` polled a specific project. Projects
+the user wasn't currently looking at kept their stale
+`refs/remotes/origin/*` refs visible in `lan_debug` dumps even
+though the readings were correct.
+
+Now: scheduler startup walks every project in `projects.json`
+and calls `strip_lan_origin_if_present(scope_to_paired_peers=True)`
+for each. One-time housekeeping that fires once per daemon
+startup; steady-state cleanup is still the `_h_project_status`
+path. After the next deploy + first daemon respawn, all four
+projects on both phones should report `remote_refs_present: []`
+(when `has_origin_url: false`) without the user having to open
+each one.
+
+### Fast-fail for recently-unreachable peers
+
+Paired-but-absent peers were costing ~23 seconds per burst per
+peer. The phone has three paired peers and only one in the room;
+the absent two (`77a1384f` at 192.168.10.101, `aa970b36` at
+192.168.10.143) each ate three urllib3 retries × ~2.3 s connect
+timeout × two projects in the sweep. The sweep summary line
+showed `0/N delivered` after the dust settled. Net effect: every
+burst spent most of its 30 s window waiting on dead peers.
+
+New per-peer fast-fail gate:
+
+- `_unreachable_at[peer_id_hex]` (in-memory monotonic timestamp)
+- `_UNREACHABLE_COOLDOWN_S = 60.0`
+- `_recently_unreachable(peer_id)` — predicate; True while in
+  cooldown
+- `_record_unreachable(peer_id)` / `_record_reachable(peer_id)` —
+  set / clear
+
+Wiring:
+
+- `_push_to_peer` checks the gate at entry, returns False
+  immediately (logged as `recently unreachable; skipping
+  (fast-fail)`) when set.
+- `_https_post_to_peer` checks the gate at entry, returns
+  `(0, b'')` immediately when set.
+- The network-error paths in both helpers call
+  `_record_unreachable(peer_id)`. Success paths call
+  `_record_reachable(peer_id)`.
+- `lan_discovery._fire_arrival` clears the gate before firing
+  `sweep_peer` — mDNS arrival is a strong "this peer is back"
+  signal and shouldn't be blocked by the previous-burst
+  observation.
+
+Net effect for a 3-peer-paired, 1-peer-in-room sweep:
+- First absent-peer attempt: ~7 s timeout (same as before),
+  records unreachable.
+- Every subsequent attempt within 60 s: ~µs skip.
+- mDNS arrival of the in-room peer: gate clears, sweep proceeds
+  normally.
+
+### Stale-endpoint race (task #31 in the session log) — resolved by fast-fail
+
+The "tablet tried 35581 instead of the just-resolved 36587"
+behavior the previous logs surfaced was actually mDNS not having
+resolved yet at sync time, so `_resolve_endpoint` fell back to
+the previous-session `static_endpoints` port. The fast-fail gate
+above absorbs the retry storm from the stale port; the mDNS
+arrival callback then clears the gate and the sweep retries with
+the fresh endpoint. No separate code change needed for this
+specific case.
+
+## 0.50.48 — Orphan-tracking-ref bugs: wan_unshared honored stale refs, cleanup pass missed half-stripped state
+
+Field repro 2026-06-05: tablet showed WAN-302, phone showed WAN-17
+for the same project, same HEAD SHA, same ancestor depth (both 302
+from HEAD). The diagnostic snapshot from the 0.50.47 daemon-log
+dump nailed it:
+
+- Tablet: `has_origin_url: false`, `remote_refs_present:
+  [origin/HEAD, origin/master]`, `wan_unshared: 302`.
+- Phone: `has_origin_url: false`, `remote_refs_present:
+  [origin/HEAD, origin/main, origin/master]`, `wan_unshared: 17`.
+
+The phone had stale `refs/remotes/origin/main` (and friends) left
+over from a previous origin that had since been stripped — but
+`_wan_unshared` happily walked excluding that orphan, producing 17.
+Two interlocking bugs:
+
+### Bug 1: `_wan_unshared` branched on tracking-ref existence, not URL
+
+Pre-fix the helper checked "does `refs/remotes/origin/<branch>`
+exist?" first, only consulting the URL when the ref was absent. So
+a project with no origin URL but lingering tracking refs got
+walked as if those refs were real upstream state, producing
+nonsense counts. New shape: read URL first. If empty, it's a
+LAN-only project — walk from HEAD regardless of what refs are
+hanging around. Tracking ref only matters when there's an actual
+URL behind it.
+
+### Bug 2: orphan-tracking-ref cleanup blocked by half-stripped config
+
+The orphan cleanup in `_strip_lan_origin_locked` was supposed to
+remove these refs after URL strip, but its `has_url_now` check
+treated "key exists, empty value" the same as "URL present" —
+which is exactly the state the older `config.set(... url, b'')`
+fallback (for dulwich versions without `remove_section`) leaves
+behind. The phone's project was in that half-stripped state, so
+every cleanup pass since the orphan handler shipped (0.46.2 era)
+skipped over it. Now `has_url_now` checks the decoded value, not
+just key existence — empty string = no URL = run the cleanup.
+
+### Bug 3: `lan_debug.head_branch` always empty
+
+`refs.read_ref(b'HEAD')` follows the symbolic ref and returns the
+resolved SHA, not `b'refs/heads/<branch>'`. Switched to
+`refs.get_symrefs()` which returns the symbolic-ref mapping
+directly. Diagnostic dumps from 0.50.48+ will carry the real
+branch name.
+
+## 0.50.47 — lan_debug snapshot lands in daemon log on toggle-on
+
+0.50.46 added the `lan_debug` RPC but only via the python client
+wrapper. That's useless when the tester only has the device UI
+and the Share daemon log button — no python shell to call the
+wrapper. 0.50.47 fixes the delivery path:
+
+When the user turns the daemon-log toggle ON (the gesture that
+starts a fresh capture before sharing), `_h_set_daemon_log_to_file`
+now immediately writes a `[lan-debug] snapshot start … snapshot
+end` block to stderr, one JSON line per registered project with
+the full `lan_debug` payload. The user then taps Share daemon log
+and the diagnostic baseline is already in the file.
+
+No new UI button — the gesture you already do (toggle on → share)
+now carries the diagnostic. Per the existing "remote-tester
+diagnostics need a user-visible delivery path" rule from session
+memory.
+
+## 0.50.46 — Diagnostic RPC for WAN-N disparity (GET /v1/projects/<lang>/lan_debug)
+
+Read-only diagnostic dump for chasing the "tablet says WAN-302,
+phone says WAN-17, but the sweep proves they're at the same SHA"
+class of issue. Hit it from each phone for the same project and
+compare fields directly: HEAD branch + SHA, ancestor count from
+HEAD, origin URL, tracking ref SHA, full list of local branches
+and remote refs, current ``wan_unshared`` reading. Returns:
+
+```json
+{"ok": true,
+ "langcode": "en-TH-x-anna",
+ "head_branch": "main",
+ "head_sha": "abc123…",
+ "ancestor_count_from_head": 302,
+ "has_origin_url": false,
+ "origin_url": "",
+ "tracking_ref_sha": null,
+ "remote_refs_present": [],
+ "branches_present": ["refs/heads/main"],
+ "wan_unshared": 302}
+```
+
+Per-field errors surface as ``<field>_error`` rather than
+silently zeroing — different from the production helpers which
+follow "OK on uncertainty" because diagnostics need the real
+reason. Client wrapper: ``lan_debug(langcode)`` returns the raw
+dict (no Result wrapping, since this is structural info, not a
+status-coded op).
+
 ## 0.50.45 — LAN sync convergence: sweep, backoff, lifecycle bursts
 
 Six changes that close the "two phones on the same LAN don't always

@@ -157,9 +157,8 @@ _HANDLERS = {
     S.COMMITTED_NO_REMOTE:    lambda p: _tr('Committed (no remote configured)'),
     S.DATA_LOSS_RISK:         lambda p: _fmt(_tr(
         'Data-loss risk: {count} file(s) written to your project '
-        "aren't being backed up. Please enable Settings → "
-        'Diagnostic log → Log server activity = yes, then Share '
-        'daemon log so we can investigate.'), p),
+        "aren't being backed up. Please tap Share diagnostics on "
+        'the project picker so we can investigate.'), p),
     S.COMMITTED_AND_PUSHED:   lambda p: _fmt(_tr('Committed and pushed {n} file(s)'), p),
     S.NOTHING_TO_COMMIT:      lambda p: _tr('Nothing new to commit.'),
     S.REMOTE_SET:             lambda p: _fmt(_tr('Remote set to {url}'), p),
@@ -190,9 +189,9 @@ _HANDLERS = {
     S.COMMIT_REPEATEDLY_FAILED: lambda p: _fmt(_tr(
         'Saving to git has failed {count} times in a row '
         '({error}). Your recordings are still on the device '
-        "but aren't being backed up. Please enable Settings → "
-        'Diagnostic log → Log server activity = yes, then Share '
-        'daemon log so we can investigate.'), p),
+        "but aren't being backed up. Please tap Share "
+        'diagnostics on the project picker so we can '
+        'investigate.'), p),
     S.PUSH_FAILED:            lambda p: _fmt(_tr('Push failed: {error}'), p),
     S.DNS_RESOLUTION_FAILED:  lambda p: _tr(
         'Network reachable, but the sync host could not be resolved. '
@@ -342,6 +341,11 @@ _HANDLERS = {
         '{raw_bytes:,} bytes). This may be a connection problem or '
         'a GitHub-side issue — try again later or on a different '
         'network.'), p),
+    S.BLOB_EXCEEDS_BUDGET: lambda p: _fmt(_tr(
+        'Could not push to GitHub: one file (sha {blob_sha}, '
+        '{blob_bytes:,} bytes) is larger than the {budget_bytes:,}-byte '
+        'per-upload limit. Try a faster connection, or ask support '
+        'to raise the limit.'), p),
     S.LARGE_AUDIO_FILE_DETECTED: lambda p: _fmt(_tr(
         'Unusually large file recorded: {path} ({bytes:,} bytes). '
         'The recorder is for word-list elicitation — please check '

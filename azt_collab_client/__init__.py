@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.50.45"
+__version__ = "0.52.20"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -165,7 +165,16 @@ __version__ = "0.50.45"
 # WAN-behind / LAN-behind / at-risk states. Force the floor so
 # the bootstrap popup prompts a daemon rebuild before that misread
 # happens.
-MIN_SERVER_VERSION = "0.49.1"
+# 0.50.51 floor: new ``commit_after`` body field on
+# ``atomic_commit`` / ``set_audio`` / ``set_illustration`` /
+# ``atomic_finalize``. Older daemons silently ignore unknown
+# body fields, so a 0.50.51+ peer passing ``commit_after=False``
+# (e.g. the recorder's swipe-boundary commit model) would have
+# the auto-commit fire anyway with no signal back. Pinning the
+# floor forces the bootstrap update prompt before the recorder
+# trusts the opt-out. See CHANGELOG 0.50.51 + NOTES_TO_DAEMON
+# (now empty) for the rationale.
+MIN_SERVER_VERSION = "0.50.51"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``
@@ -1949,6 +1958,21 @@ def project_status(langcode):
     return ProjectStatus.from_dict(resp)
 
 
+def lan_debug(langcode):
+    """Diagnostic dump for *langcode*: HEAD branch + SHA, ancestor
+    count, origin URL, tracking ref SHA, all local branches +
+    remote refs, current wan_unshared reading. Returns a plain
+    dict (not a Result) since this is a structured debug view,
+    not a status-coded op. Returns ``{ok: False, error: ...}``
+    on transport / project-lookup failure. Since 0.50.45."""
+    try:
+        resp = call('GET', f'/v1/projects/{langcode}/lan_debug')
+    except ServerUnavailable as ex:
+        return {"ok": False, "error": "server_unavailable",
+                "detail": str(ex), "langcode": langcode}
+    return resp
+
+
 def lan_burst_now():
     """Ask the daemon to bring the LAN radio up for a 30s discovery
     burst. Lifecycle gesture: peers call this on Activity resume,
@@ -2384,7 +2408,7 @@ def set_repo_slug(langcode, slug):
     return Project.from_dict(resp.get('project', {}))
 
 
-def atomic_commit_bytes(langcode, rel_path, data):
+def atomic_commit_bytes(langcode, rel_path, data, commit_after=True):
     """Atomically write *data* to ``<working_dir>/<rel_path>`` for
     project *langcode*. Goes through the daemon's
     ``/v1/projects/<lang>/atomic_commit`` endpoint so the
@@ -2398,6 +2422,13 @@ def atomic_commit_bytes(langcode, rel_path, data):
     - ``<file>.lift``           — top-level LIFT file
     - ``audio/<file>``          — sibling audio
     - ``images/<file>``         — sibling image
+
+    *commit_after* (default ``True``) controls whether the daemon
+    schedules a debounced commit on success. Pass ``False`` when
+    the peer owns the commit boundary itself (e.g. recorder
+    swipe-to-accept) so writes during a "preview" phase don't
+    land in git history. The peer is then responsible for calling
+    ``commit_project(langcode)`` at the boundary. Added 0.50.51.
 
     Returns ``Result``. Success: a single ``ATOMIC_COMMITTED``
     status with ``bytes_written`` and ``sha256`` params. Transport
@@ -2417,9 +2448,11 @@ def atomic_commit_bytes(langcode, rel_path, data):
     Pass chunked uploads if a future case ships a much larger
     payload."""
     data_b64 = base64.b64encode(data).decode('ascii')
+    body = {'path': rel_path, 'data_b64': data_b64,
+            'commit_after': bool(commit_after)}
     try:
         resp = call('POST', f'/v1/projects/{langcode}/atomic_commit',
-                    {'path': rel_path, 'data_b64': data_b64})
+                    body)
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -2429,7 +2462,7 @@ def atomic_commit_bytes(langcode, rel_path, data):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
-def set_audio(langcode, guid, lang, filename):
+def set_audio(langcode, guid, lang, filename, commit_after=True):
     """Surgically set the audio filename on one LIFT entry for
     project *langcode*. Goes through the daemon's
     ``/v1/projects/<lang>/set_audio`` endpoint so the peer doesn't
@@ -2441,8 +2474,15 @@ def set_audio(langcode, guid, lang, filename):
     ``<citation>/<form lang={lang}><text>{filename}</text></form>``,
     leave other forms in the citation untouched, splice byte-stable
     around the entry, SAX-validate, atomic write under
-    ``project_lock``, fire ``notify_project_changed``, and schedule
-    a debounced commit.
+    ``project_lock``, fire ``notify_project_changed``, and (when
+    *commit_after* is True, default) schedule a debounced commit.
+
+    *commit_after* (default ``True``) controls whether the daemon
+    schedules a debounced commit on success. Pass ``False`` when
+    the peer owns the commit boundary itself (e.g. recorder's
+    swipe = "I accept this take"; writes during preview should
+    NOT commit). The peer is then responsible for calling
+    ``commit_project(langcode)`` at the boundary. Added 0.50.51.
 
     Returns a ``Result`` carrying ``S.AUDIO_SET`` on first-time
     write, ``S.AUDIO_SET_NO_CHANGE`` when the form's text already
@@ -2455,7 +2495,8 @@ def set_audio(langcode, guid, lang, filename):
     try:
         resp = call('POST', f'/v1/projects/{langcode}/set_audio',
                     {'guid': guid, 'lang': lang,
-                     'filename': filename})
+                     'filename': filename,
+                     'commit_after': bool(commit_after)})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -2465,11 +2506,14 @@ def set_audio(langcode, guid, lang, filename):
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
-def set_illustration(langcode, guid, href):
+def set_illustration(langcode, guid, href, commit_after=True):
     """Surgically set the illustration href on one LIFT entry for
     project *langcode*. Sibling to ``set_audio`` for image saves;
     targets ``<sense>/<illustration href={href}/>`` on the entry's
     first sense (creating the sense if absent).
+
+    *commit_after* (default ``True``) — see ``set_audio`` for the
+    semantics. Added 0.50.51.
 
     Returns a ``Result`` carrying ``S.ILLUSTRATION_SET`` /
     ``S.ILLUSTRATION_SET_NO_CHANGE`` / ``S.ENTRY_NOT_FOUND`` /
@@ -2478,7 +2522,8 @@ def set_illustration(langcode, guid, href):
     try:
         resp = call(
             'POST', f'/v1/projects/{langcode}/set_illustration',
-            {'guid': guid, 'href': href})
+            {'guid': guid, 'href': href,
+             'commit_after': bool(commit_after)})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -2486,25 +2531,6 @@ def set_illustration(langcode, guid, href):
         return Result.from_dict(resp.get('result') or {})
     return Result(statuses=[Status(
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
-
-
-def set_daemon_log_to_file(enabled):
-    """Toggle the daemon's stderr-to-file mirror. Takes effect
-    immediately in the running daemon process — no restart
-    required. Returns ``{'enabled': bool, 'log_path': str}`` on
-    success, ``None`` on transport failure."""
-    try:
-        resp = call('POST',
-                    '/v1/logging/daemon_log_to_file',
-                    {'enabled': bool(enabled)})
-    except ServerUnavailable:
-        return None
-    if not resp.get('ok'):
-        return None
-    return {
-        'enabled': bool(resp.get('enabled')),
-        'log_path': resp.get('log_path') or '',
-    }
 
 
 def get_daemon_log():
@@ -2529,6 +2555,143 @@ def get_daemon_log():
         'bytes': int(resp.get('bytes') or 0),
         'enabled': bool(resp.get('enabled')),
     }
+
+
+def prepare_share_bundle():
+    """Stage the diagnostic snapshot + per-day daemon logs into
+    ``$AZT_HOME/.shares/<token>/`` on the daemon side and return
+    ``{'token': str, 'items': [{'display_name': str,
+    'uri_path': str}, ...]}`` so the caller can build ContentProvider
+    URIs of the form
+    ``content://org.atoznback.aztcollab/<uri_path>``.
+
+    Used by the picker / settings ``Share diagnostics`` button
+    (since 0.52.13) instead of writing to MediaStore Downloads.
+    Signal refuses MediaStore URIs (its receive-side security
+    policy whitelist) but accepts URIs from the sender's own
+    ContentProvider authority — which is what this RPC produces.
+
+    Daemon-side TTL: stale bundles (>1h old) are swept on every
+    prepare call so an abandoned share doesn't leak. The TTL is
+    generous because some receivers (Signal in particular) hold
+    the URI in a compose draft and don't read until send time —
+    minutes after the chooser closes.
+
+    Returns ``None`` on transport failure; an empty ``items``
+    list if both the snapshot and the log-file copy failed
+    (shouldn't happen in practice — the snapshot generator is
+    near-bulletproof).
+    """
+    try:
+        resp = call('POST',
+                    '/v1/diagnostics/prepare_share_bundle', {})
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    items = []
+    for entry in resp.get('items') or []:
+        items.append({
+            'display_name': str(entry.get('display_name') or ''),
+            'uri_path': str(entry.get('uri_path') or ''),
+        })
+    return {
+        'token': str(resp.get('token') or ''),
+        'items': items,
+    }
+
+
+def log_diagnostic(tag, line):
+    """Append a one-line peer-side trace to the always-on daemon
+    log (since 0.52.11). Use for behaviour that lives outside the
+    daemon's own process — picker UI decisions, share-intent
+    construction, host-app startup events — so a shared
+    diagnostic bundle captures BOTH sides of the daemon /
+    UI-process boundary.
+
+    ``tag`` is a short subsystem prefix (``share_files``,
+    ``picker.on_enter``, ``recorder.commit``, etc.); ``line``
+    is the human-readable payload. Lines are capped server-side
+    at 1024 chars (longer payloads silently truncated with a
+    ``…[truncated]`` suffix).
+
+    Best-effort: any transport failure is swallowed so peer code
+    paths aren't derailed by a stalled write. Returns ``True`` on
+    successful send, ``False`` otherwise — caller doesn't need to
+    check unless they want to skip subsequent trace calls when
+    the channel is broken."""
+    try:
+        resp = call('POST', '/v1/logging/append',
+                    {'tag': str(tag or 'peer'),
+                     'line': str(line or '')})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
+
+
+def get_daemon_log_files():
+    """Return the daemon's per-day stderr log files inside the
+    daemon-side retention window (since 0.52.6, default 3 days).
+    Shape: ``{'files': [{'date': 'YYYY-MM-DD',
+    'filename': '<basename>', 'content': str, 'bytes': int}, ...],
+    'retention_days': int, 'enabled': bool}``. Files are ordered
+    oldest-first so a tester reading top-to-bottom gets
+    chronological flow. Each ``content`` is daemon-side truncated
+    to the last ~256 KB if larger (same cap as
+    ``get_daemon_log``).
+
+    Returns ``None`` on transport failure; an empty ``files`` list
+    when the toggle has never been enabled or no per-day file
+    exists yet (e.g., a fresh install where the daemon hasn't
+    written anything to today's file). Surfaced by the picker's
+    multi-file Share path so the bundle ships every day inside
+    the retention window in one ``ACTION_SEND_MULTIPLE``
+    dispatch."""
+    try:
+        resp = call('GET', '/v1/logging/daemon_log_files')
+    except ServerUnavailable:
+        return None
+    if not resp.get('ok'):
+        return None
+    files = []
+    for entry in resp.get('files') or []:
+        files.append({
+            'date': str(entry.get('date') or ''),
+            'filename': str(entry.get('filename') or ''),
+            'content': str(entry.get('content') or ''),
+            'bytes': int(entry.get('bytes') or 0),
+        })
+    return {
+        'files': files,
+        'retention_days': int(resp.get('retention_days') or 3),
+        'enabled': bool(resp.get('enabled')),
+    }
+
+
+def get_diagnostic_snapshot():
+    """Return the daemon's registry / filesystem state as a multi-
+    line text blob, or ``''`` on transport failure.
+
+    Output captures ``$AZT_HOME``, ``projects.json`` state, on-disk
+    subdirs with ``.git`` / LIFT presence, which subdirs are
+    registered, and relevant config. Surfaced by the picker's
+    Share-diagnostics button so a user stuck on an empty picker
+    (no projects to select → can't reach gear → can't share daemon
+    log) can ship a snapshot for remote support without first
+    selecting a project.
+
+    Daemon endpoint never raises — every section catches its own
+    errors and embeds an inline marker. A wrapper failure here
+    (no daemon, transport error) returns ``''`` so callers can
+    treat empty as "couldn't talk to daemon" and surface that
+    distinctly from "snapshot generated"."""
+    try:
+        resp = call('GET', '/v1/diagnostics/snapshot')
+    except ServerUnavailable:
+        return ''
+    if not resp.get('ok'):
+        return ''
+    return str(resp.get('text') or '')
 
 
 def restart_server():
@@ -2568,11 +2731,17 @@ def restart_server():
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
 
-def atomic_finalize_pending(langcode, rel_path, token):
+def atomic_finalize_pending(langcode, rel_path, token,
+                            commit_after=True):
     """Phase 2 of the two-phase atomic write: rename the daemon's
     scratch file at ``<working_dir>/.azt_atomic_pending/<token>``
     to ``<working_dir>/<rel_path>``, atomically, under the project
     lock.
+
+    *commit_after* (default ``True``) controls whether the daemon
+    schedules a debounced commit after the finalize. Pass
+    ``False`` when the peer owns the commit boundary — see
+    ``atomic_commit_bytes`` for the contract. Added 0.50.51.
 
     Used internally by ``LiftHandle.atomic_open_write`` /
     ``MediaHandle.atomic_open_write`` on Android to bypass the
@@ -2591,7 +2760,8 @@ def atomic_finalize_pending(langcode, rel_path, token):
     try:
         resp = call('POST',
                     f'/v1/projects/{langcode}/atomic_finalize',
-                    {'token': token, 'path': rel_path})
+                    {'token': token, 'path': rel_path,
+                     'commit_after': bool(commit_after)})
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
@@ -2703,11 +2873,16 @@ __all__ = [
     'clone_project',
     'clone_project_start', 'clone_project_status',
     'project_status', 'sync_project', 'sync_nudge', 'lan_burst_now',
+    'lan_debug',
     'commit_project', 'request_sync', 'poll_job',
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
     'set_audio', 'set_illustration',
-    'set_daemon_log_to_file', 'get_daemon_log',
+    'get_daemon_log',
+    'get_daemon_log_files',
+    'log_diagnostic',
+    'prepare_share_bundle',
+    'get_diagnostic_snapshot',
     'restart_server',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
     'set_cawl_image_repo', 'set_repo_slug',

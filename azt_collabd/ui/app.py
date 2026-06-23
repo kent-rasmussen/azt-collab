@@ -44,7 +44,6 @@ from azt_collabd.status import AuthError
 from azt_collab_client import (
     S,
     cawl_cache_status,
-    get_daemon_log,
     get_contributor,
     get_credentials_status,
     github_app_install_url,
@@ -59,7 +58,6 @@ from azt_collab_client import (
     test_github_credentials,
     test_gitlab_credentials,
     set_contributor,
-    set_daemon_log_to_file,
     get_cawl_prefetch_all_variants,
     set_cawl_prefetch_all_variants,
     translate_result,
@@ -739,51 +737,28 @@ KV_TEMPLATE = '''
                 Widget:
                     size_hint_y: None
                     height: dp(8)
-                # Diagnostic log capture — off by default. When on,
-                # the daemon mirrors its stderr to
-                # ``$AZT_HOME/daemon.log`` and the Share button
-                # below dispatches the contents through an Android
-                # share intent. Used when a tester reproduces a
-                # bug on a device that doesn't have adb access.
-                SectionLabel:
-                    text: _('Diagnostic log')
-                BoxLayout:
-                    size_hint_y: None
-                    height: dp(52)
-                    spacing: dp(8)
-                    BodyLabel:
-                        text: _('Log server activity:')
-                        size_hint_x: None
-                        width: dp(160)
-                        halign: 'left'
-                        valign: 'middle'
-                        text_size: self.size
-                    RecBtn:
-                        id: daemon_log_yes_btn
-                        text: _('yes')
-                        on_press: root.set_daemon_log_mode(True)
-                    RecBtn:
-                        id: daemon_log_no_btn
-                        text: _('no')
-                        on_press: root.set_daemon_log_mode(False)
-                RecBtn:
-                    id: daemon_log_share_btn
-                    text: _('Share daemon log')
-                    normal_color: T.SURFACE
-                    on_press: root.share_daemon_log()
-                # Restart on its own row — the French translation
-                # ("Redémarrer le service") + share button's French
-                # translation ("Partager le journal du service") are
-                # both too long to fit side by side on a phone-width
-                # screen. Stacking vertically lets each label render
-                # at full width without truncation.
+                # Service-control row. Diagnostic-log capture is
+                # always-on since 0.52.7 (per-day rotation + 3-day
+                # retention bound disk cost); no toggle here. The
+                # ``Share diagnostics`` button ships the same multi-
+                # attachment bundle the picker's button ships —
+                # snapshot + per-day daemon logs. Same label, same
+                # underlying ``share_files`` action, two affordances
+                # (one here for when the user is already in settings,
+                # one on the picker for the "stuck on empty picker"
+                # case). Status label below fields restart feedback.
                 RecBtn:
                     id: restart_server_btn
                     text: _('Restart server')
                     normal_color: T.SURFACE
                     on_press: root.restart_server()
+                RecBtn:
+                    id: share_diagnostics_btn
+                    text: _('Share diagnostics')
+                    normal_color: T.SURFACE
+                    on_press: root.share_diagnostics()
                 BodyLabel:
-                    id: daemon_log_status
+                    id: service_status
                     text: ''
                     color: T.TEXT_DIM
                     size_hint_y: None
@@ -1349,10 +1324,6 @@ class SettingsScreen(Screen):
         except Exception:
             pass
         try:
-            self._refresh_daemon_log_state()
-        except Exception:
-            pass
-        try:
             self._refresh_work_offline_state()
         except Exception:
             pass
@@ -1713,73 +1684,6 @@ class SettingsScreen(Screen):
         else:
             label.text = _tr('Wordlist images')
 
-    def set_daemon_log_mode(self, enabled):
-        """Set the "Log server activity" toggle explicitly. Bound
-        from the yes / no buttons. Idempotent — tapping the active
-        button is a no-op as far as the daemon is concerned (the
-        RPC re-applies the same state).
-
-        Takes effect immediately in the running daemon (the RPC
-        installs / removes the stderr tee in-process); no restart
-        required."""
-        status = self.ids.get('daemon_log_status')
-        new_state = bool(enabled)
-        result = set_daemon_log_to_file(new_state)
-        if result is None:
-            if status is not None:
-                status.text = _tr('Failed to update logging setting.')
-            return
-        self._daemon_log_enabled = result['enabled']
-        if status is not None:
-            if result['enabled']:
-                status.text = _tr(
-                    'Daemon log is being saved to {path}').format(
-                        path=result['log_path'])
-            else:
-                status.text = _tr('Daemon log capture is off.')
-        self._refresh_daemon_log_buttons()
-
-    def _daemon_log_enabled_state(self):
-        return bool(getattr(self, '_daemon_log_enabled', False))
-
-    def _refresh_daemon_log_state(self):
-        """Read the daemon's current toggle state. Called from
-        ``refresh()`` so the button label is correct on screen
-        entry."""
-        data = get_daemon_log()
-        if data is None:
-            return
-        self._daemon_log_enabled = data['enabled']
-        self._refresh_daemon_log_buttons()
-        status = self.ids.get('daemon_log_status')
-        if status is None:
-            return
-        if data['enabled']:
-            status.text = _tr(
-                'Daemon log is being saved to {path} '
-                '({bytes_n} bytes).').format(
-                    path=data['log_path'], bytes_n=data['bytes'])
-        else:
-            status.text = ''
-
-    def _refresh_daemon_log_buttons(self):
-        enabled = self._daemon_log_enabled_state()
-        yes_btn = self.ids.get('daemon_log_yes_btn')
-        no_btn = self.ids.get('daemon_log_no_btn')
-        # Active gets GREEN, inactive sits at SURFACE — same
-        # convention as the wordlist-image-cache row and the
-        # language-selector row.
-        if yes_btn is not None:
-            yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
-        if no_btn is not None:
-            no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
-        for btn_id in ('daemon_log_share_btn',
-                       'daemon_log_email_btn'):
-            btn = self.ids.get(btn_id)
-            if btn is not None:
-                btn.disabled = not enabled
-                btn.opacity = 1.0 if enabled else 0.4
-
     def set_work_offline_mode(self, enabled):
         """Set the work-offline toggle explicitly. Bound from the
         yes / no buttons. Idempotent.
@@ -1956,58 +1860,30 @@ class SettingsScreen(Screen):
                 label.text = _tr('Could not open paired-devices '
                                  'list: {error}').format(error=str(ex))
 
-    def share_daemon_log(self):
-        """Dispatch the daemon log through Android's share sheet —
-        any app that handles ``text/plain`` (email, messaging,
-        file-saver, cloud-paste) accepts it, so the user can pick
-        their email app from the chooser when the destination is
-        email. (A dedicated Email button used to live next to this
-        one and called ``email_text`` with the log inlined into a
-        ``mailto:`` URI body; that path was strictly worse — log
-        text truncated to the daemon's 256 KB RPC cap, no
-        ``[daemon X.Y.Z]`` session-header tag, and at risk of being
-        further truncated by mailto-URI size limits. Removed in
-        0.43.17.)"""
-        status = self.ids.get('daemon_log_status')
-        data = get_daemon_log()
-        if data is None:
-            if status is not None:
-                status.text = _tr('Daemon log unreachable.')
-            return
-        if not data['log']:
-            if status is not None:
-                status.text = _tr(
-                    'Daemon log is empty — turn on saving '
-                    'first, then reproduce the issue.')
-            return
+    def share_diagnostics(self):
+        """Daemon-settings affordance for the canonical share-
+        diagnostics action (since 0.52.8). Same label and same
+        underlying ``share_diagnostics_action`` the picker's
+        button fires — two affordances over one collapsed
+        implementation. The settings surface exists for the
+        common case where the user is already in settings (just
+        configured something, just compared two settings, etc.)
+        and wants to share what just happened without
+        navigating back to the picker first."""
+        from azt_collab_client.ui.share import share_diagnostics_action
+        status = self.ids.get('service_status')
 
         def _on_err(msg):
             if status is not None:
                 status.text = msg
-
-        from azt_collab_client.ui.share import share_log_file
-        # Pass ``<log>.prev`` so the previous toggle-on session
-        # (preserved via the daemon-side rotate-on-truncate added
-        # in 0.43.18) ships alongside the current one under a
-        # ``=== previous session === / === current session ===``
-        # section break. ``share_log_file`` silently skips the
-        # previous section when the path doesn't exist (first run
-        # after toggle-on, no prior file to rotate).
-        ok = share_log_file(log_path=data['log_path'],
-                            prev_path=data['log_path'] + '.prev',
-                            on_error=_on_err)
-        if ok and status is not None:
-            status.text = _tr(
-                'Sending {bytes_n} bytes of daemon log…'
-            ).format(bytes_n=data['bytes'])
+        share_diagnostics_action(on_error=_on_err)
 
     def restart_server(self):
         """Ask the daemon to restart itself. The settings UI lives in
         a separate process (``python -m azt_collabd ui`` on desktop;
         PythonActivity on Android) from the daemon process, so the
         restart is safe from here — the UI keeps running. Status
-        shows up in the existing ``daemon_log_status`` label that
-        also fields share-daemon-log feedback.
+        shows up in the ``service_status`` label below the button.
 
         Two paths:
 
@@ -2033,7 +1909,7 @@ class SettingsScreen(Screen):
            version.
         """
         from azt_collab_client import restart_server as _restart
-        status = self.ids.get('daemon_log_status')
+        status = self.ids.get('service_status')
 
         def _do():
             res = _restart()

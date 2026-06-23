@@ -126,7 +126,8 @@ fullscreen = 0
 # Identity of this APK. Peer APKs probe for exactly this package name
 # / authority — see azt_collab_client/transports/android_cp.py.
 android.package = org.atoznback.aztcollab
-p4a.branch = master
+p4a.branch = ${P4A_BRANCH}
+p4a.commit = ${P4A_COMMIT}
 # The hook + local recipes live in a sibling repo (buildozer_tweaks/)
 # that maintainers check out next to this one. Set the env vars
 # P4A_HOOK and P4A_LOCAL_RECIPES; build.sh substitutes here.

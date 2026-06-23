@@ -116,8 +116,9 @@ sync). Watch for:
 - Sync completion (should not bail on the daemon's
   `MAX_CONSECUTIVE_FAILURES = 12` adaptive-batching budget; if
   it does, the CPU is too slow for the project's pack size).
-- "Save daemon log to file" → reproduce the session → Share log:
-  the `[boot-trace-daemon]` `t=…` numbers tell you exactly how
-  long each daemon-boot phase took on the candidate. Devices
-  whose `after_install_callbacks` lands beyond ~3 s are below
-  the Recommended tier.
+- Reproduce the session → picker's `Share diagnostics`:
+  daemon logging is always-on (since 0.52.7), and the
+  `[boot-trace-daemon]` `t=…` lines tell you exactly how long
+  each daemon-boot phase took on the candidate. Devices whose
+  `after_install_callbacks` lands beyond ~3 s are below the
+  Recommended tier.

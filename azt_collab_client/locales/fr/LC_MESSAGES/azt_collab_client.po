@@ -629,6 +629,15 @@ msgstr "Journal de diagnostic"
 msgid "Share daemon log"
 msgstr "Partager le journal du service"
 
+msgid "Share diagnostics"
+msgstr "Partager les diagnostics"
+
+msgid "Diagnostics"
+msgstr "Diagnostics"
+
+msgid "Could not reach the AZT Collab daemon. Please confirm the AZT Collaboration app is installed and re-open this app."
+msgstr "Impossible de joindre le service AZT Collab. Veuillez confirmer que l'application AZT Collaboration est installée et rouvrir cette application."
+
 msgid "Restart server"
 msgstr "Redémarrer le service"
 
@@ -700,6 +709,25 @@ msgstr "Le fichier journal est vide."
 
 msgid "Log file: {path}"
 msgstr "Fichier journal : {path}"
+
+msgid "Files: {names}"
+msgstr "Fichiers : {names}"
+
+msgid "No files to share."
+msgstr "Aucun fichier à partager."
+
+msgid "Could not share files:\n{error}"
+msgstr "Impossible de partager les fichiers :\n{error}"
+
+msgid "AZT diagnostics"
+msgstr "Diagnostics AZT"
+
+msgid ""
+"No diagnostics available yet. Reproduce the issue first, then tap "
+"Share diagnostics again."
+msgstr ""
+"Aucun diagnostic disponible pour l'instant. Reproduisez le problème "
+"d'abord, puis appuyez à nouveau sur Partager les diagnostics."
 
 msgid "Connect to GitHub"
 msgstr "Se connecter à GitHub"
@@ -1686,14 +1714,11 @@ msgstr "Cache d'images : {cached} / {total} (en pause — connectivité perdue)"
 
 # ── Daemon log section: binary-toggle layout ──────────────────────────
 
-msgid "Log server activity:"
-msgstr "Journaliser l'activité du serveur :"
+msgid "Data-loss risk: {count} file(s) written to your project aren't being backed up. Please tap Share diagnostics on the project picker so we can investigate."
+msgstr "Risque de perte de données : {count} fichier(s) enregistré(s) dans votre projet ne sont pas sauvegardés. Veuillez appuyer sur Partager les diagnostics sur le sélecteur de projet pour que nous puissions investiguer."
 
-msgid "Data-loss risk: {count} file(s) written to your project aren't being backed up. Please enable Settings → Diagnostic log → Log server activity = yes, then Share daemon log so we can investigate."
-msgstr "Risque de perte de données : {count} fichier(s) enregistré(s) dans votre projet ne sont pas sauvegardés. Veuillez activer Paramètres → Journal de diagnostic → Journaliser l'activité du serveur = oui, puis Partager le journal du service pour que nous puissions investiguer."
-
-msgid "Saving to git has failed {count} times in a row ({error}). Your recordings are still on the device but aren't being backed up. Please enable Settings → Diagnostic log → Log server activity = yes, then Share daemon log so we can investigate."
-msgstr "L'enregistrement dans git a échoué {count} fois de suite ({error}). Vos enregistrements sont toujours sur l'appareil mais ne sont pas sauvegardés. Veuillez activer Paramètres → Journal de diagnostic → Journaliser l'activité du serveur = oui, puis Partager le journal du service pour que nous puissions investiguer."
+msgid "Saving to git has failed {count} times in a row ({error}). Your recordings are still on the device but aren't being backed up. Please tap Share diagnostics on the project picker so we can investigate."
+msgstr "L'enregistrement dans git a échoué {count} fois de suite ({error}). Vos enregistrements sont toujours sur l'appareil mais ne sont pas sauvegardés. Veuillez appuyer sur Partager les diagnostics sur le sélecteur de projet pour que nous puissions investiguer."
 
 msgid "first_name last_name"
 msgstr "prénom nom"
@@ -1722,6 +1747,16 @@ msgstr ""
 "{raw_bytes:,} octets). Cela peut être un problème de connexion "
 "ou un problème côté GitHub — réessayez plus tard ou sur un autre "
 "réseau."
+
+msgid ""
+"Could not push to GitHub: one file (sha {blob_sha}, {blob_bytes:,} "
+"bytes) is larger than the {budget_bytes:,}-byte per-upload limit. "
+"Try a faster connection, or ask support to raise the limit."
+msgstr ""
+"Impossible de pousser vers GitHub : un fichier (sha {blob_sha}, "
+"{blob_bytes:,} octets) dépasse la limite par envoi de "
+"{budget_bytes:,} octets. Essayez une connexion plus rapide, ou "
+"demandez au support de relever la limite."
 
 msgid ""
 "Unusually large file recorded: {path} ({bytes:,} bytes). The "

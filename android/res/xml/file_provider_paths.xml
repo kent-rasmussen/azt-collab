@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paths exposed by the recorder's FileProvider (declared in the
+  recorder's AndroidManifest.xml at authority
+  org.atoznback.aztrecorder.fileprovider, injected via
+  p4a_hook_recorder.py). Only the share-staging subdirectory of
+  cacheDir is served, so accidental misuse can't leak audio
+  recordings, LIFT data, etc.
+
+  Loaded as @xml/file_provider_paths via the <meta-data> child
+  of the <provider> element.
+-->
+<paths>
+    <cache-path name="shares" path="shares/" />
+</paths>

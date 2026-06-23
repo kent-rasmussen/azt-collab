@@ -136,6 +136,17 @@ TOPIC_BRANCH_CONFLICT = 'TOPIC_BRANCH_CONFLICT'
 # a faster connection or moving audio out of git history (LFS /
 # external store); the daemon can't work around it. Since 0.44.11.
 COMMIT_PACK_EXCEEDS_NETWORK_BUDGET = 'COMMIT_PACK_EXCEEDS_NETWORK_BUDGET'
+# Sub-commit pre-seeding can't help: a single blob's size
+# (uncompressed) exceeds the per-attempt budget. The
+# topic-push tried to upload the commit's blobs into side refs
+# so the eventual commit-pack would fit — but at least one
+# blob is bigger than the budget alone. Params: ``blob_sha``
+# (hex prefix), ``blob_bytes``, ``budget_bytes``. Remedies:
+# bigger budget, faster connection, or move that file out of
+# git history. Surfaces in place of
+# ``COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`` when the daemon has
+# identified the specific oversized blob. Since 0.52.4.
+BLOB_EXCEEDS_BUDGET = 'BLOB_EXCEEDS_BUDGET'
 # Data-quality flag: a just-made commit contains a file whose size
 # exceeds ``data_quality.large_audio_byte_threshold`` (default 500 KB).
 # The recorder is for word-list elicitation; multi-MB files almost

@@ -519,6 +519,57 @@ def _handle_share_offer(environ, start_response, peer_id,
         return _json_response(start_response, '200 OK',
                               {'ok': True, 'dispatch': 'noop'})
     if not local_url:
+        # Auto-accept adopt-origin (0.50.58). The peer has the
+        # project locally but no remote_url; the incoming offer
+        # carries one. Pre-0.50.58 this stashed a
+        # KIND_ADOPT_ORIGIN pending decision and waited for the
+        # user to tap "accept" in the picker — which created
+        # friction for the unambiguous case (project content
+        # already shared via LAN, peer is just supplying the
+        # github URL we don't have yet). User already consented
+        # to the share by pairing the peer; receiving the URL is
+        # the natural completion. Apply synchronously and report
+        # ``dispatch='adopted'`` to the sender.
+        #
+        # KIND_REMOTE_CONFLICT (URLs differ) stays a pending
+        # decision because that case is genuinely ambiguous —
+        # the daemon can't tell which github repo is "canonical"
+        # so the user must pick (keep_mine / use_theirs /
+        # dual_publish).
+        adopted = False
+        try:
+            _projects.set_remote_url(langcode, repo_url)
+            wd = str(getattr(local_proj, 'working_dir', '') or '')
+            if wd:
+                from . import repo as _repo
+                _repo.set_remote_origin_url(wd, repo_url)
+            adopted = True
+        except Exception as ex:
+            print(f'[lan-listener] auto-adopt-origin for '
+                  f'{langcode!r} (peer={peer_id[:8]!r} '
+                  f'url={repo_url!r}) failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+        if adopted:
+            print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
+                  f'for {langcode!r} auto-adopted origin '
+                  f'{repo_url!r}',
+                  file=sys.stderr, flush=True)
+            # Push-notify any peer observing this project's status
+            # URI so the settings UI re-polls and picks up the new
+            # ``remote_url`` immediately. Without this the picker
+            # holds its cached "publish candidate: remote_url=''"
+            # snapshot until the user navigates away and back —
+            # field-confirmed in 0.50.60 testing.
+            try:
+                from .android_cp import notify as _notify
+                _notify.notify_project_changed(langcode)
+            except Exception:
+                pass
+            return _json_response(start_response, '200 OK',
+                                  {'ok': True,
+                                   'dispatch': 'adopted'})
+        # On failure, fall back to the pre-0.50.58 stash so the
+        # user has a manual path to retry via the picker.
         _pending.add(_pending.KIND_ADOPT_ORIGIN, {
             'peer_id': peer_id,
             'device_name': device_name,
@@ -527,7 +578,7 @@ def _handle_share_offer(environ, start_response, peer_id,
         })
         print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
               f'for {langcode!r} stashed (adopt-origin '
-              f'{repo_url!r})',
+              f'{repo_url!r}) — auto-adopt failed above',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
                               {'ok': True,
@@ -1253,6 +1304,30 @@ def _reset_working_tree_after_receive(langcode):
                     _notify.notify_project_changed(langcode)
                 except Exception:
                     pass
+                # Post-receive peer-SHA refresh (0.50.50). Receive-
+                # pack didn't tell us WHICH paired peer pushed, but
+                # the pusher must be at our new HEAD (they couldn't
+                # have pushed a SHA they don't have). Without this
+                # refresh, our ``last_seen_main[<every-paired-peer>]
+                # [langcode]`` stays at whatever it was before, so
+                # ``_lan_unshared`` walks excluding stale peer SHAs
+                # and reports the just-received commit as "unshared"
+                # — visible as LAN-1 on a project both phones are
+                # actually in sync on. ls-remote each paired peer
+                # sharing this langcode; update last_seen_main for
+                # the ones matching our new HEAD. Background thread
+                # so we don't block the WSGI worker.
+                try:
+                    new_sha_hex = head_sha.decode('ascii', 'replace')
+                    threading.Thread(
+                        target=_refresh_peer_last_seen_after_receive,
+                        args=(langcode, new_sha_hex),
+                        daemon=True,
+                        name='lan-post-receive-refresh').start()
+                except Exception as ex:
+                    print(f'[lan-listener] post-receive refresh '
+                          f'spawn raised: {ex!r}',
+                          file=sys.stderr, flush=True)
             finally:
                 try:
                     repo.close()
@@ -1280,6 +1355,76 @@ def _reset_working_tree_after_receive(langcode):
         print(f'[lan-listener] post-receive reset {langcode!r} '
               f'failed: {ex!r}',
               file=sys.stderr, flush=True)
+
+
+def _refresh_peer_last_seen_after_receive(langcode, new_head_sha_hex):
+    """Post-receive last_seen_main refresh (0.50.50).
+
+    After our listener accepts a push, walk every paired peer
+    whose ``shared_projects`` contains *langcode* and ask them
+    (via ls-remote) what SHA they hold. For any peer whose main
+    matches our new HEAD, update ``last_seen_main[peer][langcode]``
+    so ``_lan_unshared`` no longer reports the just-received
+    commit as unshared. Runs on a worker thread off the WSGI
+    request path; per-peer failures are isolated.
+
+    Cost: one ls-remote per paired peer sharing the project.
+    Fast-fail gate makes recently-unreachable peers free skips.
+
+    Why we don't update peers whose main is BEHIND our HEAD:
+    those peers may have a stale view (they pushed to us earlier
+    but haven't seen our subsequent commits) OR they genuinely
+    are behind. Either way we don't know they have the new SHA,
+    so leaving their ``last_seen_main`` where it was is the
+    "OK on uncertainty" answer — same convention the helper
+    families follow."""
+    try:
+        from . import peers as _peers
+        from . import lan_push as _lan_push
+    except Exception as ex:
+        print(f'[lan-listener] post-receive refresh dispatch '
+              f'raised: {ex!r}', file=sys.stderr, flush=True)
+        return
+    try:
+        candidates = []
+        for entry in _peers.list_peers() or []:
+            pid = entry.get('peer_id', '') or ''
+            if not pid:
+                continue
+            shared = entry.get('shared_projects') or []
+            if langcode not in shared:
+                continue
+            candidates.append(pid)
+    except Exception as ex:
+        print(f'[lan-listener] post-receive refresh candidate '
+              f'enumeration raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    if not candidates:
+        return
+    matched = []
+    for pid in candidates:
+        try:
+            peer_sha = _lan_push.peek_peer_head(pid, langcode)
+        except Exception as ex:
+            print(f'[lan-listener] post-receive refresh peek '
+                  f'{pid[:8]!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            continue
+        if peer_sha and peer_sha == new_head_sha_hex:
+            try:
+                _peers.set_peer_last_seen_main(
+                    pid, langcode, peer_sha)
+                matched.append(pid[:8])
+            except Exception as ex:
+                print(f'[lan-listener] post-receive refresh '
+                      f'set_peer_last_seen_main {pid[:8]!r} '
+                      f'raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+    print(f'[lan-listener] post-receive refresh '
+          f'{langcode!r}: peers_sharing={len(candidates)} '
+          f'at-our-HEAD={len(matched)} ({matched!r})',
+          file=sys.stderr, flush=True)
 
 
 _POST_RECEIVE_PATH_RE = None

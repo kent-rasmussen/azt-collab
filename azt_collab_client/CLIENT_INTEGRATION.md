@@ -488,19 +488,38 @@ peer never sees the LIFT bytes; the call returns a typed `Result`.
    intact.
 5. **`notifyStatusChanged` fires** on success so peers'
    `ContentObserver` wake within ~10 ms.
-6. **Debounced auto-commit fires** on success — same shape as
-   `atomic_commit_bytes`. The peer does not need to call
-   `commit_project` after.
+6. **Debounced auto-commit fires** on success by default — same
+   shape as `atomic_commit_bytes`. The peer does not need to call
+   `commit_project` after. **Opt-out (since 0.50.51):** pass
+   `commit_after=False` to `set_audio` / `set_illustration` /
+   `atomic_commit_bytes` / `atomic_finalize_pending` when the
+   peer owns the commit boundary itself (e.g. recorder's
+   swipe = "I accept this take"; writes during preview /
+   re-record must not commit). When suppressed, the peer is
+   responsible for calling `commit_project(langcode)` at the
+   boundary. The atomic write + `notify_project_changed` still
+   happen unchanged.
 
 ### Targets
 
-- `set_audio(langcode, guid, lang, filename)` →
+- `set_audio(langcode, guid, lang, filename, commit_after=True)` →
   `<entry guid="X">/<citation>/<form lang="{lang}">/<text>{filename}</text></form>`.
   Creates `<citation>` if absent.
-- `set_illustration(langcode, guid, href)` →
+- `set_illustration(langcode, guid, href, commit_after=True)` →
   `<entry guid="X">/<sense>/<illustration href="{href}"/>`. Uses
   the first `<sense>` (creates one if absent); within it, updates
   the first `<illustration>` (creates one if absent).
+
+Same `commit_after=True` default on
+`atomic_commit_bytes(langcode, rel_path, data, commit_after=True)`
+and
+`atomic_finalize_pending(langcode, rel_path, token, commit_after=True)`.
+Pass `False` to suppress the auto-commit (see step 6 above);
+peer is then responsible for calling `commit_project(langcode)`
+at its own boundary. Requires daemon 0.50.51+ — enforced by the
+client's `MIN_SERVER_VERSION` floor, so a peer running on an
+older daemon hits the bootstrap update prompt before the
+silent-ignored-flag case can fire.
 
 If the field doesn't fit one of these two paths (e.g.,
 `<pronunciation>` audio, `<gloss>` text, sense-indexed
@@ -1522,19 +1541,72 @@ project" button warns about. Daemon-side button is a no-op
 without peer-side adoption; ship both halves of the
 migration.
 
-## 14b. Sharing text / email / log-file helpers
+## 14b. Sharing text / email / files helpers
 
-Peers that need to dispatch a string or log file through
-Android's share sheet — diagnostic dump, status report, log
-attachment, etc. — should use the shared helpers in
-``azt_collab_client.ui.share`` rather than inlining
-``ACTION_SEND`` JNI plumbing per peer.
+Peers that need to dispatch a string or one-or-more files
+through Android's share sheet — diagnostic dump, status
+report, log attachment, multi-day log bundle, etc. — should
+use the shared helpers in ``azt_collab_client.ui.share``
+rather than inlining ``ACTION_SEND`` / ``ACTION_SEND_MULTIPLE``
+JNI plumbing per peer.
 
-Three flavours:
+### 14b-i. The two load-bearing constraints
+
+Skip this section once and Signal-compatible shares will
+silently fail. Both constraints are receiver-side; we can't
+patch around them.
+
+**(1) URI authority.** Privacy-restricted receivers (Signal
+in particular) refuse URIs whose authority isn't the
+sender's own. MediaStore URIs (``content://media/...``) are
+fine for Gmail and most other receivers but Signal drops
+them silently. The supported authority for AZT-suite shares
+is ``org.atoznback.aztcollab`` (served by
+``AZTCollabProvider``). Peer code MUST NOT pass MediaStore
+URIs into ``share_files`` for receivers where Signal might
+be picked. The legacy ``share_log_file`` is the exception —
+it still uses MediaStore for its single-blob path and is
+kept only for the recorder team's existing button.
+
+**(2) Action choice by content type.** Signal's
+``ACTION_SEND_MULTIPLE`` resolver runtime-filters per-URI
+MIMEs to image and video only:
+
+```kotlin
+// ShareRepository.kt, verbatim:
+.filterValues {
+  MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
+}
+```
+
+Anything else (text, application/zip, audio outside
+music-share contexts) is silently dropped. Signal's
+manifest advertises ``text/*`` SEND_MULTIPLE; the runtime
+ignores its own manifest. Verified verbatim against the
+``main`` branch on 2026-06-22.
+
+Consequence: for non-image/non-video content, USE
+``ACTION_SEND`` (single attachment), NOT
+``ACTION_SEND_MULTIPLE``. If you have multiple files of
+text/log/binary content to share via Signal, bundle them
+into a single zip and ship the zip. APKs already travel
+through Signal this way (single ``application/*`` URI);
+the diagnostic bundle uses the same shape.
+
+``share_files(items=[...])`` does the action routing
+automatically: single item → ``ACTION_SEND``, multi-item →
+``ACTION_SEND_MULTIPLE``. **Peer code that wants
+Signal-compatible multi-file share MUST hand
+``share_files`` exactly one item — typically a zip URI.**
+The daemon's ``prepare_share_bundle`` returns one zip item
+for this reason.
+
+### 14b-ii. Helpers
 
 ```python
 from azt_collab_client.ui.share import (
-    share_text, email_text, share_log_file)
+    share_text, email_text, share_files,
+    share_diagnostics_action, share_log_file)
 
 # 1. Generic text/plain share sheet (email, messaging, cloud-
 #    paste, file-saver all accept). EXTRA_TEXT body — limited
@@ -1552,7 +1624,7 @@ share_text(
 #    the user's intent is specifically "send this to the
 #    developer". ``to=''`` lets the user pick a recipient.
 #    Body lives in the URI's ``body`` query — practical
-#    kilobyte limit; large payloads should prefer share_log_file.
+#    kilobyte limit; large payloads should prefer share_files.
 email_text(
     text=some_short_dump,
     to='',
@@ -1560,11 +1632,62 @@ email_text(
     on_error=self._show_error,
 )
 
-# 3. File-based log share with optional previous-session
-#    bundling. Inserts into MediaStore Downloads to get a real
-#    content:// URI, attaches as EXTRA_STREAM. Receivers can
-#    save as a file rather than read inline. Use for log
-#    sharing where the payload may exceed text-extras limits.
+# 3. File-or-URI share via Android share sheet. Each item is
+#    ONE of three shapes:
+#
+#    (a) {'uri': '<content://… URI>', 'display_name': str}
+#        — pre-staged URI from a ContentProvider you control.
+#        Used for the diagnostic bundle (URIs served by the
+#        server APK's own AZTCollabProvider). The supported
+#        authority for AZT-suite shares is
+#        ``org.atoznback.aztcollab``.
+#
+#    (b) {'path': str, 'display_name': str}
+#        — peer-owned file on disk. share_files copies the
+#        bytes into MediaStore Downloads (with IS_PENDING=0
+#        cleared in the same call). Signal-incompatible
+#        because the resulting URI is MediaStore. Use for
+#        non-Signal receivers only.
+#
+#    (c) {'content': str|bytes, 'display_name': str}
+#        — in-memory blob. share_files writes the bytes into
+#        a MediaStore Downloads entry. Same Signal caveat as
+#        (b).
+#
+#    Action routing: len(items) == 1 → ACTION_SEND;
+#    len(items) > 1 → ACTION_SEND_MULTIPLE.
+#
+#    For Signal compatibility with non-image/non-video
+#    content, use exactly one item with a zip URI from your
+#    own ContentProvider. Multi-item with text content will
+#    be silently rejected by Signal (per § 14b-i above).
+share_files(
+    items=[
+        {'uri': 'content://org.atoznback.aztcollab/'
+                '_shares/abc123/azt_diagnostics_20260622.zip',
+         'display_name': 'azt_diagnostics_20260622.zip'},
+    ],
+    mime_type='application/zip',
+    chooser_title=_('Share diagnostics'),
+    on_error=self._show_error,
+)
+
+# 4. Canonical "share diagnostics" composition. Single source
+#    of truth for the server-APK settings button, the picker
+#    button, and any peer app that wants to ship the daemon's
+#    diagnostic bundle. Internally: prepare_share_bundle()
+#    RPC returns a single zip URI, share_files dispatches via
+#    ACTION_SEND. The peer just chooses an `on_error`
+#    callback for its error-display channel.
+share_diagnostics_action(on_error=self._show_error)
+
+# 5. Legacy single-file log share (kept for the recorder
+#    peer's existing button). Bundles ``log_path`` and an
+#    optional ``prev_path`` into one concatenated text/plain
+#    blob with === section === headers, then ships via
+#    MediaStore + ACTION_SEND. Signal-incompatible (MediaStore
+#    URI). New code should prefer share_diagnostics_action
+#    (which uses our own provider's authority).
 share_log_file(
     log_path='/sdcard/azt_recorder.log',
     prev_path='/sdcard/azt_recorder.log.prev',  # optional
@@ -1573,36 +1696,123 @@ share_log_file(
 )
 ```
 
-All three are Android-only — non-Android platforms invoke
+All are Android-only — non-Android platforms invoke
 ``on_error`` with a translated message; same shape as
 ``share_running_apk``. All return ``bool`` indicating dispatch
 success.
 
-**Picking between the three.** Short text (< 100 KB) → either
+**Picking between them.** Short text (< 100 KB) → either
 ``share_text`` (broad picker) or ``email_text`` (email only).
-Larger payloads or anything you want to bundle with a previous
-session log → ``share_log_file``. The daemon UI uses
-``share_log_file`` to ship its ``$AZT_HOME/daemon.log`` blob.
+Diagnostic bundle → ``share_diagnostics_action``. Peer-built
+zip bundles destined for Signal-compatibility →
+``share_files`` with one URI item from your own provider's
+authority. Image/video bundles where Signal-compat doesn't
+matter (or where you're OK with Signal dropping it) →
+``share_files`` with multiple URI items. Legacy single-blob
+text bundles where Signal-compat doesn't matter →
+``share_log_file``.
 
-**Bundled blob shape (``share_log_file``).**::
+### 14b-iii. Daemon-side share-staging (since 0.52.13)
 
-    === previous session (<prev_path>) ===
-    <prev contents>
+The authoritative way to get the diagnostic bundle into a
+shareable shape is the daemon RPC. Peer code SHOULD NOT
+write share files itself — see § 14b-i constraint (1).
 
-    === current session (<log_path>) ===
-    <current contents>
+```python
+from azt_collab_client import prepare_share_bundle
+from azt_collab_client.transports.android_cp import CANONICAL_AUTHORITY
+from azt_collab_client.ui.share import share_files
 
-Section breaks let the receiver scroll to the relevant
-session.
+bundle = prepare_share_bundle()
+# Since 0.52.19 the bundle is a single zip:
+# {'token': '<hex>',
+#  'items': [
+#    {'display_name': 'azt_diagnostics_20260622_143052.zip',
+#     'uri_path': '_shares/<token>/azt_diagnostics_20260622_143052.zip'},
+#  ]}
+# The zip contains the snapshot and per-day daemon logs
+# (each as a separate entry) — files stay separate inside
+# the archive so support's first action is unzip+grep.
 
-**Why peer-shared.** Four+ surfaces need to dispatch through
-the share sheet (recorder log, daemon log, recorder status
-snapshot, future viewer diagnostic). Each was about to
-re-derive ~30-50 lines of jnius autoclass + Intent
-construction + MediaStore plumbing + error translation.
-Extracted into ``ui/share.py`` alongside ``share_running_apk``
-so every peer + the daemon UI uses the same code path, and a
-future tightening of Android share APIs is one fix instead of N.
+items = [
+    {'uri': f'content://{CANONICAL_AUTHORITY}/{it["uri_path"]}',
+     'display_name': it['display_name']}
+    for it in bundle.get('items') or []
+]
+share_files(items, mime_type='application/zip', on_error=...)
+```
+
+Most peers should just call ``share_diagnostics_action``
+which does this composition automatically.
+
+**Peers shipping their own files alongside the daemon
+bundle.** If you want to include peer-side files (e.g. the
+recorder's own log) in the same share, you need to combine
+them into your own zip first (so the share is still one
+ACTION_SEND-shaped attachment that Signal will accept) — or
+declare your own FileProvider for the peer-owned file and
+ship a multi-item ``share_files`` knowing Signal will reject
+the share but other receivers will accept it. The simpler
+pattern: build your own zip containing both daemon-bundle
+contents (read via ``get_daemon_log_files``) and peer-owned
+content, save under your FileProvider authority, ship via
+``share_files`` with one URI item.
+
+**Daemon log file access** (for peers that need raw content
+rather than URIs) — ``get_daemon_log_files()`` returns the
+per-day daemon logs as text strings (each
+daemon-side-truncated to ~256 KB). Useful for in-app log
+viewers, console previews, peer-side zip-building. NOT for
+direct share dispatch as ``'content'`` items, since those
+go through MediaStore which Signal rejects.
+
+**TTL on the share bundle.** ``prepare_share_bundle`` sweeps
+stale ``$AZT_HOME/.shares/<token>/`` directories older than
+1 hour on every call. The TTL is generous because some
+receivers (Signal especially) hold the URI in a compose
+draft and don't read the file until the user actually sends
+the message — minutes after the chooser closes. Don't keep
+a ``token`` cached across an app restart; call
+``prepare_share_bundle`` again to get a fresh one.
+
+**On-disk daemon log filenames.** Per-day daemon log files
+are named ``daemon-<peer>-YYYY-MM-DD_log.txt`` (since
+0.52.20; pre-0.52.20 was ``.log``). The ``_log.txt`` suffix
+keeps "log" in the basename for grep / triage while making
+the actual extension ``.txt`` so text editors with
+extension-based syntax detection treat the file as text.
+Inside the diagnostic zip the same filenames are used as zip
+entry names; receivers unpacking the archive see ``.txt``
+files their editor opens directly.
+
+### 14b-iv. Legacy share_log_file blob shape
+
+```
+=== previous session (<prev_path>) ===
+<prev contents>
+
+=== current session (<log_path>) ===
+<current contents>
+```
+
+The daemon-side ``<path>.prev`` rotation mechanism was
+removed in 0.52.5 — passing ``prev_path`` is still legal
+(the helper silently skips a nonexistent path) but the
+canonical daemon log path no longer has a ``.prev`` sibling.
+
+### 14b-v. Why peer-shared
+
+Multiple surfaces need to dispatch through the share sheet
+(recorder log, daemon log bundle, recorder status snapshot,
+picker Share-diagnostics, server-APK settings Share-
+diagnostics). Each was about to re-derive ~30-50 lines of
+jnius autoclass + Intent construction + MediaStore plumbing
++ error translation, plus discover Signal's manifest-vs-
+runtime mismatch independently. Extracted into ``ui/share.py``
+alongside ``share_running_apk`` so every peer + the daemon UI
+uses the same code path, and a future tightening of Android
+share APIs (or another receiver-specific quirk) is one fix
+instead of N.
 
 ## 15. Recovery
 
@@ -3332,6 +3542,20 @@ behaviour without spelunking the CHANGELOG):
    without invalidating any claim (e.g. when the user
    renames their contributor). Peer UI displays
    ``device_name``; peer logic compares ``peer_id``.
+
+   **``lan_peer_id()`` guarantee (since 0.50.9).** The daemon
+   eager-initialises the ed25519 keypair on every startup, so
+   ``lan_peer_id().get('peer_id', '')`` is guaranteed to return
+   a non-empty 64-char hex string on any daemon at 0.50.9+ with
+   the ``cryptography`` package present (the build dependency
+   that signs the cert). Suite APKs ship cryptography
+   unconditionally; the guarantee is effectively unconditional
+   in the field. Peers may safely drop legacy ``device_name``
+   fallbacks for peer-identity matching against a 0.50.9+
+   daemon. Pre-0.50.9 instances — and the rare host build
+   without cryptography — return ``''`` with a logged warning;
+   those are end-user upgrade prompts, not peer-side workaround
+   territory.
 
 3. **One file per slot.** ``.azt/slots/<slot>.txt`` content:
 
