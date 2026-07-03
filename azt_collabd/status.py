@@ -227,6 +227,25 @@ APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'
 APP_SUSPENDED = 'APP_SUSPENDED'
 REPO_NOT_AUTHORIZED = 'REPO_NOT_AUTHORIZED'
 ACCESS_DENIED = 'ACCESS_DENIED'
+# 404 / NotGitRepository from a git op with a VALID token (0.52.24).
+# GitHub returns 404 for any repo the token can't see — private-and-
+# not-shared, caller-not-a-collaborator, app-not-granted-this-repo,
+# or wrong name — and gives us no way to tell them apart from the
+# client side (``/user/installations`` is blind to an owner the caller
+# isn't a member of, so it can't even confirm "app not installed").
+# So this is the honest, cause-enumerating status for a 404: distinct
+# from ACCESS_DENIED (which is the 403 branch — authenticated but
+# forbidden on a repo we CAN see) and from APP_NOT_INSTALLED (which
+# asserts a specific cause we cannot actually verify from a 404).
+# ``params``: ``owner_repo``. Never emitted when there's no token at
+# all — that stays silent (creds simply not set up yet).
+REPO_NO_ACCESS = 'REPO_NO_ACCESS'
+# The daemon found a PENDING GitHub repo invitation matching this repo and
+# accepted it on the user's behalf (0.52.24; see auth.try_accept_repo_
+# invitation). Transient/retryable — access should now be granted, so the
+# caller re-attempts (next drain tick / run-to-completion loop). Turns the
+# "you must accept the invitation on GitHub" manual step into a no-op.
+INVITE_ACCEPTED = 'INVITE_ACCEPTED'
 # Refresh-token broken: the daemon attempted a proactive
 # refresh against the GitHub OAuth endpoint and got
 # ``incorrect_client_credentials`` (or any other refresh-side

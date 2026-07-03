@@ -324,6 +324,39 @@ def share_pairing_qr_popup(font_name='Roboto', langcode=''):
         content=content, size_hint=(0.9, 0.9),
         auto_dismiss=False)
     close_btn.bind(on_release=lambda *_: popup.dismiss())
+
+    # "Valid while displayed" share offer (0.52.26): the initial
+    # ``lan_pair_qr`` above already armed the offer for *langcode*; while
+    # this popup stays open we heartbeat so it stays armed, and we revoke
+    # it the instant the popup closes. Multi-use daemon-side, so one
+    # displayed QR can be scanned by several peers. Pair-only QRs carry no
+    # langcode and share nothing, so no heartbeat needed.
+    hb = {'ev': None}
+    if langcode:
+        from kivy.clock import Clock
+        from .. import lan_pair_qr_keepalive, lan_pair_qr_close
+
+        def _beat(_dt):
+            try:
+                lan_pair_qr_keepalive(langcode)
+            except Exception:
+                pass
+
+        # Every 10 s; the daemon keepalive window is 30 s, so one missed
+        # beat is tolerated before the offer lapses.
+        hb['ev'] = Clock.schedule_interval(_beat, 10)
+
+        def _on_dismiss(*_):
+            if hb['ev'] is not None:
+                hb['ev'].cancel()
+                hb['ev'] = None
+            try:
+                lan_pair_qr_close(langcode)
+            except Exception:
+                pass
+
+        popup.bind(on_dismiss=_on_dismiss)
+
     popup.open()
     return popup
 

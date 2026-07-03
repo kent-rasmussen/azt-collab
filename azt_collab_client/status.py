@@ -160,6 +160,17 @@ APP_NOT_INSTALLED = 'APP_NOT_INSTALLED'
 APP_SUSPENDED = 'APP_SUSPENDED'
 REPO_NOT_AUTHORIZED = 'REPO_NOT_AUTHORIZED'
 ACCESS_DENIED = 'ACCESS_DENIED'
+# Mirror of azt_collabd.status.REPO_NO_ACCESS (0.52.24). 404 /
+# NotGitRepository from a git op with a valid token — the repo can't
+# be seen with this account (private-not-shared / not-a-collaborator /
+# app-not-granted / wrong name; GitHub can't disambiguate). Distinct
+# from ACCESS_DENIED (403 branch) and APP_NOT_INSTALLED (unverifiable
+# from a 404). Never emitted when there are no credentials at all.
+REPO_NO_ACCESS = 'REPO_NO_ACCESS'
+# Mirror of azt_collabd.status.INVITE_ACCEPTED (0.52.24). Daemon auto-
+# accepted a pending GitHub repo invitation for this repo; transient/
+# retryable — access should now work on the next attempt.
+INVITE_ACCEPTED = 'INVITE_ACCEPTED'
 # Carries ``params['expires_at']`` — unix timestamp at which the
 # current GitHub access token expires (token_time + 8h). See the
 # daemon's status.py for the full rationale and the peer-side

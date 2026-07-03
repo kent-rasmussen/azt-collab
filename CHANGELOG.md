@@ -9,7 +9,416 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.52.20 — daemon log filename uses _log.txt suffix for text-editor recognition
+## 0.52.31 — topic-push: chunk-pick fallback for off-spine base (don't degenerate to whole-history)
+
+Field follow-up to 0.52.30 (nml, both phones now on .30). **0.52.30 worked** where it
+mattered: device aztobt1-sudo broke the DivergedBranches wedge and started converging —
+`topic-push chunk OK (advanced to 9641a2a7)` then a steady one-commit-per-~15s march,
+`remaining` 861 → 860 → 859 → …. That device's topic ref already held `913fedc4`, which
+sits on the merge tip's first-parent spine, so the .30 first-parent picker advanced cleanly.
+
+But the same first-parent-only rule **regressed device aztobt2-ui**, whose topic ref is
+empty (`server_topic_tip='(none)'`) so its chunk base is the *old* `origin/main`
+(`7c42ae48`). That commit is not on the merge tip's first-parent spine, so
+`_pick_intermediate_sha` returned the tip itself:
+
+```
+topic-push attempt target=3cefc3e0 chunk_n=50 …
+topic-push pack-size: 11900 objects, 9,360,658,319 bytes
+topic-push pre-shrink chunk_n 50→1 …
+topic-push attempt target=3cefc3e0 chunk_n=1   ← still the whole 9.3 GB tip
+```
+
+i.e. it degenerated a fresh topic ref to a single ~9.3 GB push that can never chunk
+(pre-0.52.30 it at least picked an intermediate). First-parent-only was too strict.
+
+Fix: keep the first-parent spine as the fast path (device aztobt1-sudo's cheap, common
+case — unchanged), but when base is off the spine, fall back to the general rule: return
+the n-th commit in oldest-first order that has base as an **ancestor** (`base→C` is a valid
+fast-forward). That excludes sibling parent-line commits (no divergence — device
+aztobt1-sudo still picks `9641a2a7`) *and* still chunks when base is the pre-merge root
+(device aztobt2-ui advances in ~200 MB steps again instead of one 9.3 GB brick). Bounded by
+early-exit at n. Linear histories are unaffected (spine == the old walk).
+
+Note aztobt2-ui's radio 408s even on a single ~4 MB commit, so it likely won't finish its
+own WAN push regardless — but it doesn't need to: once aztobt1-sudo's topic ref completes
+and `main` fast-forwards, aztobt2-ui converges for free on its next fetch. Both phones stay
+LAN-converged at `3cefc3e0`, `at_risk=0` throughout. Daemon only; no wire/client change.
+
+## 0.52.30 — topic-push: FF-clean chunk picks (fix the post-merge divergence wedge)
+
+Field follow-up to 0.52.28 (nml, aztobt1-sudo/aztobt2-ui). The 0.52.28 phones ran
+all day and device aztobt1-sudo made large real progress — its
+`azt-pending-nml-aztobt1-sudo` topic ref advanced ~1700 commits (`remaining`
+2573 → 861). Then a LAN merge moved its HEAD onto the merge commit `3cefc3e0`,
+and the topic-push **wedged permanently** — ~5 h stuck at `remaining=861`,
+`server_topic_tip=913fedc4`, every chunk raising `DivergedBranches`:
+
+```
+topic-push begin … target=3cefc3e0 server_topic_tip='913fedc4'
+topic-push attempt target=3305a38e chunk_n=50 …
+topic-push raised: DivergedBranches(b'913fedc4…', b'3305a38e…')
+… (halve → re-pick → re-diverge, forever)
+```
+
+Root cause: `_pick_intermediate_sha` walked `get_walker(include=[tip],
+exclude=[base])`, which for a **merge-commit target** yields commits from *both*
+parent lines. Picking one off the sibling line gives a commit that is an
+ancestor of the target but **not a descendant of the current topic tip**, so the
+fast-forward push is rejected with `DivergedBranches`. The chunk loop had no
+`DivergedBranches` handling (the docstring asserted it "can't happen"), so it
+halved → re-picked the same DAG → re-diverged; `chunk_n=1` diverged too; then it
+bailed transient and the next drain re-entered the identical wedge.
+
+Fix:
+- **`_pick_intermediate_sha` walks first-parent only.** Every intermediate is now
+  a first-parent descendant of `base`, so `base → intermediate` is always a valid
+  fast-forward. If `base` is off the tip's first-parent spine (merged in via a
+  second parent), it returns the tip directly — still a valid FF, since the caller
+  already verified `base is-ancestor-of tip`; the pack-size estimate + blob
+  pre-seed handle the larger direct push. Linear histories are unaffected
+  (first-parent == the old walk).
+- **Explicit bounded `DivergedBranches` handling in the topic loop.** With
+  FF-clean picks our own pushes never diverge; a `DivergedBranches` now means the
+  server ref genuinely moved under us. Re-anchor `chunk_base` on the server's
+  authoritative tip (from the exception, via `_extract_diverged_remote`) and
+  continue — without counting a failure or halving — bounded by
+  `MAX_DIVERGED_RESYNCS`. If that tip isn't an ancestor of our target (HEAD moved
+  under us), bail transient so the next drain rebuilds the chain from scratch.
+
+Stacks on 0.52.29 (oversize-blob atomic push) and 0.52.28 (fetch-skip). Daemon
+only; no wire/client change. Deploy to both phones.
+
+## 0.52.29 — topic-push: never let the byte budget veto an atomic object
+
+Field follow-up to 0.52.28 (nml, aztobt1-sudo/aztobt2-ui). With the fetch-skip
+in place the topic-branch chunked push finally ran and **converged in bursts** —
+the `azt-pending-nml-…` ref advanced on github (`e25c192 → 0a04558`, hundreds of
+objects). But it kept stalling at a hard wall:
+
+```
+topic-push attempt … chunk_n=1 … pack-size: 5 objects, 4,319,254 bytes
+topic-push raised: 408 … git-receive-pack
+preseed: blob 15a738fb79b5 is 4,272,261 bytes; alone exceeds budget 3,145,728
+pre-seed surfaced terminal status 'BLOB_EXCEEDS_BUDGET'; bailing
+drain push 'nml' codes=['BLOB_EXCEEDS_BUDGET','PUSH_FAILED']   → wan_backoff ~24h
+```
+
+nml audio blobs run ~4.3 MB; `sync.commit_pack_byte_budget` is 3 MB. On a
+transient `408`, the chunk_n=1 path pre-seeded, and `_preseed_oversize_blobs`
+**refused** the >budget blob as terminal `BLOB_EXCEEDS_BUDGET` → 24 h backoff →
+stuck at the first oversize file until an app restart re-escalated. Proof it was
+a false veto: identical ~4.3 MB chunk_n=1 packs pushed fine seconds earlier
+(`chunk OK … 4,316,364 bytes`). The 408 is a slow-link timeout, not a size
+ceiling; a single blob is atomic and cannot be split, so the budget must never
+forbid it.
+
+Fixes (daemon-only; no wire-format / client-contract change):
+- **`repo._preseed_oversize_blobs` no longer refuses an oversize blob.** The
+  early terminal `BLOB_EXCEEDS_BUDGET` return is gone; an oversize blob is pushed
+  alone in its own single-blob batch (side ref). Once it lands, the retried
+  chunk_n=1 commit pack is tiny (commit + tree). The budget governs *batching*,
+  never whether an unavoidable object is allowed.
+- **chunk_n=1 bail is now transient, not terminal.** `oversize`/`exhausted` at
+  the atomic unit returns a plain `(False, None, …)` → `PUSH_FAILED` "will
+  resume" instead of `COMMIT_PACK_EXCEEDS_NETWORK_BUDGET` — so escalation resumes
+  from the server topic tip (banked progress preserved) rather than parking a
+  day. (The old `COMMIT_PACK_EXCEEDS_NETWORK_BUDGET`/`BLOB_EXCEEDS_BUDGET` caller
+  branches are now dead but harmless; statuses left defined.)
+- **Estimate-based initial chunk size.** `_push_chunked_to_ref` pre-shrinks
+  `chunk_n` from the pack-size estimate (`chunk_n * budget / raw_bytes`) before
+  attempting, so a fat-history/thin-pipe project goes straight to a fitting size
+  instead of burning a multi-minute 408 on chunk_n=50→25→12→… every daemon
+  lifetime (nml: ~194 MB @ n=50 shrinks straight to n=1).
+
+Net: the github backup now grinds continuously past oversize audio instead of
+stalling ~24 h at each one and only advancing when the app is restarted.
+
+## 0.52.28 — deblock stuck WAN sync: skip needless fetch, cap escalation lock hold
+
+Field diagnosis from two paired phones (nml, aztobt2-ui / db033cd4):
+sync was wedged for days despite valid GitHub credentials (`app_installed=True`,
+`confirmed=True`) and healthy LAN convergence (`at_risk=0`, both phones at the
+merged HEAD). Root cause was **not** access — it was a hung fetch:
+
+- Every escalated drain ran a full `porcelain.fetch`. The log showed
+  `[sync-trace] fetch begin` with **no** matching `fetch done`/`fetch failed`
+  — once for **85 minutes** in a single daemon lifetime — while
+  `[service] idle-stop deferred: WAN sync in flight` fired throughout.
+- `_FETCH_TIMEOUT_S` is applied via `socket.setdefaulttimeout`, which is a
+  **per-`recv` timeout, not a wall-clock deadline** — a slow/negotiating fetch
+  never trips it. Because the single fetch call never returned, the escalation's
+  own giveup valve (`_ESCALATE_MAX_VISITS`) was downstream of a call that never
+  returned → unreachable.
+- The fetch held `project_lock` its whole run, so user-tapped Sync returned
+  `BUSY` (confirmed: two `[sync-rpc] 'nml' … done: codes=['BUSY']` at 17:53 and
+  18:16). The resumable chunked *push* — which could actually make progress —
+  was never reached.
+- The remote had **never advanced** (no push ever succeeded; only two phones
+  push this repo), so the fetch was pulling nothing useful.
+
+Fixes (daemon-only; no wire-format change, no client-contract change):
+- **`repo._push_step_locked` skips the fetch when the remote tip hasn't moved.**
+  New `repo._ls_remote_main_tip` does one bounded `GET info/refs` ref
+  advertisement (no negotiation, no pack, no local graph walk) and compares the
+  remote's branch tip to our tracking mirror. On a confident equality the fetch
+  is skipped and the resumable chunked push proceeds. Any peek failure (`None`)
+  or a missing mirror falls through to the normal fetch, so first-ever pushes
+  and genuinely advanced remotes still reconcile.
+- **`scheduler._run_to_completion` gets a wall-clock visit ceiling**
+  (`_RUN_TO_COMPLETION_DEADLINE_S = 120s`, checked between iterations) so an
+  escalated visit yields `project_lock` after ~one in-flight chunk instead of
+  holding it for the whole 8-iteration budget. A user Sync tapped during
+  escalation now waits ≤ one chunk (`_PUSH_TIMEOUT_S`), not minutes. The push is
+  resumable, so yielding loses no progress.
+
+## 0.52.27 — diagnostics-archive format is a shared client helper
+
+Resolves the `NOTES_TO_DAEMON` "REFACTOR" item (filed from
+azt-recorder 1.58.6). The `.tar.gz` diagnostics format was implemented
+**twice** — daemon `_h_prepare_share_bundle` and a peer-owned recorder
+builder — so the 0.52.19→0.52.23 zip→tar.gz change had to be applied in
+both, and the recorder shipped stale `.zip` for a build. No test caught
+the drift.
+
+New `azt_collab_client/diagnostics.py` is the single source of the
+container **format** (import direction allows it: daemon imports client,
+never the reverse; serves daemon + every peer):
+- `DIAGNOSTICS_MIME = 'application/gzip'`
+- `diagnostics_archive_name(slug='', stamp='')` → `azt_diagnostics_…tar.gz`
+  (daemon) / `azt_recorder_diagnostics_…tar.gz` (slug), charset-guarded.
+- `build_diagnostics_targz(dest, *, file_items, content_items)` — files
+  (per-file `OSError` skipped) + in-memory blobs (`TarInfo`+`addfile`);
+  raises only if the archive itself can't be written; returns entry count.
+
+Daemon `_h_prepare_share_bundle` and client `share_diagnostics_action`
+now use it. **Collection/staging/dispatch stay per-process** (each side
+has files the other can't see, in separate Android sandboxes) — only the
+format is shared. No wire-contract change (token + `items[].uri_path` +
+`display_name` unchanged) → no `MIN_CLIENT_VERSION` bump. The recorder
+peer self-serves onto the helper and deletes its hand-rolled tar block.
+
+Files: `azt_collab_client/diagnostics.py` (new),
+`azt_collabd/server.py`, `azt_collab_client/ui/share.py`,
+`azt_collab_client/CLIENT_INTEGRATION.md`, `azt_collab_client/CLAUDE.md`.
+
+## 0.52.26 — LAN share QR: valid while displayed, multi-use
+
+Two fixes to the project share-QR consent model:
+
+- **Multi-use while shown.** `qr_offer_active` no longer consumes
+  (pops) the offer, so **one displayed QR can be scanned by several
+  peers** and each gets the share (the workshop "show it to the room"
+  case). Previously the first scanner consumed a single-use offer and
+  everyone after got no share unless the owner re-displayed the QR.
+- **Validity is driven by the QR being on screen, not a 10-minute
+  timer.** The share popup (`share_pairing_qr_popup`) heartbeats
+  `lan_pair_qr_keepalive(langcode)` every 10 s while displayed and calls
+  `lan_pair_qr_close(langcode)` on dismiss. Daemon keepalive window is
+  30 s (tolerates one missed beat). So the offer is armed exactly while
+  the QR is up — held indefinitely if the user keeps it open, and
+  self-revoked within seconds of closing it (or the app dying), instead
+  of staying armed for 10 minutes after a glance. More intuitive
+  refresh/retry: just reopen the QR.
+
+Security unchanged in spirit: auto-share still requires an *active*
+user-displayed QR for that langcode (the only consent signal the
+CERT_NONE LAN TLS gives us) — it's just scoped to "while shown" rather
+than "single-use within 10 min."
+
+New RPCs `POST /v1/lan/pair/qr/keepalive` + `/close`; client wrappers
+`lan_pair_qr_keepalive` / `lan_pair_qr_close`. `consume_qr_offer` →
+`qr_offer_active` (+ `clear_qr_offer`).
+
+Files: `azt_collabd/lan_listener.py`, `azt_collabd/server.py`,
+`azt_collab_client/__init__.py`, `azt_collab_client/ui/lan_popups.py`.
+
+## 0.52.25 — repo-access browser fallback + completes the invite flow
+
+Debug cut that finishes the 0.52.24 invite work (the 0.52.24 field build
+predated the completed wiring). Adds the **browser-open fallback** for
+when the daemon can't auto-accept an invitation (none pending yet, or the
+app token can't accept it):
+
+- `azt_collab_client.ui.open_url(url)` — `ACTION_VIEW` to the device
+  browser (no-op with `on_error` off-Android).
+- `azt_collab_client.ui.repo_access_popup(owner_repo, url)` — a peer-
+  facing popup for a `REPO_NO_ACCESS` result / `last_sync_error`: explains
+  the cause and offers **Open GitHub** (→ the repo/invitations page to
+  accept or request access) + Close. Peers route a `S.REPO_NO_ACCESS`
+  status (or the `project_status.last_sync_error` banner) here, passing
+  the status params' `owner_repo` + `url`.
+
+This is the *fallback*; the common path is still silent auto-accept
+(0.52.24) — the browser only opens when there's nothing to auto-accept.
+
+Files: `azt_collab_client/ui/share.py`, `azt_collab_client/ui/popups.py`,
+`azt_collab_client/ui/__init__.py`.
+
+## 0.52.24 — auto-accept GitHub invitations; honest no-access diagnosis
+
+A project pointing at someone else's GitHub repo (e.g. a peer cloned
+`aztobt2-ui/nml`) 404s forever until the invitee **accepts** the
+collaborator invitation on GitHub — a step field users never find.
+And the daemon churned on that 404: dulwich raises `NotGitRepository`,
+which wasn't recognized as no-access, so the push loop retried it 11×
+(holding the lock, BUSY-ing commits) before backing off 24 h — with no
+user-visible reason.
+
+- **Auto-accept (the 404 is the trigger).** On a 404 / `NotGitRepository`
+  from a fetch or push, the daemon calls `GET /user/repository_invitations`
+  and, if one matches this exact repo, `PATCH`-accepts it and retries
+  (`INVITE_ACCEPTED`). No in-app invite flow, no browser, nothing to tap —
+  aztobt2 grants collaborator, and aztobt1's next sync accepts its own
+  invite and proceeds. Scoped to the repo being synced (never accepts
+  unrelated invites); gated by `wan_backoff` so it doesn't re-poll.
+  `auth.list_repo_invitations` / `accept_repo_invitation` /
+  `try_accept_repo_invitation`.
+- **Honest no-access verdict.** When there's no matching invite, the 404
+  is surfaced as new `REPO_NO_ACCESS` (owner/repo + repo URL) — which
+  enumerates the real causes (private-not-shared / not-a-collaborator /
+  app-not-granted / wrong name) instead of falsely asserting
+  `APP_NOT_INSTALLED`. GitHub returns 404 for all of these and gives us
+  no way to disambiguate from the caller's side; `check_app_installed`
+  run with the caller's token can't even confirm "installed", so we no
+  longer claim it. Only a *positive* API result refines to
+  `REPO_NOT_AUTHORIZED` / `APP_SUSPENDED`. (`auth.diagnose_no_access`.)
+- **Short-circuit the churn.** `repo._is_repo_not_found` + `_handle_no_access`
+  bail out of the fetch/push paths on no-access instead of running the
+  11× retry loop.
+- **Surface it, don't silently die (req 1.1).** Access-class failures
+  persist as `projects.last_sync_error` (a typed code) and ride out on
+  `project_status.last_sync_error` so the peer can show a persistent
+  "sync blocked: <reason>" banner. Cleared on the next successful sync or
+  an auto-accepted invite. The only silent case remains "no credentials
+  at all" (not set up yet).
+
+- **End the wait on an event, not a blind timer.** A blocked push stays
+  on the normal (up-to-24 h) backoff — that's what protects the radio.
+  But the *access* condition is re-checked cheaply and independently:
+  - **Event-nudge (local fixes):** saving GitHub credentials
+    (`_h_set_github_tokens`) nudges every access-blocked project;
+    a successful **Grant collaborator** nudges that project.
+  - **Cheap re-probe (remote fixes):** `_drain_access_reprobe` runs one
+    small call per blocked project (throttled 5 min, decoupled from the
+    push backoff) — `try_accept_repo_invitation`, else
+    `auth.probe_repo_access` (`GET /repos/{owner}/{repo}` → existence +
+    `permissions.push`). When it flips to OK (collaborator grant /
+    permission upgrade / invite appeared), it clears the error and
+    `wan_backoff.nudge`s the real push. So sync resumes within minutes of
+    an out-of-band grant instead of waiting out the 24 h curve.
+  - Codes re-probed: `REPO_NO_ACCESS`, `REPO_NOT_AUTHORIZED`,
+    `APP_NOT_INSTALLED`, `APP_SUSPENDED`, `ACCESS_DENIED`. `NOT_A_REPO`
+    is excluded (local / publish-flow, not a remote grant).
+
+Files: `azt_collabd/auth.py`, `azt_collabd/repo.py`,
+`azt_collabd/scheduler.py`, `azt_collabd/projects.py`,
+`azt_collabd/server.py`, `azt_collabd/status.py`,
+`azt_collab_client/status.py`, `azt_collab_client/translate.py`.
+
+Still peer-side (not in this cut): opening the browser to the
+invitations page as the *fallback* when there's no pending invite to
+auto-accept, and prompting at LAN-accept / project-receive.
+
+## 0.52.23 — diagnostic share archive is now .tar.gz (Dome strips .zip)
+
+The field's Dome email server silently **strips `.zip` attachments**,
+so a shared diagnostic bundle never arrived. Switched the archive
+from zip to gzipped-tar. gzip's magic bytes (`1f 8b`) aren't in the
+zip family (`PK\x03\x04`, which also fingerprints .docx/.jar/.apk),
+so `.tar.gz` clears both extension-based and content-sniffing
+attachment filters. Still a single attachment via `ACTION_SEND`, so
+Signal's ACTION_SEND_MULTIPLE image/video-only filter (the reason
+0.52.19 bundled to one file) is still avoided; `application/gzip`
+clears Signal's `application/*` manifest entry. stdlib `tarfile` —
+no new deps, works under p4a.
+
+Three sides, in lockstep:
+- **Daemon** (`server.py:_h_prepare_share_bundle`): builds
+  `azt_diagnostics_<stamp>.tar.gz` with `tarfile.open('w:gz')` (the
+  snapshot goes in via `TarInfo`+`addfile` from memory, per-day logs
+  via `tf.add`).
+- **Client log-share fn** (`ui/share.py:share_diagnostics_action`):
+  dispatches with `mime_type='application/gzip'`. This is the fn the
+  picker's and the daemon UI's "Share diagnostics" buttons call, so
+  every in-repo client log-share path gets the new format.
+- **ContentProvider** (`AZTCollabProvider.mimeForPath`): `gz`/`tgz`
+  → `application/gzip` so receivers that consult `getType` route it
+  as a binary attachment matching the intent.
+
+Legacy `share_log_file` (no in-repo callers; ships a single
+`text/plain` `.log`, not a zip) is unaffected by the strip and left
+as-is.
+
+Files: `azt_collabd/server.py`, `azt_collab_client/ui/share.py`,
+`android/src/main/java/org/atoznback/aztcollab/AZTCollabProvider.java`.
+
+## 0.52.21 — push a stuck, diverged history through instead of dying mid-fetch
+
+Field repro (nml, two phones): a project's local history diverged
+from its github remote by thousands of commits and **never
+converged**. On the repo owner's phone the WAN push started
+(`[sync-trace] fetch begin`) and was killed before it could finish
+— every daemon lifetime restarted from scratch. Root cause: the
+Android `:provider` idle-stop loop
+(`server_apk/service.py`) stops the service after
+`IDLE_TIMEOUT_SECONDS` of no ContentProvider touches + no bound
+peers, and that measure is **blind to a WAN fetch/merge/push
+running in a scheduler thread**. Close the UI mid-push → 300 s
+later the process is killed → the resumable chunked push
+(`repo._push_chunked_to_ref`) never banks progress. (On the other
+phone the same project also can't sync, for an unrelated reason —
+the GitHub App isn't installed on that repo's owner account; that
+is a separate config issue, not addressed here.)
+
+Three layers, all daemon-side (no wire-format change, no client
+bump):
+
+- **Layer 1 — don't kill an in-flight sync.** New
+  `azt_collabd/sync_flight.py` holds an in-memory "a WAN sync is
+  running" counter. The scheduler wraps every push attempt
+  (`_attempt_push`) in `sync_flight.guard()`; the `service.py`
+  idle loop refuses to `stopSelf()` while the count is nonzero
+  (`idle-stop deferred: WAN sync in flight`). Same `:provider`
+  process, so the flag is genuinely shared.
+
+- **Layer 2 — notice *this* is happening (not just "no internet").**
+  `wan_backoff.py` gains `push_inflight_since` /
+  `interrupted_count`: a push that starts sets the marker, a push
+  that *finishes* (success or explicit failure) clears it. If it
+  survives to the next daemon startup, the previous attempt was
+  killed → `note_interrupted_on_startup` (called from
+  `reconcile_on_startup`) bumps `interrupted_count`. A high count
+  while online is the escalation trigger; offline stays quiet.
+
+- **Layer 3 — do whatever it takes.** When online AND
+  `interrupted_count >= 2`, the drain routes to
+  `_run_to_completion`: promote to an Android foreground service +
+  WifiLock (`lan_fgs.arm_for_transfer`) so the process stays alive
+  and the radio stays high-perf, then loop the resumable chunked
+  push, bypassing the radio-friendly backoff curve, until it
+  converges. Bounded per visit (`_RUN_TO_COMPLETION_MAX_ITERS`);
+  resumable across ticks; permanent failures (no-access / not-a-repo)
+  and a battery giveup valve (`_ESCALATE_MAX_VISITS`) revert it to
+  normal backoff.
+
+The user-gestured Sync path (`server.py:_h_project_sync`) is also
+wrapped in the Layer-1 guard, so tapping Sync then closing the app
+can't get the sync killed mid-flight either.
+
+Files: `azt_collabd/sync_flight.py` (new), `azt_collabd/wan_backoff.py`,
+`azt_collabd/scheduler.py`, `azt_collabd/server.py`,
+`server_apk/service.py`.
+
+**Build fix (server APK):** added `filetype` to
+`server_apk/buildozer.spec.tmpl` requirements. Kivy 2.3.0's
+`kivy/core/image/__init__.py` imports `filetype` at load (it
+replaced the stdlib `imghdr`), so a rebuilt APK without it crashed
+on startup with `ModuleNotFoundError: No module named 'filetype'`
+before any daemon code ran. Peer APKs that rebuild on Kivy 2.3.0
+need the same requirement.
+
+
 
 Field feedback 2026-06-22: when the support engineer unzips a
 diagnostic share and opens the daemon log files, some text

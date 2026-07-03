@@ -276,6 +276,10 @@ public class AZTCollabProvider extends ContentProvider {
         if (ext.equals("lift")) return "application/xml";
         if (ext.equals("xml")) return "application/xml";
         if (ext.equals("zip")) return "application/zip";
+        // .tar.gz diagnostic bundle (0.52.22): lastIndexOf('.') gives
+        // ext "gz". application/gzip so receivers route it as a
+        // binary attachment, matching the ACTION_SEND intent type.
+        if (ext.equals("gz") || ext.equals("tgz")) return "application/gzip";
         if (ext.equals("png")) return "image/png";
         if (ext.equals("jpg") || ext.equals("jpeg")) return "image/jpeg";
         if (ext.equals("webp")) return "image/webp";

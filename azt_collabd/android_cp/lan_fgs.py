@@ -139,15 +139,18 @@ def _build_minimal_notification(ctx):
         if Build.SDK_INT >= 26 and nm is not None:
             channel = NotificationChannel(
                 _NOTIFICATION_CHANNEL_ID,
-                'AZT LAN sync',
+                'AZT sync',
                 NotificationManager.IMPORTANCE_LOW)
             channel.setDescription(
-                'AZT Collaboration sharing with nearby devices.')
+                'AZT Collaboration keeping your work backed up '
+                'and shared.')
             nm.createNotificationChannel(channel)
         builder = NotificationCompat(ctx, _NOTIFICATION_CHANNEL_ID)
-        builder.setContentTitle(
-            'AZT Collaboration: sharing with nearby devices')
-        builder.setContentText('Tap to manage paired phones.')
+        # Neutral copy: this FGS now covers both LAN peer sharing and
+        # WAN github backup (0.52.21 run-to-completion), so it must
+        # not claim to be only "nearby devices".
+        builder.setContentTitle('AZT Collaboration: syncing')
+        builder.setContentText('Keeping your work backed up and shared.')
         builder.setSmallIcon(ctx.getApplicationInfo().icon)
         builder.setOngoing(True)
         return builder.build()

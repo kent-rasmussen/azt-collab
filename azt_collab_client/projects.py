@@ -109,6 +109,16 @@ class ProjectStatus:
     commit_failure_count: int = 0
     last_commit_failure_at: float = 0.0
     last_commit_error: str = ''
+    # Access-class reason the last WAN *sync* failed (daemon 0.52.24+):
+    # a typed status CODE — ``REPO_NO_ACCESS`` / ``AUTH_REQUIRED`` /
+    # ``REPO_NOT_AUTHORIZED`` / ``APP_SUSPENDED`` / ``ACCESS_DENIED`` /
+    # ``AUTH_REFRESH_STALE`` — or ``''`` when the last sync had no access
+    # problem. Persistent (survives restart), cleared on the next
+    # successful sync or an auto-accepted invite. Lets a peer show a
+    # standing "sync blocked: <reason>" banner instead of silently
+    # backing off; route ``REPO_NO_ACCESS`` to ``repo_access_popup``.
+    last_sync_error: str = ''
+    last_sync_error_at: float = 0.0
     # Atomic-recovery diagnostic counter (daemon 0.41.27+). The
     # daemon auto-merges orphaned ``.azt_atomic_pending/<token>``
     # LIFT scratches into the current LIFT in the background;
@@ -181,6 +191,9 @@ class ProjectStatus:
             last_commit_failure_at=float(
                 d.get('last_commit_failure_at', 0.0) or 0.0),
             last_commit_error=d.get('last_commit_error', '') or '',
+            last_sync_error=d.get('last_sync_error', '') or '',
+            last_sync_error_at=float(
+                d.get('last_sync_error_at', 0.0) or 0.0),
             n_recovered_today=int(
                 d.get('n_recovered_today', 0) or 0),
             work_offline=bool(d.get('work_offline', False)),

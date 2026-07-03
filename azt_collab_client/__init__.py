@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.52.20"
+__version__ = "0.52.31"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -970,6 +970,36 @@ def lan_pair_qr(endpoint='', langcode=''):
     if not isinstance(payload, dict):
         return {}
     return payload
+
+
+def lan_pair_qr_keepalive(langcode):
+    """Heartbeat while a project share-QR is on screen (0.52.26). The
+    share offer for *langcode* is valid only while the QR is displayed;
+    the display screen calls this every ~10 s so the daemon keeps
+    auto-share armed. Best-effort — returns True on ack, False on any
+    failure. No-op for an empty langcode (pair-only QR)."""
+    if not langcode:
+        return False
+    try:
+        resp = call('POST', '/v1/lan/pair/qr/keepalive',
+                    {'langcode': langcode})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
+
+
+def lan_pair_qr_close(langcode):
+    """Revoke a project share offer when its QR screen closes (0.52.26)
+    — instant, rather than waiting out the keepalive grace. Best-effort;
+    no-op for an empty langcode."""
+    if not langcode:
+        return False
+    try:
+        resp = call('POST', '/v1/lan/pair/qr/close',
+                    {'langcode': langcode})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
 
 
 def lan_toggle():
@@ -2851,7 +2881,8 @@ __all__ = [
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
-    'lan_peer_id', 'lan_list_peers', 'lan_pair_qr', 'lan_pair_accept',
+    'lan_peer_id', 'lan_list_peers', 'lan_pair_qr',
+    'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
     'lan_clone', 'lan_pending', 'lan_accept_offer',

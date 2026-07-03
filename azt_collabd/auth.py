@@ -330,6 +330,52 @@ def diagnose_403(token, remote_url):
 _diagnose_403 = diagnose_403
 
 
+def diagnose_no_access(token, remote_url):
+    """Diagnose a 404 / ``NotGitRepository`` from a git op that had a valid
+    token. GitHub returns 404 for *any* repo the token can't see, so the
+    cause is inherently ambiguous — private-and-not-shared,
+    not-a-collaborator, app-not-granted-this-repo, or wrong name.
+
+    We narrow it with the API only where the API can be trusted:
+    a *positive* installed-result lets us refine to
+    ``REPO_NOT_AUTHORIZED`` (app installed on the owner but this repo not
+    selected). We deliberately DO NOT emit ``APP_NOT_INSTALLED`` from a
+    404: ``check_app_installed`` runs with the caller's token, whose
+    ``/user/installations`` is blind to an owner the caller isn't a member
+    of, so ``installed=False`` here would be a false assertion. Everything
+    else returns the honest, cause-enumerating ``REPO_NO_ACCESS`` carrying
+    ``owner_repo`` + the repo ``url`` so the peer can offer "open GitHub to
+    accept / ask the owner". No token → ``AUTH_REQUIRED`` (creds problem,
+    not silence — but the caller only reaches here WITH a token; the
+    no-credentials case stays silent upstream)."""
+    if not token:
+        return Status(S.AUTH_REQUIRED)
+    import re
+    m = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', remote_url or '')
+    owner = m.group(1) if m else None
+    repo_name = m.group(2) if m else None
+    owner_repo = (f'{owner}/{repo_name}' if owner and repo_name
+                  else (remote_url or ''))
+    try:
+        info = check_app_installed(token, account_login=owner)
+    except Exception:
+        info = {}
+    if info.get('suspended'):
+        return Status(S.APP_SUSPENDED,
+                      {'url': app_install_url(info.get('installation_id'))})
+    if (info.get('installed') and not info.get('all_repos')
+            and owner and repo_name):
+        if not check_repo_in_installation(
+                token, info.get('installation_id'), owner, repo_name):
+            return Status(S.REPO_NOT_AUTHORIZED,
+                          {'owner_repo': owner_repo,
+                           'url': app_install_url(info.get('installation_id'))})
+    repo_url = (f'https://github.com/{owner_repo}'
+                if owner and repo_name else (remote_url or ''))
+    return Status(S.REPO_NO_ACCESS,
+                  {'owner_repo': owner_repo, 'url': repo_url})
+
+
 def test_github_credentials(token):
     """Hit ``api.github.com/user`` with the supplied access token.
     Returns ``{'valid': bool, 'server_username': str,
@@ -487,3 +533,139 @@ def add_collaborator(owner, repo_name, collaborator, token,
         if e.code == 422:
             return 'already'  # pending invite already exists
         raise
+
+
+# ── repository-invitation acceptance (0.52.24) ─────────────────────────────
+#
+# The receiving side of ``add_collaborator``. When someone is invited to a
+# repo, GitHub does NOT grant access until the invitee *accepts* — and until
+# then every git op 404s (private repos are hidden). Field users never find
+# the GitHub email, so a received project sits un-syncable forever. These
+# helpers let the daemon accept the invitation itself, on the invitee's
+# behalf, using the invitee's own token — turning "go accept it on GitHub"
+# into a no-op.
+#
+# REST endpoints (user-scoped, act on the authenticated user):
+#   GET   /user/repository_invitations                → list pending
+#   PATCH /user/repository_invitations/{id}           → accept (204)
+#
+# Caveat: whether a GitHub-App *user-to-server* token is allowed on these
+# endpoints depends on the app's granted permissions; if GitHub refuses,
+# these return empty / False and the caller falls back to the browser path.
+
+
+def list_repo_invitations(token):
+    """Return the authenticated user's pending repository invitations as a
+    list of ``{'id': int, 'full_name': 'owner/repo'}``. Empty on any
+    failure (no token, HTTP error, app-token not permitted)."""
+    if not token:
+        return []
+    _ensure_ssl()
+    from urllib.request import Request, urlopen
+    out = []
+    req = Request(
+        'https://api.github.com/user/repository_invitations?per_page=100',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+        },
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        for inv in data if isinstance(data, list) else []:
+            repo = inv.get('repository') or {}
+            out.append({
+                'id': inv.get('id'),
+                'full_name': (repo.get('full_name') or ''),
+            })
+    except Exception as ex:
+        import sys
+        print(f'[invite] list_repo_invitations failed: {ex!r}',
+              file=sys.stderr, flush=True)
+    return out
+
+
+def accept_repo_invitation(token, invitation_id):
+    """Accept one repository invitation by id. Returns True on success
+    (HTTP 204). Best-effort — returns False on any failure."""
+    if not token or invitation_id is None:
+        return False
+    _ensure_ssl()
+    from urllib.request import Request, urlopen
+    import sys
+    req = Request(
+        f'https://api.github.com/user/repository_invitations/{invitation_id}',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+        },
+        method='PATCH',
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            ok = resp.status in (204, 200)
+            print(f'[invite] accepted invitation id={invitation_id} '
+                  f'status={resp.status}', file=sys.stderr, flush=True)
+            return ok
+    except Exception as ex:
+        print(f'[invite] accept id={invitation_id} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+
+
+def probe_repo_access(token, remote_url):
+    """Cheap "is the access blocker gone?" probe: ``GET /repos/{owner}/
+    {repo}``. One small API call (not the radio-heavy git op), so it's
+    safe to run on a light cadence decoupled from the push backoff.
+
+    Returns ``{'ok': bool, 'exists': bool, 'can_push': bool,
+    'status': int|None}``. ``ok`` means we can now SEE and PUSH the repo —
+    the signal that ends the wait after a collaborator grant / permission
+    upgrade / app (re)install. ``permissions.push`` in the response is the
+    caller's own effective write access. Best-effort: any failure →
+    ok=False (we simply don't nudge)."""
+    out = {'ok': False, 'exists': False, 'can_push': False, 'status': None}
+    if not token:
+        return out
+    import re
+    m = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', remote_url or '')
+    if not m:
+        return out
+    owner, repo_name = m.group(1), m.group(2)
+    _ensure_ssl()
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+    req = Request(
+        f'https://api.github.com/repos/{owner}/{repo_name}',
+        headers={'Authorization': f'Bearer {token}',
+                 'Accept': 'application/vnd.github+json'})
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out['status'] = resp.status
+        out['exists'] = True
+        perms = data.get('permissions') or {}
+        out['can_push'] = bool(perms.get('push'))
+        out['ok'] = out['can_push']
+    except HTTPError as e:
+        out['status'] = e.code
+    except Exception:
+        pass
+    return out
+
+
+def try_accept_repo_invitation(token, remote_url):
+    """If there's a pending invitation for the repo named by *remote_url*,
+    accept it. Returns True iff an invitation was found AND accepted (so
+    the caller should retry the git op). No-op → False when there's no
+    matching invite, no token, or the API refuses our token."""
+    import re
+    m = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', remote_url or '')
+    if not m:
+        return False
+    target = f'{m.group(1)}/{m.group(2)}'.lower()
+    for inv in list_repo_invitations(token):
+        if (inv.get('full_name') or '').lower() == target and inv.get('id'):
+            return accept_repo_invitation(token, inv['id'])
+    return False

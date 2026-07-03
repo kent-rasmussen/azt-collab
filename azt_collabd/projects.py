@@ -367,6 +367,32 @@ def set_remote_url(langcode, url):
     _update(mut)
 
 
+def set_last_sync_error(langcode, code, ts=None):
+    """Persist the access-class reason the last WAN sync failed
+    (``AUTH_REQUIRED`` / ``REPO_NO_ACCESS`` / ``REPO_NOT_AUTHORIZED`` /
+    ``APP_SUSPENDED`` / …) so ``project_status`` can surface WHY sync is
+    stuck instead of silently backing off (0.52.24, requirement 1.1).
+    Cleared by ``clear_last_sync_error`` on the next successful sync."""
+    if ts is None:
+        ts = time.time()
+    def mut(d):
+        if langcode in d:
+            d[langcode]['last_sync_error'] = str(code)
+            d[langcode]['last_sync_error_at'] = float(ts)
+    _update(mut)
+
+
+def clear_last_sync_error(langcode):
+    """Drop any persisted sync-error reason. Called on a successful sync
+    and after an auto-accepted invite clears the access problem."""
+    def mut(d):
+        entry = d.get(langcode)
+        if isinstance(entry, dict):
+            entry.pop('last_sync_error', None)
+            entry.pop('last_sync_error_at', None)
+    _update(mut)
+
+
 def add_extra_remote(langcode, url):
     """Append *url* to this project's ``extra_remotes`` list,
     preserving order and deduping. No-op if *url* equals the

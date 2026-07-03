@@ -132,19 +132,26 @@ def record_success(langcode: str) -> None:
 
 def record_failure(langcode: str) -> None:
     """Advance the curve. Persists across restart so the curve
-    survives daemon respawn."""
+    survives daemon respawn.
+
+    An explicit failure return is a *clean finish* of the attempt —
+    not a process-death interruption — so it clears
+    ``push_inflight_since`` while PRESERVING ``interrupted_count``
+    (the Layer-2 escalation signal survives ordinary network
+    failures; only ``record_success`` / never-getting-killed clears
+    it). See ``note_interrupted_on_startup``."""
     state = _load()
-    entry = state.get(langcode) or {}
+    entry = dict(state.get(langcode) or {})
     try:
         failures = int(entry.get('consecutive_failures', 0) or 0) + 1
     except (TypeError, ValueError):
         failures = 1
     now = time.time()
-    state[langcode] = {
-        'consecutive_failures': failures,
-        'last_attempt_at': now,
-        'next_attempt_at': now + _curve_seconds(failures),
-    }
+    entry['consecutive_failures'] = failures
+    entry['last_attempt_at'] = now
+    entry['next_attempt_at'] = now + _curve_seconds(failures)
+    entry.pop('push_inflight_since', None)   # clean finish, not a kill
+    state[langcode] = entry
     _save(state)
 
 
@@ -159,6 +166,122 @@ def nudge(langcode: str) -> None:
         return
     state[langcode]['next_attempt_at'] = 0.0
     _save(state)
+
+
+# ── push-interruption tracking (0.52.21, Layer 2) ──────────────────
+#
+# Distinguishes "this push keeps getting killed mid-flight" from
+# "ordinary network failure". A push that starts sets
+# ``push_inflight_since``; a push that *finishes* (success OR explicit
+# failure) clears it. If the daemon restarts and the marker is still
+# set, the previous attempt was killed (OOM / idle-stop / APK update)
+# before it could finish → ``note_interrupted_on_startup`` bumps
+# ``interrupted_count``. A high ``interrupted_count`` while online is
+# the Layer-3 escalation trigger (run-to-completion under FGS).
+
+
+def mark_push_started(langcode: str) -> None:
+    """Record that a WAN push for *langcode* has begun. Cleared by
+    ``mark_push_finished`` / ``record_failure`` / ``record_success``.
+    If it survives to the next daemon startup, the attempt was
+    killed (see ``note_interrupted_on_startup``)."""
+    state = _load()
+    entry = dict(state.get(langcode) or {})
+    entry['push_inflight_since'] = time.time()
+    state[langcode] = entry
+    _save(state)
+
+
+def mark_push_finished(langcode: str) -> None:
+    """Clear the in-flight marker after an attempt returns (any
+    outcome). A clean return means the process was NOT killed
+    mid-push, so this attempt should not count as interrupted."""
+    state = _load()
+    entry = state.get(langcode)
+    if not isinstance(entry, dict) or 'push_inflight_since' not in entry:
+        return
+    entry = dict(entry)
+    entry.pop('push_inflight_since', None)
+    state[langcode] = entry
+    _save(state)
+
+
+def interrupted_count(langcode: str) -> int:
+    entry = _load().get(langcode) or {}
+    try:
+        return int(entry.get('interrupted_count', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def note_interrupted_on_startup() -> list:
+    """Called once per daemon startup (from
+    ``scheduler.reconcile_on_startup``). Any project whose
+    ``push_inflight_since`` is still set had its push killed before it
+    could finish — bump ``interrupted_count`` and clear the marker.
+    Returns the list of affected langcodes for logging.
+
+    ``interrupted_count`` is only reset by ``record_success`` (which
+    deletes the whole entry) — so it accumulates across the repeated
+    kill/respawn cycle that characterises the stuck-diverged-push
+    pathology, and drops to zero the moment the push actually lands."""
+    state = _load()
+    affected = []
+    for langcode, entry in list(state.items()):
+        if not isinstance(entry, dict) or 'push_inflight_since' not in entry:
+            continue
+        entry = dict(entry)
+        try:
+            entry['interrupted_count'] = int(
+                entry.get('interrupted_count', 0) or 0) + 1
+        except (TypeError, ValueError):
+            entry['interrupted_count'] = 1
+        entry.pop('push_inflight_since', None)
+        state[langcode] = entry
+        affected.append(langcode)
+    if affected:
+        _save(state)
+    return affected
+
+
+def bump_escalation_attempts(langcode: str) -> int:
+    """Increment + persist the count of run-to-completion visits that
+    did NOT converge, and return the new value. The scheduler uses
+    this as a battery safety valve: after enough non-converging
+    escalated visits it gives up escalating (``clear_interrupted``)
+    and falls back to the normal backoff curve until the next user
+    Sync / online edge. Reset by ``record_success`` (entry delete) or
+    ``clear_interrupted``."""
+    state = _load()
+    entry = dict(state.get(langcode) or {})
+    try:
+        n = int(entry.get('escalation_attempts', 0) or 0) + 1
+    except (TypeError, ValueError):
+        n = 1
+    entry['escalation_attempts'] = n
+    state[langcode] = entry
+    _save(state)
+    return n
+
+
+def clear_interrupted(langcode: str) -> None:
+    """Drop the Layer-2/3 escalation signals for *langcode* without
+    touching the backoff curve. Called when escalation should stop —
+    a permanent (no-access) failure, or the escalation giveup cap.
+    The project reverts to ordinary backoff-gated draining."""
+    state = _load()
+    entry = state.get(langcode)
+    if not isinstance(entry, dict):
+        return
+    entry = dict(entry)
+    changed = False
+    for k in ('interrupted_count', 'escalation_attempts',
+              'push_inflight_since'):
+        if entry.pop(k, None) is not None:
+            changed = True
+    if changed:
+        state[langcode] = entry
+        _save(state)
 
 
 def reset_due_times_on_startup() -> None:

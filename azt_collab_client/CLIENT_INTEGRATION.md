@@ -1658,16 +1658,16 @@ email_text(
 #    len(items) > 1 → ACTION_SEND_MULTIPLE.
 #
 #    For Signal compatibility with non-image/non-video
-#    content, use exactly one item with a zip URI from your
-#    own ContentProvider. Multi-item with text content will
-#    be silently rejected by Signal (per § 14b-i above).
+#    content, use exactly one item with an archive URI from
+#    your own ContentProvider. Multi-item with text content
+#    will be silently rejected by Signal (per § 14b-i above).
 share_files(
     items=[
         {'uri': 'content://org.atoznback.aztcollab/'
-                '_shares/abc123/azt_diagnostics_20260622.zip',
-         'display_name': 'azt_diagnostics_20260622.zip'},
+                '_shares/abc123/azt_diagnostics_20260622.tar.gz',
+         'display_name': 'azt_diagnostics_20260622.tar.gz'},
     ],
-    mime_type='application/zip',
+    mime_type='application/gzip',
     chooser_title=_('Share diagnostics'),
     on_error=self._show_error,
 )
@@ -1676,8 +1676,8 @@ share_files(
 #    of truth for the server-APK settings button, the picker
 #    button, and any peer app that wants to ship the daemon's
 #    diagnostic bundle. Internally: prepare_share_bundle()
-#    RPC returns a single zip URI, share_files dispatches via
-#    ACTION_SEND. The peer just chooses an `on_error`
+#    RPC returns a single .tar.gz URI, share_files dispatches
+#    via ACTION_SEND. The peer just chooses an `on_error`
 #    callback for its error-display channel.
 share_diagnostics_action(on_error=self._show_error)
 
@@ -1704,9 +1704,10 @@ success.
 **Picking between them.** Short text (< 100 KB) → either
 ``share_text`` (broad picker) or ``email_text`` (email only).
 Diagnostic bundle → ``share_diagnostics_action``. Peer-built
-zip bundles destined for Signal-compatibility →
+archive bundles destined for Signal-compatibility →
 ``share_files`` with one URI item from your own provider's
-authority. Image/video bundles where Signal-compat doesn't
+authority (use a non-zip container — e.g. ``.tar.gz`` — if the
+recipient's mail server strips ``.zip``). Image/video bundles where Signal-compat doesn't
 matter (or where you're OK with Signal dropping it) →
 ``share_files`` with multiple URI items. Legacy single-blob
 text bundles where Signal-compat doesn't matter →
@@ -1724,22 +1725,24 @@ from azt_collab_client.transports.android_cp import CANONICAL_AUTHORITY
 from azt_collab_client.ui.share import share_files
 
 bundle = prepare_share_bundle()
-# Since 0.52.19 the bundle is a single zip:
+# Single-file bundle since 0.52.19; a .tar.gz since 0.52.23
+# (a field mail server strips .zip — gzip magic dodges the
+# filter). Shape:
 # {'token': '<hex>',
 #  'items': [
-#    {'display_name': 'azt_diagnostics_20260622_143052.zip',
-#     'uri_path': '_shares/<token>/azt_diagnostics_20260622_143052.zip'},
+#    {'display_name': 'azt_diagnostics_20260622_143052.tar.gz',
+#     'uri_path': '_shares/<token>/azt_diagnostics_20260622_143052.tar.gz'},
 #  ]}
-# The zip contains the snapshot and per-day daemon logs
+# The archive contains the snapshot and per-day daemon logs
 # (each as a separate entry) — files stay separate inside
-# the archive so support's first action is unzip+grep.
+# so support's first action is untar+grep.
 
 items = [
     {'uri': f'content://{CANONICAL_AUTHORITY}/{it["uri_path"]}',
      'display_name': it['display_name']}
     for it in bundle.get('items') or []
 ]
-share_files(items, mime_type='application/zip', on_error=...)
+share_files(items, mime_type='application/gzip', on_error=...)
 ```
 
 Most peers should just call ``share_diagnostics_action``
@@ -1753,10 +1756,31 @@ ACTION_SEND-shaped attachment that Signal will accept) — or
 declare your own FileProvider for the peer-owned file and
 ship a multi-item ``share_files`` knowing Signal will reject
 the share but other receivers will accept it. The simpler
-pattern: build your own zip containing both daemon-bundle
+pattern: build your own archive containing both daemon-bundle
 contents (read via ``get_daemon_log_files``) and peer-owned
 content, save under your FileProvider authority, ship via
 ``share_files`` with one URI item.
+
+**Use the shared format helper — don't hand-roll the tar
+(since 0.52.27).** A peer building its own diagnostics bundle
+MUST use ``azt_collab_client.diagnostics`` so the container
+format can't drift from the daemon's (the zip→tar.gz change
+shipped stale in the recorder for a build because the format
+was duplicated). Collection/staging/dispatch stay yours; only
+the format is shared::
+
+    from azt_collab_client.diagnostics import (
+        build_diagnostics_targz, diagnostics_archive_name,
+        DIAGNOSTICS_MIME)
+
+    name = diagnostics_archive_name(slug='recorder', stamp=stamp)
+    build_diagnostics_targz(
+        dest_path,
+        file_items=[(n, os.path.join(log_dir, n)) for n in my_logs],
+        content_items=[(e['filename'], e['content'])
+                       for e in get_daemon_log_files().get('files', [])])
+    share_files([{...uri..., 'display_name': name}],
+                mime_type=DIAGNOSTICS_MIME)
 
 **Daemon log file access** (for peers that need raw content
 rather than URIs) — ``get_daemon_log_files()`` returns the
@@ -1932,6 +1956,8 @@ the sync settings screen anchored on the work-offline toggle
 | ``S.NO_REMOTE`` | **Silent.** Log; project keeps working. | Same — route to publish settings. |
 | ``S.AUTH_REQUIRED`` | **Silent.** Log; sync doesn't happen until creds configured. | Route to GitHub Connect flow. |
 | ``S.APP_NOT_INSTALLED`` / ``S.APP_SUSPENDED`` / ``S.REPO_NOT_AUTHORIZED`` | **Silent.** Log; project still usable. | Open the ``url`` param the Status carries. |
+| ``S.REPO_NO_ACCESS`` | **Silent.** Log; also persisted to ``project_status.last_sync_error`` so a persistent banner can show it. The daemon already tried to auto-accept a pending invite before emitting this. | ``ui.popups.repo_access_popup(owner_repo, url)`` — offers **Open GitHub** (→ the repo/invitations page via ``ui.open_url``) so the user can accept an invite or request access. Params: ``owner_repo``, ``url``. (0.52.24+.) |
+| ``S.INVITE_ACCEPTED`` | **Silent.** Transient/retryable — the daemon auto-accepted a pending GitHub invitation for this repo; access should now work and the next drain retries. | **Silent** (or a brief "access granted, syncing" toast). Not an error. (0.52.24+.) |
 | ``S.CONTRIBUTOR_UNSET`` | **Silent.** Log; sync refused until name set. | Route to daemon settings UI's contributor field. |
 | ``S.WORK_OFFLINE_ENABLED`` | n/a — auto-commit doesn't see this (only ``sync_project`` emits it). | Toast "Work-offline mode is on" + ``open_server_ui()`` to the sync settings screen. The user explicitly turned the toggle on; the Sync button is the only path that surfaces the refusal. (0.43.0+.) |
 | ``S.BUSY`` | **Silent.** Daemon's project_lock is held by another caller (almost always *this peer's* prior in-flight sync). Lock clears in milliseconds; the next regular tick covers it. Auto-sync surfaces nothing. | **Silent.** Even on user-gesture: showing "Another sync is in progress" toasts back-to-back is just punishing the user for the peer's missing in-flight guard. Optionally: debounce the Sync button so a fast double-tap fires once. See § 17c for the load-shedding rules that prevent ``S.BUSY`` in the first place. |
@@ -2051,6 +2077,8 @@ S.COMMIT_REPEATEDLY_FAILED # 'COMMIT_REPEATEDLY_FAILED' ← never silenced
 S.APP_NOT_INSTALLED       # 'APP_NOT_INSTALLED'
 S.APP_SUSPENDED           # 'APP_SUSPENDED'
 S.REPO_NOT_AUTHORIZED     # 'REPO_NOT_AUTHORIZED'
+S.REPO_NO_ACCESS          # 'REPO_NO_ACCESS'       (0.52.24+)
+S.INVITE_ACCEPTED         # 'INVITE_ACCEPTED'      (0.52.24+, transient)
 S.CONTRIBUTOR_UNSET       # 'CONTRIBUTOR_UNSET'
 S.JOB_INTERRUPTED         # 'JOB_INTERRUPTED'
 S.INSUFFICIENT_MEMORY_FOR_MERGE  # ← 0.44.4+, daemon refused merge under memory pressure
@@ -2515,6 +2543,11 @@ ps = project_status(langcode)
 ps.commit_failure_count    # int — successive failed commit attempts (0.41.27+)
 ps.last_commit_failure_at  # float — unix timestamp of latest failure (0.41.27+)
 ps.last_commit_error       # str  — last dulwich error message (0.41.27+)
+ps.last_sync_error         # str  — access-class code blocking WAN sync,
+                           #        e.g. 'REPO_NO_ACCESS' / 'AUTH_REQUIRED';
+                           #        '' when none. Cleared on next success.
+                           #        Route 'REPO_NO_ACCESS' → repo_access_popup. (0.52.24+)
+ps.last_sync_error_at      # float — unix ts of that failure (0.52.24+)
 ps.n_recovered_today       # int — orphan LIFT scratches auto-merged today (0.41.29+)
 ```
 
@@ -3163,6 +3196,7 @@ from azt_collab_client import (
     lan_peer_id,
     # Paired-peers registry
     lan_list_peers, lan_pair_qr, lan_pair_accept, lan_unpair,
+    lan_pair_qr_keepalive, lan_pair_qr_close,
     lan_set_static_endpoints,
     # Per-peer share allowlist + outbound courtesy notify
     lan_share_project, lan_unshare_project,
@@ -3186,12 +3220,26 @@ Field shapes worth knowing:
   When ``langcode`` is non-empty, the QR carries the
   project's ``remote_url`` + ``vernlang`` so a single scan
   does pair + share + clone. Empty dict on transport failure.
-  **Side effect:** displaying a QR for ``langcode`` registers
-  a 10-minute single-use auto-share offer in the daemon so the
-  peer's hello back can auto-share that langcode (and only
-  that langcode). Without an active offer, a hello requesting
-  any langcode still records the pair but refuses auto-share —
-  user must tap Share manually.
+  **Side effect:** it arms a project auto-share offer for
+  ``langcode`` so a scanning peer's hello-back auto-shares that
+  langcode (and only that one). Without an active offer, a hello
+  records the pair but refuses auto-share.
+- **"Valid while displayed" contract (since 0.52.26).** The
+  auto-share offer is armed **only while the QR is actually on
+  screen**, and is **multi-use** (one shown QR can be scanned by
+  several peers — the workshop case). A peer that renders its own
+  share-QR screen (rather than the shared
+  ``ui.lan_popups.share_pairing_qr_popup``, which already does this)
+  MUST, for a non-empty ``langcode``:
+  - call ``lan_pair_qr_keepalive(langcode)`` on open and every ~10 s
+    while displayed (daemon keepalive window is 30 s), and
+  - call ``lan_pair_qr_close(langcode)`` on dismiss.
+  Skipping the heartbeat lets the offer lapse within ~30 s (share
+  stops working mid-display); skipping ``close`` just means the offer
+  self-expires ~30 s after the screen goes away instead of instantly.
+  Both are no-ops for an empty langcode (pair-only QR) and return
+  ``bool``. This replaced the pre-0.52.26 single-use + 10-minute
+  timer.
 - ``lan_pair_accept({payload})`` → ``Result`` carrying
   ``LAN_PAIRED`` + the recorded peer entry.
 - ``lan_clone(peer_id, langcode, remote_url='', vernlang='')``
@@ -3694,6 +3742,13 @@ peer; don't duplicate them in your peer code:
 - ``azt_collab_client.ui.popups.grant_collaborator_popup`` —
   per-project "invite a GitHub collaborator" popup; wire it from
   your project-context settings (see § 13).
+- ``azt_collab_client.ui.popups.repo_access_popup(owner_repo, url)``
+  — fallback for a ``REPO_NO_ACCESS`` result / ``last_sync_error``:
+  explains the cause + offers **Open GitHub** to accept an invite or
+  request access. (0.52.24+)
+- ``azt_collab_client.ui.open_url(url)`` — ``ACTION_VIEW`` to the
+  device browser (used by ``repo_access_popup``; also usable
+  directly). (0.52.24+)
 - ``azt_collab_client.ui.LangPickerScreen`` /
   ``ProjectPickerScreen`` / ``LiftHandle`` / ``MediaHandle`` — see
   ``azt_collab_client/CLAUDE.md`` for the longer rundown.

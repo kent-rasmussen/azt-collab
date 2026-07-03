@@ -50,6 +50,7 @@ from collections import OrderedDict
 from . import projects
 from . import settings as _settings
 from . import status as S
+from . import sync_flight
 from . import wan_backoff
 from .net import _has_internet
 from .paths import azt_home
@@ -268,6 +269,21 @@ def reconcile_on_startup():
     if interrupted or stale:
         print(f'[scheduler] reconcile_on_startup: '
               f'interrupted={interrupted} gc={len(stale)}', flush=True)
+    # Layer 2 (0.52.21): any project whose WAN push was still marked
+    # in-flight when the previous daemon died had its push killed
+    # before it could bank progress (Android idle-stop / OOM / APK
+    # update). Bump its interrupted_count so the drain escalates to
+    # run-to-completion (Layer 3) instead of politely restarting the
+    # same doomed attempt. Best-effort; never blocks startup.
+    try:
+        killed = wan_backoff.note_interrupted_on_startup()
+        if killed:
+            print(f'[scheduler] reconcile_on_startup: push interrupted '
+                  f'mid-flight for {killed!r} (will escalate)',
+                  flush=True)
+    except Exception as ex:
+        print(f'[scheduler] note_interrupted_on_startup raised: {ex!r}',
+              file=sys.stderr, flush=True)
     # Run outside the scheduler lock — touches the filesystem, not
     # the jobs registry. Best-effort; never raises.
     _sweep_legacy_orphans()
@@ -778,6 +794,17 @@ def _watcher_loop():
             except Exception as ex:
                 print(f'[scheduler] _drain_pending_push failed: {ex}',
                       file=sys.stderr, flush=True)
+            # Cheap access re-probe for projects blocked on a remote-
+            # fixable access error (0.52.24). Decoupled from the push
+            # backoff: one small GET per blocked project, throttled to
+            # 5 min, that nudges the real push the moment access is
+            # restored (collaborator grant / permission upgrade / invite
+            # accepted) instead of waiting out the 24 h curve.
+            try:
+                _drain_access_reprobe()
+            except Exception as ex:
+                print(f'[scheduler] _drain_access_reprobe failed: {ex}',
+                      file=sys.stderr, flush=True)
         # Every tick (not just on edges): retry stuck commits with
         # exponential backoff so an idle device discovers a
         # persistent failure without needing the user to gesture
@@ -1025,7 +1052,18 @@ def _drain_pending_push(ignore_backoff=False):
         p = projects.get(langcode)
         if p is None:
             continue
-        if not ignore_backoff and not wan_backoff.is_due(langcode):
+        # Layer 3 (0.52.21): escalate a stuck-but-online project to
+        # run-to-completion. Trigger = online AND the push has been
+        # killed mid-flight at least ``_ESCALATE_INTERRUPT_THRESHOLD``
+        # times (Layer 2 marker). This is the "notice this is
+        # happening, not just no internet" gate the field repro (nml,
+        # 2167 commits, killed every daemon lifetime) needed.
+        escalate = (
+            is_online_cached() is True
+            and wan_backoff.interrupted_count(langcode)
+            >= _ESCALATE_INTERRUPT_THRESHOLD)
+        if not escalate and not ignore_backoff \
+                and not wan_backoff.is_due(langcode):
             # Curve says wait. Don't bother probing credentials or
             # the network — that's the whole point of the curve.
             # Rate-limited diagnostic so "drain pushes: ['nml']"
@@ -1042,13 +1080,10 @@ def _drain_pending_push(ignore_backoff=False):
             # user gesture routes AUTH_REQUIRED. Don't advance the
             # backoff curve: nothing failed network-wise.
             continue
-        try:
-            res = _push_repo(p.working_dir, git_user, token)
-        except Exception as ex:
-            print(f'[scheduler] drain push {langcode!r} '
-                  f'raised: {ex!r}',
-                  file=sys.stderr, flush=True)
-            res = None
+        if escalate:
+            _run_to_completion(langcode, p, git_user, token)
+            continue
+        res = _attempt_push(langcode, p, git_user, token)
         if res is None:
             wan_backoff.record_failure(langcode)
             continue
@@ -1060,8 +1095,351 @@ def _drain_pending_push(ignore_backoff=False):
             _set_pending_push(langcode, False)
             projects.set_last_sync(langcode)
             wan_backoff.record_success(langcode)
+            _clear_access_error(langcode)
+        elif 'INVITE_ACCEPTED' in codes:
+            # Auto-accepted a pending GitHub invite (the 404 handler).
+            # Access should now work — clear the stale error and leave
+            # pending_push set so the next tick retries against the now-
+            # accessible repo. Don't advance the backoff curve.
+            _clear_access_error(langcode)
         elif 'NOTHING_TO_COMMIT' in codes or 'NO_REMOTE' in codes:
             # No-op outcomes don't advance the backoff curve.
             pass
         else:
             wan_backoff.record_failure(langcode)
+            _note_access_error(langcode, res)
+
+
+# ── stuck-diverged-push run-to-completion (0.52.21) ─────────────────
+#
+# Layers 1-3 of the fix for a large diverged history that never
+# converges because the Android idle-stop kills the push before the
+# resumable chunked upload (repo._push_chunked_to_ref) can bank
+# progress. See azt_collab_client/docs/rationale/sync.md and
+# sync_flight.py.
+
+# Escalate after the push has been killed mid-flight this many times.
+_ESCALATE_INTERRUPT_THRESHOLD = 2
+# Push attempts per escalated drain visit. The chunked push is
+# resumable, so remaining work resumes on the next tick; this bounds
+# how long one visit holds the wakelock.
+_RUN_TO_COMPLETION_MAX_ITERS = 8
+# Wall-clock ceiling on a single escalated visit's hold of
+# ``project_lock``. Checked BETWEEN iterations so a user Sync tapped
+# during escalation waits at most ~one in-flight chunk push
+# (``repo._PUSH_TIMEOUT_S``) rather than the whole visit. Without this
+# an escalated run could iterate its full budget back-to-back and keep
+# every user RPC on ``BUSY`` for minutes (field: nml, aztobt2-ui). The
+# push is resumable, so yielding here loses no progress — the next
+# drain tick resumes from the server-side topic-branch tip.
+_RUN_TO_COMPLETION_DEADLINE_S = 120.0
+# Battery safety valve: after this many non-converging escalated
+# visits, stop escalating and fall back to the normal backoff curve
+# until the next user Sync / online edge re-arms it.
+_ESCALATE_MAX_VISITS = 12
+# Push outcomes that retrying can't fix — stop escalating immediately.
+_PERMANENT_PUSH_CODES = (
+    'AUTH_REQUIRED', 'APP_NOT_INSTALLED', 'APP_SUSPENDED',
+    'REPO_NOT_AUTHORIZED', 'ACCESS_DENIED', 'NOT_A_REPO',
+    'REPO_NO_ACCESS',
+)
+# Access-class codes worth persisting as the project's last_sync_error so
+# project_status surfaces WHY sync is stuck (0.52.24, requirement 1.1 —
+# don't silently die on a creds/access problem when creds ARE present).
+_ACCESS_ERROR_CODES = _PERMANENT_PUSH_CODES + ('AUTH_REFRESH_STALE',)
+
+
+def _note_access_error(langcode, res):
+    """If *res* carries an access-class status, persist it as the project's
+    last_sync_error so ``project_status`` can tell the user WHY sync is
+    stuck. No-op for non-access failures (plain network) — those are
+    transient and shouldn't nag."""
+    try:
+        codes = res.codes()
+    except Exception:
+        return
+    for c in _ACCESS_ERROR_CODES:
+        if c in codes:
+            try:
+                projects.set_last_sync_error(langcode, c)
+            except Exception:
+                pass
+            return
+
+
+def _clear_access_error(langcode):
+    """Drop any persisted access error (successful sync / invite accepted)."""
+    try:
+        projects.clear_last_sync_error(langcode)
+    except Exception:
+        pass
+
+
+# Access errors that a *remote* change can fix (a collaborator grant, a
+# permission upgrade, an app (re)install / unsuspend) — and that we can
+# cheaply RE-PROBE for without running the expensive git op. NOT_A_REPO is
+# excluded (local / publish-flow); AUTH_* are excluded (fixed by the local
+# credential-save event, handled by nudge_access_blocked_projects).
+_ACCESS_REPROBE_CODES = (
+    'REPO_NO_ACCESS', 'REPO_NOT_AUTHORIZED',
+    'APP_NOT_INSTALLED', 'APP_SUSPENDED', 'ACCESS_DENIED',
+)
+# The cheap probe is one small API call, so it can run far more often than
+# the expensive push — but not every 30 s tick. Once every 5 min per
+# blocked project is plenty to self-heal within minutes of an out-of-band
+# grant, at negligible cost.
+_ACCESS_REPROBE_MIN_INTERVAL_S = 300.0
+_access_reprobe_last = {}   # langcode -> monotonic time of last probe
+
+
+def nudge_access_blocked_projects(codes=None):
+    """Clear WAN backoff for every project whose ``last_sync_error`` is in
+    *codes*. Called from events that plausibly fix access — credentials
+    (re)saved, collaborator granted — so a blocked push retries at once
+    instead of waiting out the 24 h curve. Doesn't clear the error itself;
+    the next successful sync does. Returns the count nudged."""
+    want = set(codes) if codes is not None else set(_ACCESS_ERROR_CODES)
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return 0
+    n = 0
+    for langcode, entry in data.items():
+        if (entry.get('last_sync_error') or '') in want:
+            try:
+                wan_backoff.nudge(langcode)
+                n += 1
+            except Exception:
+                pass
+    if n:
+        _reset_probe_backoff('access-event-nudge')
+        print(f'[scheduler] access-event nudge: {n} blocked project(s)',
+              file=sys.stderr, flush=True)
+    return n
+
+
+def nudge_project(langcode):
+    """Clear WAN backoff for one project so its next drain fires now. Used
+    by the grant-collaborator success path (the grant may have just
+    created the invite / access this project was blocked on)."""
+    try:
+        wan_backoff.nudge(langcode)
+        _reset_probe_backoff('project-nudge')
+    except Exception:
+        pass
+
+
+def _drain_access_reprobe():
+    """For each project blocked on a remote-fixable access error, run a
+    CHEAP probe — accept a now-pending invite, or ``GET /repos`` for
+    existence + ``permissions.push`` — decoupled from the expensive-push
+    backoff. When the probe flips to OK, that's the event that ends the
+    wait: clear the error and nudge the real push. Throttled per project
+    (`_ACCESS_REPROBE_MIN_INTERVAL_S`); online-gated by the caller."""
+    try:
+        data = projects._load_raw()
+    except Exception:
+        return
+    blocked = [lang for lang, e in data.items()
+               if (e.get('last_sync_error') or '') in _ACCESS_REPROBE_CODES]
+    if not blocked:
+        return
+    from . import auth as _auth
+    now = time.monotonic()
+    for langcode in blocked:
+        last = _access_reprobe_last.get(langcode, 0.0)
+        if (now - last) < _ACCESS_REPROBE_MIN_INTERVAL_S:
+            continue
+        _access_reprobe_last[langcode] = now
+        p = projects.get(langcode)
+        if p is None or not p.remote_url:
+            continue
+        git_user, token = get_sync_credentials(p.remote_url)
+        if not token:
+            continue
+        # A matching invitation may have appeared since we last failed —
+        # accept it (cheap) and nudge.
+        try:
+            if _auth.try_accept_repo_invitation(token, p.remote_url):
+                print(f'[scheduler] access re-probe {langcode!r}: accepted '
+                      f'pending invite → nudge',
+                      file=sys.stderr, flush=True)
+                _clear_access_error(langcode)
+                wan_backoff.nudge(langcode)
+                _reset_probe_backoff('access-restored')
+                continue
+        except Exception as ex:
+            print(f'[scheduler] access re-probe {langcode!r} invite '
+                  f'check raised: {ex!r}', file=sys.stderr, flush=True)
+        # Otherwise: can we now see AND push the repo?
+        try:
+            probe = _auth.probe_repo_access(token, p.remote_url)
+        except Exception as ex:
+            print(f'[scheduler] access re-probe {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            continue
+        if probe.get('ok'):
+            print(f'[scheduler] access re-probe {langcode!r}: access '
+                  f'restored (can_push) → nudge',
+                  file=sys.stderr, flush=True)
+            _clear_access_error(langcode)
+            wan_backoff.nudge(langcode)
+            _reset_probe_backoff('access-restored')
+
+
+def _attempt_push(langcode, p, git_user, token):
+    """One WAN push attempt, guarded so the Android idle-stop won't
+    kill the process mid-push (Layer 1: ``sync_flight.guard``) and
+    marked so a process death mid-push is detectable on the next
+    daemon startup (Layer 2: ``wan_backoff.mark_push_started`` /
+    ``mark_push_finished``). Returns the ``Result``, or None if
+    ``_push_repo`` raised. Outcome handling is the caller's job."""
+    with sync_flight.guard():
+        wan_backoff.mark_push_started(langcode)
+        try:
+            return _push_repo(p.working_dir, git_user, token)
+        except Exception as ex:
+            print(f'[scheduler] push {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+            return None
+        finally:
+            # Clean return (any outcome) ⇒ NOT a process-death
+            # interruption. If the process is instead killed inside
+            # ``_push_repo`` (OOM), this ``finally`` never runs, the
+            # marker survives, and startup counts it as interrupted.
+            wan_backoff.mark_push_finished(langcode)
+
+
+def _run_to_completion(langcode, p, git_user, token):
+    """Layer 3: drive a stuck-but-online diverged push to completion.
+
+    Holds an Android foreground service + WifiLock for the duration
+    (``lan_fgs.arm_for_transfer`` — keeps the process alive and the
+    radio in high-perf so the pack doesn't stall) and loops the
+    resumable chunked push, bypassing the radio-friendly
+    ``wan_backoff`` curve. Bounded per invocation
+    (``_RUN_TO_COMPLETION_MAX_ITERS``); the chunked push is resumable
+    so any remaining work continues on the next drain tick / daemon
+    lifetime. ``_ESCALATE_MAX_VISITS`` is the battery giveup valve."""
+    print(f'[scheduler] run-to-completion {langcode!r}: escalating '
+          f'(interrupted={wan_backoff.interrupted_count(langcode)}, '
+          f'visits={wan_backoff.snapshot().get(langcode, {}).get("escalation_attempts", 0)})',
+          file=sys.stderr, flush=True)
+    try:
+        from .android_cp import lan_fgs as _fgs
+    except Exception:
+        _fgs = None
+    if _fgs is not None:
+        try:
+            _fgs.arm_for_transfer()
+        except Exception as ex:
+            print(f'[scheduler] run-to-completion arm_for_transfer '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+    outcome = 'incomplete'
+    deadline = time.monotonic() + _RUN_TO_COMPLETION_DEADLINE_S
+    try:
+        for i in range(_RUN_TO_COMPLETION_MAX_ITERS):
+            if is_online_cached() is not True:
+                outcome = 'offline'
+                break
+            if time.monotonic() >= deadline:
+                # Yield project_lock so a waiting user Sync / commit
+                # isn't starved with BUSY. Reaching the wall-clock
+                # deadline means iterations were SLOW — i.e. the chunked
+                # push was actually transferring (progress), not spinning
+                # on a fast-failing chunk. So this is 'yielded', NOT a
+                # non-converging visit: it must not count against the
+                # battery giveup valve. The push is resumable; remaining
+                # work continues next tick.
+                print(f'[scheduler] run-to-completion {langcode!r}: '
+                      f'visit deadline reached (iter={i}), yielding lock '
+                      f'— resumes next tick', file=sys.stderr, flush=True)
+                outcome = 'yielded'
+                break
+            res = _attempt_push(langcode, p, git_user, token)
+            if res is None:
+                # Transient raise — loop and let the chunked push
+                # resume; don't advance the curve (irrelevant while
+                # escalated).
+                continue
+            codes = res.codes()
+            print(f'[scheduler] run-to-completion {langcode!r} '
+                  f'iter={i} codes={codes!r}',
+                  file=sys.stderr, flush=True)
+            if 'PUSHED' in codes:
+                _set_pending_push(langcode, False)
+                projects.set_last_sync(langcode)
+                wan_backoff.record_success(langcode)   # clears all state
+                _clear_access_error(langcode)
+                outcome = 'converged'
+                break
+            if 'INVITE_ACCEPTED' in codes:
+                # The 404 handler just auto-accepted a pending GitHub
+                # invitation — access should now be granted. Clear the
+                # stale access error and retry immediately (don't count
+                # it as a failure).
+                _clear_access_error(langcode)
+                print(f'[scheduler] run-to-completion {langcode!r}: '
+                      f'accepted pending invite, retrying',
+                      file=sys.stderr, flush=True)
+                continue
+            if 'NOTHING_TO_COMMIT' in codes or 'NO_REMOTE' in codes:
+                outcome = 'noop'
+                break
+            if any(c in codes for c in _PERMANENT_PUSH_CODES):
+                _note_access_error(langcode, res)
+                outcome = 'permanent'
+                break
+            # Network / partial-progress failure: the chunked push
+            # banked whatever chunks it could — loop to resume.
+    finally:
+        if _fgs is not None:
+            try:
+                _fgs.disarm_for_transfer()
+            except Exception as ex:
+                print(f'[scheduler] run-to-completion disarm raised: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+    if outcome == 'converged':
+        print(f'[scheduler] run-to-completion {langcode!r}: converged',
+              file=sys.stderr, flush=True)
+        return
+    if outcome == 'noop':
+        return
+    if outcome == 'offline':
+        # Not the push's fault — resume when online, don't count it
+        # against the giveup valve.
+        print(f'[scheduler] run-to-completion {langcode!r}: went '
+              f'offline, will resume', file=sys.stderr, flush=True)
+        return
+    if outcome == 'yielded':
+        # Progressing but polite about the lock — resume next tick.
+        # Does NOT count against the battery giveup valve (that's for
+        # non-converging visits, not slow-but-transferring ones).
+        return
+    if outcome == 'permanent':
+        # No amount of retrying fixes no-access / not-a-repo. Stop
+        # escalating and let the normal backoff surface the reason on
+        # the next user Sync.
+        wan_backoff.clear_interrupted(langcode)
+        wan_backoff.record_failure(langcode)
+        print(f'[scheduler] run-to-completion {langcode!r}: permanent '
+              f'failure, reverting to normal backoff',
+              file=sys.stderr, flush=True)
+        return
+    # incomplete: exhausted the per-visit iteration budget while
+    # online and still not converged. Count the visit; give up
+    # escalating after the cap so we don't hold the radio forever on
+    # a push that genuinely can't complete (e.g. a single blob larger
+    # than the remote accepts).
+    n = wan_backoff.bump_escalation_attempts(langcode)
+    if n >= _ESCALATE_MAX_VISITS:
+        print(f'[scheduler] run-to-completion {langcode!r}: giving up '
+              f'after {n} non-converging visits — reverting to normal '
+              f'backoff until next Sync/online-edge',
+              file=sys.stderr, flush=True)
+        wan_backoff.clear_interrupted(langcode)
+        wan_backoff.record_failure(langcode)
+    else:
+        print(f'[scheduler] run-to-completion {langcode!r}: visit '
+              f'{n}/{_ESCALATE_MAX_VISITS} incomplete, resumes next tick',
+              file=sys.stderr, flush=True)

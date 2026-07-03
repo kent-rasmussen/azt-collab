@@ -21,7 +21,8 @@ from . import status as S
 from .status import Result, Status
 from .locks import project_lock, LockTimeout
 from .net import _ensure_ssl, _has_internet
-from .auth import add_collaborator, diagnose_403
+from .auth import (add_collaborator, diagnose_403, diagnose_no_access,
+                   try_accept_repo_invitation)
 from . import lift_merge
 from . import merge_commit
 from . import settings as _settings
@@ -189,6 +190,44 @@ _HTTP_403_RE = re.compile(r'\b403\b')
 
 def _is_http_403(exc):
     return bool(_HTTP_403_RE.search(str(exc)))
+
+
+# 404 / no-access from a git op. GitHub hides any repo the token can't see
+# behind a 404 (private-not-shared / not-a-collaborator / app-not-granted /
+# wrong name), which dulwich surfaces as ``NotGitRepository`` on the HTTP
+# transport. Detect by the exception TYPE first (reliable); the ``\b404\b``
+# fallback is word-bounded so it doesn't false-match a hex SHA that happens
+# to contain "404" (see feedback_substring_check_on_dulwich_exceptions).
+_HTTP_404_RE = re.compile(r'\b404\b')
+
+
+def _is_repo_not_found(exc):
+    if type(exc).__name__ == 'NotGitRepository':
+        return True
+    return bool(_HTTP_404_RE.search(str(exc)))
+
+
+def _handle_no_access(token, remote_url, result, cleanup=None):
+    """Shared 404/no-access handler for the fetch and push paths (0.52.24).
+
+    Opportunistically auto-accepts a matching PENDING GitHub invitation —
+    the 404 IS the trigger, no in-app invite flow needed. If one is found
+    and accepted, emits ``INVITE_ACCEPTED`` (transient → caller retries).
+    Otherwise emits the honest ``diagnose_no_access`` verdict
+    (``REPO_NO_ACCESS`` / ``REPO_NOT_AUTHORIZED`` / ``APP_SUSPENDED``) and
+    returns — the caller short-circuits instead of churning the retry loop
+    on an error that won't change. ``cleanup`` runs first (push path drops
+    its temp ref)."""
+    if cleanup is not None:
+        cleanup()
+    if try_accept_repo_invitation(token, remote_url):
+        lift_merge.trace(
+            '[sync-trace] 404 → accepted pending invite, will retry')
+        result.add(S.INVITE_ACCEPTED)
+        return result
+    lift_merge.trace('[sync-trace] 404 / NotGitRepository → no access')
+    result.statuses.append(diagnose_no_access(token, remote_url))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3455,26 +3494,80 @@ def _count_commits_between(repo, ancestor_sha, descendant_sha):
 
 
 def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
-    """Return the SHA *n* commits forward from ``base_sha`` along the
-    chain to ``tip_sha`` (1-indexed). Used by adaptive push batching
-    to pick a partial-advance target when the full push didn't fit
-    through the network. ``n >= total_commits`` returns ``tip_sha``.
-    Any walker error returns ``tip_sha`` (safest fallback — pushing
-    the tip just retries the original full transaction)."""
+    """Return a partial-advance target *n* commits forward from
+    ``base_sha`` toward ``tip_sha`` (1-indexed) for the adaptive push
+    chunker. Any walker error returns ``tip_sha`` (safest fallback —
+    pushing the tip just retries the original full transaction).
+
+    **The result is always a descendant of ``base_sha``** so that a
+    fast-forward push ``base_sha → result`` succeeds. The naive
+    ``get_walker(include=[tip], exclude=[base])`` yields commits from
+    *both* parent lines of any merge in tip's ancestry; picking one off
+    the sibling line gives a commit that is an ancestor of tip but NOT
+    a descendant of base, so the FF push is rejected with
+    ``DivergedBranches`` and the chunker halves → re-picks the same DAG
+    → re-diverges, wedging convergence permanently (field: nml, device
+    aztobt1-sudo stuck ~5 h at remaining=861 after a LAN merge moved
+    HEAD onto a merge commit — CHANGELOG 0.52.30).
+
+    Two paths:
+
+    - **Fast path — first-parent spine.** Walk tip's first parents back
+      to base. When base is on that spine (the common linear /
+      already-chunking case) every spine commit is a first-parent
+      descendant of base; pick the n-th. O(spine length), no per-commit
+      ancestry test.
+    - **Fallback — ancestor filter.** When base is NOT on the spine
+      (merged in via a second parent, or the pre-divergence root of a
+      merge tip), return the n-th commit in oldest-first order that has
+      base as an ancestor. This still chunks — returning the tip
+      outright would degenerate a fresh topic ref to a single
+      whole-history push (field: device aztobt2-ui, base=old
+      origin/main off the merge spine, estimate 9.3 GB — CHANGELOG
+      0.52.31). Bounded by early-exit at n."""
     if not base_sha or not tip_sha or base_sha == tip_sha or n <= 0:
         return tip_sha
+    # Fast path: first-parent spine tip → … → (child of base), newest
+    # first. Bounded by history length; `seen` guards a malformed cycle.
+    spine = []
+    seen = set()
+    cur = tip_sha
     try:
-        walker = repo.get_walker(
-            include=[tip_sha], exclude=[base_sha])
-        # Walker yields newest-first; reverse so commits[0] is the
-        # immediate child of base_sha.
-        commits = [entry.commit.id for entry in walker]
+        while cur and cur != base_sha and cur not in seen:
+            seen.add(cur)
+            spine.append(cur)
+            parents = repo[cur].parents
+            if not parents:
+                break
+            cur = parents[0]
     except Exception:
         return tip_sha
-    if not commits:
+    if cur == base_sha and spine:
+        # spine[-1] is the immediate first-parent child of base; reverse
+        # so index 0 is that child and index n-1 is n commits forward.
+        spine.reverse()
+        return spine[min(n, len(spine)) - 1]
+    # Fallback: base is off tip's first-parent spine. Return the n-th
+    # oldest commit reachable from tip that descends from base (base→C
+    # is a valid fast-forward). Excludes sibling parent-line commits
+    # (which would DivergedBranches) while still advancing in chunks.
+    try:
+        walker = repo.get_walker(include=[tip_sha], exclude=[base_sha])
+        delta = [entry.commit.id for entry in walker]
+    except Exception:
         return tip_sha
-    commits.reverse()
-    return commits[min(n, len(commits)) - 1]
+    if not delta:
+        return tip_sha
+    delta.reverse()  # oldest first
+    picked = None
+    count = 0
+    for c in delta:
+        if _is_ancestor(repo, base_sha, c):
+            picked = c
+            count += 1
+            if count >= n:
+                break
+    return picked if picked is not None else tip_sha
 
 
 def _check_large_files_in_commit(repo, commit_sha, threshold_bytes):
@@ -3813,27 +3906,27 @@ def _preseed_oversize_blobs(
     # across runs.
     blobs.sort(key=lambda t: t[0])
 
-    # Refuse early on any single blob > budget. Without this we'd
-    # still terminate (the 1-blob batch would push, succeed under
-    # github's compression, or fail), but surfacing the specific
-    # offending blob up front is more diagnosable than waiting
-    # for the batch to fail.
-    for sha, size in blobs:
-        per_blob_floor = (
-            size + _PRESEED_OVERHEAD_PER_BLOB +
-            _PRESEED_OVERHEAD_PER_COMMIT)
-        if budget_bytes > 0 and per_blob_floor > budget_bytes:
-            sha_str = sha.decode() if isinstance(sha, bytes) else str(sha)
-            lift_merge.trace(
-                f'[sync-trace] preseed: blob {sha_str[:12]} is '
-                f'{size:,} bytes; alone exceeds budget '
-                f'{budget_bytes:,}')
-            return False, Status(
-                S.BLOB_EXCEEDS_BUDGET,
-                {'blob_sha': sha_str[:12],
-                 'blob_bytes': size,
-                 'budget_bytes': budget_bytes},
-            )
+    # A blob is an ATOMIC object — it cannot be split, so it is always
+    # pushed (in its own single-blob batch below), regardless of the
+    # byte budget. Do NOT refuse here: the budget governs *batching*
+    # (how many blobs to group), never whether an unavoidable object is
+    # allowed. Field proof (nml, 0.52.28): audio files ~4.3 MB > the
+    # 3 MB budget push fine on their own — pushing the blob alone as a
+    # side ref, then the commit pack is tiny (commit + tree only). The
+    # old early-refuse converted a transient 408 on such a blob into a
+    # permanent BLOB_EXCEEDS_BUDGET + 24 h backoff, stalling any commit
+    # whose audio exceeded the budget. See CHANGELOG 0.52.29.
+    oversize = [
+        (sha, size) for sha, size in blobs
+        if budget_bytes > 0 and (
+            size + _PRESEED_OVERHEAD_PER_BLOB
+            + _PRESEED_OVERHEAD_PER_COMMIT) > budget_bytes]
+    if oversize:
+        biggest = max(sz for _, sz in oversize)
+        lift_merge.trace(
+            f'[sync-trace] preseed: {len(oversize)} blob(s) exceed '
+            f'budget {budget_bytes:,} (biggest {biggest:,}); each will '
+            f'be pushed alone in its own batch (atomic — cannot split)')
 
     # Greedy-fill batches up to a conservative fraction of budget
     # so post-compression variance doesn't push any batch over the
@@ -4056,9 +4149,16 @@ def _push_chunked_to_ref(
     """Phase A of the topic-branch push: push *target_sha* to
     ``refs/heads/<topic_ref_name>`` on the remote in adaptive chunks
     so each chunk's pack fits inside the server's per-request timeout.
-    The topic-branch is ours alone (per-device naming) — each chunk
-    fast-forwards our own previous progress on this ref, so there's
-    no ``DivergedBranches`` handling needed here.
+    The topic-branch is ours alone (per-device naming) and every
+    intermediate is a first-parent descendant of the current tip (see
+    ``_pick_intermediate_sha``), so each chunk fast-forwards our own
+    previous progress. A ``DivergedBranches`` therefore only means the
+    server ref moved under us (concurrent advance / earlier partial
+    run); the loop re-anchors on the server's authoritative tip and
+    continues, bounded (see ``MAX_DIVERGED_RESYNCS``). Pre-0.52.30 a
+    merge-commit target could make the picker return a sibling
+    parent-line commit — an ancestor of target but not a descendant of
+    the tip — which wedged the chunker in a permanent divergence loop.
 
     Used when ``_all_commits_descend_from(remote_sha, local_sha)``
     returned False (typical post-merge state) and a direct push to
@@ -4173,8 +4273,18 @@ def _push_chunked_to_ref(
     # this function and the deterministic-batch / side-ref-aware
     # enumeration in pre-seed picks up where we left off.
     preseed_attempted = False
+    # Bounded re-sync on DivergedBranches. With FF-clean intermediates
+    # (see _pick_intermediate_sha) our own picks never diverge; a
+    # DivergedBranches here means the server topic ref genuinely moved
+    # under us (a concurrent process / earlier partial run). Re-anchor
+    # chunk_base on the server's authoritative tip and continue rather
+    # than halving forever. Bounded so a truly pathological ref can't
+    # spin. Since 0.52.30.
+    diverged_resyncs = 0
+    MAX_DIVERGED_RESYNCS = 4
     backoff_s = 1.0
     initial_n = _settings.topic_branch_chunk_size()
+    budget = _settings.commit_pack_byte_budget()
     working_n = None
     chunk_n = initial_n
 
@@ -4221,6 +4331,26 @@ def _push_chunked_to_ref(
             f'[sync-trace] topic-push pack-size: {obj_count} objects, '
             f'{raw_bytes:,} bytes (uncompressed upper bound)')
 
+        # Pre-shrink from the estimate instead of attempting a doomed
+        # oversize push. Only while we've never had a success at this
+        # size (working_n is None) and there's a smaller multi-commit
+        # size to try. The estimate is an uncompressed upper bound, so
+        # this is conservative; a single commit (chunk_n==1) is atomic
+        # and always attempted below (the oversize path + blob pre-seed
+        # handle it). Skips burning a multi-minute 408 on
+        # chunk_n=50/25/… every daemon lifetime (field: nml, ~194 MB at
+        # chunk_n=50 shrinks straight to chunk_n=1).
+        if (working_n is None and chunk_n > 1 and budget > 0
+                and raw_bytes > budget):
+            shrunk = max(1, int(chunk_n * budget / raw_bytes))
+            if shrunk < chunk_n:
+                lift_merge.trace(
+                    f'[sync-trace] topic-push pre-shrink chunk_n '
+                    f'{chunk_n}→{shrunk} (est {raw_bytes:,} > '
+                    f'budget {budget:,})')
+                chunk_n = shrunk
+                continue
+
         # Park the intermediate sha under TEMP_REF so dulwich can
         # resolve the lhs of the refspec.
         _cleanup_temp_ref()
@@ -4264,6 +4394,40 @@ def _push_chunked_to_ref(
             if _is_http_401(exc):
                 _cleanup_temp_ref()
                 return False, Status(S.AUTH_REQUIRED), None
+            # Server topic ref moved under us. With FF-clean picks this
+            # is not our fault (concurrent advance / earlier partial
+            # run) — re-anchor on the server's authoritative tip (from
+            # the exception itself, more reliable than re-fetching when
+            # DNS is flapping) and continue without counting a failure
+            # or halving. Bounded to avoid a pathological spin.
+            diverged_tip = _extract_diverged_remote(exc)
+            if diverged_tip is not None and diverged_resyncs < MAX_DIVERGED_RESYNCS:
+                diverged_resyncs += 1
+                try:
+                    repo.refs[topic_remote_ref] = diverged_tip
+                except Exception:
+                    pass
+                _cleanup_temp_ref()
+                lift_merge.trace(
+                    f'[sync-trace] topic-push: DivergedBranches — '
+                    f're-anchoring on server tip '
+                    f'{_sha_str(diverged_tip)[:8]!r} '
+                    f'(resync {diverged_resyncs}/{MAX_DIVERGED_RESYNCS}); '
+                    f'continuing')
+                # If the server tip is already our target, we're done.
+                if diverged_tip == target_sha:
+                    return True, None, target_sha
+                # If it's not even an ancestor of target, HEAD changed
+                # under us; bail transient so the next drain re-reads
+                # target and rebuilds the chain from scratch.
+                if not _is_ancestor(repo, diverged_tip, target_sha):
+                    lift_merge.trace(
+                        '[sync-trace] topic-push: server tip is not an '
+                        'ancestor of our target — HEAD moved; bailing '
+                        'transient (next drain rebuilds)')
+                    return False, None, diverged_tip
+                backoff_s = 1.0
+                continue
             # Two OR'd bails at chunk_n=1 (no smaller unit to fall back
             # to). Either trips → surface S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET.
             #   1. Size gate: pre-flight estimate > budget — we already
@@ -4324,19 +4488,23 @@ def _push_chunked_to_ref(
 
                 _cleanup_temp_ref()
                 reason = 'oversize' if oversize else 'exhausted'
+                # TRANSIENT, not terminal. A single commit is the atomic
+                # unit — its pack exceeding the byte budget (oversize) or
+                # timing out twice (exhausted) is NOT a permanent
+                # condition: field logs show identical ~4.3 MB chunk_n=1
+                # packs pushing fine moments later (nml, 0.52.28). The old
+                # terminal S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET here drove
+                # a 24 h wan_backoff and parked convergence for a day at
+                # every oversize audio file. Return a plain transient so
+                # the next drain / escalation resumes from the server
+                # topic tip (progress already banked is preserved). See
+                # CHANGELOG 0.52.29.
                 lift_merge.trace(
-                    f'[sync-trace] topic-push: chunk_n=1 bail '
-                    f'({reason}) pack={raw_bytes:,} bytes '
-                    f'budget={budget:,} failures={chunk_n_1_failures}; '
-                    f'surfacing typed status')
-                return False, Status(
-                    S.COMMIT_PACK_EXCEEDS_NETWORK_BUDGET,
-                    {'commit_sha': label,
-                     'raw_bytes': raw_bytes,
-                     'budget_bytes': budget,
-                     'object_count': obj_count,
-                     'reason': reason},
-                ), chunk_base
+                    f'[sync-trace] topic-push: chunk_n=1 {reason} '
+                    f'(pack={raw_bytes:,} bytes budget={budget:,} '
+                    f'failures={chunk_n_1_failures}) — transient, '
+                    f'resuming next drain')
+                return False, None, chunk_base
             consecutive_failures += 1
             # Halve the chunk size and try again. Floor at 1 — a
             # single-commit chunk is the smallest unit; if even
@@ -4434,6 +4602,46 @@ def _push_extras_step(repo, project_dir, result):
                        error=_format_push_error(exc))
 
 
+def _ls_remote_main_tip(remote_url, username, token, branch):
+    """Bounded single-request probe of the remote's ``<branch>`` tip
+    via a git ref advertisement (one ``GET info/refs``). Returns the
+    sha bytes, or ``None`` on any failure / absence.
+
+    Much cheaper than ``porcelain.fetch``: one HTTP GET, no
+    negotiation, no pack download, no local graph walk — so it can't
+    inherit the fetch's unbounded-hang failure mode. Used by
+    ``_push_step_locked`` to skip an unnecessary fetch when the remote
+    hasn't advanced past our tracking mirror.
+
+    Why this matters (field, nml on aztobt2-ui, 0.52.x): the remote
+    had never advanced (no push ever succeeded), yet every escalated
+    drain ran a full ``porcelain.fetch`` that never returned inside a
+    daemon lifetime — holding ``project_lock`` for its whole run and
+    starving user Sync with ``BUSY`` across 30+ restarts.
+    ``socket.setdefaulttimeout`` is per-``recv``, not wall-clock, so it
+    does NOT bound a slow/negotiating fetch; skipping the fetch when
+    there is provably nothing to pull is the actual bound, and it lets
+    the resumable chunked push proceed."""
+    try:
+        from dulwich.client import HttpGitClient
+        from urllib.parse import urlparse
+        parsed = urlparse(remote_url)
+        base = f'{parsed.scheme}://{parsed.netloc}'
+        path = parsed.path or '/'
+        client = HttpGitClient(base, username=username, password=token)
+        with _socket_timeout(_FETCH_TIMEOUT_S):
+            refs = client.get_refs(path)
+        if hasattr(refs, 'refs'):
+            refs = refs.refs
+        tip = refs.get(_enc(f'refs/heads/{branch}'))
+        if isinstance(tip, bytes):
+            return tip
+        return None
+    except Exception as exc:
+        lift_merge.trace(f'[sync-trace] ls-remote peek failed: {exc!r}')
+        return None
+
+
 def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     """Fetch + merge + push on an already-opened repo. Mutates
     *result* in place. Caller holds the project lock and has
@@ -4476,15 +4684,36 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
     # URL via the config we already populated in
     # ``_init_repo_locked`` / ``_clone_repo_locked``, so the URL we
     # read above is only used for diagnostics and error reporting.
+    # Cheap remote-tip probe before the (potentially very expensive,
+    # non-resumable, and — per ``_ls_remote_main_tip`` — unbounded)
+    # fetch. When the remote's branch tip still matches our tracking
+    # mirror there is nothing to pull, so skip the fetch and go
+    # straight to the resumable chunked push. Only skip on a confident
+    # equality: any peek failure (``None``) or a missing mirror falls
+    # through to the normal fetch so first-ever pushes and genuinely
+    # advanced remotes still reconcile.
+    mirror_before = _read_ref(remote_ref)
+    peek_tip = _ls_remote_main_tip(remote_url, username, token, branch)
+    skip_fetch = (
+        peek_tip is not None
+        and mirror_before is not None
+        and peek_tip == mirror_before)
+    if skip_fetch:
+        lift_merge.trace(
+            f'[sync-trace] fetch skipped: remote tip '
+            f'{_sha_str(peek_tip)[:8]!r} == mirror; nothing to pull')
     lift_merge.trace(f'[sync-trace] fetch begin remote={remote_url!r}')
     try:
-        with _socket_timeout(_FETCH_TIMEOUT_S):
-            porcelain.fetch(
-                repo, 'origin',
-                username=username, password=token,
-                errstream=io.BytesIO(),
-            )
-        lift_merge.trace('[sync-trace] fetch done')
+        if skip_fetch:
+            lift_merge.trace('[sync-trace] fetch done (skipped)')
+        else:
+            with _socket_timeout(_FETCH_TIMEOUT_S):
+                porcelain.fetch(
+                    repo, 'origin',
+                    username=username, password=token,
+                    errstream=io.BytesIO(),
+                )
+            lift_merge.trace('[sync-trace] fetch done')
     except Exception as exc:
         if _is_http_403(exc):
             result.statuses.append(diagnose_403(token, remote_url))
@@ -4503,6 +4732,13 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 'aborting before push')
             result.add(S.AUTH_REQUIRED)
             return result
+        if _is_repo_not_found(exc):
+            # 404 / NotGitRepository: auto-accept a pending invite (the
+            # 404 is the trigger) or surface the honest no-access verdict,
+            # then short-circuit — don't fall through to the push loop,
+            # which would churn the same NotGitRepository 11× (device-1
+            # field repro, 0.52.23).
+            return _handle_no_access(token, remote_url, result)
         # Non-fatal: maybe remote is empty or temporarily unreachable.
         # Trace explicitly so a stale ``refs/remotes/origin/*`` read
         # downstream isn't misread as authoritative — pre-0.43.19
@@ -5127,6 +5363,12 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                 _cleanup_temp_ref()
                 result.add(S.AUTH_REQUIRED)
                 return result
+            if _is_repo_not_found(exc):
+                # 404 / NotGitRepository on push: auto-accept a pending
+                # invite or surface no-access, and bail without burning
+                # the consecutive-failures budget on a doomed retry.
+                return _handle_no_access(
+                    token, remote_url, result, cleanup=_cleanup_temp_ref)
             # Wall-clock budget: when DNS / TLS / connection-reset
             # storms exhaust the network for minutes, the logical-
             # attempts cap (``consecutive_failures``) can take 30+

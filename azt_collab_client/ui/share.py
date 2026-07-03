@@ -22,6 +22,45 @@ the error strings.
 from ..translate import tr as _tr
 
 
+def open_url(url, on_error=None):
+    """Open *url* in the device's browser via ``ACTION_VIEW``.
+
+    The fallback for the GitHub repo-invitation flow (0.52.24): when the
+    daemon can't auto-accept an invitation (none pending yet, or the app
+    token can't accept it) it emits ``REPO_NO_ACCESS`` carrying the repo
+    ``url``; the peer offers this to send the user to the repo /
+    invitations page to accept or request access. Returns True if the
+    intent was dispatched. Non-Android → calls ``on_error`` with the link
+    text so a desktop host can show it. Best-effort; never raises."""
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    if not url:
+        return False
+    if platform != 'android':
+        if on_error is not None:
+            on_error(_tr('Open this link on the device: {url}').format(
+                url=url))
+        return False
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Intent = autoclass('android.content.Intent')
+        Uri = autoclass('android.net.Uri')
+        activity = PythonActivity.mActivity
+        intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(intent)
+        return True
+    except Exception as ex:
+        print(f'[open_url] failed: {ex!r}')
+        if on_error is not None:
+            on_error(_tr('Could not open the browser. Link: {url}').format(
+                url=url))
+        return False
+
+
 def share_running_apk(filename=None, on_error=None):
     """Share the running APK via Android's share sheet.
 
@@ -631,13 +670,20 @@ def share_diagnostics_action(on_error=None):
                 'again.'),
             on_error=on_error)
 
-    # Diagnostic bundle is a zip archive since 0.52.19; intent-
-    # level MIME has to match (``application/zip``) so Signal's
-    # ACTION_SEND filter accepts it (its ``application/*``
-    # mimeType entry in the manifest covers this) and other
-    # receivers' attachment pickers route the file correctly.
+    # Diagnostic bundle is a gzipped tar (``.tar.gz``) since 0.52.22
+    # (was ``.zip`` 0.52.19–0.52.21; a field email server silently
+    # stripped ``.zip`` attachments — gzip's magic bytes dodge both
+    # extension and content-sniffing filters). Intent-level MIME must
+    # match (``application/gzip``) so Signal's single-attachment
+    # ACTION_SEND filter accepts it (its ``application/*`` mimeType
+    # entry in the manifest covers this) and other receivers' pickers
+    # route the file correctly. The daemon builds the .tar.gz in
+    # ``prepare_share_bundle``; the provider's ``getType`` maps the
+    # ``gz`` extension to ``application/gzip`` for receivers that
+    # consult it.
+    from ..diagnostics import DIAGNOSTICS_MIME
     return share_files(items, on_error=on_error,
-                       mime_type='application/zip')
+                       mime_type=DIAGNOSTICS_MIME)
 
 
 def share_log_file(log_path, prev_path=None, on_error=None,

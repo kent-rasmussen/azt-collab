@@ -494,6 +494,38 @@ def _h_lan_pair_qr(body):
     return 200, {"ok": True, "payload": payload}
 
 
+def _h_lan_qr_keepalive(body):
+    """``POST /v1/lan/pair/qr/keepalive`` — heartbeat from a share-QR
+    screen that's currently displayed (0.52.26). Re-stamps the offer so
+    ``qr_offer_active`` stays true while the QR is on screen. The screen
+    calls this every ~10 s; the offer self-expires seconds after the
+    heartbeats stop (screen closed / app killed). Body: ``{langcode}``."""
+    langcode = str((body or {}).get('langcode', '') or '')
+    if not langcode:
+        return 200, {"ok": False, "error": "missing_langcode"}
+    try:
+        _lan_listener.record_qr_offered(langcode)
+    except Exception as ex:
+        print(f'[server] qr keepalive failed: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
+
+
+def _h_lan_qr_close(body):
+    """``POST /v1/lan/pair/qr/close`` — the share-QR screen closed;
+    revoke the offer immediately rather than waiting out the keepalive
+    grace (0.52.26). Body: ``{langcode}``."""
+    langcode = str((body or {}).get('langcode', '') or '')
+    if not langcode:
+        return 200, {"ok": False, "error": "missing_langcode"}
+    try:
+        _lan_listener.clear_qr_offer(langcode)
+    except Exception as ex:
+        print(f'[server] qr close failed: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
+
+
 def _h_lan_pair_accept(body):
     """Record a peer into ``peers.json`` from a scanned-QR payload.
     Phase 2 of the LAN sync transport.
@@ -1929,6 +1961,13 @@ def _h_set_github_tokens(body):
         username=body.get('username', ''),
         token_time=body.get('token_time'),
     )
+    # A-nudge (0.52.24): fresh credentials can fix any access-class
+    # blocker (auth expiry, or a token that now sees the repo). Clear the
+    # WAN backoff for every access-blocked project so they retry now.
+    try:
+        scheduler.nudge_access_blocked_projects()
+    except Exception:
+        pass
     return 200, {"ok": True}
 
 
@@ -2689,7 +2728,14 @@ def _h_project_sync(langcode, body):
         res = Result().add(S.AUTH_REQUIRED)
         return 200, {"ok": True, "result": res.to_dict()}
     try:
-        res = _sync_repo(p.working_dir, git_user, token, contributor)
+        # 0.52.21: user-gestured Sync can be a long fetch+merge+push
+        # on a diverged history. Hold the in-flight guard so the
+        # Android idle-stop loop doesn't kill the process mid-sync if
+        # the user closes the app right after tapping Sync (same
+        # killer as the auto-drain path — see sync_flight.py).
+        from . import sync_flight
+        with sync_flight.guard():
+            res = _sync_repo(p.working_dir, git_user, token, contributor)
     except Exception as ex:
         print(f'[sync-rpc] {langcode!r} raised: {ex}',
               file=sys.stderr, flush=True)
@@ -2816,6 +2862,13 @@ def _h_project_status(langcode, _body):
     last_commit_failure_at = float(
         raw.get('last_commit_failure_at', 0.0) or 0.0)
     last_commit_error = raw.get('last_commit_error', '') or ''
+    # Access-class reason the last WAN sync failed (0.52.24, req 1.1):
+    # AUTH_REQUIRED / REPO_NO_ACCESS / REPO_NOT_AUTHORIZED / APP_SUSPENDED
+    # / … — a typed status CODE (not translated text) the peer routes to
+    # a persistent "sync blocked: <reason>" banner instead of silently
+    # backing off. Empty when the last sync had no access problem.
+    last_sync_error = raw.get('last_sync_error', '') or ''
+    last_sync_error_at = float(raw.get('last_sync_error_at', 0.0) or 0.0)
     # Atomic-recovery diagnostic counter; resets at the day
     # boundary. Purely informational — the recovery happens
     # daemon-side without any user gesture; this field lets a
@@ -2878,6 +2931,10 @@ def _h_project_status(langcode, _body):
         "commit_failure_count": commit_failure_count,
         "last_commit_failure_at": last_commit_failure_at,
         "last_commit_error": last_commit_error,
+        # Access-class sync blocker (0.52.24). Typed status code + when.
+        # Empty string when the last sync had no access problem.
+        "last_sync_error": last_sync_error,
+        "last_sync_error_at": last_sync_error_at,
         # Atomic-recovery diagnostic (since 0.41.27): count of
         # orphan LIFT scratches the daemon auto-recovered today.
         # Zero on a healthy project; positive when Phase-1-only
@@ -3001,6 +3058,14 @@ def _h_grant_collaborator(langcode, body):
         res.add(S.COLLABORATOR_INVITED, username=username,
                 owner_repo=f'{owner}/{repo_name}',
                 permission=permission)
+    # A-nudge (0.52.24): a grant may have just unblocked THIS project (the
+    # same-device case where the granter is also the blocked peer). Clear
+    # its WAN backoff so it retries now rather than waiting out the curve.
+    # Harmless when the project wasn't blocked.
+    try:
+        scheduler.nudge_project(langcode)
+    except Exception:
+        pass
     return 200, {"ok": True, "result": res.to_dict()}
 
 
@@ -3642,37 +3707,21 @@ def _h_prepare_share_bundle(_body):
     bundle_dir = os.path.join(shares_root, token)
     os.makedirs(bundle_dir, exist_ok=True)
 
-    # Single zip archive (since 0.52.19). Signal's
-    # ACTION_SEND_MULTIPLE resolver filters URIs to image and
-    # video MIME types only — every text/log URI gets
-    # rejected silently regardless of intent-filter
-    # advertisements. Source confirmed verbatim from
-    # ``ShareRepository.kt``:
-    #
-    #     .filterValues {
-    #       MediaUtil.isImageType(it) || MediaUtil.isVideoType(it)
-    #     }
-    #
-    # Empirically verified 2026-06-22 by sharing two .txt
-    # files from a third-party file manager → same flash-and-
-    # back. The bug is Signal-side, independent of our app.
-    #
-    # Signal's ACTION_SEND (single attachment) resolver has
-    # no such filter. Its intent-filter accepts
-    # ``application/*`` (and ``*/*``) so ``application/zip``
-    # works. We bundle the snapshot + per-day daemon logs
-    # into one .zip and ship that single file via
-    # ACTION_SEND. Files stay separate inside the archive,
-    # so triage is one grep per file, and large text logs
-    # compress well.
-    import zipfile
+    # Single gzipped-tar archive. The container FORMAT (tar.gz + name +
+    # MIME) is the suite-shared helper ``azt_collab_client.diagnostics``
+    # — see that module for the zip→tar.gz rationale (a field mail server
+    # strips ``.zip``) and the single-attachment / Signal constraints.
+    # Only the COLLECTION is daemon-specific (snapshot + per-day daemon
+    # logs); the format lives in the client so it can't drift from the
+    # peers' own builders again (was implemented twice; recorder shipped
+    # stale ``.zip`` for a build). Daemon imports client = allowed.
+    from azt_collab_client.diagnostics import (
+        build_diagnostics_targz, diagnostics_archive_name)
     stamp = _time.strftime('%Y%m%d_%H%M%S')
-    archive_name = f'azt_diagnostics_{stamp}.zip'
-    if not _SHARE_BUNDLE_FILENAME_RE.match(archive_name):
-        archive_name = 'azt_diagnostics.zip'
+    archive_name = diagnostics_archive_name(slug='', stamp=stamp)
     archive_path = os.path.join(bundle_dir, archive_name)
 
-    # 1. Snapshot.
+    # 1. Snapshot (in-memory content).
     try:
         snapshot = _build_diagnostic_snapshot()
     except Exception as ex:
@@ -3680,7 +3729,7 @@ def _h_prepare_share_bundle(_body):
               file=sys.stderr, flush=True)
         snapshot = ''
 
-    # 2. Per-day daemon logs inside the retention window.
+    # 2. Per-day daemon logs inside the retention window (real files).
     import datetime as _dt
     try:
         retention = _settings.log_retention_days()
@@ -3696,28 +3745,22 @@ def _h_prepare_share_bundle(_body):
             keep_dates.add(
                 (today_d - _dt.timedelta(days=k)).isoformat())
 
-    log_entries = 0
+    log_files = [
+        (os.path.basename(src_path), src_path)
+        for date_str, src_path in _iter_daemon_log_files()
+        if not (keep_dates and date_str not in keep_dates)
+    ]
+    content_items = (
+        [(f'azt_snapshot_{stamp}.txt', snapshot)] if snapshot else [])
     try:
-        with zipfile.ZipFile(archive_path, 'w',
-                             compression=zipfile.ZIP_DEFLATED,
-                             compresslevel=6) as zf:
-            if snapshot:
-                zf.writestr(f'azt_snapshot_{stamp}.txt', snapshot)
-            for date_str, src_path in _iter_daemon_log_files():
-                if keep_dates and date_str not in keep_dates:
-                    continue
-                try:
-                    zf.write(src_path,
-                             arcname=os.path.basename(src_path))
-                    log_entries += 1
-                except OSError as ex:
-                    print(f'[share-bundle] zip-add {src_path!r} '
-                          f'raised: {ex!r}',
-                          file=sys.stderr, flush=True)
+        written = build_diagnostics_targz(
+            archive_path, file_items=log_files,
+            content_items=content_items)
     except OSError as ex:
         print(f'[share-bundle] archive write raised: {ex!r}',
               file=sys.stderr, flush=True)
         return 500, {"ok": False, "error": "share_write_failed"}
+    log_entries = max(0, written - (1 if snapshot else 0))
 
     items = [{
         'display_name': archive_name,
@@ -4464,6 +4507,10 @@ def dispatch(method, path, body):
             return _h_set_work_offline(body)
         if path == '/v1/lan/pair/qr':
             return _h_lan_pair_qr(body)
+        if path == '/v1/lan/pair/qr/keepalive':
+            return _h_lan_qr_keepalive(body)
+        if path == '/v1/lan/pair/qr/close':
+            return _h_lan_qr_close(body)
         if path == '/v1/lan/pair/accept':
             return _h_lan_pair_accept(body)
         if path == '/v1/lan/unshare_project':

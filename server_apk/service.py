@@ -712,11 +712,27 @@ def main():
     print('[service] entering idle-stop loop '
           f'(check={IDLE_CHECK_SECONDS}s timeout={IDLE_TIMEOUT_SECONDS}s)',
           flush=True)
+    try:
+        from azt_collabd import sync_flight
+    except Exception:
+        sync_flight = None
     while True:
         time.sleep(IDLE_CHECK_SECONDS)
         bound = _bound_count()
         idle_for = cp_service.seconds_since_last_touch()
         if bound == 0 and idle_for > IDLE_TIMEOUT_SECONDS:
+            # Layer 1 (0.52.21): never stop the service while a WAN
+            # sync is actively running in a scheduler thread. The
+            # idle measure only sees ContentProvider touches, so a
+            # long fetch/merge/push (large diverged history) with the
+            # UI closed used to get killed mid-flight — restarting
+            # from scratch every lifetime and never converging. The
+            # in-flight guard keeps the process alive so the
+            # resumable chunked push can bank progress.
+            if sync_flight is not None and sync_flight.in_flight():
+                print('[service] idle-stop deferred: WAN sync in '
+                      'flight', flush=True)
+                continue
             print(f'[service] idle-stop: bound={bound} '
                   f'idle_for={idle_for:.0f}s — stopSelf()',
                   flush=True)

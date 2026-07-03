@@ -136,15 +136,17 @@ to accept. Verbatim, from `main` 2026-06-22:
 
 `ACTION_SEND` (single attachment) has no such filter — any
 URI goes through to the blob path. So 0.52.19 switched the
-diagnostic bundle to a single zip archive
-(`azt_diagnostics_<stamp>.zip` containing the snapshot +
-per-day logs as separate zip entries) dispatched via
-`ACTION_SEND` with MIME `application/zip`. Files stay
-separate inside the archive, so support triage is
-`unzip && grep` rather than scrolling through a
-concatenated text blob (the 0.52.18 intermediate). APKs
-already travel through Signal this way (single
-`application/*` URI), which is the precedent.
+diagnostic bundle to a single archive dispatched via
+`ACTION_SEND`. 0.52.23 changed the container from zip to
+gzipped-tar (`azt_diagnostics_<stamp>.tar.gz`, MIME
+`application/gzip`) after a field mail server (Dome) was
+found to silently strip `.zip` attachments — gzip's magic
+bytes aren't in the zip family, so it clears both extension
+and content-sniffing filters. Files stay separate inside the
+archive, so support triage is `tar xzf && grep` rather than
+scrolling through a concatenated text blob (the 0.52.18
+intermediate). APKs already travel through Signal as a single
+`application/*` URI, which is the precedent.
 
 `share_files` retains the multi-item path for peer apps
 that ship image/video bundles — `len(items) > 1` routes to

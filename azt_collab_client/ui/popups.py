@@ -261,6 +261,80 @@ def grant_collaborator_popup(langcode, on_done=None, font_name='Roboto'):
     return popup
 
 
+def repo_access_popup(owner_repo, url, on_done=None, font_name='Roboto'):
+    """Fallback for the GitHub repo-invitation flow (0.52.24): when the
+    daemon reports ``REPO_NO_ACCESS`` (a 404 with no pending invite the
+    daemon could auto-accept), a peer shows this to send the user to the
+    repo / invitations page to accept — or to ask the owner for access.
+
+    Peer integration: route a sync result carrying ``S.REPO_NO_ACCESS``
+    (or a ``project_status.last_sync_error == 'REPO_NO_ACCESS'`` banner)
+    here, passing the status params' ``owner_repo`` + ``url``::
+
+        from azt_collab_client.ui.popups import repo_access_popup
+        repo_access_popup(owner_repo=p['owner_repo'], url=p['url'],
+                          font_name=_FONT_NAME)
+
+    Returns the Popup object."""
+    from .share import open_url
+
+    content = BoxLayout(
+        orientation='vertical', spacing=dp(10), padding=dp(12))
+    content.add_widget(Label(
+        text=(_tr('No access to {repo} with your GitHub account.')
+              .format(repo=owner_repo or _tr('this repository'))),
+        size_hint_y=None, height=dp(52),
+        font_size=sp(14), color=theme.TEXT, font_name=font_name,
+        halign='left', valign='top'))
+    body = content.children[0]
+    body.bind(size=lambda w, s: setattr(w, 'text_size', s))
+    content.add_widget(Label(
+        text=_tr('Ask the repository owner to add you as a '
+                 'collaborator, then open GitHub to accept the '
+                 'invitation. Sync resumes on its own once access '
+                 'is granted.'),
+        size_hint_y=None, height=dp(84),
+        font_size=sp(12), color=theme.TEXT_DIM, font_name=font_name,
+        halign='left', valign='top'))
+    content.children[0].bind(
+        size=lambda w, s: setattr(w, 'text_size', s))
+
+    btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(12))
+    close_btn = Button(
+        text=_tr('Close'), font_size=sp(14), font_name=font_name)
+    open_btn = Button(
+        text=_tr('Open GitHub'), font_size=sp(14), font_name=font_name,
+        background_color=theme.ACCENT)
+    if not url:
+        open_btn.disabled = True
+    btn_row.add_widget(close_btn)
+    btn_row.add_widget(open_btn)
+    content.add_widget(btn_row)
+
+    popup = Popup(
+        title=_tr('Repository access needed'),
+        content=content,
+        size_hint=(0.9, None), height=dp(280),
+        auto_dismiss=False)
+
+    def _open(*_):
+        open_url(url)
+        try:
+            popup.dismiss()
+        except Exception:
+            pass
+        if on_done is not None:
+            try:
+                on_done()
+            except Exception as ex:
+                print(f'[repo_access_popup] on_done raised: {ex}')
+
+    close_btn.bind(on_release=lambda *_: popup.dismiss())
+    open_btn.bind(on_release=_open)
+    popup.open()
+    return popup
+
+
 def _derive_langcode_from_url(url):
     """Cheap default langcode for a clone URL: repo basename minus
     ``.git``. Mirrors the daemon's ``projects.derive_langcode`` URL

@@ -298,6 +298,8 @@ _HANDLERS = {
     S.APP_SUSPENDED:          lambda p: _fmt(_tr("GitHub App installation is suspended at {url}. Open it, scroll to the bottom, and tap 'Unsuspend'."), p),
     S.REPO_NOT_AUTHORIZED:    lambda p: _fmt(_tr('App not authorized for {owner_repo}. Add it at {url}'), p),
     S.ACCESS_DENIED:          lambda p: _fmt(_tr('Access denied (403). Check app permissions at {url}'), p),
+    S.REPO_NO_ACCESS:         lambda p: _fmt(_tr('No access to {owner_repo}. Ask the owner to add you as a collaborator, then open {url} to accept.'), p),
+    S.INVITE_ACCEPTED:        lambda p: _tr('Accepted the repository invitation — syncing now.'),
     S.AUTH_REFRESH_STALE:     lambda p: _refresh_stale_message(p),
 
     S.AUTH_EXPIRED:           lambda p: _tr('Authorization expired. Please try again.'),

@@ -1,7 +1,8 @@
-# Suite status & roadmap
+# Suite status & doc index
 
-One-page index of what's shipped vs. what's open across the docs
-in this directory. Re-read alongside `CHANGELOG.md` (the
+One-page index of what's **shipped** across the docs in this
+directory, plus the reference-doc index. **Open work is tracked
+in the agenda, not here.** Re-read alongside `CHANGELOG.md` (the
 source of truth for what shipped when) before each release pass.
 
 ## Recently shipped (2026-05)
@@ -35,71 +36,6 @@ source of truth for what shipped when) before each release pass.
   view get suspended. See
   `azt_collab_client/CLIENT_INTEGRATION.md` § 11.
 
-## Open work, prioritised
-
-Highest-leverage first. None are blocking; pick up when the
-relevant trigger surfaces (user report, related work in the
-area, release-prep pass).
-
-### High
-
-1. **Google developer-verification enrollment for SIL** — the
-   load-bearing distribution piece per
-   `research_notes_2026-05.md` § 1 + saved memory
-   `project_android_2026_sideload_lockdown.md`. Without it, new
-   Android 16 devices in the field can't sideload the suite at
-   all. SIL-side process; tracked outside this codebase.
-2. **GitHub-connect UX item #9 (device-flow timeout
-   countdown + Start over)** — visible papercut in the "user
-   sets phone down" case. See `github_connect_ux_audit.md`.
-
-### Medium
-
-3. **GitHub-connect UX items #10–#12** — plain-language
-   status messages, more prominent "Setup complete" moment,
-   pre-explain OAuth scope grant. See
-   `github_connect_ux_audit.md`.
-4. **Web Flow + Device Flow fallback** — drafted, on hold
-   pending decision on embedding `client_secret` (PKCE-only
-   isn't legal for GitHub Apps as of 2026-05). See
-   `web_flow_migration_plan.md`. Eliminates the 8-character
-   device-flow papercut; tradeoff is a non-secret secret in
-   the APK.
-5. **Recorder-side reload-on-PULLED implementation** — the
-   peer-side half of the smooth-UI-across-reloads principle.
-   Daemon already delivers the fresh bytes after sync (fixed
-   in `azt_collabd 0.31.2`); the recorder still needs to
-   reload its in-memory LIFT model + re-render the user's
-   current entry on `S.PULLED`. Not in this repo (lives in
-   `azt_recorder/`); flagged here so it doesn't get lost.
-
-### Low / design call
-
-6. **GitHub-connect UX item #8** — Re-authenticate /
-   Disconnect prominence. Per maintainer preference (#7) no
-   confirmation popups; the move is reducing visual weight
-   without changing behaviour.
-7. **GitHub-connect UX item #13** — "Skip for now / use
-   without backup" path. Design call; defer until raised by a
-   real user.
-8. **Phase B1 daemon-state field in 503** — would surface
-   phase-grained boot progress in the connecting popup. Phase
-   B2 dropped peer wait to ~50 ms so this delivers
-   diminishing returns; ship only if a future device class
-   makes the wait visible again. See `daemon_boot_plan.md`.
-9. **Loopback transport `kind`** — desktop-side
-   `ServerUnavailable.kind` is unspecified (Android side has
-   the diagnostic categories). Address only if a desktop user
-   hits a long-wait symptom that benefits.
-
-### Not worth shipping (kept for context)
-
-- **Phase C daemon-side lazy imports** — measured
-  `import azt_collabd` cost is ~120 ms on the slow tablet,
-  invisible behind the bind+overlap. Don't ship unless a
-  regression makes the import the long pole again. See
-  `daemon_boot_plan.md`.
-
 ## Reference docs (not work items)
 
 - `research_notes_2026-05.md` — platform state of the art.
@@ -117,3 +53,6 @@ area, release-prep pass).
   refreshed (1–7 done). `p4a_hook_picker_intent.md` reduced to
   a redirect stub (work shipped in v0.28.x). This file
   created.
+- 2026-06-29: open-work section removed (now tracked in the
+  agenda); file moved to `agenda/` and reframed as a
+  status + doc-index page.

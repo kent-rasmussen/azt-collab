@@ -85,43 +85,54 @@ _STATE = {
 # this langcode exists, the hello records the pair but refuses
 # auto-share.
 #
-# TTL deliberately wide enough for cross-device flows
-# (user shows QR, walks across the room, asks B to scan, B
-# scans + connects) — 10 minutes covers the common case;
-# anything stale is treated as "the user moved on, this isn't
-# the active gesture."
-_QR_OFFER_TTL_S = 600.0
-_pending_qr_offers = {}   # langcode (str) → unix timestamp (float)
+# Validity is driven by the QR actually being ON SCREEN, not a blind
+# timer (0.52.26). The share-QR popup heartbeats ``record_qr_offered``
+# every ~10 s while displayed and calls ``clear_qr_offer`` when it
+# closes. So this keepalive window only has to outlast one heartbeat
+# interval — it is NOT a guess at "how long the user might keep the QR
+# up" (the old 10-minute TTL). Consequences: a display that's closed
+# (or whose app is killed / backgrounded) self-expires within seconds
+# instead of staying armed for 10 minutes, and a QR the user
+# deliberately keeps up stays valid for as long as it's shown.
+_QR_OFFER_KEEPALIVE_S = 30.0
+_pending_qr_offers = {}   # langcode (str) → last-heartbeat unix ts
 
 
 def record_qr_offered(langcode):
-    """Note that the user just displayed a pair-share-clone QR for
-    *langcode*. Consulted by the hello handler to gate auto-share.
-    Empty / falsy langcode is a no-op (legacy pair-only QR)."""
+    """Heartbeat: the share QR for *langcode* is currently displayed.
+    Called on QR open and every ~10 s while it stays up. Consulted by
+    the hello handler to gate auto-share. Empty langcode is a no-op
+    (pair-only QR, no project share)."""
     if not langcode:
         return
     _pending_qr_offers[str(langcode)] = _time.time()
 
 
-def consume_qr_offer(langcode):
-    """If a recent QR-offer for *langcode* exists, clear and return
-    True. Else return False. Single-use — once a peer's hello
-    consumes the offer, a second auto-share for the same langcode
-    requires the user to re-display the QR. Limits damage if a
-    legitimate scan happens but is followed by an attacker hello
-    racing in for the same langcode."""
+def qr_offer_active(langcode):
+    """True if a share QR for *langcode* is currently being displayed
+    (a heartbeat landed within ``_QR_OFFER_KEEPALIVE_S``). **Multi-use**
+    — does NOT consume the offer, so one displayed QR can share to
+    several peers who scan it (the workshop "show it to the room" case).
+    The offer is revoked by ``clear_qr_offer`` (screen closed) or by the
+    heartbeat lapsing (display gone). This "valid while shown" model
+    replaced the single-use + 10-minute TTL in 0.52.26."""
     if not langcode:
         return False
     key = str(langcode)
     ts = _pending_qr_offers.get(key)
     if ts is None:
         return False
-    if _time.time() - ts > _QR_OFFER_TTL_S:
-        # Stale; clean up.
+    if _time.time() - ts > _QR_OFFER_KEEPALIVE_S:
         _pending_qr_offers.pop(key, None)
         return False
-    _pending_qr_offers.pop(key, None)
     return True
+
+
+def clear_qr_offer(langcode):
+    """Revoke a share offer immediately — called when the QR popup
+    closes. No-op if none pending / empty langcode."""
+    if langcode:
+        _pending_qr_offers.pop(str(langcode), None)
 
 
 def is_running():
@@ -304,9 +315,10 @@ def _handle_hello_bodyauth(environ, start_response):
     # second tap on Share after the QR scan; the underlying share
     # was the QR-show gesture itself.
     #
-    # SECURITY: only fire if the user actually displayed a QR
-    # offering this langcode within the last few minutes
-    # (``consume_qr_offer``). Without this gate, anyone on the
+    # SECURITY: only fire if the user is actively DISPLAYING a QR
+    # offering this langcode right now (``qr_offer_active`` — a
+    # heartbeat within the keepalive window). Without this gate, anyone
+    # on the
     # LAN can POST ``/v1/lan/hello`` claiming any langcode and we
     # would auto-grant them read access to that project (the git
     # smart-protocol handler accepts requests for any project in
@@ -319,7 +331,7 @@ def _handle_hello_bodyauth(environ, start_response):
     # manually if they meant to allow this peer.
     langcode_offered = str(payload.get('langcode', '') or '')
     if langcode_offered:
-        if consume_qr_offer(langcode_offered):
+        if qr_offer_active(langcode_offered):
             try:
                 _peers.add_shared_project(
                     actual_peer_id, langcode_offered)
