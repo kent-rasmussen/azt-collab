@@ -420,6 +420,31 @@ pick up the new two-phase write transparently — no code
 change, just rebuild. Pre-0.41.7 daemons get the legacy
 single-RPC path as a fallback (works for small payloads).
 
+## 8a. New-project template cleanup is the daemon's job (since 0.52.32)
+
+When a peer starts a new project from the language picker's
+new-from-template flow, the daemon downloads the wordlist template and
+**prunes it to the chosen vernacular server-side**, inside
+``create_from_template``, before the project is registered. The project
+the peer loads is already cleaned: `<lexical-unit>` holds only the
+vernacular headword form (with a no-loss move of any source word into a
+gloss), empty glosses are dropped, and `SILCAWL` / `grammatical-info` /
+`semantic-domain` / `illustration` / `trait` are preserved.
+
+**Don't** run your own template cleanup / pruning / "strip the other
+languages" pass over a freshly-created project. It's redundant, and a
+second cleaner with different rules re-introduces exactly the
+cross-peer drift the server-side single-sourcing exists to prevent.
+**A peer that shipped its own template cleaner before 0.52.32 must
+remove it** — historically it ran only on one creation path and missed
+picker-created projects entirely (the bug that motivated moving this
+into the daemon), so deleting it loses nothing and stops double-work.
+
+Just ``load_lift`` what the picker/daemon hands back. The vernacular
+tag it was cleaned against is the full assembled BCP-47 tag the picker
+produced (e.g. ``nml``, ``ba-x-dialect``, ``en-US-x-Kent``) — the same
+value the daemon owns as the project's langcode.
+
 ## 9. Audio / image references
 
 For audio recording:

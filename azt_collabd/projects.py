@@ -535,6 +535,109 @@ def _mint_fresh_guids(xml_bytes):
     return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
 
+def _clean_template(xml_bytes, vernlang):
+    """Prune a freshly-downloaded SILCAWL template down to the target
+    vernacular language — once, server-side, so no peer needs its own
+    cleaner and the rules can't drift across peers.
+
+    Host-decided rules (2026-07-04; full rationale in
+    ``azt_collab_client/NOTES_TO_DAEMON.md``):
+
+      1. **lexical-unit** — keep only ``<form lang=vernlang>``. Drop
+         every other-language form. *No-loss guard:* before dropping a
+         populated other-language form, if its language has no non-empty
+         ``<gloss>`` in the entry, move the form's text into a
+         ``<gloss>`` first (reusing an empty gloss for that lang if one
+         exists, else creating one). If no vernlang form exists, add an
+         empty ``<form lang=vernlang><text/></form>`` so the headword
+         slot exists and vernlang stays auto-detectable by peers.
+      2. **glosses** — drop ``<gloss>`` whose text is empty/whitespace;
+         keep every populated one. Runs after rule 1 so a just-moved
+         gloss is never pruned.
+      3. **definition** — left as-is (kept for user familiarity).
+      4. **citation** — left as-is (``set_audio`` tolerates its
+         presence or absence).
+      5. **sense** — left as-is (never empty in practice).
+
+    ``vernlang`` is matched as the full assembled BCP-47 tag, compared
+    exactly (``nml``, ``ba-x-dialect``, ``en-US-x-Kent``) — never on a
+    bare language subtag.
+
+    Bytes -> bytes, same contract as ``_mint_fresh_guids``: returns the
+    input unchanged on parse failure (or when nothing needed changing),
+    so an almost-but-not-quite-LIFT template flows through untouched.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes
+
+    def _text_of(holder):
+        # <form>/<gloss> carry their text in a child <text> element.
+        t = holder.find('text')
+        return None if t is None else t.text
+
+    def _is_empty(s):
+        return s is None or not s.strip()
+
+    changed = False
+
+    for entry in root.iter('entry'):
+        lu = entry.find('lexical-unit')
+        if lu is not None:
+            forms = lu.findall('form')
+            has_vern = any(f.get('lang') == vernlang for f in forms)
+
+            for f in forms:
+                if f.get('lang') == vernlang:
+                    continue
+                lang = f.get('lang')
+                txt = _text_of(f)
+                if lang and not _is_empty(txt):
+                    # No-loss: ensure this source word survives as a gloss.
+                    sense = entry.find('sense')
+                    if sense is None:
+                        sense = ET.SubElement(entry, 'sense')
+                        changed = True
+                    have_populated = any(
+                        g.get('lang') == lang and not _is_empty(_text_of(g))
+                        for g in sense.findall('gloss'))
+                    if not have_populated:
+                        target = next(
+                            (g for g in sense.findall('gloss')
+                             if g.get('lang') == lang), None)
+                        if target is None:
+                            target = ET.SubElement(sense, 'gloss')
+                            target.set('lang', lang)
+                        gt = target.find('text')
+                        if gt is None:
+                            gt = ET.SubElement(target, 'text')
+                        gt.text = txt
+                        changed = True
+                lu.remove(f)
+                changed = True
+
+            if not has_vern:
+                vf = ET.SubElement(lu, 'form')
+                vf.set('lang', vernlang)
+                ET.SubElement(vf, 'text')
+                changed = True
+
+        # Rule 2: drop empty glosses (after the rule-1 move above).
+        for sense in entry.findall('sense'):
+            for g in list(sense.findall('gloss')):
+                if _is_empty(_text_of(g)):
+                    sense.remove(g)
+                    changed = True
+
+    if not changed:
+        return xml_bytes
+
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+
 def create_from_template(template_url, vernlang, dest_dir,
                          timeout=60, size_cap=10 * 1024 * 1024):
     """Download a LIFT template and register it as a project.

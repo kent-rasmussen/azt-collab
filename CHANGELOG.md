@@ -9,6 +9,37 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.52.32 — new-project template: prune to vernacular server-side, single-sourced
+
+Field bug (azt-recorder triage, 2026-07-04): projects created via the language picker
+came up carrying the **full multilingual SILCAWL template** — `<lexical-unit>` with `en`/
+`fr`/`pt` source words in the vernacular headword slot, plus empty gloss/definition/citation
+forms in ~8 languages. Root cause: `azt_collabd/projects.py::create_from_template` wrote the
+downloaded template **verbatim** (only `_mint_fresh_guids`); the intended cleaner was a peer-
+side `clean_template` in the recorder that never fired on the picker path (picker-created
+projects arrive as `_current_langcode`/authoritative and deliberately do NOT set
+`_pending_vernlang`, the only path that ran the cleaner). So no cleanup ran anywhere.
+
+Fix: single-source the cleanup in the daemon. New `_clean_template(xml_bytes, vernlang)`
+runs in `create_from_template` right after `_mint_fresh_guids`, same bytes→bytes contract
+(parse-fail → return input unchanged). Host-decided rules:
+
+- **lexical-unit** — keep only `<form lang=vernlang>`; drop other-language forms. No-loss
+  guard: a populated other-language form whose language has no non-empty `<gloss>` is moved
+  into a gloss first (empty gloss treated as absent; runs before the empty-gloss prune), so
+  no source word is lost. Add an empty `<form lang=vernlang><text/></form>` if none exists.
+- **glosses** — drop empty, keep populated.
+- **definition** / **citation** — left as-is (kept for familiarity; `set_audio` tolerates
+  citation present or absent).
+- vernlang matched as the full assembled BCP-47 tag, exactly (`nml`, `ba-x-dialect`,
+  `en-US-x-Kent`) — never a bare subtag. Order-preserving; leaves `SILCAWL` field,
+  `grammatical-info`, `semantic-domain`, `illustration`, `trait` untouched.
+
+Daemon only; no wire/client change. Follow-on (separate peer task): retire the recorder's
+now-dead `clean_template` on this path. Also incidental — the recorder's `clean_template`,
+even when it did run, only walked citation/definition (never lexical-unit or `<gloss>`), a
+second reason it couldn't have produced clean output; moot now the daemon owns it.
+
 ## 0.52.31 — topic-push: chunk-pick fallback for off-spine base (don't degenerate to whole-history)
 
 Field follow-up to 0.52.30 (nml, both phones now on .30). **0.52.30 worked** where it

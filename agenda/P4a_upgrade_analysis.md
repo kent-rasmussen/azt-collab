@@ -378,3 +378,49 @@ notes):
    (Could implicitly bump Python from 3.13 → 3.14, which is a
    wholly separate compatibility surface for our `azt_collab_client`
    wire protocol — worth knowing up front.)
+
+---
+
+## 9. Bundled sub-task: suite-wide `defusedxml` XXE-hardening pass
+
+Added 2026-07-04. Bundled here because it's a **new build dependency +
+requirements churn + forced rebuild** — exactly the batch this p4a
+flip already pays for. Do it in the same cutover so one clean rebuild
+validates both.
+
+**What.** Every XML *parse* of external/untrusted bytes in the daemon
+uses stdlib `xml.etree.ElementTree`, which is XXE- and
+billion-laughs-exposed by default (flagged when `_clean_template`
+shipped in 0.52.32). Swap the **parse** sites to
+`defusedxml.ElementTree` (guards entity expansion + external-entity /
+DTD fetch). Keep `ET.tostring` (stdlib) for **serialization** —
+defusedxml only hardens parsing, not output, so this is a
+parse-only swap; the serialize path is unchanged.
+
+**Dependency.** `defusedxml` is **pure Python** → just add it to each
+app's buildozer `requirements` line. No recipe override, no NDK
+surface, no manifest change. Verify it imports inside the p4a bundle
+on first rebuild.
+
+**Daemon call sites (azt-collab, in-lane) — grep 2026-07-04:**
+
+| File:line | Input | Priority |
+|---|---|---|
+| `projects.py:514` (`_mint_fresh_guids`), `:573` (`_clean_template`) | downloaded SILCAWL template (configured URL, but external) | **high** |
+| `lift_surgery.py:238` | peer-streamed entry bytes | **high** |
+| `lift_merge.py:194/196/199/886` | fetched / merged LIFT content | **high** |
+| `atomic_recovery.py:83/84` | on-disk orphan / current LIFT | **high** |
+| `lift_merge.py:268/276/332` (`_canon` re-parse) | daemon's own just-serialized bytes (trusted) | low — swap for uniformity only |
+
+(`ui/picker_app.py:830` is `Uri.parse`, not XML — exclude.)
+
+**Out of lane (note only, parallel peer sweep):** the desktop app
+(`azt/io_put/lift.py`) and recorder parse LIFT with stdlib ET too;
+same swap belongs there but lands in the sister repos, not azt-collab.
+
+**Scope discipline.** Parse-only swap; do not touch `tostring` calls,
+the `_canon`/merge logic, or the bytes→bytes fallback contracts —
+`defusedxml.ElementTree.fromstring` raises on a defused payload, so
+the existing `except ...: return original_bytes` guards must catch
+`defusedxml`'s exception types too (or a broad `Exception`) so a
+hostile template still falls back rather than crashing the path.
