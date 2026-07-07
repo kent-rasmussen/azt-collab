@@ -331,6 +331,11 @@ msgstr "Validé."
 msgid "Committed local changes."
 msgstr "Modifications locales validées."
 
+msgid "Merged your changes with updates from your team."
+msgstr ""
+"Vos modifications ont été fusionnées avec les mises à jour de votre "
+"équipe."
+
 msgid "Committed locally (offline)"
 msgstr "Validé localement (hors ligne)"
 
@@ -1408,6 +1413,19 @@ msgid ""
 msgstr ""
 "Projet : {langcode}\n"
 "(non publié sur GitHub — partage uniquement sur le réseau local)"
+
+# GitHub backup-progress line (settings 'Current project' block, 0.53.3).
+msgid "GitHub backup: ✓ backed up"
+msgstr "Sauvegarde GitHub : ✓ sauvegardé"
+
+msgid "GitHub backup: finishing (merging)…"
+msgstr "Sauvegarde GitHub : finalisation (fusion en cours)…"
+
+msgid "GitHub backup: {n} commit(s) to go"
+msgstr "Sauvegarde GitHub : {n} commit(s) restant(s)"
+
+msgid "GitHub backup: {n} commit(s) to go (paused — work offline)"
+msgstr "Sauvegarde GitHub : {n} commit(s) restant(s) (en pause — hors ligne)"
 
 # KV-template form: brace-escaped for KV pre-processing, then
 # .format() called at runtime. The msgid here mirrors the source

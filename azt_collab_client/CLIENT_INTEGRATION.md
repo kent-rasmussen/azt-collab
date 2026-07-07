@@ -445,6 +445,75 @@ tag it was cleaned against is the full assembled BCP-47 tag the picker
 produced (e.g. ``nml``, ``ba-x-dialect``, ``en-US-x-Kent``) — the same
 value the daemon owns as the project's langcode.
 
+## 8b. Whole-file editor contract (`submit_file`, since 0.53.0; desktop-only)
+
+The contract for a peer that serializes and saves the **entire LIFT**
+per edit (desktop A-Z+T) instead of using § 9a's surgical writes.
+Design + rationale: `azt-collab/agenda/azt_persistence_server_sync.md`.
+
+A whole-file editor MUST NOT plain-overwrite the working-tree LIFT: the
+daemon merges peer changes into that file (WAN sync, LAN receive), and
+an overwrite based on a stale in-memory model silently reverts them at
+the content level. Instead, every save is **base-aware**:
+
+```python
+from azt_collab_client import submit_file, project_status, S
+
+# At load: remember the base you are editing on.
+base = project_status(langcode).head_sha    # '' pre-first-commit
+
+# At save: serialize the WHOLE file to a staged sibling (same
+# directory as the target — the daemon does a same-filesystem
+# os.replace), then hand it off:
+result = submit_file(langcode, 'xyz.lift', staged_path, base)
+if result.has(S.MERGED_WITH_LOCAL):
+    # Peer changes landed since ``base`` and were three-way-merged
+    # with your bytes. NOTHING WAS LOST — but your in-memory model
+    # is stale. Reload before accepting further edits (§ 14 smooth
+    # reload).
+    ...
+if result.has(S.COMMITTED_LOCAL):
+    base = result.head_sha                  # your next base
+elif result.has(S.CONTRIBUTOR_UNSET):
+    # Bytes landed on disk (durability never waits on identity);
+    # only the commit was refused. Route to the set-your-name
+    # screen; keep base unchanged.
+    ...
+elif result.has_any(S.SERVER_UNAVAILABLE, S.SERVER_ERROR, S.BUSY,
+                    S.COMMIT_FAILED):
+    # Bytes may not have landed — fall back to your direct
+    # atomic write so the user's save NEVER fails, and retry the
+    # daemon path later. (A 'not_found' SERVER_ERROR means the
+    # daemon predates 0.53.0.)
+    ...
+```
+
+Obligations:
+
+1. **Never bypass.** All LIFT writes in collab mode go through
+   ``submit_file`` (or, on daemon-unavailable, the documented direct
+   fallback + a later ``commit_project`` to pick the bytes up). Never
+   write the working-tree LIFT while also holding a stale base — the
+   base-aware handoff is the no-clobber guarantee.
+2. **Reload on `MERGED_WITH_LOCAL`** before accepting further edits;
+   until the reload completes, defer/queue saves.
+3. **§ 17b still applies.** Poll ``project_status`` (5–15 s) and
+   reload on ``head_sha`` change — ``submit_file`` protects your
+   *writes*; the poll bounds how long you *display* stale peer data.
+4. **Commit cadence.** ``submit_file`` commits synchronously per save.
+   Non-LIFT artifacts (settings files, audio, chart output) are picked
+   up by whole-tree staging on the next commit — call
+   ``commit_project`` at task boundaries / shutdown for those; don't
+   call it per keystroke.
+5. **Desktop only.** On Android there is no staged-file handoff
+   through the ContentProvider; use § 9a surgical writes there.
+
+Registration of a desktop project (adopt-in-place) also appends azt's
+artifact ignore patterns to the project ``.gitignore`` (daemon-side,
+idempotent, content-preserving) and refuses a second langcode over an
+already-registered working_dir with HTTP 409
+``working_dir_already_registered`` + ``existing_langcode``.
+
 ## 9. Audio / image references
 
 For audio recording:
@@ -2196,8 +2265,12 @@ doesn't wait a full ``connectivity_poll_s`` tick.
 # is its own walk over the local commit graph); two are the
 # settings toggles that gate auto-resolution.
 #
-#   1. wan_unshared  — commits not on github (the "remote
-#                       tracking ref" channel). Special case:
+#   1. wan_unshared  — commits whose bytes are not yet on github
+#                       — not on the main tracking ref NOR on any
+#                       per-device topic ref. Since 0.53.3 this
+#                       counts DOWN as a chunked topic-push uploads
+#                       history (was: pinned at the full divergence
+#                       until the final merge). Special case:
 #                       LAN-only projects with no origin URL
 #                       walk from HEAD, so wan_unshared equals
 #                       the whole history. Intentional friction
@@ -2209,18 +2282,32 @@ doesn't wait a full ``connectivity_poll_s`` tick.
 #   3. at_risk        — commits on neither channel (intersection
 #                       of wan_unshared and lan_unshared as
 #                       commit sets). Zero except in state E.
-#   4. n_changes      — uncommitted working-tree changes.
+#                       Since 0.53.3 also excludes topic refs
+#                       (bytes on a topic ref are on github, so
+#                       not at risk) — matches wan_unshared.
+#   4. main_merged    — bool, since 0.53.3. True only when the
+#                       local tip is fully on github's main. The
+#                       gate for "OK": because wan_unshared can
+#                       reach 0 while bytes sit on a topic ref
+#                       awaiting merge, wan==0 alone no longer
+#                       means backed up. Pre-0.53 daemons omit
+#                       it; the mirror defaults it True.
+#   5. n_changes      — uncommitted working-tree changes.
 #                       Drives the always-red R(+n) badge.
-#   5. work_offline   — daemon-wide toggle. When on, scheduler
+#   6. work_offline   — daemon-wide toggle. When on, scheduler
 #                       drain does not push to github.
-#   6. lan_allow_sync — daemon-wide toggle. When on, LAN
+#   7. lan_allow_sync — daemon-wide toggle. When on, LAN
 #                       listener / fan-out is armed.
 #
-# Five sync-status labels fall out of the three count axes:
+# Sync-status labels (wan_done := wan==0 AND main_merged):
 #
-#   wan=0, lan=0                          → "OK"
+#   wan_done, lan=0                       → "OK"
+#   wan==0, not main_merged, lan=0        → "WAN-0" (finishing:
+#                                           all bytes uploaded to a
+#                                           topic ref, final merge to
+#                                           main pending)
 #   wan>0, lan=0                          → "WAN-{wan}"
-#   wan=0, lan>0                          → "LAN-{lan}"
+#   wan_done, lan>0                       → "LAN-{lan}"
 #   wan>0, lan>0, at_risk=0  (rare)       → "WAN-{wan}_LAN-{lan}"
 #                                           (split-brain — different
 #                                            commits on each channel
@@ -2271,6 +2358,7 @@ ps = project_status(langcode)
 wan = ps.wan_unshared
 lan = ps.lan_unshared
 ar  = ps.at_risk
+mm  = ps.main_merged   # since 0.53.3; pre-0.53 daemons → True
 n   = ps.n_changes
 wo  = ps.work_offline
 lt  = ps.lan_allow_sync
@@ -2282,13 +2370,23 @@ def plain(text):return text
 wan_part = red(f"WAN-{wan}") if not wo else plain(f"WAN-{wan}")
 lan_part = red(f"LAN-{lan}") if lt        else plain(f"LAN-{lan}")
 
+# WAN "done" gate (since 0.53.3). ``wan_unshared`` now counts DOWN as
+# a chunked topic-push uploads history and reaches 0 once all bytes
+# are on github but BEFORE the final merge into main. So wan==0 no
+# longer means "backed up" — the WAN channel is done only when there
+# is nothing left to upload (wan==0) AND the merge landed
+# (main_merged). The wan==0-but-not-merged window renders as "WAN-0"
+# ("finishing"), never "OK". Pre-0.53 daemons omit main_merged; the
+# mirror defaults it True, so this collapses to the old wan==0 rule.
+wan_done = (wan == 0 and mm)
+
 # State label.
-if wan == 0 and lan == 0:
+if wan_done and lan == 0:
     label = "OK"
-elif wan == 0:
+elif wan_done:
     label = lan_part
 elif lan == 0:
-    label = wan_part
+    label = wan_part          # "WAN-0" during the finishing/merging window
 elif ar == 0:
     # State D (rare): split-brain — underscore separator.
     label = wan_part + "_" + lan_part

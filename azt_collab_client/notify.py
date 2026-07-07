@@ -49,9 +49,10 @@ _subscriptions_lock = threading.Lock()
 
 
 def _is_android():
+    # Kivy-free (0.53.1); see azt_collab_client/_platform.py.
     try:
-        from kivy.utils import platform
-        return platform == 'android'
+        from ._platform import on_android
+        return on_android()
     except Exception:
         return False
 

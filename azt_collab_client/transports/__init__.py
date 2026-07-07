@@ -69,9 +69,13 @@ _transport: Optional[Transport] = None
 
 
 def _on_android():
+    # Kivy-free on purpose (0.53.1): this runs on EVERY RPC, and
+    # importing Kivy from a non-Kivy host (desktop azt) lets Kivy's
+    # import-time argv parser kill the process on host flags like
+    # --restart. See azt_collab_client/_platform.py.
     try:
-        from kivy.utils import platform
-        return platform == 'android'
+        from .._platform import on_android
+        return on_android()
     except Exception:
         return False
 

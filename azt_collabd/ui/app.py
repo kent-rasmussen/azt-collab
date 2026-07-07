@@ -1068,6 +1068,41 @@ class RootSM(ScreenManager):
     pass
 
 
+def _github_backup_line(ps):
+    """One-line GitHub backup-progress summary for the settings
+    'Current project' block — the surface a user can screenshot to
+    show how far a slow trickle-up still has to go.
+
+    Reads the daemon's sync counters with 0.53.3 semantics:
+    ``wan_unshared`` is how many commits still need their bytes on
+    github and TICKS DOWN as a chunked topic-push uploads history
+    (pre-0.53 it stayed pinned at the full divergence until the final
+    merge); ``main_merged`` gates the fully-backed-up state, because
+    all bytes can be on github via a topic ref before the final merge
+    to main lands — the "WAN-0 / finishing" window. Returns '' when
+    the status is unknown (never guesses "backed up")."""
+    if ps is None:
+        return ''
+    try:
+        wan = int(getattr(ps, 'wan_unshared', 0) or 0)
+        merged = bool(getattr(ps, 'main_merged', True))
+        offline = bool(getattr(ps, 'work_offline', False))
+    except Exception:
+        return ''
+    if wan <= 0 and merged:
+        return _tr('GitHub backup: ✓ backed up')
+    if wan <= 0 and not merged:
+        # All bytes uploaded to a topic ref; the final merge to main
+        # hasn't completed yet. Not "backed up" per the user contract
+        # ("no OK until it's merged"); the count stays at 0.
+        return _tr('GitHub backup: finishing (merging)…')
+    # wan > 0: still uploading. Show how far it has to go.
+    if offline:
+        return _tr('GitHub backup: {n} commit(s) to go '
+                   '(paused — work offline)').format(n=wan)
+    return _tr('GitHub backup: {n} commit(s) to go').format(n=wan)
+
+
 # ── Settings ────────────────────────────────────────────────────────────────
 
 class SettingsScreen(Screen):
@@ -1495,25 +1530,31 @@ class SettingsScreen(Screen):
         # not have to Publish to GitHub first just to see the Share
         # button. So the gate is gone; the popup adapts internally
         # (hides the github-invite section when remote_url is empty).
+        # GitHub backup-progress line (0.53.3). Only meaningful when
+        # the project has a github remote; for LAN-only / unpublished
+        # projects the info block already says "not published".
+        backup_line = _github_backup_line(ps) if live_remote_url else ''
         if info is not None:
             if live_remote_url:
                 info.text = _tr(
                     'Project: {langcode}\nRemote: {remote_url}'
                 ).format(langcode=project.langcode,
                          remote_url=live_remote_url)
+                if backup_line:
+                    info.text = info.text + '\n' + backup_line
             else:
                 info.text = _tr(
                     'Project: {langcode}\n'
                     '(not published to GitHub — '
                     'share over local network only)'
                 ).format(langcode=project.langcode)
-        # Heights (0.45.0): section label (dp 32) + info (~dp 40) +
-        # share-project button (dp 52) + msg (dp 20) + 3× spacing
-        # (dp 8 each). The separate grant_collab button is gone in
-        # 0.45.0 — folded into the share popup's three-section
-        # body. Switch-project lives OUTSIDE this row.
-        row.height = (dp(32) + dp(40) + dp(52) + dp(20)
-                      + dp(8) * 3)
+        # Heights (0.45.0): section label (dp 32) + info (~dp 40, +dp 20
+        # for the optional backup line) + share-project button (dp 52) +
+        # msg (dp 20) + 3× spacing (dp 8 each). The separate grant_collab
+        # button is gone in 0.45.0 — folded into the share popup's
+        # three-section body. Switch-project lives OUTSIDE this row.
+        row.height = (dp(32) + dp(40) + (dp(20) if backup_line else 0)
+                      + dp(52) + dp(20) + dp(8) * 3)
         row.opacity = 1
         # Restore the children that ``_detach_project_actions_children``
         # may have removed during a previous refresh while the row

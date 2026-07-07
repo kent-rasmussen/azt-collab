@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.52.33"
+__version__ = "0.53.3"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -251,10 +251,11 @@ def open_server_ui(on_status=None):
         if not result['ok'] and not result.get('prompted'):
             self._set_log(result['error'])
     """
-    try:
-        from kivy.utils import platform
-    except Exception:
-        platform = ''
+    # Kivy-free platform probe (0.53.1) — importing Kivy from a
+    # non-Kivy host lets its argv parser kill the process; see
+    # azt_collab_client/_platform.py.
+    from ._platform import platform as _plat
+    platform = _plat()
     if platform == 'android':
         return _open_server_ui_android(on_status)
     import os
@@ -356,10 +357,11 @@ def pick_project(timeout_seconds=None):
         {'ok': False, 'error': 'server_apk_not_installed'}
         {'ok': False, 'error': 'timeout'}
     """
-    try:
-        from kivy.utils import platform
-    except Exception:
-        platform = ''
+    # Kivy-free platform probe (0.53.1) — importing Kivy from a
+    # non-Kivy host lets its argv parser kill the process; see
+    # azt_collab_client/_platform.py.
+    from ._platform import platform as _plat
+    platform = _plat()
     if platform == 'android':
         return _pick_project_android(timeout_seconds)
     return _pick_project_desktop(timeout_seconds)
@@ -2080,7 +2082,14 @@ def sync_project(langcode):
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])
     if resp.get('ok'):
-        return Result.from_dict(resp.get('result') or {})
+        res = Result.from_dict(resp.get('result') or {})
+        # Post-sync HEAD (daemon 0.53.0+; '' from older daemons).
+        # Lets a whole-file editor update its cached base — and,
+        # after PULLED, decide reload-vs-not — without a follow-up
+        # project_status poll. Daemon-provided, plain attribute (not
+        # part of the Result wire shape).
+        res.head_sha = str(resp.get('head_sha', '') or '')
+        return res
     return Result(statuses=[Status(
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
 
@@ -2223,10 +2232,11 @@ def cawl_index(langcode):
     the daemon emits the full payload. The file route uses a
     kernel FD with no IPC size limit. Desktop loopback HTTP has
     no such cap so the JSON-RPC path is fine there."""
-    try:
-        from kivy.utils import platform
-    except Exception:
-        platform = ''
+    # Kivy-free platform probe (0.53.1) — importing Kivy from a
+    # non-Kivy host lets its argv parser kill the process; see
+    # azt_collab_client/_platform.py.
+    from ._platform import platform as _plat
+    platform = _plat()
     if platform == 'android':
         try:
             from .lift_io import _cawl_index_via_fd
@@ -2490,6 +2500,67 @@ def atomic_commit_bytes(langcode, rel_path, data, commit_after=True):
         return Result.from_dict(resp.get('result') or {})
     return Result(statuses=[Status(
         'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
+def submit_file(langcode, rel_path, staged_path, base_sha, message=''):
+    """Base-aware whole-file save — the desktop A-Z+T write
+    primitive (daemon 0.53.0+). The caller serializes its full file
+    to *staged_path* (a sibling of the target, e.g. the ``.part``
+    file azt already writes) and declares *base_sha*, the HEAD it
+    loaded / last saved against (from ``project_status.head_sha``
+    or the previous submit's ``head_sha``; pass ``''`` on a fresh
+    unregistered tree). The daemon, under ``project_lock``, either
+    fast-path replaces + commits (HEAD unchanged) or three-way
+    LIFT-merges the submitted bytes with the peer changes that
+    landed in between — the caller's edits and the peers' both
+    survive, by construction, regardless of poll freshness.
+
+    *rel_path* uses the atomic-commit whitelist (``<file>.lift`` /
+    ``audio/<f>`` / ``images/<f>``). The staged file is consumed on
+    success. Desktop/loopback only — Android peers keep the
+    surgical-write path.
+
+    Returns ``Result``; drive logic with codes, in this order:
+
+    - ``result.has(S.MERGED_WITH_LOCAL)`` → save succeeded AND a
+      peer merge was folded in: the caller's in-memory model is
+      stale and MUST reload before further edits (params
+      ``n_conflicts``, ``base_sha``).
+    - ``result.has(S.COMMITTED_LOCAL)`` → committed; the new base
+      is ``result.head_sha`` (also on
+      ``result.param(S.COMMITTED_LOCAL, 'head_sha')``).
+    - ``S.CONTRIBUTOR_UNSET`` → bytes landed on disk (durability
+      never waits on identity) but no commit — route to the
+      set-your-name screen.
+    - ``S.BUSY`` / ``S.COMMIT_FAILED`` / ``S.SERVER_ERROR`` /
+      ``S.SERVER_UNAVAILABLE`` → bytes may not have landed; the
+      caller should fall back to its direct write path.
+
+    ``result.head_sha`` (plain attribute, '' on failure) is the
+    post-commit HEAD — the caller's next *base_sha*. Against a
+    pre-0.53.0 daemon the endpoint 404s and this returns
+    ``SERVER_ERROR`` with ``error='not_found'`` — callers treat
+    that as "fall back to direct write"."""
+    body = {'path': rel_path, 'staged_path': staged_path,
+            'base_sha': base_sha or ''}
+    if message:
+        body['message'] = message
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/submit_file',
+                    body)
+    except ServerUnavailable as ex:
+        res = Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+        res.head_sha = ''
+        return res
+    if resp.get('ok'):
+        res = Result.from_dict(resp.get('result') or {})
+        res.head_sha = str(resp.get('head_sha', '') or '')
+        return res
+    res = Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+    res.head_sha = ''
+    return res
 
 
 def set_audio(langcode, guid, lang, filename, commit_after=True):
@@ -2908,6 +2979,7 @@ __all__ = [
     'commit_project', 'request_sync', 'poll_job',
     'get_work_offline', 'set_work_offline',
     'atomic_commit_bytes', 'atomic_finalize_pending',
+    'submit_file',
     'set_audio', 'set_illustration',
     'get_daemon_log',
     'get_daemon_log_files',

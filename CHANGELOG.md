@@ -9,6 +9,138 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.53.3 — sync: WAN count ticks down during chunked push; GitHub-backup progress in server settings UI
+
+Field gap (deblock-sync item): during a big chunked topic-push (nml, 2754 commits), nothing
+showed the user how far the trickle-up had left to go. `wan_unshared` compared local `main`
+against `origin/main`, so it stayed **pinned at 2754** the whole upload and only dropped to 0
+at the final merge — no visible progress. The live decreasing number (`remaining=…`) existed
+only in trace logs.
+
+Fix — redefine the count against what's actually on github, and surface it:
+
+- **`_wan_unshared` (repo.py)** now counts commits not reachable from `origin/main` **∪ any
+  `origin/azt-pending-*` topic ref**. A commit's bytes are durable on github the moment its
+  chunk lands on the topic ref (whose local tracking ref advances per chunk), so the count
+  now **ticks down** as the push progresses instead of staying pinned.
+- **`_at_risk`** excludes those topic tips too — commits parked on github (pre-merge) are not
+  at risk.
+- **`_main_merged` (new)** — True only when the local tip is fully on `origin/main`. This is
+  the gate for the "OK/backed-up" state: because the count can reach 0 while bytes sit on a
+  topic ref awaiting merge, **`wan_unshared == 0` no longer means backed up**. That window is
+  "WAN-0 / finishing"; "OK" requires the merge to have landed. (Per the explicit contract:
+  no OK until it's merged; if everything's uploaded but not merged, the count stays at 0.)
+- **Wire**: `project_status` gains `main_merged` (bool). Client `ProjectStatus` mirror adds it
+  **defaulting True**, so a pre-0.53.3 daemon reproduces the old "OK when wan==0" behaviour
+  rather than sticking at WAN-0. Additive + backward-tolerant → no `MIN_*` floor bump.
+- **§ 17b** rendering recipe updated: `wan_done := wan==0 AND main_merged`; the wan==0-not-
+  merged window renders `WAN-0`.
+- **Server settings UI** (`azt_collabd/ui/app.py`, the daemon-owned settings screen): the
+  "Current project" block now shows a GitHub-backup line — `✓ backed up` / `finishing
+  (merging)…` / `{n} commit(s) to go` (+ `paused — work offline`). French strings added to
+  the client catalog. This is server-UI-only; nothing new was added to the peer sync indicator.
+
+LAN-only projects (no origin URL) are unchanged — no topic ref, so the whole-history "WAN-+N"
+friction signal stands.
+
+## 0.53.2 — daemon: DATA_LOSS_RISK no longer false-alarms on desktop-azt project shapes
+
+Field repro (first desktop-azt commit on nml, 2026-07-07): `submit_file`'s
+commit returned `['DATA_LOSS_RISK', 'COMMITTED_LOCAL']`. The
+`_detect_uncommittable` walk in `_commit_step_locked` checks a recorder-shaped
+whitelist (`audio/`, `images/`, top-level `.lift`), so a desktop project's
+settings JSONs / `WritingSystems/*.ldml` / `reports/` / dated `.lift_*.txt`
+backups all get flagged as "will silently never be backed up" — which is false
+on this path: staging is whole-tree `add -A`, so every such file was either
+just staged (backed up) or is `.gitignore`-matched (deliberate exclusion per
+the AZT persistence contract D5/D6). Since peers route `DATA_LOSS_RISK` as a
+never-silenced sticky banner, the false alarm is user-facing and loud.
+
+Fix: after staging, filter the walk's candidates to the genuinely-at-risk
+remainder — not in the index AND not ignore-matched (via
+`dulwich.ignore.IgnoreFilterManager`); filter failure keeps the unfiltered
+list (fail-alarming, not fail-silent). The `_stage_audio` copy of the walk is
+untouched — staging there is genuinely selective, so its warning stays
+truthful. Test: `test_desktop_project_shapes_do_not_trip_data_loss_risk`.
+
+## 0.53.1 — client: Kivy-free platform probes on all non-UI paths
+
+Field repro (desktop azt, 2026-07-07): the first RPC from a non-Kivy host
+imported Kivy — `transports._on_android` (and five sibling non-UI sites) did a
+function-local `from kivy.utils import platform` — and Kivy's import-time argv
+parser rejected the host's own `--restart` flag: `Core: option --restart not
+recognized` → hard exit before azt could even load. Kivy hosts (recorder,
+viewer) never saw this because Kivy was already imported with argv they own.
+
+Fix: new `azt_collab_client/_platform.py` (env/sys.platform mirror of
+`kivy.utils.platform`, identical answers on all suite platforms); all non-UI
+probes now use it (`transports/__init__._on_android`, `__init__.py`
+open_server_ui / pick_project / CAWL-index route, `lift_io.LiftHandle.
+open_read`, `notify._is_android`, `lowpower._is_android`). `ui/` modules may
+still import Kivy — they require a Kivy host anyway (hard rule #4 updated).
+Regression test `tests/test_no_kivy_on_desktop_paths.py` runs the desktop path
+in a clean subprocess with a hostile `--restart` argv and asserts `kivy` never
+enters `sys.modules`. Desktop azt also sets `KIVY_NO_ARGS=1` defensively
+before importing the client (azt 1.6.0), so any future leak degrades to a
+harmless import instead of a dead app. No wire change; no version-floor bumps.
+
+## 0.53.0 — desktop AZT persistence: base-aware `submit_file` + adopt-in-place hardening (G1–G4)
+
+The daemon half of the AZT persistence contract
+(`agenda/azt_persistence_server_sync.md`; azt-side wiring is the sibling
+`azt/agenda/azt_run_with_server.md` item). Desktop A-Z+T autosaves the whole
+LIFT on nearly every edit and never re-reads; without a base-aware write, its
+first save after a daemon-side merge would content-clobber peer work. New
+capability set:
+
+- **G1 `POST /v1/projects/<lang>/submit_file`** (`{path, staged_path,
+  base_sha, message?}`): the caller serializes its full file to a **staged
+  sibling** (azt's existing `.part` discipline) and declares the HEAD it
+  edited against. Under `project_lock`: HEAD == base → zero-copy
+  `os.replace` + synchronous commit; HEAD moved → three-way LIFT merge
+  (blob@base, blob@HEAD, staged bytes) via the existing `lift_merge` +
+  truncation guards + forensic diagnostics, then commit. New status code
+  **`MERGED_WITH_LOCAL`** (both mirrors + FR translation) tells the caller
+  its in-memory state is stale and must reload. Empty/unknown base against
+  an existing HEAD merges with empty base (add-add) — never a plain replace.
+  Bytes-durability never waits on identity: contributor-unset still lands
+  the file, refuses only the commit. Post-commit side effects (pending-push,
+  `last_commit` stamp, LAN backoff/burst + fan-out) shared with the debounced
+  commit worker via the new `scheduler.after_committed_local()`. Client
+  wrapper `azt_collab_client.submit_file(...)` returns a `Result` with
+  `.head_sha` (the caller's next base); against a pre-0.53 daemon it
+  surfaces `SERVER_ERROR error='not_found'` → caller falls back to direct
+  write. Desktop/loopback only by design (Android peers keep surgical
+  writes; no cross-process staged-file handoff via ContentProvider).
+- **G2 `head_sha` in results.** `COMMITTED_LOCAL` now carries a `head_sha`
+  param (extra params are invisible to older clients — no
+  `MIN_CLIENT_VERSION` bump); `/sync` responses carry a top-level
+  `head_sha` the client attaches as `result.head_sha`. New `Result.param()`
+  accessor on both status mirrors.
+- **G3 adopt-time `.gitignore` hardening.** `register_project` now appends
+  (idempotently, content-preserving) azt's desktop artifact patterns
+  (`*.lift*txt` daily backups, `*.gz`/`*.7z` emailed variants, `reports/**`,
+  `exports/**`, `*.pdf`, WeSay/Chorus sidecars, …) via
+  `repo.ensure_ignore_patterns` — `_stage_all` is whole-tree `add -A`, so
+  an adopted desktop tree would otherwise commit all of it. Harmless no-op
+  on recorder projects.
+- **G4 duplicate-working_dir guard.** `projects.register()` refuses a
+  second langcode over an already-registered working_dir
+  (`WorkingDirAlreadyRegistered` → HTTP 409 `working_dir_already_registered`
+  + `existing_langcode`); previously `find_langcode_by_working_dir`
+  (first-hit scan) went nondeterministic under a duplicate. Re-registering
+  the same langcode (the normal update path) is unchanged.
+
+Tests: `tests/test_submit_file.py` — fast path, divergent no-clobber merge
+(both sides' entry edits survive), empty-base merge, auto-init recovery,
+contributor-unset durability, staged-path validation, ignore idempotence,
+409 guard, debounce burst-collapse, mirror drift, `Result.param`.
+
+No `MIN_CLIENT_VERSION` / `MIN_SERVER_VERSION` bump — all additions are
+new endpoints, new params, or new top-level response keys that older
+peers never read; the one new status code is only ever returned by the
+new endpoint.
+
 ## 0.52.33 — new-project template: prune definition + citation forms (rules 3 & 4)
 
 Follow-up to 0.52.32, which deliberately left `<definition>` and `<citation>` "as-is".

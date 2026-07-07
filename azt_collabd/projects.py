@@ -43,6 +43,22 @@ from .paths import azt_home
 _PROJECTS_FILENAME = 'projects.json'
 
 
+class WorkingDirAlreadyRegistered(ValueError):
+    """A different langcode already claims this working_dir.
+
+    ``register()`` raises this instead of silently upserting a
+    second project over the same tree. Carries the existing
+    langcode so the RPC layer can return a typed error the client
+    routes ("this folder already belongs to project X")."""
+
+    def __init__(self, existing_langcode, working_dir):
+        self.existing_langcode = existing_langcode
+        self.working_dir = working_dir
+        super().__init__(
+            f'working_dir {working_dir!r} is already registered to '
+            f'project {existing_langcode!r}')
+
+
 def projects_path():
     return os.path.join(azt_home(), _PROJECTS_FILENAME)
 
@@ -213,6 +229,30 @@ def register(langcode, working_dir, lift_path='', remote_url='',
     if not working_dir:
         raise ValueError('working_dir required')
     data = _load_raw()
+    if not isinstance(data, _LoadFailed):
+        # One working_dir belongs to at most one langcode. Without
+        # this guard a second registration over the same tree makes
+        # ``find_langcode_by_working_dir`` (first-hit scan)
+        # nondeterministic, and two projects' commit/merge paths
+        # would fight over one git repo. Re-registering the SAME
+        # langcode stays allowed (that's the normal update path).
+        try:
+            wd_abs = os.path.abspath(working_dir)
+        except Exception:
+            wd_abs = working_dir
+        for other_lang, entry_d in data.items():
+            if other_lang == langcode:
+                continue
+            other_wd = entry_d.get('working_dir', '') if isinstance(
+                entry_d, dict) else ''
+            if not other_wd:
+                continue
+            try:
+                same = os.path.abspath(other_wd) == wd_abs
+            except Exception:
+                same = other_wd == working_dir
+            if same:
+                raise WorkingDirAlreadyRegistered(other_lang, working_dir)
     if isinstance(data, _LoadFailed):
         # Same guard as ``_update``: refuse to clobber a corrupt
         # ``projects.json`` with a registry that contains *only* the

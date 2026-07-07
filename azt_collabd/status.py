@@ -65,6 +65,18 @@ NO_REPO = 'NO_REPO'
 # wrapper ``atomic_commit_bytes``.
 ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 
+# ``submit_file`` (0.53.0) took the divergent path: HEAD had moved
+# past the caller's declared ``base_sha`` (a peer merge landed since
+# the caller loaded), so the daemon three-way-merged the submitted
+# bytes with HEAD instead of plain-replacing. The caller's content
+# is preserved AND the peer's — but the caller's in-memory state is
+# now stale and it MUST reload the file before further edits.
+# Params: ``n_conflicts`` (entry-level conflicts annotated in the
+# merged LIFT), ``base_sha`` (the stale base the caller declared).
+# Usually accompanied by ``COMMITTED_LOCAL`` carrying the new
+# ``head_sha``.
+MERGED_WITH_LOCAL = 'MERGED_WITH_LOCAL'
+
 # Surgical LIFT edits (since 0.50.29). Both endpoints
 # (``set_audio`` / ``set_illustration``) splice one sub-element
 # into one entry without round-tripping the whole DOM peer-side,
@@ -502,6 +514,16 @@ class Result:
 
     def codes(self):
         return [s.code for s in self.statuses]
+
+    def param(self, code, key, default=None):
+        """Value of ``params[key]`` on the first status matching
+        *code*, or *default*. Convenience for single-value reads
+        like ``result.param(S.COMMITTED_LOCAL, 'head_sha', '')``.
+        Mirrored in ``azt_collab_client/status.py``."""
+        for s in self.statuses:
+            if s.code == code:
+                return s.params.get(key, default)
+        return default
 
     def to_dict(self):
         return {'statuses': [s.to_dict() for s in self.statuses]}

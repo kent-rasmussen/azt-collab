@@ -55,6 +55,7 @@ from . import store
 from .locks import project_lock
 from .net import _has_internet
 from .paths import azt_home, server_info_path
+from . import repo as repo_mod
 from .repo import sync_repo as _sync_repo, repo_status_summary as _repo_status
 from .status import Result, Status
 from . import status as S
@@ -2690,7 +2691,21 @@ def _h_register_project(body):
         lift_path = os.path.abspath(lift_path)
     if not remote_url:
         remote_url = projects.derive_remote_url(working_dir)
-    p = projects.register(langcode, working_dir, lift_path, remote_url)
+    try:
+        p = projects.register(langcode, working_dir, lift_path, remote_url)
+    except projects.WorkingDirAlreadyRegistered as ex:
+        return 409, {"ok": False,
+                     "error": "working_dir_already_registered",
+                     "existing_langcode": ex.existing_langcode}
+    # Desktop-adopt hardening: whole-tree staging (``_stage_all`` is
+    # ``add -A``) would otherwise commit azt's emailed-backup
+    # variants, reports, and PDFs. Idempotent; harmless on recorder
+    # projects (they never produce these files).
+    added = repo_mod.ensure_ignore_patterns(working_dir)
+    if added:
+        print(f'[register] {langcode!r}: appended '
+              f'{len(added)} azt ignore pattern(s) to .gitignore',
+              file=sys.stderr, flush=True)
     _touch_project(langcode)
     return 200, {"ok": True, "project": _project_for_api(p)}
 
@@ -2754,7 +2769,12 @@ def _h_project_sync(langcode, body):
         scheduler._set_pending_push(langcode, False)
     elif 'COMMITTED_LOCAL' in codes:
         scheduler._set_pending_push(langcode, True)
-    return 200, {"ok": True, "result": res.to_dict()}
+    # ``head_sha`` (0.53.0): post-sync HEAD so the caller can update
+    # its cached base (and decide whether a reload is needed after
+    # PULLED) without a follow-up project_status poll. Top-level key
+    # — old clients' Result decode ignores it.
+    return 200, {"ok": True, "result": res.to_dict(),
+                 "head_sha": repo_mod.head_sha_of(p.working_dir)}
 
 
 def _h_project_status(langcode, _body):
@@ -2785,10 +2805,19 @@ def _h_project_status(langcode, _body):
     # contract of ``_wan_unshared``).
     lan_unshared = 0
     at_risk = 0
+    # main_merged: True only when the local branch tip is fully on
+    # github's main — the gate for the "OK" sync state. Since 0.53.3
+    # ``wan_unshared`` counts DOWN as a chunked topic-push uploads
+    # history and reaches 0 when all bytes are on github but BEFORE
+    # the final merge; ``main_merged`` distinguishes that "WAN-0,
+    # finishing" window from a genuinely backed-up "OK" project. False
+    # on any uncertainty so the UI never falsely claims "backed up".
+    main_merged = False
     try:
         from dulwich.repo import Repo as _Repo
         from .repo import _lan_unshared as _calc_lan_unshared
         from .repo import _at_risk as _calc_at_risk
+        from .repo import _main_merged as _calc_main_merged
         _diag_repo = None
         try:
             _diag_repo = _Repo(p.working_dir)
@@ -2805,6 +2834,10 @@ def _h_project_status(langcode, _body):
                     _diag_repo, branch, langcode)
             except Exception:
                 at_risk = 0
+            try:
+                main_merged = _calc_main_merged(_diag_repo, branch)
+            except Exception:
+                main_merged = False
             try:
                 _diag_repo.close()
             except Exception:
@@ -2916,6 +2949,15 @@ def _h_project_status(langcode, _body):
         "wan_unshared": wan_unshared,
         "lan_unshared": lan_unshared,
         "at_risk": at_risk,
+        # Merge gate for the "OK" state (since 0.53.3). Since
+        # ``wan_unshared`` now counts down during a chunked topic-push
+        # and hits 0 once all bytes are on github but before the final
+        # merge, ``wan_unshared == 0`` no longer implies "backed up".
+        # "OK" requires ``main_merged`` too; ``wan_unshared == 0 and
+        # not main_merged`` is the "WAN-0, finishing" window. Older
+        # peers that don't read this key default it True (§ 17b),
+        # preserving pre-0.53 behaviour (OK when wan==0).
+        "main_merged": main_merged,
         "last_commit": p.last_commit,
         "last_sync": p.last_sync,
         "working_dir": p.working_dir,
@@ -3432,6 +3474,83 @@ def _h_project_atomic_commit(langcode, body):
                        bytes_written=len(data),
                        sha256=hashlib.sha256(data).hexdigest())
     return 200, {"ok": True, "result": res.to_dict()}
+
+
+def _h_project_submit_file(langcode, body):
+    """POST /v1/projects/<lang>/submit_file  (0.53.0)
+
+    Base-aware whole-file write + synchronous commit — the desktop
+    A-Z+T save primitive. Request body::
+
+        {"path": "<rel_path>",          # atomic-commit whitelist
+         "staged_path": "/abs/…part",   # sibling file, same dir
+         "base_sha": "<hex|''>",        # HEAD the caller edited on
+         "message": "…"}                # optional commit message
+
+    The caller writes its full serialization to ``staged_path``
+    (a sibling of the target, so the handoff is a same-filesystem
+    ``os.replace`` — no byte copy through the RPC body, unlike
+    ``atomic_commit``'s base64 path). The daemon, under
+    ``project_lock``: fast-path replaces + commits when HEAD ==
+    ``base_sha``; otherwise three-way-merges (blob at base, blob at
+    HEAD, staged bytes) so a merge that landed since the caller's
+    base is never clobbered. See ``repo.submit_file`` for the full
+    semantics and status codes.
+
+    Response: ``{ok, result, head_sha}`` — ``head_sha`` is the
+    post-commit HEAD, the caller's next base. Desktop-only by
+    design (Android peers use surgical writes; there is no
+    cross-process staged-file handoff through the ContentProvider)."""
+    p = projects.get(langcode)
+    if p is None:
+        return 404, {"ok": False, "error": "project_not_found"}
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "invalid_body"}
+    rel = body.get('path') or ''
+    staged = body.get('staged_path') or ''
+    base_sha = body.get('base_sha') or ''
+    message = body.get('message') or ''
+    if not isinstance(rel, str) or not rel:
+        return 400, {"ok": False, "error": "missing_path"}
+    if not isinstance(staged, str) or not staged:
+        return 400, {"ok": False, "error": "missing_staged_path"}
+    if not isinstance(base_sha, str):
+        return 400, {"ok": False, "error": "invalid_base_sha"}
+    target = _resolve_atomic_commit_path(p.working_dir, rel)
+    if target is None:
+        return 400, {"ok": False, "error": "path_rejected"}
+    staged_real = os.path.realpath(staged)
+    # Staged file must be a sibling of the target: same directory ⇒
+    # same filesystem (os.replace stays atomic) and inside the
+    # whitelisted tree (no path smuggling), and must not BE the
+    # target (a replace onto itself would no-op and then unlink).
+    if (not os.path.isfile(staged_real)
+            or os.path.dirname(staged_real) != os.path.dirname(target)
+            or staged_real == target):
+        return 400, {"ok": False, "error": "staged_rejected"}
+    rel_clean = '/'.join(rel.lstrip('/').split('/'))
+    contributor = store.get_contributor()
+    _touch_project(langcode)
+    try:
+        res, head_sha = repo_mod.submit_file(
+            p.working_dir, rel_clean, staged_real, base_sha,
+            contributor, message=message or None)
+    except Exception as ex:
+        print(f'[submit_file] {langcode!r} raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 500, {"ok": False, "error": str(ex)}
+    codes = res.codes()
+    print(f'[submit_file] {langcode!r} done: codes={codes!r} '
+          f'head={head_sha[:12]!r}', file=sys.stderr, flush=True)
+    if 'COMMITTED_LOCAL' in codes:
+        # Same post-commit side effects as the debounced commit
+        # worker: pending-push for the WAN drain, last_commit stamp,
+        # LAN backoff/burst + fan-out so a desktop commit converges
+        # to paired peers exactly like a recorder commit.
+        scheduler._set_pending_push(langcode, True)
+        scheduler.after_committed_local(langcode, p)
+    return 200, {"ok": True, "result": res.to_dict(),
+                 "head_sha": head_sha}
 
 
 def _h_set_audio(langcode, body):
@@ -4602,6 +4721,8 @@ def dispatch(method, path, body):
                 return _h_project_atomic_commit(parts[3], body)
             if len(parts) == 5 and parts[4] == 'atomic_finalize':
                 return _h_project_atomic_finalize(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'submit_file':
+                return _h_project_submit_file(parts[3], body)
             if len(parts) == 5 and parts[4] == 'set_audio':
                 return _h_set_audio(parts[3], body)
             if len(parts) == 5 and parts[4] == 'set_illustration':

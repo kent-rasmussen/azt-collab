@@ -760,6 +760,78 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Ignore patterns for artifacts the desktop A-Z+T app drops beside its
+# LIFT file (mirrors azt's own ``vcs.py Git.ignorelist()``, minus
+# azt-source-repo leftovers). ``_stage_all`` is whole-tree ``add -A``,
+# so without these an adopted desktop project would commit every
+# emailed-backup variant, report, and PDF. Appended (idempotently) to
+# the project's ``.gitignore`` at registration — see
+# ``ensure_ignore_patterns`` and the AZT persistence contract
+# (azt-collab/agenda/azt_persistence_server_sync.md, G3/D5/D6).
+AZT_DESKTOP_IGNORES = (
+    '*.lift*txt',            # daily crash-safety backups (kept, emailed)
+    '*.gz',                  # writegzip variants
+    '*.7z',                  # writelzma variants
+    '*.zip',
+    '*.pdf',                 # chart/report output enters git only via
+    '*.xcf',                 # azt's deliberate force-add paths
+    'XLingPaperPDFTemp/**',
+    'reports/**',
+    'exports/**',
+    'userlogs/**',
+    'excess/**',
+    'images/archive/**',
+    'images/scaled/**',
+    '*backupBeforeLx2LcConversion',
+    '*~',
+    '*.ChorusNotes',         # WeSay/Chorus sidecars from legacy sync
+    '*.WeSayUserMemory',
+    '*.WeSayConfig*',
+    '*.WeSayUserConfig',
+    '*.ChorusRescuedFile',
+)
+
+_AZT_IGNORE_HEADER = ('# A-Z+T desktop artifacts '
+                      '(appended by azt_collabd at registration)')
+
+
+def ensure_ignore_patterns(project_dir, patterns=AZT_DESKTOP_IGNORES):
+    """Idempotently append *patterns* to ``<project_dir>/.gitignore``.
+
+    Creates the file if absent. Existing content is never rewritten
+    or reordered — only patterns not already present (as a whole
+    line, comments ignored) are appended, under a marker header.
+    Returns the list of patterns actually added ([] when everything
+    was already covered). Best-effort: any OSError is swallowed
+    after logging, since a missing ignore rule is recoverable noise
+    while a failed registration is not."""
+    path = os.path.join(project_dir, '.gitignore')
+    try:
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                existing_lines = [ln.strip() for ln in fh.readlines()]
+        except FileNotFoundError:
+            existing_lines = []
+        have = {ln for ln in existing_lines
+                if ln and not ln.startswith('#')}
+        missing = [p for p in patterns if p not in have]
+        if not missing:
+            return []
+        block = ''
+        if existing_lines and existing_lines[-1] != '':
+            block += '\n'
+        if _AZT_IGNORE_HEADER not in existing_lines:
+            block += _AZT_IGNORE_HEADER + '\n'
+        block += '\n'.join(missing) + '\n'
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write(block)
+        return missing
+    except OSError as ex:
+        print(f'[register] ensure_ignore_patterns({project_dir!r}) '
+              f'failed: {ex!r}', file=sys.stderr, flush=True)
+        return []
+
+
 def _enc(s):
     return s.encode('utf-8') if isinstance(s, str) else s
 
@@ -785,6 +857,26 @@ def _get_repo(project_dir):
         return Repo(project_dir)
     except Exception:
         return None
+
+
+def head_sha_of(project_dir):
+    """Current HEAD sha (hex str) of *project_dir*, or '' when the
+    dir isn't a repo / has no commits. The cheap change probe peers
+    compare across polls (CLIENT_INTEGRATION § 17b)."""
+    r = _get_repo(project_dir)
+    if r is None:
+        return ''
+    try:
+        h = r.refs[b'HEAD']
+        return h.decode('ascii', 'replace') if isinstance(h, bytes) \
+            else str(h)
+    except Exception:
+        return ''
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
 
 
 def _is_private_ip_url(url):
@@ -1970,11 +2062,74 @@ def _walk_count_log(repo, tag, msg):
           file=sys.stderr, flush=True)
 
 
+def _origin_topic_ref_tips(repo):
+    """SHA tips of every locally-cached
+    ``refs/remotes/origin/azt-pending-*`` ref — the per-device topic
+    branches a chunked push uploads history to. Commits reachable from
+    these tips have their bytes ON github (durable) even before the
+    final merge into main, so the sync counters treat them as shared.
+    The local mirror of our own topic ref is advanced after every
+    successful chunk (``_push_chunked_to_ref``), which is what makes
+    ``_wan_unshared`` tick down during an in-flight upload. Returns a
+    list of SHA bytes; empty on any failure (OK-on-uncertainty)."""
+    tips = []
+    try:
+        prefix = b'refs/remotes/origin/azt-pending-'
+        for ref, sha in repo.get_refs().items():
+            if ref.startswith(prefix) and sha:
+                tips.append(sha)
+    except Exception:
+        pass
+    return tips
+
+
+def _main_merged(repo, branch):
+    """True when the local branch tip is fully contained in
+    ``refs/remotes/origin/<branch>`` — every local commit is on
+    github's main, so the project is genuinely backed up, not merely
+    uploaded to a topic ref awaiting merge. This is the gate for the
+    "OK" sync state: a project whose bytes are all on a topic ref but
+    not yet merged reads ``WAN-0`` (nothing left to upload) but is NOT
+    "OK". Returns False when no origin URL is configured (LAN-only —
+    never github-merged), when main was never fetched, or on any
+    uncertainty (never falsely claims "merged")."""
+    try:
+        url_str = ''
+        try:
+            url = repo.get_config().get((b'remote', b'origin'), b'url')
+            url_str = url.decode('utf-8', 'replace').strip()
+        except Exception:
+            url_str = ''
+        if not url_str:
+            return False
+        local_ref = b'refs/heads/' + branch.encode()
+        remote_ref = b'refs/remotes/origin/' + branch.encode()
+        try:
+            local_sha = repo.refs[local_ref]
+            remote_sha = repo.refs[remote_ref]
+        except KeyError:
+            return False
+        if local_sha == remote_sha:
+            return True
+        return bool(_is_ancestor(repo, local_sha, remote_sha))
+    except Exception:
+        return False
+
+
 def _wan_unshared(repo, branch):
-    """Count commits on ``refs/heads/<branch>`` not yet on
-    ``refs/remotes/origin/<branch>`` using the local ref cache. Any
-    failure (detached HEAD, no remote ref cached, walker error)
-    returns 0 — the indicator's contract is "OK on uncertainty."
+    """Count commits on ``refs/heads/<branch>`` whose bytes are NOT
+    yet on github — i.e. not reachable from
+    ``refs/remotes/origin/<branch>`` NOR from any per-device topic ref
+    (``refs/remotes/origin/azt-pending-*``). Counting topic refs as
+    "on github" (0.53.3) lets the count tick DOWN as a chunked
+    topic-push uploads history, instead of staying pinned at the full
+    divergence until the final merge. A commit is durable on github
+    the moment its chunk lands on the topic ref; the subsequent merge
+    to main is a cheap last step gated separately by ``_main_merged``
+    (so the count can reach 0 — "nothing left to upload" — while the
+    project is not yet "OK"/merged). Any failure (detached HEAD, no
+    remote ref cached, walker error) returns 0 — the indicator's
+    contract is "OK on uncertainty."
 
     Special case for LAN-only projects (since 0.46.1): when there
     is NO ``origin`` remote configured at all (vs. "configured but
@@ -2060,56 +2215,59 @@ def _wan_unshared(repo, branch):
                     f'local={local_sha[:12]!r}: '
                     f'walk-from-HEAD raised {ex!r} → 0')
                 return 0
-        # Origin URL exists — tracking ref is meaningful when present.
+        # Origin URL exists. Build the "known on github" exclude set:
+        # the main tracking ref (when present) PLUS every per-device
+        # topic ref. Commits reachable from a topic ref are already
+        # uploaded to github (durable) even though they haven't merged
+        # into main yet — excluding the topic tips is what lets the
+        # count tick down during a chunked topic-push. 0.53.3.
+        exclude = []
         try:
-            remote_sha = repo.refs[remote_ref]
+            exclude.append(repo.refs[remote_ref])
         except KeyError:
-            # Case (a): origin configured but no tracking ref. Two
-            # ways this happens, both load-bearing: never-fetched
-            # (transient, self-corrects on first success) OR every
-            # fetch always fails (404, auth missing — e.g. github
-            # app on wrong account; entire history at risk via
-            # github). Pre-0.52.3 collapsed both to 0
-            # (OK-on-uncertainty), masking the always-failing case
-            # as "OK +N" on the picker. Walk from HEAD instead —
-            # the count is the honest "not known to be on github"
-            # answer, and the transient case self-heals on the first
-            # successful fetch (tracking ref appears, next call
-            # falls through to the walk-excluding-tracking branch).
+            # Case (a): origin configured but no main tracking ref
+            # (never-fetched, or every fetch fails — 404 / auth). Any
+            # topic refs from our own uploads still count below, so a
+            # partial upload keeps ticking down; if there are none
+            # either, we fall through to the honest walk-from-HEAD.
+            pass
+        exclude.extend(_origin_topic_ref_tips(repo))
+        if not exclude:
+            # Nothing known on github at all — honest walk-from-HEAD
+            # (the whole history is unpublished; the transient
+            # never-fetched case self-heals once the first fetch or
+            # topic-push lands a ref). Pre-0.52.3 collapsed this to 0
+            # (OK-on-uncertainty), masking the always-failing case as
+            # "OK +N" on the picker.
             try:
                 walker = repo.get_walker(include=[local_sha])
                 n = sum(1 for _ in walker)
                 _walk_count_log(repo, 'wan-unshared',
-                    f'branch={branch!r} '
-                    f'local={local_sha[:12]!r}: '
-                    f'origin URL configured ({url_str[:48]}…) + '
-                    f'no tracking ref (never-fetched or '
-                    f'fetch-always-failed) → '
-                    f'walk-from-HEAD = {n}')
+                    f'branch={branch!r} local={local_sha[:12]!r}: '
+                    f'origin URL configured ({url_str[:48]}…) + no '
+                    f'main/topic refs → walk-from-HEAD = {n}')
                 return n
             except Exception as ex:
                 _walk_count_log(repo, 'wan-unshared',
-                    f'branch={branch!r} '
-                    f'local={local_sha[:12]!r}: '
+                    f'branch={branch!r} local={local_sha[:12]!r}: '
                     f'walk-from-HEAD raised {ex!r} → 0')
                 return 0
-        if local_sha == remote_sha:
+        if local_sha in exclude:
             _walk_count_log(repo, 'wan-unshared',
                 f'branch={branch!r} local={local_sha[:12]!r}: '
-                f'tracking ref equals local → 0')
+                f'local tip already on github → 0')
             return 0
         try:
             walker = repo.get_walker(
-                include=[local_sha], exclude=[remote_sha])
+                include=[local_sha], exclude=exclude)
             n = sum(1 for _ in walker)
             _walk_count_log(repo, 'wan-unshared',
                 f'branch={branch!r} local={local_sha[:12]!r} '
-                f'remote={remote_sha[:12]!r}: '
-                f'walk excluding tracking → {n}')
+                f'exclude={len(exclude)} github ref(s) → {n}')
             return n
         except Exception as ex:
             _walk_count_log(repo, 'wan-unshared',
-                f'branch={branch!r}: tracking-walk raised '
+                f'branch={branch!r}: exclude-walk raised '
                 f'{ex!r} → 0')
             return 0
     except Exception as ex:
@@ -2233,6 +2391,11 @@ def _at_risk(repo, branch, langcode):
                 excludes.append(repo.refs[ref])
             except KeyError:
                 continue
+        # Topic refs are on github too (0.53.3): commits parked on a
+        # per-device topic branch during a chunked push are durable on
+        # github, so they are not "at risk" even before merge. Mirrors
+        # the same exclusion in ``_wan_unshared``.
+        excludes.extend(_origin_topic_ref_tips(repo))
         try:
             walker = repo.get_walker(
                 include=[local_sha], exclude=excludes)
@@ -2754,6 +2917,180 @@ def _commit_repo_locked(project_dir, contributor_name):
     return result
 
 
+def submit_file(project_dir, rel_path, staged_path, base_sha,
+                contributor_name, message=None):
+    """Base-aware whole-file write + commit — the desktop A-Z+T save
+    primitive (0.53.0; contract in
+    azt-collab/agenda/azt_persistence_server_sync.md → to land in
+    CLIENT_INTEGRATION.md).
+
+    The caller has serialized the full file to *staged_path* (a
+    sibling of the target, so ``os.replace`` stays same-filesystem
+    atomic) and declares *base_sha* — the HEAD it loaded / last
+    wrote against. Under ``project_lock``:
+
+    - HEAD == base_sha (or no commits yet): ``os.replace`` staged →
+      target, commit. The normal case; zero-copy handoff.
+    - HEAD != base_sha (a merge landed since the caller's base):
+      three-way merge — base = the file's blob at *base_sha*, ours
+      = the blob at HEAD, theirs = the staged bytes — via
+      ``lift_merge.three_way_merge`` for ``.lift`` targets (theirs
+      wins for non-LIFT paths, same last-write-wins the plain
+      atomic write had). Merged bytes land atomically; the commit
+      is linear (single parent) because "theirs" was never a
+      commit, just a working-file state — content converges, and
+      the caller must reload before further edits.
+
+    Empty/unknown *base_sha* against an existing HEAD takes the
+    divergent path with an empty base (add-add semantics — the
+    guards in lift_merge still apply). The staged file is consumed
+    (unlinked) on every success path.
+
+    Returns ``(Result, head_sha)``. Codes: ``COMMITTED_LOCAL``
+    (with ``head_sha`` param) / ``MERGED_WITH_LOCAL`` (divergent
+    path taken; params ``n_conflicts``, ``base_sha``) /
+    ``NOTHING_TO_COMMIT`` / ``CONTRIBUTOR_UNSET`` (file bytes still
+    land — durability never waits on identity) / ``COMMIT_FAILED``
+    / ``BUSY``. Contributor-unset and commit-failure still leave
+    the submitted content on disk; the next successful commit
+    stages it (same containment as a power cut)."""
+    _ensure_ssl()
+    try:
+        with project_lock(project_dir):
+            return _submit_file_locked(
+                project_dir, rel_path, staged_path, base_sha,
+                contributor_name, message)
+    except LockTimeout:
+        return _busy_result(project_dir), head_sha_of(project_dir)
+
+
+def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
+                        contributor_name, message):
+    from dulwich import porcelain
+    result = Result()
+    target = os.path.join(project_dir, rel_path)
+    repo = _get_repo(project_dir)
+    if repo is None:
+        # Same auto-init recovery as ``_commit_repo_locked`` — a
+        # registered-but-never-initialized dir must not lose writes.
+        try:
+            repo = porcelain.init(project_dir)
+            result.add(S.INITIALIZED)
+        except Exception as ex:
+            print(f'[submit_file] {project_dir!r}: auto-init failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+            # Bytes first, even with no repo: land the content, give
+            # up on history for this call.
+            os.replace(staged_path, target)
+            result.add(S.NOT_A_REPO)
+            return result, ''
+    try:
+        head = repo.refs[b'HEAD']
+    except KeyError:
+        head = None
+    head_str = _sha_str(head) if head else ''
+    base_str = (base_sha or '').strip()
+
+    if head is None or (base_str and base_str == head_str):
+        # Fast path — nothing landed since the caller's base.
+        os.replace(staged_path, target)
+    else:
+        # Divergent path — HEAD moved past the caller's base.
+        theirs_bytes = None
+        try:
+            with open(staged_path, 'rb') as fh:
+                theirs_bytes = fh.read()
+        except OSError as ex:
+            result.add(S.COMMIT_FAILED, error=f'staged read: {ex}')
+            return result, head_str
+        ours_sha = _walk_tree(repo, repo[head].tree).get(rel_path)
+        if ours_sha is None:
+            # HEAD doesn't have the file (renamed away / first write
+            # on an adopted tree): fall back to the working tree.
+            try:
+                with open(target, 'rb') as fh:
+                    ours_bytes = fh.read()
+            except OSError:
+                ours_bytes = b''
+        else:
+            ours_bytes = _blob_bytes(repo, ours_sha) or b''
+        base_bytes = b''
+        if base_str:
+            try:
+                base_commit = repo[base_str.encode('ascii')]
+                base_blob_sha = _walk_tree(
+                    repo, base_commit.tree).get(rel_path)
+                if base_blob_sha is not None:
+                    base_bytes = _blob_bytes(repo, base_blob_sha) or b''
+            except KeyError:
+                # Unknown base (re-clone, GC'd history): empty base →
+                # add-add semantics; the truncation guards still hold.
+                print(f'[submit_file] {project_dir!r}: base '
+                      f'{base_str[:12]!r} not in repo; merging with '
+                      f'empty base', file=sys.stderr, flush=True)
+        if rel_path.lower().endswith('.lift'):
+            mr = lift_merge.three_way_merge(
+                base_bytes, ours_bytes, theirs_bytes, path=rel_path)
+            merged = mr.merged_bytes
+            n_conflicts = len(mr.conflicts)
+            for _c in mr.conflicts:
+                if lift_merge.is_guard_kind(_c.kind):
+                    _write_merge_diagnostic(
+                        project_dir, guard_kind=_c.kind,
+                        lift_path=rel_path,
+                        local_sha=head_str, remote_sha='<staged>',
+                        base_sha=base_str,
+                        base_bytes=base_bytes, ours_bytes=ours_bytes,
+                        theirs_bytes=theirs_bytes,
+                        merged_bytes=merged,
+                        conflict_fields=_c.fields)
+                    break
+        else:
+            # Non-LIFT: no entry-level merge semantics — theirs wins,
+            # exactly what a plain atomic write would have done.
+            merged = theirs_bytes
+            n_conflicts = 0
+        tmp = f'{target}.tmp.{os.getpid()}.{_rand_hex8()}'
+        try:
+            with open(tmp, 'wb') as fh:
+                fh.write(merged)
+            os.replace(tmp, target)
+        except OSError as ex:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            result.add(S.COMMIT_FAILED, error=f'merged write: {ex}')
+            return result, head_str
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        result.add(S.MERGED_WITH_LOCAL,
+                   n_conflicts=n_conflicts, base_sha=base_str)
+        print(f'[submit_file] {project_dir!r}: base '
+              f'{base_str[:12] or "<none>"!r} != HEAD '
+              f'{head_str[:12]!r} — merged ({n_conflicts} '
+              f'conflict(s))', file=sys.stderr, flush=True)
+
+    if not contributor_name:
+        # Bytes are durable on disk; only history waits. Same code
+        # the other commit-issuing endpoints use, so the peer's
+        # routing (→ set-your-name screen) is uniform.
+        result.add(S.CONTRIBUTOR_UNSET)
+        return result, head_str
+    _commit_step_locked(
+        repo, project_dir, contributor_name, result,
+        message=message or f'A-Z+T edit by {contributor_name}')
+    return result, head_sha_of(project_dir)
+
+
+def _rand_hex8():
+    import secrets
+    return secrets.token_hex(8)
+
+
 def integrate_head_into_working_tree(repo, project_dir):
     """Three-way file-level merge after an incoming receive-pack
     moved HEAD past our pre-pack base, while our working_tree
@@ -3119,17 +3456,60 @@ def _ensure_initial_commit_locked(project_dir, contributor_name):
     return result
 
 
-def _commit_step_locked(repo, project_dir, contributor_name, result):
+def _commit_step_locked(repo, project_dir, contributor_name, result,
+                        message=None):
     """Stage + commit on an already-opened repo. Mutates *result*
     in place (adds COMMITTED_LOCAL / NOTHING_TO_COMMIT / etc.).
-    Caller holds the project lock."""
+    Caller holds the project lock. ``message`` overrides the default
+    commit message (used by ``submit_file`` for desktop LIFT edits;
+    the default names the recorder's audio-recording case)."""
     from dulwich import porcelain
     _stage_all(repo, project_dir)
     # Diagnostic: walk for any file outside the staging filter
     # (peer-write-to-unexpected-location class). The walk runs
     # both here and inside ``_stage_audio`` because either entry
     # point can be the one a peer hits.
+    #
+    # 0.53.2: the whitelist walk was written for the recorder's
+    # tidy project shape; a desktop-azt project legitimately
+    # carries settings JSONs, WritingSystems/*.ldml, dated
+    # backups, reports/ … which the walk flags — but on THIS
+    # path staging is whole-tree ``add -A``, so every such file
+    # was either just staged (in the index → backed up; the old
+    # message was simply false) or is .gitignore-matched (a
+    # deliberate exclusion per the AZT persistence contract
+    # D5/D6, not data loss). Filter to the genuinely-at-risk
+    # remainder; field repro was a false DATA_LOSS_RISK — a
+    # never-silenced sticky banner on peers — on the first
+    # desktop-azt commit (nml, 2026-07-07).
     uncommittable = _detect_uncommittable(project_dir)
+    if uncommittable:
+        try:
+            idx = repo.open_index()
+            try:
+                from dulwich.ignore import IgnoreFilterManager
+                ign = IgnoreFilterManager.from_repo(repo)
+            except Exception:
+                ign = None
+
+            def _genuinely_at_risk(rel):
+                relp = rel.replace('\\', '/')
+                if os.fsencode(relp) in idx:
+                    return False        # staged → backed up
+                if ign is not None:
+                    try:
+                        if ign.is_ignored(relp):
+                            return False  # deliberate exclusion
+                    except Exception:
+                        pass
+                return True
+
+            uncommittable = [r for r in uncommittable
+                             if _genuinely_at_risk(r)]
+        except Exception as ex:
+            print(f'[data-loss-risk] at-risk filter raised {ex!r}; '
+                  f'keeping unfiltered list',
+                  file=sys.stderr, flush=True)
     if uncommittable:
         for rel in uncommittable[:20]:
             print(f'[data-loss-risk] uncommittable file in '
@@ -3146,10 +3526,16 @@ def _commit_step_locked(repo, project_dir, contributor_name, result):
         try:
             sha = porcelain.commit(
                 repo,
-                message=_enc(f'Audio recordings by {contributor_name}'),
+                message=_enc(message
+                             or f'Audio recordings by {contributor_name}'),
                 author=author, committer=committer,
             )
-            result.add(S.COMMITTED_LOCAL)
+            # ``head_sha`` param (0.53.0): lets a peer that just
+            # caused this commit update its cached base without an
+            # extra ``project_status`` poll. Extra params are
+            # invisible to older clients (translations only format
+            # the params they name), so no MIN_CLIENT_VERSION bump.
+            result.add(S.COMMITTED_LOCAL, head_sha=_sha_str(sha))
             _clear_commit_failure_count(project_dir)
             # Push-notify any peer observing this project's status URI.
             # HEAD just advanced; subscribed peers wake up + re-poll.

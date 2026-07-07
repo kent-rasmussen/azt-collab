@@ -71,11 +71,16 @@ into here; this package owns:
    `paths.py`, `status.py`, and `projects.py` are duplicated on
    purpose so the client doesn't depend on the server package.
 
-4. **No Kivy at import time at the package root.** `azt_collab_client.ui`
-   imports Kivy; `azt_collab_client` itself does not. Sister apps may
-   import the top-level module from non-Kivy contexts (CLI helpers,
-   tests). Keep it that way — guard any Kivy imports inside `ui/` or
-   inside functions that are only called from a Kivy host.
+4. **No Kivy outside `ui/` — not even function-local.** `azt_collab_client.ui`
+   imports Kivy; the rest of the package must not, at import time OR
+   call time. Non-Kivy hosts (desktop A-Z+T is one) call the RPC
+   surface, and importing Kivy from their process lets Kivy's
+   import-time argv parser eat the host's own flags and hard-exit
+   (field repro 2026-07-07: azt's `--restart` → `Core: option
+   --restart not recognized`). For platform detection use
+   `from ._platform import platform / on_android` — a dependency-free
+   mirror of `kivy.utils.platform` (since 0.53.1).
+   `tests/test_no_kivy_on_desktop_paths.py` pins this.
 
 5. **Structured `Result`s drive logic; translated text is for humans.**
    Use `result.has(S.PUSHED)` / `result.has_any(S.AUTH_REQUIRED, ...)`

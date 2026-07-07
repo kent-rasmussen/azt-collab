@@ -693,10 +693,11 @@ class CAWLHandle:
         """Open for binary read. Returns a file-like usable as a
         context manager. Closing closes the underlying descriptor
         / releases the in-memory buffer."""
-        try:
-            from kivy.utils import platform
-        except Exception:
-            platform = ''
+        # Kivy-free platform probe (0.53.1) — importing Kivy from a
+        # non-Kivy host lets its argv parser kill the process; see
+        # azt_collab_client/_platform.py.
+        from ._platform import platform as _plat
+        platform = _plat()
         # URL-encode each path component for transit so that
         # spaces, commas, parentheses, etc. that CAWL filenames
         # commonly contain don't break URI / URL parsing. The

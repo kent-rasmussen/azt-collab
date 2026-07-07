@@ -93,6 +93,17 @@ class ProjectStatus:
     wan_unshared: int = 0
     lan_unshared: int = 0
     at_risk: int = 0
+    # Merge gate for the "OK" sync state (since 0.53.3). Since
+    # ``wan_unshared`` counts DOWN as a chunked topic-push uploads
+    # history and reaches 0 when all bytes are on github but BEFORE
+    # the final merge into main, ``wan_unshared == 0`` no longer
+    # means "backed up". "OK" requires ``main_merged`` too; the
+    # window ``wan_unshared == 0 and not main_merged`` renders as
+    # ``WAN-0`` ("finishing / merging"), not "OK". See § 17b.
+    # DEFAULTS TRUE: a pre-0.53 daemon omits the key, and defaulting
+    # True reproduces the old behaviour (OK as soon as wan==0) rather
+    # than pinning such daemons permanently out of "OK".
+    main_merged: bool = True
     # Per-project metadata mirrored from the project record so
     # peers can read status + identity in one round-trip. Empty
     # for forward-compat with pre-0.39 daemons.
@@ -184,6 +195,9 @@ class ProjectStatus:
             wan_unshared=int(d.get('wan_unshared', 0) or 0),
             lan_unshared=int(d.get('lan_unshared', 0) or 0),
             at_risk=int(d.get('at_risk', 0) or 0),
+            # Absent (pre-0.53 daemon) → True, preserving old "OK
+            # when wan==0" behaviour rather than sticking at WAN-0.
+            main_merged=bool(d.get('main_merged', True)),
             repo_slug=d.get('repo_slug', '') or '',
             cawl_image_repo=d.get('cawl_image_repo', '') or '',
             commit_failure_count=int(

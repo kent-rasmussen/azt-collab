@@ -524,77 +524,92 @@ def _run_commit(langcode):
     print(f'[commit] {langcode!r} done: codes={codes!r}',
           file=sys.stderr, flush=True)
     if 'COMMITTED_LOCAL' in codes:
-        projects.set_last_commit(langcode)
-        # Eagerly fan-out to paired LAN peers when the LAN toggle
-        # is on. Without this, ``last_lan_pushed_sha`` only
-        # advances on the watcher loop's drain tick (every
-        # ``sync.connectivity_poll_s``, default 30 s) — so any
-        # commit landing between ticks isn't recorded as "shared
-        # somewhere" until the next tick, and the peer-side LANOK
-        # indicator stays dark because ``lan_unshared`` is
-        # almost never 0 under any sustained editing pace (typical
-        # field cadence is several commits per minute, > 30 s
-        # cycle). Firing here makes the latency from
-        # ``COMMITTED_LOCAL`` to ``last_lan_pushed_sha`` ≈ one
-        # listener round-trip on the LAN (single-digit ms when
-        # both phones are up) instead of up to 30 s, so LANOK
-        # surfaces on the next peer poll. Idempotent: fan_out
-        # internally peeks each peer's main first and no-ops if
-        # they're already at our HEAD. 0.45.32.
-        # Post-commit LAN fan-out: when autodiscovery is on, peers
-        # are reachable directly; when it's off we kick off a
-        # burst so paired peers' parallel bursts can rendezvous
-        # with us during the window. ``start_burst`` is cheap when
-        # the LAN is already up.
-        #
-        # Backoff (0.50.45): only fire the burst when the per-
-        # project counter hits a power of two. ``record_commit``
-        # increments + persists + returns the new count. The
-        # counter resets on actual LAN delivery (see below). A
-        # lone worker still attempts ``fan_out`` (cheap, no-ops
-        # if nobody's reachable) but the radio-wakening burst is
-        # rare. The Sync button always bursts (separate path via
-        # ``lan_backoff.nudge``); online-edge and lifecycle
-        # bursts (0.50.45) also bypass this gate because they
-        # reflect intent, not routine activity.
-        try:
-            from . import lan_backoff as _lan_backoff
-            from . import lan_burst as _lan_burst
-            n = _lan_backoff.record_commit(langcode)
-            if _lan_backoff._is_power_of_two(n):
-                _lan_burst.start_burst()
-                print(f'[commit] {langcode!r} burst fired '
-                      f'(commits_since_lan_success={n}, '
-                      f'power-of-two)',
-                      file=sys.stderr, flush=True)
-            else:
-                print(f'[commit] {langcode!r} burst skipped '
-                      f'(commits_since_lan_success={n}, '
-                      f'not power-of-two)',
-                      file=sys.stderr, flush=True)
-        except Exception as ex:
-            print(f'[commit] {langcode!r} post-commit burst '
-                  f'raised: {ex!r}',
-                  file=sys.stderr, flush=True)
-        try:
-            from . import lan_push as _lan_push
-            results = _lan_push.fan_out(p)
-            # If ANY peer received the push, the backoff curve
-            # has done its job — reset. Per-project; other
-            # projects' curves are untouched.
-            if results and any(results.values()):
-                try:
-                    from . import lan_backoff as _lan_backoff
-                    _lan_backoff.record_success(langcode)
-                except Exception as ex_b:
-                    print(f'[commit] {langcode!r} lan_backoff '
-                          f'record_success raised: {ex_b!r}',
-                          file=sys.stderr, flush=True)
-        except Exception as ex:
-            print(f'[commit] {langcode!r} post-commit LAN fan-out '
-                  f'raised: {ex!r}',
-                  file=sys.stderr, flush=True)
+        after_committed_local(langcode, p)
     return res
+
+
+def after_committed_local(langcode, p):
+    """Post-``COMMITTED_LOCAL`` side effects, shared by the
+    debounced commit worker (``_run_commit``) and the synchronous
+    ``submit_file`` path (``server._h_project_submit_file``) so a
+    desktop whole-file commit converges over LAN exactly like a
+    recorder commit. Never raises.
+
+    Eagerly fan-out to paired LAN peers when the LAN toggle
+    is on. Without this, ``last_lan_pushed_sha`` only
+    advances on the watcher loop's drain tick (every
+    ``sync.connectivity_poll_s``, default 30 s) — so any
+    commit landing between ticks isn't recorded as "shared
+    somewhere" until the next tick, and the peer-side LANOK
+    indicator stays dark because ``lan_unshared`` is
+    almost never 0 under any sustained editing pace (typical
+    field cadence is several commits per minute, > 30 s
+    cycle). Firing here makes the latency from
+    ``COMMITTED_LOCAL`` to ``last_lan_pushed_sha`` ≈ one
+    listener round-trip on the LAN (single-digit ms when
+    both phones are up) instead of up to 30 s, so LANOK
+    surfaces on the next peer poll. Idempotent: fan_out
+    internally peeks each peer's main first and no-ops if
+    they're already at our HEAD. 0.45.32.
+
+    Post-commit LAN fan-out: when autodiscovery is on, peers
+    are reachable directly; when it's off we kick off a
+    burst so paired peers' parallel bursts can rendezvous
+    with us during the window. ``start_burst`` is cheap when
+    the LAN is already up.
+
+    Backoff (0.50.45): only fire the burst when the per-
+    project counter hits a power of two. ``record_commit``
+    increments + persists + returns the new count. The
+    counter resets on actual LAN delivery (see below). A
+    lone worker still attempts ``fan_out`` (cheap, no-ops
+    if nobody's reachable) but the radio-wakening burst is
+    rare. The Sync button always bursts (separate path via
+    ``lan_backoff.nudge``); online-edge and lifecycle
+    bursts (0.50.45) also bypass this gate because they
+    reflect intent, not routine activity."""
+    try:
+        projects.set_last_commit(langcode)
+    except Exception as ex:
+        print(f'[commit] {langcode!r} set_last_commit raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    try:
+        from . import lan_backoff as _lan_backoff
+        from . import lan_burst as _lan_burst
+        n = _lan_backoff.record_commit(langcode)
+        if _lan_backoff._is_power_of_two(n):
+            _lan_burst.start_burst()
+            print(f'[commit] {langcode!r} burst fired '
+                  f'(commits_since_lan_success={n}, '
+                  f'power-of-two)',
+                  file=sys.stderr, flush=True)
+        else:
+            print(f'[commit] {langcode!r} burst skipped '
+                  f'(commits_since_lan_success={n}, '
+                  f'not power-of-two)',
+                  file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[commit] {langcode!r} post-commit burst '
+              f'raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    try:
+        from . import lan_push as _lan_push
+        results = _lan_push.fan_out(p)
+        # If ANY peer received the push, the backoff curve
+        # has done its job — reset. Per-project; other
+        # projects' curves are untouched.
+        if results and any(results.values()):
+            try:
+                from . import lan_backoff as _lan_backoff
+                _lan_backoff.record_success(langcode)
+            except Exception as ex_b:
+                print(f'[commit] {langcode!r} lan_backoff '
+                      f'record_success raised: {ex_b!r}',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[commit] {langcode!r} post-commit LAN fan-out '
+              f'raised: {ex!r}',
+              file=sys.stderr, flush=True)
 
 
 def get_job(job_id):

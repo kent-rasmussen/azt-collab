@@ -270,6 +270,31 @@ Harmless (LAN-converged, at_risk=0; device 1 carries github) but wastes its batt
 Action: push 0.52.31 to device 2 to stop the thrash, OR just let it converge on fetch after
 main FFs. Not blocking.
 
+## WAN-progress visibility — user can SEE how far the trickle has to go (0.53.3, 2026-07-07)
+
+Sub-task of this item: the whole convergence saga above was invisible to the user — nothing
+showed "2754 → 656 → …, still going." `wan_unshared` compared local main vs `origin/main`, so
+it stayed **pinned at the full divergence** during a chunked topic-push and only dropped at the
+final merge. The live `remaining=…` was trace-log only.
+
+Fix (0.53.3, daemon + contract + server settings UI):
+- `_wan_unshared` (repo.py) now excludes `origin/azt-pending-*` topic tips too → **counts down**
+  as chunks land (topic tracking ref advances per chunk at repo.py `_push_chunked_to_ref`).
+- `_at_risk` excludes topic tips too (commits on github pre-merge aren't at risk).
+- `_main_merged` (new) gates "OK": count can hit 0 while bytes sit on a topic ref awaiting the
+  final merge — that window is **WAN-0 / finishing**, not "OK". Per Kent's contract: no OK until
+  merged; if uploaded-but-not-merged, the count stays at 0.
+- Wire: `project_status.main_merged` (bool); client `ProjectStatus` mirror defaults it True
+  (pre-0.53.3 daemon → old behaviour). Additive/backward-tolerant → no MIN_* bump. § 17b recipe
+  updated (`wan_done := wan==0 AND main_merged`).
+- **Server settings UI** (`azt_collabd/ui/app.py` "Current project" block): GitHub-backup line —
+  `✓ backed up` / `finishing (merging)…` / `{n} commit(s) to go` (+ `paused — work offline`).
+  French added. Server-UI-only per Kent; peer sync indicator untouched.
+
+Remaining: field-verify the count visibly decreases on device 1's next connected session and
+that it reads "finishing (merging)…" in the pre-merge window, then flips to "✓ backed up" only
+after `origin/main → 3cefc3e0`.
+
 ## Plans
 1. Confirm with Kent which recovery path for device 2 (assisted desktop push vs. daemon-side fix to let the big push complete). — SUPERSEDED: shipped the daemon-side fix (0.52.21); 0.52.28 fixes the deeper hung-fetch cause.
 2. Deliver device-1 deblock (app install on aztobt2-ui / LAN share) — but only meaningful AFTER device 2 gets nml onto github.

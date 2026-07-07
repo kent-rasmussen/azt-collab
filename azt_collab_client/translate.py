@@ -153,6 +153,8 @@ _HANDLERS = {
     S.COMMITTED:              lambda p: (_fmt(_tr('Committed ({sha}).'), p)
                                          if p.get('sha') else _tr('Committed.')),
     S.COMMITTED_LOCAL:        lambda p: _tr('Committed local changes.'),
+    S.MERGED_WITH_LOCAL:      lambda p: _tr(
+        'Merged your changes with updates from your team.'),
     S.COMMITTED_OFFLINE:      lambda p: _tr('Committed locally (offline)'),
     S.COMMITTED_NO_REMOTE:    lambda p: _tr('Committed (no remote configured)'),
     S.DATA_LOSS_RISK:         lambda p: _fmt(_tr(

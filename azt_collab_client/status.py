@@ -51,6 +51,15 @@ NO_REPO = 'NO_REPO'
 # 0.36.0+). Carries ``params['bytes_written']`` and ``params['sha256']``.
 ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 
+# ``submit_file`` (daemon 0.53.0+) took the divergent path: a peer
+# merge landed since the caller's declared ``base_sha``, so the
+# daemon three-way-merged the submitted bytes with HEAD instead of
+# plain-replacing. Peer routing: the save succeeded and nothing was
+# lost, but in-memory state is stale — reload the file before
+# further edits. Params: ``n_conflicts``, ``base_sha``. See
+# ``azt_collabd/status.py`` for the full rationale.
+MERGED_WITH_LOCAL = 'MERGED_WITH_LOCAL'
+
 # Surgical LIFT edits (daemon 0.50.29+). See ``azt_collabd/status.py``
 # for the full rationale. The ``NO_CHANGE`` variants let peers
 # suppress redundant UI updates when the target already had the new
@@ -287,6 +296,16 @@ class Result:
 
     def codes(self):
         return [s.code for s in self.statuses]
+
+    def param(self, code, key, default=None):
+        """Value of ``params[key]`` on the first status matching
+        *code*, or *default*. Convenience for single-value reads
+        like ``result.param(S.COMMITTED_LOCAL, 'head_sha', '')``.
+        Mirror of ``azt_collabd/status.py``."""
+        for s in self.statuses:
+            if s.code == code:
+                return s.params.get(key, default)
+        return default
 
     @classmethod
     def from_dict(cls, d):
