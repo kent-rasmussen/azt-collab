@@ -554,9 +554,13 @@ def _clean_template(xml_bytes, vernlang):
       2. **glosses** — drop ``<gloss>`` whose text is empty/whitespace;
          keep every populated one. Runs after rule 1 so a just-moved
          gloss is never pruned.
-      3. **definition** — left as-is (kept for user familiarity).
-      4. **citation** — left as-is (``set_audio`` tolerates its
-         presence or absence).
+      3. **definition** — drop empty ``<form>`` children; keep every
+         populated one and keep the ``<definition>`` parent even when
+         it ends up formless (user familiarity).
+      4. **citation** — mirror rule 1: keep only ``<form lang=vernlang>``,
+         drop every other-language form (empty or populated); keep the
+         ``<citation>`` parent even when it ends up formless
+         (``set_audio`` tolerates its presence or absence).
       5. **sense** — left as-is (never empty in practice).
 
     ``vernlang`` is matched as the full assembled BCP-47 tag, compared
@@ -630,6 +634,25 @@ def _clean_template(xml_bytes, vernlang):
             for g in list(sense.findall('gloss')):
                 if _is_empty(_text_of(g)):
                     sense.remove(g)
+                    changed = True
+
+        # Rule 3: drop empty <form> children of <definition>; keep the
+        # <definition> parent even if it ends up formless (user
+        # familiarity). Nested under <sense>, so iter over all of them.
+        for definition in entry.iter('definition'):
+            for f in list(definition.findall('form')):
+                if _is_empty(_text_of(f)):
+                    definition.remove(f)
+                    changed = True
+
+        # Rule 4: citation mirrors lexical-unit (rule 1) — keep only
+        # <form lang=vernlang>, drop every other-language form (empty or
+        # populated). Keep the <citation> parent even if it ends up
+        # formless (set_audio tolerates its presence or absence).
+        for citation in entry.findall('citation'):
+            for f in list(citation.findall('form')):
+                if f.get('lang') != vernlang:
+                    citation.remove(f)
                     changed = True
 
     if not changed:

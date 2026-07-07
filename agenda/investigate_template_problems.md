@@ -70,9 +70,19 @@ definition + citation; full-tag vernlang match; order-preserving; SILCAWL/gramma
 semantic-domain/illustration/trait untouched. NOTE item deleted from NOTES_TO_DAEMON.md;
 recorded in CHANGELOG.
 
+## IMPLEMENTED (0.52.33, 2026-07-06)
+
+Rules 3 & 4 extended to actually prune, per host decision that the 0.52.32 "leave as-is"
+was about the *parent* elements, not their `<form>` children:
+- definition → drop empty `<form>` children, keep populated + keep the `<definition>` parent.
+- citation → mirror rule 1: keep only `<form lang=vernlang>`, drop other-language forms, keep
+  the `<citation>` parent. (Host confirmed citation follows vernlang, not an analysis-lang tag;
+  `_clean_template` has no analang param and none was added.)
+Same bytes→bytes / order-preserving contract; daemon-only, no wire change.
+
 Remaining:
 - **Verify** on the next picker-created project (fresh clone shows vernlang-only headwords +
-  populated glosses, no empty multilingual junk).
+  populated glosses, empty definition/citation forms and off-vernlang citation forms gone).
 - **Peer follow-on** (separate, not azt-collab): retire the recorder's now-dead `clean_template`
   on the picker path; also fix that it only ever walked citation/definition (never lexical-unit
   or `<gloss>`) — moot once the daemon owns cleanup.

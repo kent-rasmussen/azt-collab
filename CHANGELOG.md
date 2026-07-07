@@ -9,6 +9,23 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.52.33 — new-project template: prune definition + citation forms (rules 3 & 4)
+
+Follow-up to 0.52.32, which deliberately left `<definition>` and `<citation>` "as-is".
+That over-simplified the host-decided intent: the "leave as-is" was about the **parent
+elements** (keep them for user familiarity / `set_audio` tolerance), not about preserving
+the junk `<form>` children inside them. `_clean_template` now prunes those forms too,
+keeping the parent element even if it ends up formless:
+
+- **definition** (rule 3) — drop empty `<form>` children; keep every populated one, keep
+  the `<definition>` parent. Iterates all senses.
+- **citation** (rule 4) — mirror the lexical-unit rule: keep only `<form lang=vernlang>`,
+  drop every other-language form (empty or populated), keep the `<citation>` parent.
+
+Same bytes→bytes / parse-fail-fallback / order-preserving contract; daemon only, no
+wire/client change. `SILCAWL` field, `grammatical-info`, `semantic-domain`, `illustration`,
+`trait`, glosses (rule 2), and lexical-unit (rule 1) behaviour unchanged.
+
 ## 0.52.32 — new-project template: prune to vernacular server-side, single-sourced
 
 Field bug (azt-recorder triage, 2026-07-04): projects created via the language picker

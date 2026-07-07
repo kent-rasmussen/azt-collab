@@ -3,6 +3,7 @@
 - **Scope & relationships:** azt-collab/sync. A specific user's sync is blocked; root cause not yet known. Diagnosis-first — could land anywhere in the commit/push/merge/LAN/credential path. Uses the daemon-log share path (the very thing the share-archive item is about, so diagnostics delivery may itself be in play if the user is behind the Dome-strips-zip problem).
 - **Vision / done-criteria:** the user's project syncs to github again; root cause identified and (if it's a code bug) fixed, not just cleared for one user.
 - **Deadline:** 2026-07-01 (today, urgent).
+- **Waiting on:** user response.
 
 ## Notes
 - **User/device:** peer `7aeb3fac`, device `aztobt1-sudo`, github login `aztobt1-sudo`. Daemon 0.52.20.
