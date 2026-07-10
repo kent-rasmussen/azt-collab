@@ -142,12 +142,23 @@ def _started_path():
 
 
 def _last_crash_summary():
-    path = _crash_log_path()
+    # NEVER raise: this runs inside ``/v1/health``, and health must
+    # answer even when the process is degraded. Field incident
+    # 2026-07-10 (fd exhaustion): ``open()`` here raised
+    # ``OSError(24)``, the health handler 500'd, the client read
+    # that as "daemon dead", and auto-spawned a new daemon into the
+    # held server.lock every ~5 s for 8+ minutes. A degraded daemon
+    # that answers health honestly beats one that manufactures a
+    # spawn storm. (Same reasoning as always-emit-summary: silence
+    # or a crash here is indistinguishable from "no daemon".)
     try:
+        path = _crash_log_path()
         with open(path) as f:
             data = f.read()
     except FileNotFoundError:
         return None
+    except Exception as ex:
+        return {'unreadable': f'{ex.__class__.__name__}: {ex}'}
     if not data:
         return None
     # Each crash is appended as a JSON line; take the last one
@@ -2837,25 +2848,32 @@ def _h_project_status(langcode, _body):
             _diag_repo = _Repo(p.working_dir)
         except Exception:
             _diag_repo = None
-        if _diag_repo is not None and branch:
-            try:
-                lan_unshared = _calc_lan_unshared(
-                    _diag_repo, branch, langcode)
-            except Exception:
-                lan_unshared = 0
-            try:
-                at_risk = _calc_at_risk(
-                    _diag_repo, branch, langcode)
-            except Exception:
-                at_risk = 0
-            try:
-                main_merged = _calc_main_merged(_diag_repo, branch)
-            except Exception:
-                main_merged = False
-            try:
-                _diag_repo.close()
-            except Exception:
-                pass
+        try:
+            if _diag_repo is not None and branch:
+                try:
+                    lan_unshared = _calc_lan_unshared(
+                        _diag_repo, branch, langcode)
+                except Exception:
+                    lan_unshared = 0
+                try:
+                    at_risk = _calc_at_risk(
+                        _diag_repo, branch, langcode)
+                except Exception:
+                    at_risk = 0
+                try:
+                    main_merged = _calc_main_merged(_diag_repo, branch)
+                except Exception:
+                    main_merged = False
+        finally:
+            # Close unconditionally — pre-0.54.1 the close lived
+            # inside the ``branch`` guard, so any poll where the
+            # summary came back empty leaked the Repo (fd-leak
+            # incident 2026-07-10).
+            if _diag_repo is not None:
+                try:
+                    _diag_repo.close()
+                except Exception:
+                    pass
     except Exception:
         pass
     api = _project_for_api(p)
@@ -4901,7 +4919,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if self.path not in UNAUTHENTICATED_PATHS and not self._auth_ok():
             return self._send_json(401,
                                    {"ok": False, "error": "unauthorized"})
-        status, response = dispatch(method, self.path, body)
+        try:
+            status, response = dispatch(method, self.path, body)
+        except Exception as ex:
+            # A raising handler must still produce a JSON answer.
+            # Pre-0.54.1 the exception propagated into http.server
+            # (socket-level traceback, no response body); during
+            # the 2026-07-10 fd-exhaustion incident the client read
+            # those dead responses as "daemon gone" and spawn-
+            # stormed. The typed 500 keeps the wire honest:
+            # alive-but-failing, with the reason attached.
+            _record_crash(ex, where=f'dispatch {method} {self.path}')
+            print(f'[server] dispatch {method} {self.path!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+            status, response = 500, {
+                "ok": False, "error": "internal_error",
+                "detail": f'{ex.__class__.__name__}: {ex}'}
         self._send_json(status, response)
 
     def do_GET(self):

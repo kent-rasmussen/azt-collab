@@ -354,6 +354,11 @@ def _recover_under_lock(project_dir, lift_path, langcode,
                     print(f'[atomic-recovery] commit (empty-'
                           f'current) failed for orphan {name!r}: '
                           f'{ex!r}', file=sys.stderr, flush=True)
+                finally:
+                    try:
+                        repo.close()
+                    except Exception:
+                        pass
             _safe_unlink(orphan_path)
             summary['recovered'] += 1
             if langcode:
@@ -467,6 +472,11 @@ def _recover_under_lock(project_dir, lift_path, langcode,
                       f'orphan {name!r}: {ex!r}',
                       file=sys.stderr, flush=True)
                 # File is on disk; the next sync will pick it up.
+            finally:
+                try:
+                    repo.close()
+                except Exception:
+                    pass
 
         _safe_unlink(orphan_path)
         summary['recovered'] += 1

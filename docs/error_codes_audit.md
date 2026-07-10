@@ -115,7 +115,13 @@ surface" in `azt_collab_client/CLAUDE.md`.
 | Daemon unreachable (loopback or CP) | `SERVER_UNAVAILABLE` | "Sync service unavailable: {error}" |
 | Daemon responded with non-2xx / decode failure | `SERVER_ERROR` | "Sync service error: {error}" |
 
-## Open: French translation coverage gap (31 msgids, found 2026-07-10)
+## RESOLVED 0.54.2: French translation coverage gap (31 msgids, found 2026-07-10)
+
+All 27 unique msgids (31 callsites) got real French entries in 0.54.2
+(2026-07-10); `test_python_translation_coverage` green again. French
+pending a native-eye review pass (notably the two one-word section
+headers «Appairés» / «Non appairés»). Original finding kept below for
+context.
 
 `tests/test_translation_coverage.py::test_python_translation_coverage`
 fails: 31 Python `_(...)`/`_tr(...)` msgids are missing from

@@ -24,6 +24,13 @@ _DEFAULT_TIMEOUT = 300
 _HEALTH_TIMEOUT = 1.5
 _SPAWN_WAIT = 5.0
 _MAX_ATTEMPTS = 3
+# After a spawn attempt fails to produce a healthy daemon, don't
+# try again for this long. Without it, a host app polling every few
+# seconds turns one wedged daemon into an endless spawn storm — one
+# new ``python -m azt_collabd`` every poll, each exiting on the held
+# ``server.lock`` (field incident 2026-07-10: ~5 s cadence for 8+
+# minutes until the wedged daemon was SIGTERMed).
+_SPAWN_COOLDOWN_S = 60.0
 
 
 class LoopbackTransport(Transport):
@@ -31,6 +38,7 @@ class LoopbackTransport(Transport):
 
     def __init__(self):
         self._spawn_lock = threading.Lock()
+        self._last_failed_spawn = 0.0
 
     # ── public Transport API ────────────────────────────────────────
 
@@ -112,6 +120,16 @@ class LoopbackTransport(Transport):
         try:
             with urllib.request.urlopen(url, timeout=_HEALTH_TIMEOUT) as resp:
                 return resp.status == 200
+        except urllib.error.HTTPError:
+            # The daemon ANSWERED, just not with 200 — it's alive
+            # but degraded (e.g. fd exhaustion made a handler
+            # raise). Treating that as dead is what deleted a live
+            # daemon's server.json and manufactured the 2026-07-10
+            # spawn storm; the spawned replacement can never take
+            # the still-held server.lock anyway. Alive-but-degraded
+            # is the daemon's problem to surface, not ours to
+            # respawn over.
+            return True
         except (urllib.error.URLError, OSError):
             return False
 
@@ -128,6 +146,12 @@ class LoopbackTransport(Transport):
                     return True
             except ServerUnavailable:
                 pass
+            # Cooldown: a spawn that just failed (usually because a
+            # wedged-but-alive daemon still holds server.lock) will
+            # fail again immediately; don't burn a process per poll.
+            now = time.time()
+            if now - self._last_failed_spawn < _SPAWN_COOLDOWN_S:
+                return False
             try:
                 os.remove(server_info_path())
             except OSError:
@@ -156,6 +180,7 @@ class LoopbackTransport(Transport):
                 except ServerUnavailable:
                     pass
                 time.sleep(0.1)
+            self._last_failed_spawn = time.time()
             return False
 
     @staticmethod

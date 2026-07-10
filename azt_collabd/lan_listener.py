@@ -157,7 +157,37 @@ class _DynamicBackend:
     immediately stop serving. Tradeoff is one ``peers.json`` read
     per request; the file is tiny and cached at the OS level so
     the cost is negligible vs the network/git work that follows.
+
+    **fd hygiene (0.54.1).** dulwich's web handlers never close the
+    Repo the backend hands them, and a Repo holds pack/index fds
+    that GC does not reliably release (reference cycles). Every
+    phone poll therefore leaked fds until the 2026-07-10 EMFILE
+    incident wedged the whole daemon. Each Repo opened here is
+    recorded thread-locally; ``_repo_closing_middleware`` closes
+    them when the WSGI response for that request finishes (same
+    thread — the server is thread-per-request).
     """
+
+    def __init__(self):
+        self._thread_repos = threading.local()
+
+    def _track(self, repo):
+        lst = getattr(self._thread_repos, 'repos', None)
+        if lst is None:
+            lst = self._thread_repos.repos = []
+        lst.append(repo)
+        return repo
+
+    def close_thread_repos(self):
+        lst = getattr(self._thread_repos, 'repos', None)
+        if not lst:
+            return
+        self._thread_repos.repos = []
+        for r in lst:
+            try:
+                r.close()
+            except Exception:
+                pass
 
     def open_repository(self, path):
         from dulwich.errors import NotGitRepository
@@ -195,8 +225,22 @@ class _DynamicBackend:
         # can't pin self-signed client certs). Future-harden with
         # signed-message body auth to gate per-peer rather than
         # union-of-all-peers.
+        try:
+            peers_list = _peers.list_peers(strict=True)
+        except Exception as ex:
+            # Transient registry-read failure (fd exhaustion, EIO):
+            # do NOT read as "empty allowlist / nothing shared" —
+            # that silently unshared every project during the
+            # 2026-07-10 EMFILE incident. Refuse THIS request as
+            # transient; the peer retries on its next pass.
+            print(f'[lan-listener] defer {langcode!r}: peer '
+                  f'registry unreadable ({ex!r}) — transient, '
+                  f'NOT treating as unshared',
+                  file=sys.stderr, flush=True)
+            raise NotGitRepository(
+                'peer registry unreadable (transient)') from ex
         shared_anywhere = set()
-        for peer in _peers.list_peers():
+        for peer in peers_list:
             shared_anywhere.update(peer.get('shared_projects') or [])
         if langcode not in shared_anywhere:
             print(f'[lan-listener] reject {langcode!r}: not in any '
@@ -213,7 +257,7 @@ class _DynamicBackend:
             raise NotGitRepository(
                 f'project {langcode!r} not registered')
         try:
-            return Repo(project.working_dir)
+            return self._track(Repo(project.working_dir))
         except Exception as ex:
             print(f'[lan-listener] open repo {langcode!r} failed: '
                   f'{ex!r}', file=sys.stderr, flush=True)
@@ -229,6 +273,42 @@ def _build_dict_backend():
     request) so new share_offer arrivals work without a listener
     restart."""
     return _DynamicBackend()
+
+
+class _ClosingBody:
+    """WSGI response wrapper: when the server finishes with the
+    response (PEP 3333 guarantees a ``close()`` call), close every
+    dulwich Repo the backend opened for this request's thread."""
+
+    def __init__(self, inner, backend):
+        self._inner = inner
+        self._backend = backend
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def close(self):
+        try:
+            if hasattr(self._inner, 'close'):
+                self._inner.close()
+        finally:
+            self._backend.close_thread_repos()
+
+
+def _repo_closing_middleware(app, backend):
+    """Outermost WSGI layer: pair every request with a
+    ``close_thread_repos()`` — on the happy path via
+    ``_ClosingBody.close()`` after the response is fully sent, on
+    the raise path immediately. See ``_DynamicBackend`` docstring
+    for the fd-leak incident this fixes."""
+    def _app(environ, start_response):
+        try:
+            body = app(environ, start_response)
+        except Exception:
+            backend.close_thread_repos()
+            raise
+        return _ClosingBody(body, backend)
+    return _app
 
 
 def _peer_id_from_cert_der(cert_der):
@@ -1507,8 +1587,10 @@ def _build_server(port):
     # working-tree reset after successful receive-pack POSTs;
     # inner ``_peer_acl_middleware`` gates access by paired-peer
     # shared_projects.
-    app = _peer_acl_middleware(
-        _post_receive_pack_middleware(make_wsgi_chain(backend)))
+    app = _repo_closing_middleware(
+        _peer_acl_middleware(
+            _post_receive_pack_middleware(make_wsgi_chain(backend))),
+        backend)
 
     # Use the stdlib WSGI server rather than dulwich's
     # ``HTTPGitServer`` — the latter was removed (or renamed) in

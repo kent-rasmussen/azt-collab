@@ -508,6 +508,11 @@ def derive_remote_url(working_dir):
                 (b'remote', b'origin'), b'url').decode('utf-8')
         except KeyError:
             return ''
+        finally:
+            try:
+                repo.close()
+            except Exception:
+                pass
     except Exception:
         return ''
 

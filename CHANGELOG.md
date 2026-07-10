@@ -9,6 +9,87 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.2 — French catalog: 27 missing msgids filled (LAN share offers, repo-access popup, share helpers, paired-phones popup)
+
+`tests/test_translation_coverage.py` had been failing on 31 Python
+callsites (27 unique msgids) whose strings never got .po entries —
+the 0.50.x LAN share-offer feedback strings (`translate.py`
+`_dispatch_msg` + offer/pairing statuses), the GitHub
+repository-access popup (`ui/popups.py`), the `open_url` link
+fallbacks (`ui/share.py`), and the paired-phones popup section
+headers/placeholders (`ui/lan_popups.py`). All 27 now carry real
+French — no `msgstr ""` placeholders (an empty msgstr renders as an
+EMPTY string, not the msgid fallback). Register follows the existing
+catalog: «téléphone»/«appareil», «dépôt», «Touchez», guillemets,
+vouvoiement. The client auto-compiles .po → .mo on load when the .po
+is newer (`i18n.py` msgfmt-lite), so no build step changes.
+
+## 0.54.1 — daemon fd leak fixed (EMFILE after ~1 day); health/spawn/allowlist hardening
+
+Field incident (karlap desktop, 2026-07-10, →
+`agenda/daemon_fd_leak_emfile_hardening.md`): after ~1 day of uptime
+the daemon hit `OSError(24, 'Too many open files')`. Cascade: the LAN
+listener rejected paired phones (unreadable `peers.json` read as an
+EMPTY allowlist), LAN pushes failed (`SSLError(EMFILE)`), repo opens
+were typed `NOT_A_REPO` and fed 10 bogus consecutive failures into
+`wan_backoff`, `/v1/health` itself 500'd (unguarded `crash.log` open),
+and the client — reading a 500 health answer as "daemon dead" —
+deleted the live daemon's `server.json` and spawned a new
+`python -m azt_collabd` every ~5 s into the still-held `server.lock`
+for 8+ minutes.
+
+**Root cause: un-closed dulwich `Repo` objects.** A `Repo` holds pack
+/index fds until `.close()`, and dulwich's internal reference cycles
+mean GC does not reliably release them. The hot paths never closed:
+`repo_status_summary` (the ~10 s status poll — the dominant leak),
+the LAN listener's `open_repository` (dulwich's web handlers never
+close backend repos; one leak per phone request), the commit family
+(`commit_repo` / `submit_file` / `sync_repo` / `push_repo` /
+`commit_audio_and_sync` / `init_repo` / `ensure_initial_commit`),
+`_h_project_status`'s diag repo on the empty-branch edge,
+`derive_remote_url`, and atomic-recovery's commit step.
+
+Fixes:
+
+- **`repo._track_opened_repos()`** — thread-local scope that closes
+  every Repo `_get_repo` hands out; every public repo entry point
+  now wraps its locked body in one, so nested helpers are covered
+  without threading a handle through every signature.
+  `repo_status_summary` and the other non-lock sites close
+  explicitly. New rule: code that opens a Repo either closes it or
+  runs inside a tracking scope.
+- **LAN listener**: `_DynamicBackend` tracks the repos it opens
+  (thread-local) and the new outermost `_repo_closing_middleware`
+  closes them when each WSGI response finishes (PEP 3333 `close()`).
+- **Allowlist honesty**: `peers.list_peers(strict=True)` raises on a
+  transient registry read failure; the listener now refuses that
+  request as transient instead of treating an unreadable
+  `peers.json` as "nothing is shared with anyone".
+- **Health never raises**: `_last_crash_summary` returns an
+  `{'unreadable': …}` marker instead of propagating `OSError` out of
+  `/v1/health`; `_serve` gained a dispatch-level catch-all so ANY
+  raising handler answers a typed JSON 500 (`internal_error`)
+  instead of a socket-level traceback (the `register_project`
+  RuntimeError in the field log).
+- **Client spawn-storm damping** (`transports/loopback.py`): an
+  HTTP-error health answer now counts as *alive-but-degraded* (no
+  respawn, and crucially no `server.json` deletion of a live
+  daemon); a failed spawn starts a 60 s cooldown so a polling host
+  app can't burn one subprocess per poll against a held
+  `server.lock`.
+- **Diagnosability**: `_get_repo` logs `[repo-open]` when the open
+  failed with an OSError (EMFILE/EIO/EACCES) so those no longer
+  masquerade silently as `NOT_A_REPO` in drain logs.
+
+Tests: `tests/test_fd_hygiene.py` — close-on-poll, tracking-scope
+semantics (incl. nesting), entry-point coverage, a /proc-based
+bounded-fd regression (30 polls), peers strictness, HTTP-error-is-
+alive, and spawn cooldown.
+
+Follow-ups (tracked in the agenda item): don't advance `wan_backoff`
+on guard-class open failures; auto-init (`porcelain.init`) repos in
+the recovery paths are still untracked (rare, once per project).
+
 ## 0.54.0 — LIFT merge robustness: no duplicate same-lang forms, verification-code union, post-merge invariant
 
 Field repro (Kent, 2026-07-10): the 'wife' entry (guid 9ae43c82)

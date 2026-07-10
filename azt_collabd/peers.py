@@ -68,7 +68,7 @@ def _now_iso():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 
-def _load_raw():
+def _load_raw(strict=False):
     path = _peers_path()
     try:
         with open(path, 'rb') as f:
@@ -78,6 +78,14 @@ def _load_raw():
     except (OSError, ValueError) as ex:
         print(f'[peers] failed to load {path!r}: {ex!r}',
               file=sys.stderr, flush=True)
+        # ``strict`` callers (the LAN listener's allowlist gate)
+        # must distinguish "no peers paired" from "the registry is
+        # unreadable right now": collapsing a transient read failure
+        # (fd exhaustion, EIO) into an empty allowlist silently
+        # unshares every project (field incident 2026-07-10).
+        # Non-strict callers keep the old degrade-to-empty.
+        if strict:
+            raise
         return {'peers': {}}
     if not isinstance(data, dict) or not isinstance(
             data.get('peers'), dict):
@@ -130,12 +138,14 @@ def _normalize_entry(entry):
     }
 
 
-def list_peers():
+def list_peers(strict=False):
     """Return a list of ``{peer_id, device_name, fp, endpoints,
     static_endpoints, shared_projects, paired_at, last_seen_at}``
-    dicts. Empty list if no peers / file missing."""
+    dicts. Empty list if no peers / file missing. With
+    ``strict=True`` a transient read failure RAISES (OSError /
+    ValueError) instead of returning empty — see ``_load_raw``."""
     with _LOCK:
-        data = _load_raw()
+        data = _load_raw(strict=strict)
     out = []
     for peer_id, entry in (data.get('peers') or {}).items():
         norm = _normalize_entry(entry)

@@ -1948,3 +1948,108 @@ msgstr "AZT Collaboration ne répond pas"
 
 msgid "Open {name}"
 msgstr "Ouvrir {name}"
+
+# ── 0.54.2 coverage batch: LAN share offers, GitHub repo access, ─────────
+# share/link helpers, paired-phones popup (27 msgids flagged by
+# test_translation_coverage 2026-07-10)
+
+msgid "Offer sent."
+msgstr "Offre envoyée."
+
+msgid "Already in sync."
+msgstr "Déjà synchronisé."
+
+msgid "Other phone already has this project."
+msgstr "L'autre téléphone a déjà ce projet."
+
+msgid "Sent — waiting for the other phone to accept."
+msgstr "Envoyé — en attente d'acceptation par l'autre téléphone."
+
+msgid "Sent — other phone will be asked to adopt the GitHub URL."
+msgstr "Envoyé — l'autre téléphone sera invité à adopter l'URL GitHub."
+
+msgid "Sent — other phone has a different GitHub URL."
+msgstr "Envoyé — l'autre téléphone a une URL GitHub différente."
+
+msgid ""
+"This project has no commits yet. Record an entry first, then try "
+"sharing again."
+msgstr ""
+"Ce projet n'a encore rien de validé. Enregistrez d'abord une entrée, "
+"puis réessayez le partage."
+
+msgid "That phone is not paired with this one anymore."
+msgstr "Ce téléphone n'est plus appairé avec celui-ci."
+
+msgid "Accepted the repository invitation — syncing now."
+msgstr "Invitation au dépôt acceptée — synchronisation en cours."
+
+msgid "Could not reach the other phone (status {post_status})."
+msgstr "Impossible de joindre l'autre téléphone (statut {post_status})."
+
+msgid ""
+"No access to {owner_repo}. Ask the owner to add you as a "
+"collaborator, then open {url} to accept."
+msgstr ""
+"Pas d'accès à {owner_repo}. Demandez au propriétaire de vous ajouter "
+"comme collaborateur, puis ouvrez {url} pour accepter."
+
+msgid "Open this link on the device: {url}"
+msgstr "Ouvrez ce lien sur l'appareil : {url}"
+
+msgid "Could not open the browser. Link: {url}"
+msgstr "Impossible d'ouvrir le navigateur. Lien : {url}"
+
+msgid "Open GitHub"
+msgstr "Ouvrir GitHub"
+
+msgid "Repository access needed"
+msgstr "Accès au dépôt requis"
+
+msgid ""
+"Ask the repository owner to add you as a collaborator, then open "
+"GitHub to accept the invitation. Sync resumes on its own once access "
+"is granted."
+msgstr ""
+"Demandez au propriétaire du dépôt de vous ajouter comme "
+"collaborateur, puis ouvrez GitHub pour accepter l'invitation. La "
+"synchronisation reprendra d'elle-même une fois l'accès accordé."
+
+msgid "No access to {repo} with your GitHub account."
+msgstr "Pas d'accès à {repo} avec votre compte GitHub."
+
+msgid "this repository"
+msgstr "ce dépôt"
+
+msgid "This phone"
+msgstr "Ce téléphone"
+
+msgid "Paired"
+msgstr "Appairés"
+
+msgid "Pair a new phone"
+msgstr "Appairer un nouveau téléphone"
+
+msgid "Unpaired"
+msgstr "Non appairés"
+
+msgid "Tap to offer share again"
+msgstr "Touchez pour proposer à nouveau le partage"
+
+msgid "No phones paired yet. Show the QR below to pair a phone now."
+msgstr ""
+"Aucun téléphone appairé pour l'instant. Montrez le QR ci-dessous "
+"pour en appairer un maintenant."
+
+msgid "Add permission by github username"
+msgstr "Ajouter une permission par nom d'utilisateur GitHub"
+
+msgid "No nearby phones detected. Tap Refresh after a few seconds."
+msgstr ""
+"Aucun téléphone détecté à proximité. Touchez Actualiser après "
+"quelques secondes."
+
+msgid "No phones paired yet. Use \"Pair a phone\" to scan another phone's QR."
+msgstr ""
+"Aucun téléphone appairé pour l'instant. Utilisez « Appairer un "
+"téléphone » pour scanner le QR d'un autre téléphone."

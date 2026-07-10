@@ -14,6 +14,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 
 from . import config as _config
@@ -850,13 +851,69 @@ def _find_lift(directory):
     return None
 
 
+# ── Repo fd hygiene ──────────────────────────────────────────────────────
+#
+# A dulwich ``Repo`` holds open file descriptors (pack files, index)
+# until ``.close()`` — and reference cycles inside dulwich mean GC
+# does NOT reliably release them. Field incident 2026-07-10 (karlap
+# desktop, agenda/daemon_fd_leak_emfile_hardening.md): un-closed
+# Repos from the ~10 s status poll + per-gesture commit paths
+# exhausted the process fd table (EMFILE) in under a day, wedging
+# the LAN listener, the drain loop, and even ``/v1/health``.
+#
+# Mechanism: the ``_track_opened_repos()`` scope collects every Repo
+# ``_get_repo`` hands out on the current thread and closes them all
+# on scope exit. Each public entry point below (commit_repo,
+# push_repo, sync_repo, submit_file, init_repo, …) wraps its locked
+# body in one scope, so nested helpers get closed too, without
+# threading a repo handle through every signature. Double-close is
+# safe (dulwich tolerates it — ``head_sha_of`` closes its own).
+# New entry points that open repos MUST either close them or run
+# inside a tracking scope.
+
+_repo_tracking = threading.local()
+
+
+@contextlib.contextmanager
+def _track_opened_repos():
+    prev = getattr(_repo_tracking, 'repos', None)
+    _repo_tracking.repos = []
+    try:
+        yield
+    finally:
+        opened = _repo_tracking.repos
+        _repo_tracking.repos = prev
+        for r in opened:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+
 def _get_repo(project_dir):
-    """Return a dulwich Repo or None."""
+    """Return a dulwich Repo or None. Inside a
+    ``_track_opened_repos()`` scope the Repo is auto-closed at
+    scope exit; outside one, the CALLER owns closing it."""
     try:
         from dulwich.repo import Repo
-        return Repo(project_dir)
-    except Exception:
+        r = Repo(project_dir)
+    except Exception as ex:
+        # NotGitRepository is the normal "no .git here" answer and
+        # stays silent. An OSError (EMFILE, EIO, EACCES) is NOT
+        # "not a repo" — callers will type this None as NOT_A_REPO
+        # and (in the drain path) feed wan_backoff with it, so at
+        # minimum the log must show what really happened
+        # (2026-07-10: fd exhaustion earned nml/en a bogus 24 h
+        # backoff labelled NOT_A_REPO).
+        if isinstance(ex, OSError):
+            print(f'[repo-open] {project_dir!r}: {ex!r} — returning '
+                  f'None; callers will read this as NOT_A_REPO',
+                  file=sys.stderr, flush=True)
         return None
+    lst = getattr(_repo_tracking, 'repos', None)
+    if lst is not None:
+        lst.append(r)
+    return r
 
 
 def head_sha_of(project_dir):
@@ -1971,6 +2028,7 @@ def repo_status_summary(project_dir):
     computed separately via ``_lan_unshared`` and ``_at_risk``
     (they need the langcode for peer lookup; this function does not).
     """
+    repo = None
     try:
         from dulwich import porcelain
         repo = _get_repo(project_dir)
@@ -2037,6 +2095,18 @@ def repo_status_summary(project_dir):
         return branch, remote_url, n, wan_unshared
     except Exception:
         return None
+    finally:
+        # This runs on EVERY status poll (~10 s cadence per open
+        # peer). Pre-0.54.1 the Repo was never closed; each call
+        # left the project's pack/index fds open until GC got
+        # around to it, which on the 2026-07-10 karlap desktop
+        # exhausted the fd table in under a day (EMFILE incident —
+        # see agenda/daemon_fd_leak_emfile_hardening.md).
+        if repo is not None:
+            try:
+                repo.close()
+            except Exception:
+                pass
 
 
 _walk_count_last_logged = {}
@@ -2451,10 +2521,11 @@ def init_repo(project_dir, remote_url, username, token,
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _init_repo_locked(
-                project_dir, remote_url, username, token,
-                branch, contributor_name,
-                rollback_origin_on_create_fail=rollback_origin_on_create_fail)
+            with _track_opened_repos():
+                return _init_repo_locked(
+                    project_dir, remote_url, username, token,
+                    branch, contributor_name,
+                    rollback_origin_on_create_fail=rollback_origin_on_create_fail)
     except LockTimeout:
         print(f'[publish] init_repo BUSY: project_lock timeout on '
               f'{project_dir!r} — another writer (sync drain, lan '
@@ -2839,7 +2910,8 @@ def commit_repo(project_dir, contributor_name):
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _commit_repo_locked(project_dir, contributor_name)
+            with _track_opened_repos():
+                return _commit_repo_locked(project_dir, contributor_name)
     except LockTimeout:
         return _busy_result(project_dir)
 
@@ -2957,9 +3029,10 @@ def submit_file(project_dir, rel_path, staged_path, base_sha,
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _submit_file_locked(
-                project_dir, rel_path, staged_path, base_sha,
-                contributor_name, message)
+            with _track_opened_repos():
+                return _submit_file_locked(
+                    project_dir, rel_path, staged_path, base_sha,
+                    contributor_name, message)
     except LockTimeout:
         return _busy_result(project_dir), head_sha_of(project_dir)
 
@@ -3413,8 +3486,9 @@ def ensure_initial_commit(project_dir, contributor_name='AZT'):
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _ensure_initial_commit_locked(
-                project_dir, contributor_name)
+            with _track_opened_repos():
+                return _ensure_initial_commit_locked(
+                    project_dir, contributor_name)
     except LockTimeout:
         return _busy_result(project_dir)
 
@@ -3609,7 +3683,8 @@ def push_repo(project_dir, username, token):
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _push_repo_locked(project_dir, username, token)
+            with _track_opened_repos():
+                return _push_repo_locked(project_dir, username, token)
     except LockTimeout:
         return _busy_result(project_dir)
 
@@ -3654,8 +3729,9 @@ def sync_repo(project_dir, username, token, contributor_name):
     _ensure_ssl()
     try:
         with project_lock(project_dir):
-            return _sync_repo_locked(project_dir, username, token,
-                                     contributor_name)
+            with _track_opened_repos():
+                return _sync_repo_locked(project_dir, username, token,
+                                         contributor_name)
     except LockTimeout:
         return _busy_result(project_dir)
 
@@ -6430,8 +6506,9 @@ def commit_audio_and_sync(project_dir, contributor_name, username, token):
     Returns Result."""
     try:
         with project_lock(project_dir):
-            return _commit_audio_and_sync_locked(
-                project_dir, contributor_name, username, token)
+            with _track_opened_repos():
+                return _commit_audio_and_sync_locked(
+                    project_dir, contributor_name, username, token)
     except LockTimeout:
         return _busy_result(project_dir)
 
