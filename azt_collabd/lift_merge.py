@@ -28,6 +28,7 @@ narrows the duplication to the smallest LIFT element that can
 carry a multi-of-itself sibling without breaking the schema.
 """
 
+import ast
 import collections
 import hashlib
 import os
@@ -174,6 +175,11 @@ class Conflict:
 class MergeResult:
     merged_bytes: bytes = b''
     conflicts: list = field(default_factory=list)
+    # Count of post-merge invariant repairs applied by
+    # ``_normalize_entry`` (duplicate same-lang forms dropped or
+    # unioned, missing conflict annotations added). Informational —
+    # repairs are self-healing, not conflicts.
+    repairs: int = 0
 
 
 def _parse(xml_bytes, label=''):
@@ -392,10 +398,24 @@ def _merge_pair(b, o, t, parent_allows_multi):
     """
     if o is None and t is None:
         return []
-    if o is None:
-        return [_clone(t)]
-    if t is None:
-        return [_clone(o)]
+    if o is None or t is None:
+        # One side is missing this child. Consult the base before
+        # keeping: if the present side is UNCHANGED since base, the
+        # other side deleted it — honor the delete. Pre-0.53.x this
+        # returned the present side unconditionally, which
+        # resurrected deleted children on every merge against a
+        # stale branch; combined with the old positional pairing it
+        # was one of the two engines behind the 'wife' ×29
+        # duplicate-form accumulation (2026-07-10): once a repair
+        # consolidated the duplicates, any merge against a
+        # pre-repair branch brought them all back.
+        present = o if o is not None else t
+        if b is not None and _canon_clean(b) == _canon_clean(present):
+            return []
+        # Changed-then-deleted (or no base): keep the present side —
+        # same keep-the-data bias as the entry-level modify/delete
+        # rule.
+        return [_clone(present)]
 
     # Use ``_canon_clean`` for *detection* — strips stale
     # ``azt-lift-conflict`` annotations and inter-element
@@ -454,6 +474,87 @@ def _merge_pair(b, o, t, parent_allows_multi):
     return _Escalate(o, t)
 
 
+def _pair_same_key(b_elems, o_elems, t_elems):
+    """Pair up same-key children across base / ours / theirs into
+    ``(b, o, t)`` triples for ``_merge_pair``.
+
+    Pre-0.53.x this pairing was purely positional (index i of ours
+    against index i of theirs), which mispaired whenever the two
+    sides held same-key lists of different lengths or orders:
+    ``ours=[A,B] vs theirs=[B]`` paired A-with-B (a phantom
+    conflict producing an annotated duplicate pair) and kept the
+    overhang B unconditionally — net result ``[A,B,B]``, one extra
+    copy per merge. That linear growth is the primary engine
+    behind the 'wife' entry accumulating 28 copies of the same
+    verification form (field repro 2026-07-10).
+
+    The content-first strategy:
+
+    1. Elements semantically identical on both sides
+       (``_canon_clean``) pair with each other (and with a
+       content-matching base element when present) — these merge
+       clean, no conflict, no duplication.
+    2. A leftover one-sided element whose content matches an
+       unused base element pairs with base alone — ``_merge_pair``
+       then honors the other side's delete instead of
+       resurrecting.
+    3. Remaining leftovers pair positionally (genuinely changed
+       on both sides, or true adds) — the historical behavior,
+       now reached only when content actually diverged.
+    """
+    o_clean = [_canon_clean(e) for e in o_elems]
+    t_clean = [_canon_clean(e) for e in t_elems]
+    b_clean = [_canon_clean(e) for e in b_elems]
+    o_used, t_used, b_used = set(), set(), set()
+
+    def _take(clean_list, used, content):
+        for j, c in enumerate(clean_list):
+            if j not in used and c == content:
+                used.add(j)
+                return j
+        return None
+
+    triples = []
+    # Phase 1: identical on both sides.
+    for i, oc in enumerate(o_clean):
+        tj = _take(t_clean, t_used, oc)
+        if tj is None:
+            continue
+        o_used.add(i)
+        bj = _take(b_clean, b_used, oc)
+        triples.append((b_elems[bj] if bj is not None else None,
+                        o_elems[i], t_elems[tj]))
+    # Phase 2: one-sided leftovers that match base — deletes.
+    for i in range(len(o_elems)):
+        if i in o_used:
+            continue
+        bj = _take(b_clean, b_used, o_clean[i])
+        if bj is not None:
+            o_used.add(i)
+            triples.append((b_elems[bj], o_elems[i], None))
+    for j in range(len(t_elems)):
+        if j in t_used:
+            continue
+        bj = _take(b_clean, b_used, t_clean[j])
+        if bj is not None:
+            t_used.add(j)
+            triples.append((b_elems[bj], None, t_elems[j]))
+    # Phase 3: positional pairing for the true divergences.
+    o_left = [e for i, e in enumerate(o_elems) if i not in o_used]
+    t_left = [e for j, e in enumerate(t_elems) if j not in t_used]
+    b_left = [e for k, e in enumerate(b_elems) if k not in b_used]
+    for i in range(max(len(o_left), len(t_left), len(b_left))):
+        o_e = o_left[i] if i < len(o_left) else None
+        t_e = t_left[i] if i < len(t_left) else None
+        b_e = b_left[i] if i < len(b_left) else None
+        if o_e is None and t_e is None:
+            # Base-only remainder: deleted from both sides (or
+            # never carried forward) — nothing to emit.
+            continue
+        triples.append((b_e, o_e, t_e))
+    return triples
+
+
 def _walk_children(merged_parent, b, o, t):
     """Walk corresponding children of ``o`` and ``t`` (matching by
     key, preserving ours's document order with theirs-only keys
@@ -486,16 +587,10 @@ def _walk_children(merged_parent, b, o, t):
         o_elems = o_by_key.get(key, [])
         t_elems = t_by_key.get(key, [])
         b_elems = b_by_key.get(key, [])
-        # Pair up by position. In LIFT, each key is usually unique
-        # within a parent (sense ids, form langs, etc.) so this is
-        # 1-1. When the same unkeyed tag appears multiple times,
-        # positional pairing is best-effort.
-        max_n = max(len(o_elems), len(t_elems), len(b_elems))
-        for i in range(max_n):
-            o_e = o_elems[i] if i < len(o_elems) else None
-            t_e = t_elems[i] if i < len(t_elems) else None
-            b_e = b_elems[i] if i < len(b_elems) else None
-
+        # Pair by semantic content first, positionally for the
+        # remainder — see ``_pair_same_key`` for why pure
+        # positional pairing multiplied duplicate forms.
+        for b_e, o_e, t_e in _pair_same_key(b_elems, o_elems, t_elems):
             # The child's tag (for the multi check) comes from
             # whichever side has the element. Use ``is not None``
             # explicitly: a leaf Element (no sub-children) is falsy
@@ -555,6 +650,188 @@ def _collect_conflict_paths(merged_entry):
 
     _walk(merged_entry, '')
     return sorted(paths)
+
+
+# ── Post-merge invariant: no duplicate same-lang forms ──────────────────
+#
+# A LIFT multitext carries at most ONE <form> per lang inside one
+# parent (and one <gloss> per lang inside one sense) — consumers
+# read/write "the" form for a lang, so silent duplicates shadow
+# real data. The only sanctioned same-lang multiplicity is the
+# merge's own conflict representation: sibling copies each
+# carrying an ``azt-lift-conflict`` annotation. ``_normalize_entry``
+# enforces this after every merge:
+#
+#   * semantically-identical duplicates collapse to the
+#     document-first node;
+#   * duplicates inside a *verification* field union their code
+#     lists (mirroring azt's ``Field.consolidate_forms_by_lang``
+#     exactly, so the two layers converge on the same bytes:
+#     first-seen order, a check whose value conflicts across
+#     copies is dropped entirely — it must re-verify);
+#   * any other surviving same-lang multiplicity is forced into
+#     the annotated-conflict-pair shape so it is visible instead
+#     of silent.
+#
+# Field repro 2026-07-10 ('wife', guid 9ae43c82): one field held
+# 29 same-lang forms (1 + 28 identical copies) accumulated across
+# merges on a single computer.
+
+# A field is verification-shaped when its ``type`` contains this
+# token — matches azt's ``verificationkey`` naming ('<profile>
+# <ftype> verification', '<ftype> primitive verification',
+# 'alphabet verification', ...).
+_VERIFICATION_TOKEN = 'verification'
+
+
+def _is_verification_field(parent):
+    return (parent.tag == 'field'
+            and _VERIFICATION_TOKEN in (parent.attrib.get('type') or ''))
+
+
+def _form_text(form):
+    t = form.find('text')
+    return (t.text or '') if t is not None else ''
+
+
+def _union_verification_texts(texts):
+    """Union verification-code lists across duplicate form texts.
+    Mirrors azt ``Field.consolidate_forms_by_lang``: each text is a
+    python-list repr like ``"['V1=ai', 'C1=wh']"``; codes key on
+    the check name (everything before the LAST ``=``); first-seen
+    order wins; a check whose value CONFLICTS across copies is
+    dropped entirely (it must re-verify). Texts that don't parse
+    as a list contribute nothing (same as azt).
+
+    Returns ``(union_repr, dropped_checks, parsed_any)`` —
+    ``parsed_any`` False means no text was list-shaped and the
+    caller should fall back to conflict-pair handling instead of
+    destroying content."""
+    merged = {}
+    order = []
+    conflicted = set()
+    parsed_any = False
+    for raw in texts:
+        codes = None
+        if raw:
+            try:
+                codes = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                codes = None
+        if not isinstance(codes, list):
+            continue
+        parsed_any = True
+        for code in codes:
+            parts = str(code).split('=')
+            c, v = '='.join(parts[:-1]), parts[-1]
+            if c in merged and merged[c] != v:
+                conflicted.add(c)
+            elif c not in merged:
+                merged[c] = v
+                order.append(c)
+    keep = ['{}={}'.format(c, merged[c]) for c in order
+            if c not in conflicted]
+    return str(keep), sorted(conflicted), parsed_any
+
+
+def _conflict_side(elem):
+    """The ``azt-lift-conflict`` side value carried by *elem*'s
+    direct annotation children, or ``''`` if none."""
+    for a in elem.findall('annotation'):
+        if a.attrib.get('name') == CONFLICT_ANNOTATION_NAME:
+            return a.attrib.get('value', '')
+    return ''
+
+
+def _normalize_entry(entry, path=''):
+    """Enforce the no-duplicate-same-lang-forms invariant on
+    *entry* in place (see the section comment above). Idempotent;
+    cheap when there are no duplicates. Returns the number of
+    repairs applied (0 on the overwhelmingly common clean path)."""
+    guid = entry.attrib.get('guid', '')
+    repaired = 0
+    for parent in entry.iter():
+        groups = {}
+        for child in parent:
+            if child.tag == 'form' or (child.tag == 'gloss'
+                                       and parent.tag == 'sense'):
+                groups.setdefault(
+                    (child.tag, child.attrib.get('lang', '')),
+                    []).append(child)
+        for (tag, lang), group in groups.items():
+            if len(group) < 2:
+                continue
+            # 1) Collapse semantically-identical duplicates onto
+            #    the document-first node.
+            survivors = []
+            seen = set()
+            dropped_identical = 0
+            for f in group:
+                c = _canon_clean(f)
+                if c in seen:
+                    parent.remove(f)
+                    dropped_identical += 1
+                else:
+                    seen.add(c)
+                    survivors.append(f)
+            if dropped_identical:
+                repaired += 1
+                trace(f'[merge-repair] path={path!r} guid={guid} '
+                      f'{tag}[lang={lang}]: dropped '
+                      f'{dropped_identical} identical duplicate '
+                      f'form(s)')
+            if len(survivors) == 1:
+                if dropped_identical:
+                    # Duplicates proved agreement — any conflict
+                    # markers left on the survivor are false
+                    # positives.
+                    _strip_conflict_annotations(survivors[0])
+                continue
+            # 2) Verification fields: union the code content into
+            #    one form instead of keeping conflict copies.
+            if tag == 'form' and _is_verification_field(parent):
+                texts = [_form_text(f) for f in survivors]
+                union_repr, dropped_checks, parsed_any = \
+                    _union_verification_texts(texts)
+                if parsed_any:
+                    keeper = survivors[0]
+                    for f in survivors[1:]:
+                        parent.remove(f)
+                    _strip_conflict_annotations(keeper)
+                    tnode = keeper.find('text')
+                    if tnode is None:
+                        tnode = ET.SubElement(keeper, 'text')
+                    tnode.text = union_repr
+                    repaired += 1
+                    trace(f'[merge-repair] path={path!r} guid={guid} '
+                          f'field[type='
+                          f'{parent.attrib.get("type", "")!r}] '
+                          f'lang={lang}: unioned {len(survivors)} '
+                          f'forms -> {union_repr}'
+                          + (f' (dropped conflicting checks '
+                             f'{dropped_checks})'
+                             if dropped_checks else ''))
+                    continue
+            # 3) Anything else survives only as an annotated
+            #    conflict pair — make silent duplicates visible.
+            existing = {_conflict_side(f) for f in survivors} - {''}
+            added = 0
+            for f in survivors:
+                if _conflict_side(f):
+                    continue
+                side = 'ours' if 'ours' not in existing else 'theirs'
+                existing.add(side)
+                a = ET.SubElement(f, 'annotation')
+                a.set('name', CONFLICT_ANNOTATION_NAME)
+                a.set('value', side)
+                added += 1
+            if added:
+                repaired += 1
+                trace(f'[merge-repair] path={path!r} guid={guid} '
+                      f'{tag}[lang={lang}]: {len(survivors)} '
+                      f'divergent same-lang copies; annotated '
+                      f'{added} as conflict')
+    return repaired
 
 
 def _looks_truncated(base_entries, ours_entries, theirs_entries):
@@ -1161,6 +1438,7 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
     merged_root = _strip_entries(ours)
 
     conflicts = []
+    repairs = 0
 
     # Emit order: ``ours`` document order first, then any
     # theirs-only entries in theirs's document order. Anchoring on
@@ -1240,6 +1518,13 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
                 == merged[1].attrib.get('guid')):
             merged[1].set('guid', f'{guid}-theirs')
 
+        # Post-merge invariant BEFORE the conflict scan: duplicate
+        # same-lang forms either collapse (identical), union
+        # (verification fields — content-level auto-resolution, so
+        # no conflict survives to be scanned), or get annotated.
+        for elem in merged:
+            repairs += _normalize_entry(elem, path=path)
+
         # Did this merge produce a conflict? Look for the marker
         # annotation anywhere in the merged result.
         conflict_paths = []
@@ -1282,6 +1567,18 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
         for elem in merged:
             merged_root.append(elem)
 
+    # Final invariant sweep over EVERY entry in the output —
+    # entries taken cleanly from one side (unchanged, one-side-
+    # changed, one-side-added) bypass ``_merge_pair`` and can carry
+    # duplicate same-lang forms from polluted history; this sweep
+    # self-heals them the same way the canon-equal path self-heals
+    # stale conflict annotations. Idempotent, so re-visiting the
+    # entries normalized in the loop above is a silent no-op.
+    for e in merged_root.findall('entry'):
+        repairs += _normalize_entry(e, path=path)
+    if repairs:
+        trace(f'[merge-repair] path={path!r} total repairs={repairs}')
+
     # Output-side catastrophic-loss guard. Defends against
     # algorithmic loss inside the merger itself, distinct from
     # input-side truncation (which the upstream guard catches).
@@ -1315,4 +1612,5 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
 
     merged_bytes = ET.tostring(
         merged_root, encoding='utf-8', xml_declaration=True)
-    return MergeResult(merged_bytes=merged_bytes, conflicts=conflicts)
+    return MergeResult(merged_bytes=merged_bytes, conflicts=conflicts,
+                       repairs=repairs)

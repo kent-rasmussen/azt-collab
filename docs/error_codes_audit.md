@@ -115,6 +115,32 @@ surface" in `azt_collab_client/CLAUDE.md`.
 | Daemon unreachable (loopback or CP) | `SERVER_UNAVAILABLE` | "Sync service unavailable: {error}" |
 | Daemon responded with non-2xx / decode failure | `SERVER_ERROR` | "Sync service error: {error}" |
 
+## Open: French translation coverage gap (31 msgids, found 2026-07-10)
+
+`tests/test_translation_coverage.py::test_python_translation_coverage`
+fails: 31 Python `_(...)`/`_tr(...)` msgids are missing from
+`azt_collab_client/locales/fr/LC_MESSAGES/azt_collab_client.po`.
+Clusters (see the test output for the full list):
+
+- `translate.py` LAN share/offer strings ('Offer sent.', 'Already in
+  sync.', 'Sent — waiting for the other phone to accept.', 'That phone
+  is not paired with this one anymore.', 'Could not reach the other
+  phone (status {post_status}).', …)
+- GitHub collaborator-access strings ('No access to {owner_repo}. Ask
+  the owner to add you as a collaborator…', 'Accepted the repository
+  invitation — syncing now.')
+- `ui/popups.py` repository-access popup ('Open GitHub', 'Repository
+  access needed', 'Ask the repository owner to add you as a
+  collaborator…', 'No access to {repo} with your GitHub account.',
+  'this repository')
+- `ui/share.py` link fallbacks ('Open this link on the device: {url}',
+  'Could not open the browser. Link: {url}')
+- `ui/lan_popups.py` ('This phone', + 10 more)
+
+Reminder: never half-ship `msgstr ""` — an empty msgstr renders as an
+EMPTY string, not the msgid fallback (buttons go invisible). Add real
+French or don't add the entry.
+
 ## Adding a new error code
 
 Per `azt_collab_client/CLAUDE.md` § "When adding a new client API call":

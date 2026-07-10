@@ -11,7 +11,7 @@
   `CLIENT_INTEGRATION.md`. AZT's edits persist and converge through the daemon without
   data loss under concurrent merges.
 - **Deadline:** before [[azt_run_with_server]] ships (prerequisite).
-- **Waiting on:** Nothing
+- **Waiting on:** fix from azt team
 
 ## Decisions (Phase 0 output, locked with Kent 2026-07-06)
 

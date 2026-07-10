@@ -406,3 +406,222 @@ def test_catastrophic_output_guard_fires_directly():
     assert lm._looks_catastrophic_output(
         base_count=1700, ours_count=1, theirs_count=1700,
         merged_count=1) == ''
+
+
+# ── Duplicate same-lang forms: the 'wife' ×29 case (2026-07-10) ──────────
+#
+# Field repro: entry 9ae43c82 accumulated 29 duplicate
+# ``<form lang="en-x-py">`` nodes inside ONE verification field —
+# one ['V1=ai','C2=f'] plus 28 identical ['V1=ai','C1=wh'] — all
+# on one computer. Two engines: (1) positional same-key pairing
+# mispaired lists of different lengths and kept the overhang
+# unconditionally (one extra copy per merge); (2) one-sided-missing
+# children were kept without consulting base, resurrecting deleted
+# duplicates on any merge against a stale branch. The tests below
+# lock in the fixes: content-first pairing, base-honored deletes,
+# the azt-mirroring verification union, and the post-merge
+# invariant (no un-annotated duplicate same-lang forms, ever).
+
+_VFTYPE = 'CVC lc verification'
+
+
+def _vform(codes_repr, lang='en-x-py'):
+    return f'<form lang="{lang}"><text>{codes_repr}</text></form>'
+
+
+def _ventry(guid, forms_xml, ftype=_VFTYPE, extra=''):
+    return (f'<entry guid="{guid}" id="x_{guid}">'
+            f'<lexical-unit><form lang="en">'
+            f'<text>wife</text></form></lexical-unit>'
+            f'<field type="{ftype}">{forms_xml}</field>'
+            f'{extra}'
+            f'</entry>')
+
+
+def _vfield_forms(merged_bytes, ftype=_VFTYPE):
+    root = ET.fromstring(merged_bytes)
+    return root.findall(f'entry/field[@type="{ftype}"]/form')
+
+
+def test_verification_both_changed_unions_content():
+    """Both sides changed the same single-form verification field:
+    the merge unions the CODE LISTS (mirroring azt
+    ``Field.consolidate_forms_by_lang``) instead of keeping two
+    same-lang form nodes. No conflict survives — the union is a
+    deterministic auto-resolution."""
+    base = _lift([_ventry('aaa', _vform("['V1=ai']"))])
+    ours = _lift([_ventry('aaa', _vform("['V1=ai', 'C2=f']"))])
+    theirs = _lift([_ventry('aaa', _vform("['V1=ai', 'C1=wh']"))])
+    out = lm.three_way_merge(base, ours, theirs)
+    forms = _vfield_forms(out.merged_bytes)
+    assert len(forms) == 1, \
+        f'expected ONE unioned form, got {len(forms)}'
+    assert forms[0].find('text').text == \
+        str(['V1=ai', 'C2=f', 'C1=wh'])
+    # Union resolved the divergence — nothing left to conflict.
+    assert out.conflicts == []
+    assert out.repairs >= 1
+    # No conflict annotations anywhere in the result.
+    root = ET.fromstring(out.merged_bytes)
+    assert not [a for a in root.iter('annotation')
+                if a.attrib.get('name') == lm.CONFLICT_ANNOTATION_NAME]
+
+
+def test_verification_conflicting_check_dropped():
+    """A check verified to DIFFERENT values on the two sides is
+    dropped entirely (must re-verify) — same semantics as azt's
+    consolidate_forms_by_lang, so the two layers converge on
+    identical bytes."""
+    base = _lift([_entry_with('aaa', lex='wife')])
+    ours = _lift([_ventry('aaa', _vform("['V1=ai', 'C2=f']"))])
+    theirs = _lift([_ventry('aaa', _vform("['V1=e', 'C2=f']"))])
+    out = lm.three_way_merge(base, ours, theirs)
+    forms = _vfield_forms(out.merged_bytes)
+    assert len(forms) == 1
+    assert forms[0].find('text').text == str(['C2=f'])
+
+
+def test_wife_multiplication_stays_bounded_and_converges():
+    """The ×29 engine: repeated weak-base merges of the same
+    divergent pair (the atomic-recovery shape, base=b'') must NOT
+    grow the form count — pre-fix each pass appended one more
+    copy. The output must also converge: after the first merge,
+    re-merging yields byte-identical output (idempotence)."""
+    theirs = _lift([_ventry('aaa', _vform("['V1=ai', 'C1=wh']"))])
+    state = _lift([_ventry('aaa', _vform("['V1=ai', 'C2=f']"))])
+    seen_states = []
+    for _ in range(6):
+        out = lm.three_way_merge(b'', state, theirs)
+        state = out.merged_bytes
+        seen_states.append(state)
+        forms = _vfield_forms(state)
+        assert len(forms) == 1, \
+            f'form count grew to {len(forms)} — the ×29 bug shape'
+        assert forms[0].find('text').text == \
+            str(['V1=ai', 'C2=f', 'C1=wh'])
+    # Idempotence: from the second pass on, output is stable.
+    assert seen_states[1] == seen_states[2] == seen_states[-1]
+
+
+def test_polluted_input_self_heals_on_any_merge():
+    """A LIFT that ALREADY carries the wife-style pollution (1 + 28
+    identical duplicate forms, no annotations) is repaired by the
+    post-merge invariant sweep even when the merge itself has
+    nothing to do (both sides identical)."""
+    forms = _vform("['V1=ai', 'C2=f']") \
+        + _vform("['V1=ai', 'C1=wh']") * 28
+    polluted = _lift([_ventry('aaa', forms)])
+    out = lm.three_way_merge(b'', polluted, polluted)
+    merged_forms = _vfield_forms(out.merged_bytes)
+    assert len(merged_forms) == 1, \
+        f'29 duplicate forms must heal to 1, got {len(merged_forms)}'
+    assert merged_forms[0].find('text').text == \
+        str(['V1=ai', 'C2=f', 'C1=wh'])
+    assert out.repairs >= 1
+
+
+def test_child_level_delete_is_honored():
+    """Ours deleted a gloss that theirs left untouched (while
+    theirs edited another gloss, forcing the recursive walk). The
+    deleted gloss must NOT be resurrected — pre-fix, one-sided
+    children were kept without consulting base."""
+    two_glosses = ('<sense id="s1">'
+                   '<gloss lang="en"><text>cat</text></gloss>'
+                   '<gloss lang="fr"><text>chat</text></gloss>'
+                   '</sense>')
+    en_only = ('<sense id="s1">'
+               '<gloss lang="en"><text>cat</text></gloss>'
+               '</sense>')
+    edited = ('<sense id="s1">'
+              '<gloss lang="en"><text>feline</text></gloss>'
+              '<gloss lang="fr"><text>chat</text></gloss>'
+              '</sense>')
+    base = _lift([_entry_with('aaa', extra=two_glosses)])
+    ours = _lift([_entry_with('aaa', extra=en_only)])      # deleted fr
+    theirs = _lift([_entry_with('aaa', extra=edited)])     # edited en
+    out = lm.three_way_merge(base, ours, theirs)
+    root = ET.fromstring(out.merged_bytes)
+    glosses = root.findall('entry/sense/gloss')
+    langs = [g.attrib['lang'] for g in glosses]
+    assert langs == ['en'], \
+        f'fr gloss was deleted by ours and unchanged in theirs — ' \
+        f'must stay deleted, got {langs}'
+    assert glosses[0].find('text').text == 'feline'
+
+
+def test_consolidated_side_wins_against_stale_polluted_branch():
+    """After a repair consolidated the duplicates (ours), a merge
+    against a stale still-polluted branch (theirs == base except
+    for an unrelated edit) must keep the single consolidated form
+    — not resurrect the duplicate pile."""
+    polluted_forms = (_vform("['V1=ai', 'C2=f']")
+                      + _vform("['V1=ai', 'C1=wh']") * 2)
+    union_form = _vform(str(['V1=ai', 'C2=f', 'C1=wh']))
+    base = _lift([_ventry('aaa', polluted_forms)])
+    ours = _lift([_ventry('aaa', union_form)])
+    # theirs: same polluted field, but changed the lexical-unit so
+    # the entry differs and the recursive walk actually runs.
+    theirs = _lift([_ventry('aaa', polluted_forms)
+                    .replace('wife', 'woman')])
+    out = lm.three_way_merge(base, ours, theirs)
+    forms = _vfield_forms(out.merged_bytes)
+    assert len(forms) == 1, \
+        f'stale branch resurrected duplicates: {len(forms)} forms'
+    assert forms[0].find('text').text == \
+        str(['V1=ai', 'C2=f', 'C1=wh'])
+    # Theirs's unrelated edit was taken.
+    root = ET.fromstring(out.merged_bytes)
+    assert root.find('entry/lexical-unit/form/text').text == 'woman'
+
+
+def test_divergent_unannotated_duplicates_get_annotated():
+    """Non-verification same-lang duplicates with DIFFERENT content
+    (illegal multitext state from historical pollution) are forced
+    into the visible annotated-conflict-pair shape rather than
+    left silently shadowing each other."""
+    dup = ('<entry guid="aaa" id="x_aaa"><lexical-unit>'
+           '<form lang="en"><text>kat</text></form>'
+           '<form lang="en"><text>qat</text></form>'
+           '</lexical-unit></entry>')
+    doc = _lift([dup])
+    out = lm.three_way_merge(b'', doc, doc)
+    root = ET.fromstring(out.merged_bytes)
+    forms = root.findall('entry/lexical-unit/form')
+    assert len(forms) == 2
+    sides = sorted(f.find('annotation').attrib['value']
+                   for f in forms)
+    assert sides == ['ours', 'theirs']
+
+
+def test_identical_unannotated_duplicate_glosses_dedupe():
+    """Identical same-lang duplicates (the wife shape, but for a
+    sense gloss) collapse to the document-first node."""
+    dup = ('<sense id="s1">'
+           '<gloss lang="en"><text>cat</text></gloss>'
+           '<gloss lang="en"><text>cat</text></gloss>'
+           '</sense>')
+    doc = _lift([_entry_with('aaa', extra=dup)])
+    out = lm.three_way_merge(b'', doc, doc)
+    root = ET.fromstring(out.merged_bytes)
+    glosses = root.findall('entry/sense/gloss')
+    assert len(glosses) == 1
+    assert glosses[0].find('text').text == 'cat'
+
+
+def test_conflict_pair_remerge_converges_no_growth():
+    """Re-merging a result that carries an annotated conflict pair
+    against the same theirs must not grow the pair (no third
+    copy), and must reach a stable fixed point."""
+    base = _lift([_entry('aaa', citation='cat')])
+    ours = _lift([_entry('aaa', citation='kat')])
+    theirs = _lift([_entry('aaa', citation='qat')])
+    m1 = lm.three_way_merge(base, ours, theirs).merged_bytes
+    m2 = lm.three_way_merge(base, m1, theirs).merged_bytes
+    m3 = lm.three_way_merge(base, m2, theirs).merged_bytes
+    for label, m in (('m1', m1), ('m2', m2), ('m3', m3)):
+        forms = ET.fromstring(m).findall('entry/lexical-unit/form')
+        assert len(forms) == 2, \
+            f'{label}: conflict pair grew to {len(forms)} forms'
+        texts = sorted(f.find('text').text for f in forms)
+        assert texts == ['kat', 'qat']
+    assert m2 == m3, 're-merge must reach a fixed point'

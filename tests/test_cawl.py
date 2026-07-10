@@ -321,8 +321,9 @@ def test_get_image_path_cold_fetch_writes_cache(monkeypatch):
     payload = b'\x89PNG\r\n\x1a\nfake-png-bytes'
     monkeypatch.setattr(cawl.urllib.request, 'urlopen',
                         _FakeUrlopen(body=payload))
-    target = cawl.get_image_path('kent/images', 'cawl-1234.png')
+    target, source = cawl.get_image_path('kent/images', 'cawl-1234.png')
     assert target is not None
+    assert source == 'upstream'
     assert target.endswith(os.path.join(
         'cawl', 'kent', 'images', 'images', 'cawl-1234.png'))
     assert open(target, 'rb').read() == payload
@@ -335,7 +336,7 @@ def test_get_image_path_cache_hit_no_network(monkeypatch):
     fake = _FakeUrlopen(exc=AssertionError('should not fetch'))
     monkeypatch.setattr(cawl.urllib.request, 'urlopen', fake)
     result = cawl.get_image_path('kent/images', 'cached.jpg')
-    assert result == target
+    assert result == (target, 'cache')
     assert fake.calls == 0
 
 
@@ -343,7 +344,7 @@ def test_get_image_path_fetch_failure_returns_none(monkeypatch):
     monkeypatch.setattr(
         cawl.urllib.request, 'urlopen',
         _FakeUrlopen(exc=urllib.error.URLError('no route')))
-    assert cawl.get_image_path('kent/images', 'cawl-1.jpg') is None
+    assert cawl.get_image_path('kent/images', 'cawl-1.jpg') == (None, '')
 
 
 def test_get_image_path_rejects_path_traversal():
@@ -352,19 +353,19 @@ def test_get_image_path_rejects_path_traversal():
     # category subdirs). Only path-traversal shapes are rejected.
     for bad in ('../etc/passwd', '..', '.', '/abs/path',
                 '\\windows', 'foo//bar', 'a/../b'):
-        assert cawl.get_image_path('kent/images', bad) is None, (
+        assert cawl.get_image_path('kent/images', bad) == (None, ''), (
             f'expected {bad!r} to be rejected as unsafe rel_path')
 
 
 def test_get_image_path_empty_rel_path_rejected():
-    assert cawl.get_image_path('kent/images', '') is None
-    assert cawl.get_image_path('kent/images', None) is None
+    assert cawl.get_image_path('kent/images', '') == (None, '')
+    assert cawl.get_image_path('kent/images', None) == (None, '')
 
 
 def test_get_image_path_empty_repo_returns_none(monkeypatch):
     fake = _FakeUrlopen(body=b'unused')
     monkeypatch.setattr(cawl.urllib.request, 'urlopen', fake)
-    assert cawl.get_image_path('', 'cawl-1.jpg') is None
+    assert cawl.get_image_path('', 'cawl-1.jpg') == (None, '')
     assert fake.calls == 0
 
 
@@ -380,9 +381,10 @@ def test_get_image_path_accepts_nested_rel_path(monkeypatch):
     payload = b'\x89PNG-nested-bytes'
     monkeypatch.setattr(cawl.urllib.request, 'urlopen',
                         _FakeUrlopen(body=payload))
-    target = cawl.get_image_path(
+    target, source = cawl.get_image_path(
         'kent/images', '0001_body/foo.png')
     assert target is not None
+    assert source == 'upstream'
     assert target.endswith(
         os.path.join('cawl', 'kent', 'images', 'images',
                      '0001_body', 'foo.png'))
@@ -397,10 +399,11 @@ def test_get_image_path_accepts_spaces_and_special_chars(monkeypatch):
     payload = b'\x89PNG'
     monkeypatch.setattr(cawl.urllib.request, 'urlopen',
                         _FakeUrlopen(body=payload))
-    target = cawl.get_image_path(
+    target, source = cawl.get_image_path(
         'kent/images',
         '0001_body/2d minimalistic, line art (female)_0_bw.png')
     assert target is not None
+    assert source == 'upstream'
     assert os.path.isfile(target)
     assert open(target, 'rb').read() == payload
 

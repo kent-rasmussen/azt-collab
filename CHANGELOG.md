@@ -9,6 +9,80 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.0 — LIFT merge robustness: no duplicate same-lang forms, verification-code union, post-merge invariant
+
+Field repro (Kent, 2026-07-10): the 'wife' entry (guid 9ae43c82)
+accumulated **29 duplicate `<form lang="en-x-py">` nodes** in one
+`CVC lc verification` field — one `['V1=ai','C2=f']` plus 28
+identical copies of `['V1=ai','C1=wh']` — all on ONE computer, no
+second device involved. azt-side shipped a survivability guard the
+same day (`Field.consolidate_forms_by_lang` unions duplicates on
+read/write); this release removes the source, daemon-side.
+
+**Root cause — two cooperating defects in `lift_merge.py`:**
+
+1. **Positional same-key pairing** (`_walk_children`): children
+   sharing one key (e.g. same-lang forms) paired by list index,
+   and any length-overhang was kept unconditionally. With
+   `ours=[A,B]` vs `theirs=[B]`, index 0 paired A-with-B (a
+   phantom modify-modify → annotated duplicate pair) and the
+   overhang B was appended verbatim → `[A,B,B]`. Every merge of
+   the still-divergent pair added exactly one more copy — linear
+   growth; 28 copies ≈ 28 merge passes.
+2. **One-sided-child resurrection** (`_merge_pair`): a child
+   missing from one side was kept from the other WITHOUT
+   consulting base, so child-level deletes (including a repair
+   consolidating duplicates) were undone by the next merge
+   against any stale branch.
+
+   One computer suffices because two weak-base merge paths run
+   locally: `atomic_recovery` merges orphans with `base=b''`
+   (every same-lang divergence reads as both-changed), and
+   `reapply_snapshot_after_merge` merges working-tree snapshots
+   against merge results mid-sync.
+
+**Fixes (all in `azt_collabd/lift_merge.py`):**
+
+- **Content-first pairing** (`_pair_same_key`): same-key children
+  pair by `_canon_clean` content first (identical-on-both-sides
+  merges clean, no phantom conflict); one-sided leftovers that
+  match base pair with base so deletes are honored; only true
+  divergences fall back to positional pairing.
+- **Base-honored child deletes**: `_merge_pair` now returns
+  nothing for a one-sided child whose present side is unchanged
+  since base (the other side deleted it). Changed-then-deleted
+  still keeps the data, as at entry level.
+- **Form-aware union for verification fields**
+  (`_union_verification_texts`): duplicate same-lang forms inside
+  a `<field type="…verification…">` union their python-list code
+  content — first-seen order, a check verified to DIFFERENT
+  values on the two sides is dropped entirely (must re-verify) —
+  byte-identical semantics to azt's
+  `Field.consolidate_forms_by_lang`, so daemon merges and azt
+  read/write repairs converge on the same bytes. A genuine
+  both-changed verification conflict now auto-resolves to the
+  union instead of minting a same-lang conflict pair.
+- **Post-merge invariant** (`_normalize_entry`, run on every
+  entry of every merge output, all call sites — WAN, LAN,
+  snapshot-reapply, atomic-recovery): no duplicate same-lang
+  `<form>` (or sense-level `<gloss>`) nodes, ever.
+  Semantically-identical duplicates collapse to the
+  document-first node; verification duplicates union as above;
+  any other surviving same-lang multiplicity is forced into the
+  visible annotated `azt-lift-conflict` pair shape instead of
+  silently shadowing data. Idempotent; polluted LIFTs self-heal
+  on their next merge, even when neither side changed. Repairs
+  are logged via `trace()` (`[merge-repair] …`) and counted on
+  the new `MergeResult.repairs` field.
+
+Tests: 9 new cases in `tests/test_lift_merge.py` — the ×29 repro
+loop (bounded + convergent/idempotent), both-changed union,
+conflicting-check drop, polluted-input self-heal, child-delete
+honoring, consolidated-side-vs-stale-branch, unannotated-divergent
+annotation, identical-gloss dedupe, and conflict-pair re-merge
+fixed point. No wire-format change; no new status codes; no client
+changes (MIN_CLIENT_VERSION unchanged).
+
 ## 0.53.10 — daemon: janitor also sweeps orphaned `azt-blob-seed-*` refs after convergence
 
 Field (nml, immediately after the 0.53.9 convergence): both phones read

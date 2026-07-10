@@ -91,14 +91,20 @@ def test_state_persists_across_module_reload(azt_home):
     assert on_disk['fr']['next_attempt_at'] > time.time() + 30
 
 
-def test_reset_due_times_on_startup_preserves_failures():
-    """Daemon-startup hook: clear ``next_attempt_at`` for free
-    immediate retry, but ``consecutive_failures`` stays so a
-    re-failure re-enters the curve at the right step."""
+def test_reset_due_times_on_startup_is_a_noop():
+    """Deprecated no-op since 0.50.45: daemon lifecycle is not user
+    intent. Pre-0.50.45 this cleared every ``next_attempt_at`` on
+    respawn, which — given how often Android respawns the daemon
+    (OOM, APK self-update, sticky-service restart) — made the 24 h
+    cap effectively unreachable. Pin the no-op: due times AND
+    failure counts survive; only ``nudge`` (user tap) or
+    ``record_success`` reset the curve."""
     for _ in range(4):
         wan_backoff.record_failure('fr')
+    due_before = wan_backoff.next_due_at('fr')
+    assert due_before > 0.0
     wan_backoff.reset_due_times_on_startup()
-    assert wan_backoff.next_due_at('fr') == 0.0
+    assert wan_backoff.next_due_at('fr') == due_before
     assert wan_backoff.consecutive_failures('fr') == 4
     wan_backoff.record_failure('fr')
     assert wan_backoff.consecutive_failures('fr') == 5
