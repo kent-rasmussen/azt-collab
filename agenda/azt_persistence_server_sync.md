@@ -277,6 +277,14 @@ returns"; reopen if it recurs):**
 
 Daemon RESTART (from a clean tree) needed for the azt-collab fixes; the azt fixes
 degrade gracefully without it.
+
+**Session-end 2026-07-09:** Kent restarted the daemon (~17:00) → 0.53.8 daemon fixes
+live. A popup recurred at 17:31, but it was a `MERGED_WITH_LOCAL` offer with NO
+"latch cleared" line ⇒ the azt APP still running the pre-fix build (azt-side F1/F2/F6
+load only on an azt restart, which hadn't happened). So NOT a fix failure — the
+daemon half is confirmed live; the azt half awaits an azt restart (tracked on
+[[azt_run_with_server]]). Both trees still have uncommitted work (mine + the
+concurrent session's LAN-ancestry 0.53.8) — wants a clean commit.
 - **Post-commit hook (azt-collab, from probe findings) — DONE.** `submit_file`'s
   `COMMITTED_LOCAL` side effects (`server.py`) were unwrapped and ran on the REQUEST
   thread: `after_committed_local`'s LAN fan-out can block for minutes on a dead-endpoint

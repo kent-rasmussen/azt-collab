@@ -4173,14 +4173,31 @@ def _janitor_sweep_topic_branches(
 def _maybe_run_janitor(
     repo, project_dir, username, token, remote_url, branch,
 ):
-    """Idempotent wrapper around ``_janitor_sweep_topic_branches``
-    keyed by ``project_dir`` so the sweep runs at most once per
-    daemon-lifetime per project."""
+    """Idempotent wrapper around the once-per-lifetime remote-ref
+    sweeps, keyed by ``project_dir``: merged ``azt-pending-*``
+    topic-branches, then orphaned ``azt-blob-seed-*`` side refs.
+
+    The preseed sweep also runs at topic-push entry, but a project
+    that has *converged* never topic-pushes again — so without
+    this call, the side refs from its last chunked upload sit on
+    the server forever (field: nml left ~45 ``azt-blob-seed-*``
+    branches on github after the 0.53.9 convergence). Running it
+    here means any ordinary push after convergence cleans them up.
+    Same conservative contract as at topic-push entry: only refs
+    whose every blob is reachable from ``origin/<branch>`` are
+    deleted, so another device mid-Phase-A keeps its refs."""
     if project_dir in _JANITOR_SWEPT_PROJECTS:
         return
     _JANITOR_SWEPT_PROJECTS.add(project_dir)
     _janitor_sweep_topic_branches(
         repo, project_dir, username, token, remote_url, branch)
+    try:
+        _sweep_orphan_preseed_refs(
+            repo, remote_url, username, token, branch)
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] janitor: preseed sweep failed '
+            f'(non-fatal): {exc!r}')
 
 
 _PRESEED_REF_PREFIX = 'azt-blob-seed-'
@@ -4434,7 +4451,11 @@ def _sweep_orphan_preseed_refs(
     Phase A pre-seeded blobs and Phase C succeeded, the side refs
     are orphaned on the server until this sweep — but they're
     harmless until then, and this scheme survives daemon kills
-    between Phase C and any eager-cleanup attempt.
+    between Phase C and any eager-cleanup attempt. Since 0.53.10
+    the once-per-lifetime janitor (``_maybe_run_janitor``) also
+    runs this sweep, because a *converged* project never enters
+    topic-push again and its final upload's side refs would
+    otherwise linger on the server forever.
 
     Conservative: a side ref whose blobs are NOT all in main's
     tree is kept (it's still useful as a "have" for the current
@@ -5149,8 +5170,9 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
         f'[sync-trace] local_sha={local_sha!r} remote_sha={remote_sha!r}')
 
     # One-shot janitor: sweep merged ``azt-pending-*-<our_device>``
-    # refs on the server. Idempotent per (project, daemon lifetime).
-    # Runs after fetch so it sees fresh server refs and after
+    # refs and orphaned ``azt-blob-seed-*`` side refs on the
+    # server. Idempotent per (project, daemon lifetime). Runs
+    # after fetch so it sees fresh server refs and after
     # remote_sha is read so it can validate ancestry. Best-effort —
     # any failure logs and returns; sync proceeds.
     _maybe_run_janitor(

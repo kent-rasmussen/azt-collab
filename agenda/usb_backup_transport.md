@@ -13,7 +13,10 @@
   device plugs the same drive in and pulls the changes), all coordinated by the daemon
   (dulwich-owned), not by peer code. Github stays authoritative; USB is another
   opportunistic transport, like LAN.
-- **Deadline:** before [[azt_run_with_server]] ships (hard dependency for field parity).
+- **Deadline:** 2026-08-20 (pushed from July on 2026-07-09 — a field router makes LAN
+  available in Cameroon, so offline USB backup isn't trip-critical). Still the
+  prerequisite for [[azt_run_with_server]] **Phase 6** legacy-VCS retirement, which is
+  itself post-Cameroon — so this ordering holds.
 
 ## Plans
 - **DECIDED (2026-07-06): bare repo on the drive** (`<lang>.git`), not a bundle — matches

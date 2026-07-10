@@ -9,6 +9,34 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.53.10 — daemon: janitor also sweeps orphaned `azt-blob-seed-*` refs after convergence
+
+Field (nml, immediately after the 0.53.9 convergence): both phones read
+OK / `at_risk=0`, but https://github.com/aztobt2-ui/nml/branches still
+showed ~45 branches — the `azt-blob-seed-*` chunk-anchor side refs from
+Phase A's pre-seeding (44 of them, visible in the device's own
+`remote_refs_present` snapshot), now that the `azt-pending-*` topic ref
+itself was deleted on convergence.
+
+Root cause: the two ref families had different janitors, and only one
+fires after convergence. `azt-pending-*` topic branches are deleted
+eagerly in Phase D *and* by the once-per-lifetime janitor
+(`_maybe_run_janitor`) on every ordinary push. `azt-blob-seed-*` refs
+were swept only by `_sweep_orphan_preseed_refs` at **topic-push entry**
+(step 0 of `_topic_push`) — correct while chunking is still in
+progress, but a converged project routes every subsequent push down the
+fast path and never enters topic-push again, so its final upload's side
+refs sat on the server indefinitely.
+
+Fix: `_maybe_run_janitor` now also calls `_sweep_orphan_preseed_refs`
+(guarded, best-effort) after the topic-branch sweep. Same conservative
+delete contract as before: a side ref is deleted only when every blob
+it references is reachable from `origin/<branch>`'s HEAD tree, so
+another device mid-Phase-A keeps its refs. Effect on the field repo:
+the next commit+drain (or daemon respawn + push) on either phone
+deletes all ~45 stale branches; steady state finds zero candidates and
+costs one local ref enumeration.
+
 ## 0.53.9 — daemon: topic-branch promote skips the unbounded phase-b fetch (unblocks stuck github convergence)
 
 Field (nml on aztobt2-ui/aztobt1-sudo, the multi-day deblock): after Phase A
