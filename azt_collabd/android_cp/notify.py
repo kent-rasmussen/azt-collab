@@ -31,27 +31,45 @@ is attached to the JVM (Python-spawned threads attach lazily via the
 bootclassloader on first jnius call).
 """
 
+import os
 import sys
 
 
 def _is_android():
-    try:
-        from kivy.utils import platform
-        return platform == 'android'
-    except Exception:
-        return False
+    # Dependency-free — do NOT `import kivy.utils` here. This runs on
+    # EVERY commit and post-receive (via notify_project_changed), and
+    # importing kivy.utils pulls ALL of Kivy (logger, Config, ~/.kivy)
+    # into the DAEMON on desktop: Kivy's logger hijacks root logging /
+    # stdio (the detached-daemon "log went silent" death) and it
+    # violates the no-Kivy-in-daemon invariant. Mirror the Android
+    # signals of kivy.utils._get_platform via environment only (same
+    # answer a Kivy host would get — the recorder/viewer set
+    # ANDROID_ARGUMENT before Python starts). See client _platform.py,
+    # which exists since 0.53.1 for exactly this reason.
+    return ('ANDROID_ARGUMENT' in os.environ
+            or os.environ.get('KIVY_BUILD') == 'android'
+            or 'P4A_BOOTSTRAP' in os.environ)
 
 
 _provider_cls = None
+_not_android = False  # cached desktop negative (Android is env-stable,
+#                       so this never flips; set once, avoids re-checking)
 
 
 def _get_provider_class():
     """Lazy-load + cache the AZTCollabProvider Java class. Returns
     None off Android or if jnius isn't available."""
-    global _provider_cls
+    global _provider_cls, _not_android
     if _provider_cls is not None:
         return _provider_cls
+    if _not_android:
+        return None
     if not _is_android():
+        # Desktop: cache the negative so we stop re-checking forever
+        # (the pre-fix code re-ran the check — and its Kivy import —
+        # on every notify). Only the desktop None is cached; on Android
+        # a failed autoclass below stays uncached so it can retry.
+        _not_android = True
         return None
     try:
         from jnius import autoclass

@@ -192,6 +192,34 @@ offline use case. Park.
 
 ## Pairing
 
+**Field finding (2026-07-07, first desktop↔phone pairing attempt):** the QR/UI
+advertise `lan_listener._outward_ip_guess()` — the DEFAULT-ROUTE source IP.
+On a multi-homed desktop (ethernet to house LAN + wifi to a phone hotspot)
+that stays the ethernet IP, so the phone can't reach the advertised endpoint
+even though the listener binds 0.0.0.0 on the reachable interface too.
+Workaround: make the drill network the only network (unplug ethernet), toggle
+LAN off→on to re-guess, regenerate QR. **Improvement to make:** advertise ALL
+non-loopback local IPs in the QR (`endpoints: [ip:port, …]`) and have the
+scanner try each — the QR payload already carries a list-shaped field for
+static endpoints, and the phone-side claim loop can race/sequence them. Also
+surfaced same day: desktop LAN needs `cryptography` + `zeroconf` + `segno`
+installed (now in azt requirements; see azt/agenda/rework_install_procedure.md).
+**Sender-side pending-offer visibility (small UX gap, 2026-07-07):** offers
+live only in the INVITEE's pending_decisions; the sender's UI has no "offer
+sent, awaiting acceptance" state — a stuck adoption is invisible on the
+desktop except as `lan-sweep 0/1 delivered` in the log. Add a per-peer
+shared-but-not-adopted marker to the Paired-devices screen (the daemon can
+infer it: allowlist entry + peer's last_seen_main lacks the project).
+(Related plus: `lan_discovery` already re-sends the offer on peer ARRIVAL, so
+recovery needs no manual re-share — just a fresh arrival event.)
+Same drill, two more desktop address bugs FIXED: 0.53.6 hotspot-host guess
+(`_outward_ip_guess` → SIOCGIFCONF fallback; QR advertised 0.0.0.0 with no
+default route) and 0.53.7 mDNS advertising `gethostbyname(gethostname())` =
+Debian's 127.0.1.1 — the phone resolved the desktop to loopback and every
+phone→desktop call (en.git clone, share-offer handshake) dialed itself. The
+zeroconf ServiceInfo now carries ALL interface addresses; the QR still
+carries one (the remaining improvement above).
+
 ### One-time QR exchange
 
 Daemon settings UI on device A: "Pair a phone" button → shows a

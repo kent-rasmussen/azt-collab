@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.53.3"
+__version__ = "0.53.9"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -227,11 +227,15 @@ def configure(app_id: str):
     return None
 
 
-def open_server_ui(on_status=None):
+def open_server_ui(on_status=None, python_exe=None):
     """Open the daemon settings UI on whichever platform we're on.
 
     Desktop: spawns ``python -m azt_collabd ui`` detached and returns
-    ``{'ok': True, 'pid': <int>}``.
+    ``{'ok': True, 'pid': <int>}``. ``python_exe`` (0.53.4) overrides
+    the interpreter for the spawn — the settings UI needs Kivy, and a
+    non-Kivy host (desktop A-Z+T, tkinter) may be running a venv
+    without it; such hosts pass a Kivy-capable python here while
+    daemon auto-spawn (Kivy-free) keeps using their own.
 
     Android: dispatches a launch intent to the installed server APK
     (``org.atoznback.aztcollab``). On success returns
@@ -265,7 +269,7 @@ def open_server_ui(on_status=None):
     from ._spawn import build_spawn_env
     try:
         proc = subprocess.Popen(
-            [_sys.executable, '-m', 'azt_collabd', 'ui'],
+            [python_exe or _sys.executable, '-m', 'azt_collabd', 'ui'],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

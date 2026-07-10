@@ -5274,13 +5274,47 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                         f'[sync-trace] phase-b begin '
                         f'(attempt {promote_attempt + 1}/'
                         f'{MAX_PROMOTE_RETRIES})')
+                    # Cheap remote-tip peek before the (unbounded,
+                    # non-resumable) fetch — the SAME guard the
+                    # pre-sync path already uses (see
+                    # ``_ls_remote_main_tip``, whose docstring cites
+                    # this exact device). ``main`` has typically NOT
+                    # moved during Phase A's long upload, so skipping
+                    # the fetch is what actually lets the promote
+                    # finish. Field (nml/aztobt2-ui): phase-b's
+                    # UNconditional ``porcelain.fetch`` never returned
+                    # inside a daemon lifetime — the log stopped at
+                    # "phase-b begin", the promote never reached
+                    # Phase C, and github ``main`` stayed behind across
+                    # dozens of process restarts. ``socket.setdefault
+                    # timeout`` is per-``recv``, not wall-clock, so it
+                    # does NOT bound a negotiating fetch; skipping it
+                    # when there is provably nothing to pull is the
+                    # real bound. Only skip on a confident equality;
+                    # any peek failure / missing mirror falls through
+                    # to the normal fetch so genuinely-advanced remotes
+                    # still reconcile.
+                    pb_mirror = _read_ref(remote_ref)
+                    pb_peek = _ls_remote_main_tip(
+                        remote_url, username, token, branch)
+                    pb_skip = (
+                        pb_peek is not None
+                        and pb_mirror is not None
+                        and pb_peek == pb_mirror)
                     try:
-                        with _socket_timeout(_FETCH_TIMEOUT_S):
-                            porcelain.fetch(
-                                repo, 'origin',
-                                username=username, password=token,
-                                errstream=io.BytesIO(),
-                            )
+                        if pb_skip:
+                            lift_merge.trace(
+                                f'[sync-trace] phase-b: fetch skipped '
+                                f'— remote tip '
+                                f'{_sha_str(pb_peek)[:8]!r} == mirror; '
+                                f'nothing to pull')
+                        else:
+                            with _socket_timeout(_FETCH_TIMEOUT_S):
+                                porcelain.fetch(
+                                    repo, 'origin',
+                                    username=username, password=token,
+                                    errstream=io.BytesIO(),
+                                )
                     except Exception as fexc:
                         if _is_http_403(fexc):
                             result.statuses.append(

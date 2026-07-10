@@ -277,12 +277,38 @@ def _start_advertise_zeroconf(peer_id_hex, fp_hex, port, device_name):
     zc = _STATE.get('zc') or Zeroconf()
     _STATE['zc'] = zc
     instance = (device_name or 'AZT device') + '.' + SERVICE_TYPE
+    # 0.53.7: advertise real interface addresses — ALL of them. The
+    # old ``gethostbyname(gethostname())`` returns 127.0.1.1 on
+    # Debian-family hosts (/etc/hosts convention), so peers resolved
+    # this desktop to loopback and dialed THEMSELVES — field repro
+    # 2026-07-07: the phone's en.git clone retried 127.0.1.1
+    # (connection refused) and the share/adopt flow surfaced "the
+    # computer wasn't responding", with no share-offer popup either.
+    # Reuse the listener's route-guess + interface enumeration
+    # (0.53.6); multiple addresses in one ServiceInfo keep a
+    # multi-homed desktop reachable on whichever network the peer
+    # shares with it.
     addrs = []
     try:
-        ip = socket.gethostbyname(socket.gethostname())
-        addrs.append(socket.inet_aton(ip))
+        from .lan_listener import _interface_ipv4s, _outward_ip_guess
+        cands = []
+        ip = _outward_ip_guess()
+        if ip and ip != '0.0.0.0' and not ip.startswith('127.'):
+            cands.append(ip)
+        for extra in _interface_ipv4s():
+            if extra not in cands:
+                cands.append(extra)
+        for c in cands:
+            addrs.append(socket.inet_aton(c))
     except Exception:
         pass
+    if not addrs:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+            if not ip.startswith('127.'):
+                addrs.append(socket.inet_aton(ip))
+        except Exception:
+            pass
     info = ServiceInfo(
         type_=SERVICE_TYPE,
         name=instance,

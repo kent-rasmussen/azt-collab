@@ -179,8 +179,17 @@ def _record_started():
         with open(_started_path(), 'w') as f:
             json.dump({'pid': os.getpid(), 'ts': _started_at,
                        'version': _VERSION}, f)
-    except OSError:
-        pass
+    except OSError as ex:
+        # F7: this write has failed silently for months — no
+        # started.json ever, though _record_started demonstrably runs.
+        # Surface the errno/path so the cause (permissions? fd
+        # exhaustion? disk full? state/ is a file?) is finally visible.
+        # _record_crash writes the same dir, so a swallowed failure
+        # here also blinds crash diagnosis.
+        print(f'[state] cannot write started.json under '
+              f'{os.path.join(azt_home(), "state")!r}: '
+              f'{ex.__class__.__name__} errno={getattr(ex, "errno", None)} '
+              f'{ex}', file=sys.stderr, flush=True)
 
 
 def _record_crash(exc, where=''):
@@ -198,8 +207,13 @@ def _record_crash(exc, where=''):
                 'tb': ''.join(traceback.format_exception(
                     type(exc), exc, exc.__traceback__))[-2000:],
             }) + '\n')
-    except OSError:
-        pass
+    except OSError as ex:
+        # F7: don't swallow — a failed crash-log write is exactly when
+        # we most need a trace of why. Surface errno/path.
+        print(f'[state] cannot append crash.log under '
+              f'{os.path.join(azt_home(), "state")!r}: '
+              f'{ex.__class__.__name__} errno={getattr(ex, "errno", None)} '
+              f'{ex}', file=sys.stderr, flush=True)
 
 
 def _acquire_server_lock(lock_path):
@@ -2862,6 +2876,14 @@ def _h_project_status(langcode, _body):
     # a user troubleshooting "why is this remote so heavy" can
     # see them.
     foreign_topic_orphan_count = 0
+    # LIFT blob SHA at HEAD (F3, 0.53.8). Lets a desktop whole-file
+    # editor classify a HEAD advance by CONTENT identity, not file
+    # stat: if the LIFT blob at HEAD equals the blob at the editor's
+    # base, the advance touched no LIFT content (artifact-only commit,
+    # a hard-reset receive that rewrote identical bytes, or a
+    # consumed-but-uncommitted save that later lands) → benign, no
+    # "team changes" dialog. Empty when HEAD has no such path yet.
+    lift_blob_sha = ''
     try:
         from dulwich.repo import Repo
         _r = Repo(p.working_dir)
@@ -2871,6 +2893,16 @@ def _h_project_status(langcode, _body):
                 head_sha = _h.decode('ascii', 'replace')
             else:
                 head_sha = str(_h)
+            try:
+                from .repo import _walk_tree as _wt
+                rel = os.path.relpath(api['lift_path'], p.working_dir)
+                _bsha = _wt(_r, _r[_h].tree).get(rel)
+                if _bsha is not None:
+                    lift_blob_sha = (
+                        _bsha.decode('ascii', 'replace')
+                        if isinstance(_bsha, bytes) else str(_bsha))
+            except Exception:
+                lift_blob_sha = ''
             try:
                 from .repo import _count_foreign_topic_orphans
                 foreign_topic_orphan_count = \
@@ -3003,6 +3035,10 @@ def _h_project_status(langcode, _body):
         # complete set of events that mutate the on-disk view of
         # this project the peer is rendering.
         "head_sha": head_sha,
+        # LIFT blob SHA at HEAD (F3, 0.53.8) — content-identity signal
+        # for desktop whole-file editors (see the computation above).
+        # Pre-0.53.8 peers ignore the unknown key.
+        "lift_blob_sha": lift_blob_sha,
         # Foreign-device topic-branch orphan count (since 0.50.15,
         # audit finding #3). Number of
         # ``refs/remotes/origin/azt-pending-*`` refs whose
@@ -3501,24 +3537,31 @@ def _h_project_submit_file(langcode, body):
     post-commit HEAD, the caller's next base. Desktop-only by
     design (Android peers use surgical writes; there is no
     cross-process staged-file handoff through the ContentProvider)."""
+    # F4(b): every rejection emits a log line (always-emit contract —
+    # the 400 paths used to return silently, so a rejected desktop save
+    # left no trace in the daemon log to triage against).
+    def _reject(status_code, err):
+        print(f'[submit_file] {langcode!r} rejected ({status_code}): {err}',
+              file=sys.stderr, flush=True)
+        return status_code, {"ok": False, "error": err}
     p = projects.get(langcode)
     if p is None:
-        return 404, {"ok": False, "error": "project_not_found"}
+        return _reject(404, "project_not_found")
     if not isinstance(body, dict):
-        return 400, {"ok": False, "error": "invalid_body"}
+        return _reject(400, "invalid_body")
     rel = body.get('path') or ''
     staged = body.get('staged_path') or ''
     base_sha = body.get('base_sha') or ''
     message = body.get('message') or ''
     if not isinstance(rel, str) or not rel:
-        return 400, {"ok": False, "error": "missing_path"}
+        return _reject(400, "missing_path")
     if not isinstance(staged, str) or not staged:
-        return 400, {"ok": False, "error": "missing_staged_path"}
+        return _reject(400, "missing_staged_path")
     if not isinstance(base_sha, str):
-        return 400, {"ok": False, "error": "invalid_base_sha"}
+        return _reject(400, "invalid_base_sha")
     target = _resolve_atomic_commit_path(p.working_dir, rel)
     if target is None:
-        return 400, {"ok": False, "error": "path_rejected"}
+        return _reject(400, "path_rejected")
     staged_real = os.path.realpath(staged)
     # Staged file must be a sibling of the target: same directory ⇒
     # same filesystem (os.replace stays atomic) and inside the
@@ -3527,7 +3570,7 @@ def _h_project_submit_file(langcode, body):
     if (not os.path.isfile(staged_real)
             or os.path.dirname(staged_real) != os.path.dirname(target)
             or staged_real == target):
-        return 400, {"ok": False, "error": "staged_rejected"}
+        return _reject(400, "staged_rejected")
     rel_clean = '/'.join(rel.lstrip('/').split('/'))
     contributor = store.get_contributor()
     _touch_project(langcode)
@@ -3547,8 +3590,31 @@ def _h_project_submit_file(langcode, body):
         # worker: pending-push for the WAN drain, last_commit stamp,
         # LAN backoff/burst + fan-out so a desktop commit converges
         # to paired peers exactly like a recorder commit.
-        scheduler._set_pending_push(langcode, True)
-        scheduler.after_committed_local(langcode, p)
+        #
+        # pending-push is cheap and must be set before we return so
+        # the WAN drain sees the work — do it synchronously (wrapped).
+        try:
+            scheduler._set_pending_push(langcode, True)
+        except Exception as ex:
+            print(f'[submit_file] {langcode!r} set_pending_push '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+        # after_committed_local does LAN fan-out, which can BLOCK for
+        # minutes on a fetch to a dead/stale peer endpoint (infinite
+        # connect timeout). The commit has ALREADY landed and the
+        # bytes are durable, so run fan-out OFF the request thread —
+        # otherwise the hang delays or loses this reply and azt sees a
+        # spurious SERVER_ERROR (the empty-reply / "commit lands but
+        # response never arrives" bug). Mirrors the scheduler's own
+        # daemon-thread commit-fire; after_committed_local never raises
+        # but the wrapper is belt-and-braces.
+        def _fanout(_lang=langcode, _p=p):
+            try:
+                scheduler.after_committed_local(_lang, _p)
+            except Exception as ex:
+                print(f'[submit_file] {_lang!r} post-commit fan-out '
+                      f'raised: {ex!r}', file=sys.stderr, flush=True)
+        threading.Thread(target=_fanout, daemon=True,
+                         name=f'submit-fanout-{langcode}').start()
     return 200, {"ok": True, "result": res.to_dict(),
                  "head_sha": head_sha}
 
@@ -5122,8 +5188,17 @@ class _LogSession:
             return
         with self._lock:
             if self._file is None:
-                # Tee uninstall in flight or open() failed; drop.
-                return
+                # F4(a): a prior open()/rotation failed (transient FS
+                # error, a permissions blip, a rotation that raised) —
+                # RETRY the open here rather than dropping every write
+                # for the rest of the process's life. Only give up when
+                # the reopen ALSO fails. This is what un-freezes the
+                # daemon log after a single failed rotation (field
+                # repro: the tee went silent ~80 s after start and
+                # never recovered, blinding diagnosis). ``open()`` is
+                # idempotent and re-enters the RLock safely.
+                if not self.open():
+                    return
             today = _today_str()
             if today != self._current_date:
                 self._rotate_locked(today)

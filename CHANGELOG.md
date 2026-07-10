@@ -9,6 +9,187 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.53.9 — daemon: topic-branch promote skips the unbounded phase-b fetch (unblocks stuck github convergence)
+
+Field (nml on aztobt2-ui/aztobt1-sudo, the multi-day deblock): after Phase A
+finished uploading the whole 2368-commit backlog to the per-device topic ref
+(every object on the server), the promote to `main` never completed. The daemon
+log stopped dead at `[sync-trace] phase-b begin (attempt 1/5)` every time —
+never `phase-b: fetch failed`, never `phase-c: pushing` — and the process was
+killed by the idle-stop ~5 min later, across dozens of restarts. `main` stayed
+frozen at `7c42ae48` while both phones sat LAN-converged at `3cefc3e0` with
+`at_risk=0` (data safe; only the github backup pointer stale).
+
+Root cause: the phase-b step (re-fetch `main` in case it moved during Phase A's
+long upload) ran an **unconditional** `porcelain.fetch`. `main` had not actually
+moved in days, so there was nothing to pull — but the fetch hung anyway.
+`socket.setdefaulttimeout` is per-`recv`, not wall-clock, so the
+`_socket_timeout(60)` wrapper does **not** bound a negotiating/slow fetch (this
+is documented on `_ls_remote_main_tip`, which was written *for this exact device*
+to fix the identical hang on the pre-sync path). The pre-sync path
+(`_push_step_locked`) already peeks the remote tip via a single bounded
+`GET info/refs` and skips the fetch when the tip equals our tracking mirror — but
+that guard was never applied to the phase-b promote loop.
+
+Fix: wire the same `_ls_remote_main_tip` peek-and-skip into phase-b. When the
+remote `main` tip still equals our tracking mirror (the common case — main hasn't
+moved), skip the fetch entirely and proceed straight to Phase C (push the merge
+commit to `main`, a near-empty pack since all objects are already server-side
+from Phase A). Only skips on a confident equality; any peek failure or missing
+mirror falls through to the normal fetch so genuinely-advanced remotes still
+reconcile. Because the promote now completes in seconds instead of hanging for
+minutes, the idle-stop no longer kills it mid-flight either — so this one change
+resolves both the hang and the idle-stop-kills-promote symptom. `nml`'s `main`
+should fast-forward to `3cefc3e0` and the topic branch get deleted (Phase D) on
+the next drain after deploy.
+
+Daemon-only; no wire-format or client change (no `MIN_*_VERSION` bump). Phase C's
+push was already bounded and was never where the log stopped, so it is unchanged.
+The still-open belt-and-suspenders items (stall-watchdog on transfers; keep the
+whole promote off the idle-stop path) are deferred — no longer required now that
+the promote is fast, tracked in `agenda/deblock_sync_unknown_bug.md`.
+
+## 0.53.8 — daemon: LAN merge no longer mints empty ping-pong merge commits
+
+Field repro (desktop `Demo_en` ↔ tablet, both current — tablet on 0.53.3, so
+NOT the pre-0.46.5 loop this superficially resembles): four content-identical
+`azt-collaboration[bot] "Merge origin/main into main"` commits appeared on the
+desktop in ~30 min (2026-07-09 20:52–21:24Z, `7851617c..f30f794b`, zero files
+changed), delivered from the tablet on LAN arrival. Each empty merge advances
+HEAD and — via the post-receive hard reset — rewrites the LIFT, which pops a
+"Team changes available" reload dialog for non-changes and grows a LAN-only
+project's history without bound (`wan_unshared` 78→82, `at_risk` climbing). No
+data was ever wrong: the merge trees equal a parent's.
+
+Root cause: `_merge_then_push_locked` (`lan_push.py`) checked only whether the
+two heads were **equal** before merging — never whether one was an **ancestor**
+of the other. So when the desktop committed a real save B atop A and the peer
+was still at A, the peer ran a three-way merge of A and B instead of
+fast-forwarding, producing a merge commit whose tree is identical to B
+(`writes_done=0`), pushing it back, and repeating on the next save. The github
+sync path (`repo.py` phase-b) already guards this with ancestry checks; the LAN
+path was missing them.
+
+Fix: two ancestry short-circuits before `_merge_diverged`, both gated on a clean
+working tree (`not snapshot`) and **neither mutating the working tree** (no
+data-loss surface):
+- peer_head is an ancestor of local_head (we are ahead) → skip the merge,
+  fast-forward-push our head so the peer FFs to us; no merge commit.
+- local_head is an ancestor of peer_head (we are behind) → skip the merge AND
+  the push; return success and let the peer's own fan-out deliver its head
+  through the normal receive-pack path (the one with the
+  `_reset_working_tree_after_receive` guards), rather than a hard reset in this
+  less-guarded path.
+Only genuine divergence (each side has unique commits) now mints a merge, which
+is correct and converges (the merge descends from both sides, so the next
+comparison is an ancestor case → no further merge). With pending uncommitted
+edits (`snapshot` non-empty) the merge is legitimate/non-empty and the existing
+reapply path runs unchanged. Whole function already runs under `project_lock`.
+
+Daemon-only; no wire-format or client change (no `MIN_*_VERSION` bump). The
+desktop-app companion (classify reload-worthiness by LIFT blob SHA so a stray
+empty merge from an un-updated peer never pops the dialog) is implemented as
+`lift_blob_sha` below (was tracked as A3 in
+`agenda/azt_persistence_server_sync.md`).
+
+### Also in 0.53.8 — desktop persistence hardening (submit_file / diagnosability)
+
+Follow-on fixes from the same "Team changes available" investigation
+(`agenda/azt_persistence_server_sync.md` F3/F4/F7/F8/post-commit/Kivy):
+
+- **submit_file post-commit hooks moved off the request thread.** The
+  `COMMITTED_LOCAL` side effects (`_set_pending_push` + `after_committed_local`)
+  ran inline and unwrapped in `_h_project_submit_file`; `after_committed_local`'s
+  LAN fan-out can block for minutes on a fetch to a dead peer endpoint (infinite
+  connect timeout), so the (already-durable) reply was delayed or lost and azt
+  saw a spurious `SERVER_ERROR`. Now `_set_pending_push` stays synchronous
+  (wrapped) and fan-out runs on a daemon thread; the reply returns immediately.
+- **`lift_blob_sha` added to `project_status`** (F3): the LIFT blob SHA at HEAD,
+  computed via `_walk_tree`. Lets a desktop whole-file editor classify a HEAD
+  advance by CONTENT identity (vs file stat), so hard-reset receives / empty
+  merges / artifact-only commits don't pop a reload dialog. Additive response
+  field; pre-0.53.8 peers ignore it (no `MIN_*` bump).
+- **LAN merge: also no-op on divergent-but-identical trees** (F8 layer-1,
+  refines the ancestry fix above). The ancestry short-circuits skip merges when
+  one head contains the other; but two commits with divergent history yet
+  IDENTICAL trees (e.g. residual empty-merge heads from an un-updated peer) still
+  fell through to `_merge_diverged` and minted another empty merge. Added a
+  tree-equality no-op before the merge (clean tree only): identical trees + no
+  ancestry ⇒ don't merge, don't push (can't FF either way); the next real edit
+  converges them. So "only genuine divergence mints a merge" now also excludes
+  genuine-but-content-identical divergence.
+- **Daemon-log tee self-heals** (F4a): `_LogSession.write` retries `open()` when
+  the handle is None instead of silently dropping every write for the process's
+  life after one failed rotation (the "daemon log went silent" death).
+- **`submit_file` rejections are logged** (F4b): the 400/404 paths emitted no log
+  line; each now logs its reason (always-emit).
+- **`state/` write failures surfaced** (F7): `_record_started` / `_record_crash`
+  no longer swallow `OSError` — they log errno + path (months-long silent
+  `started.json`/`crash.log` write failure was invisible).
+- **No Kivy in the daemon** (Kivy-in-daemon): `android_cp/notify.py._is_android`
+  did `from kivy.utils import platform` on every commit/receive, pulling all of
+  Kivy (logger, Config) into the desktop daemon and hijacking stdio (the tee
+  death's likely root) — violating the no-Kivy-in-daemon invariant. Now a
+  dependency-free env check with a cached desktop negative.
+
+## 0.53.7 — daemon: mDNS advertisement no longer resolves the desktop to 127.0.1.1
+
+Field repro (desktop↔phone drill, 2026-07-07, continued): pairing + desktop→
+phone discovery worked, but every phone→desktop call — the en.git LAN clone
+(retried `127.0.1.1:40215`, connection refused), the share-offer/decision
+handshake ("the computer wasn't responding", no adoption popup) — dialed
+loopback. `_start_advertise_zeroconf` used
+`gethostbyname(gethostname())`, which on Debian-family hosts returns the
+`/etc/hosts` `127.0.1.1` entry; the phone's NSD resolver faithfully recorded
+the desktop at `127.0.1.1` and the phone then connected to itself.
+
+Fix: register real interface addresses — the 0.53.6 route-guess plus the full
+SIOCGIFCONF enumeration, ALL of them in one ServiceInfo (multi-homed desktops
+stay reachable on whichever network the peer shares); loopback-shaped
+fallbacks filtered. Android NSD side unchanged (it advertises per-interface
+natively).
+
+## 0.53.6 — daemon: LAN endpoint guess survives a hotspot-host (no-default-route) desktop
+
+Field repro (first desktop↔phone pairing drill, 2026-07-07): with the desktop
+hosting the hotspot (NetworkManager shared connection, uplink unplugged) the
+settings UI showed `Listening on 0.0.0.0:33203` and the phone (10.42.0.100)
+got "did not respond" — `_outward_ip_guess`'s UDP default-route trick has no
+route at all on a hotspot host and fell back to '0.0.0.0', so the QR
+advertised nowhere. Now a failed/loopback guess falls through to a
+SIOCGIFCONF interface enumeration (Linux ioctl, guarded; private RFC-1918
+addresses preferred) — a hotspot host advertises its 10.42.0.1-style address.
+Known remaining gap (tracked in agenda/local_lan_sync_stub.md § Pairing): a
+multi-homed desktop whose default route is NOT the drill network still
+advertises the wrong single IP; the real fix is advertising all local
+addresses in the QR and letting the scanner try each.
+
+## 0.53.5 — client: spawn-env injection no longer fooled by parent-only importability
+
+Field repro (desktop azt, 2026-07-07, surfaced by 0.53.4's detail reporting):
+`spawn_exited rc=1 detail='…: No module named azt_collabd'`.
+`_spawn._locate_azt_collabd_parent` probed `import azt_collabd` in the PARENT
+and returned '' ("no injection needed") on success — but azt makes the package
+importable via a runtime `sys.path` insert (its discovery shim), which a child
+process does not inherit; only the environment does. Every subprocess launch
+from such a host (settings UI, picker, **daemon auto-spawn** — latent, masked
+by an already-running daemon) died on import. Now the located package's own
+parent directory is injected into the child's PYTHONPATH unconditionally;
+prepending a directory the child could already import from is harmless.
+
+## 0.53.4 — client: `open_server_ui(python_exe=…)` interpreter override
+
+Field repro (desktop azt, 2026-07-07): "Collaboration settings" died with
+`spawn_exited` — `python -m azt_collabd ui` runs the **Kivy** settings app, and
+a non-Kivy host's venv (azt is tkinter) may not have Kivy, so the child exits
+within the 0.25 s health window. The daemon auto-spawn is unaffected (Kivy-free).
+
+Additive `python_exe` param on `open_server_ui` lets such hosts hand the UI
+spawn a Kivy-capable interpreter (azt tries `AZT_COLLAB_UI_PYTHON`, its own
+python, then the suite's recorder/viewer venvs, and reports the child's stderr
+`detail` on total failure instead of a bare `spawn_exited`). Default behavior
+unchanged; no floor bumps.
+
 ## 0.53.3 — sync: WAN count ticks down during chunked push; GitHub-backup progress in server settings UI
 
 Field gap (deblock-sync item): during a big chunked topic-push (nml, 2754 commits), nothing

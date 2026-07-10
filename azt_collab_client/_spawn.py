@@ -15,8 +15,20 @@ import os
 
 def _locate_azt_collabd_parent():
     try:
-        import azt_collabd  # noqa: F401
-        return ''
+        import azt_collabd
+        # Importable HERE does NOT mean importable in the child: a
+        # child process inherits the environment, not this process's
+        # runtime sys.path — and a non-Kivy host (desktop azt) makes
+        # the package importable precisely via a runtime sys.path
+        # insert (its discovery shim). Pre-0.53.5 this branch
+        # returned '' ("no injection needed") and the child died with
+        # ``No module named azt_collabd``. Inject the located parent
+        # unconditionally instead — prepending a directory the child
+        # could already import from (site-packages case) is harmless.
+        mod_file = getattr(azt_collabd, '__file__', '')
+        if mod_file:
+            return os.path.dirname(os.path.dirname(
+                os.path.abspath(mod_file)))
     except ImportError:
         pass
     here = os.path.dirname(os.path.abspath(__file__))

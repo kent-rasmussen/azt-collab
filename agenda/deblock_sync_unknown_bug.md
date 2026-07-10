@@ -243,6 +243,142 @@ merge tip's first-parent spine), so the .30 first-parent picker advanced cleanly
 convergence is now happening via device 1** — it will grind the ~861 remaining commits onto
 the topic ref, FF `main`, and delete the topic branch; device 2 then converges free on fetch.
 
+## Phase A COMPLETE; promote (phase B/C) in a kill-restart loop (2026-07-09 full-day logs)
+
+**The upload is DONE.** Device 1 (0.52.32) ground the last 68 chunks overnight
+(00:28→09:15, through 408s/SSLEOF + preseed retries) and at 09:15:07 hit
+`topic-push chunk OK (advanced to 3cefc3e0)` — the server topic ref now equals both
+phones' HEAD. Every object of the 2368-commit backlog is physically on GitHub.
+
+**New blocker: the promote step never completes and never logs.** From 09:19 to 21:30,
+~44 identical cycles: `topic-push: server already at target; skip` →
+`phase-b begin (attempt 1/5)` → **zero further trace** → service process restarts
+5–15 min later (`mirroring stdio` + `reconcile: push interrupted mid-flight`,
+interrupted counter 4→48). Never seen: `phase-b: fetch failed`, `phase-b: main moved`,
+`phase-c: pushing`. So each attempt dies inside phase B's **unconditional real
+`porcelain.fetch`** (repo.py:5278) — the `_socket_timeout(60)` guard evidently doesn't
+bound it (same hung-fetch family as the 0.52.28 finding; the .28 ls-remote fetch-skip
+protects only the PRE-sync fetch, not phase B's) — or in the silent stretch before
+phase C's first trace. Compounding: several kill windows show NO `idle-stop deferred:
+WAN sync in flight` lines, so the 300 s idle-stop fires mid-promote.
+
+**Device 2 (0.52.31):** re-uploading the SAME 2368 commits up its own topic ref
+(pointless — device 1's ref already has all objects); its GitHub uplink 408s even on a
+16 KB preseed batch; 15 consecutive failures → `wan_backoff next=2026-07-10T11:45Z`.
+Harmless: it converges by fetch once main moves. LAN between phones: healthy no-ops
+(both at 3cefc3e0) all day. `at_risk=0` — no data in danger; only the GitHub backup ref
+is stale (`main` = 7c42ae48, target 3cefc3e0).
+
+**Fix candidates (daemon, needs new APK):** (i) phase B: reuse the ls-remote peek /
+fetch-skip instead of an unconditional fetch (main hasn't moved all day — the fetch is
+pure risk); (ii) trace-before-and-after every phase-B/C sub-step (always-emit); (iii)
+make the in-flight flag cover the whole promote so idle-stop can't kill it; (iv) hard
+wall-clock cap + resume for phase B like phase A chunks.
+
+**Risk assessment for other users (2026-07-09):**
+- (i) SAFE: a stale/raced peek cannot clobber — GitHub receive-pack rejects non-FF
+  server-side; worst case is one extra DivergedBranches loop iteration (bounded, 5).
+  Does NOT rely on dulwich `set_if_equals` (not an FF check — LAN lesson); the WAN
+  server enforces FF for us. Same pattern field-proven since 0.52.28.
+- (ii) SAFE: log volume bounded by per-day rotation + 256 KB share tails.
+- (iii) HARMFUL IF SHIPPED ALONE: today's 5-min idle-stop is an accidental watchdog.
+  Immunizing the promote without a completion bound pins FGS+WifiLock indefinitely on
+  a genuinely hung fetch (battery, off-grid users) AND holds `project_lock` → BUSY
+  storm (the 0.52.2x pathology). Ship only paired with (iv).
+- (iv) TWO TRAPS: (a) tuning — too-low cap turns slow-but-succeeding promotes on weak
+  radios into perpetual bail-retry (the pre-0.52.29 timeout-ladder shape); bail
+  transient + resumable. (b) enforcement — Python can't kill threads; the cap must be
+  transport-level timeouts on dulwich's HTTP client (urllib3 timeout=None is the
+  recurring root disease), not an advisory timer. Interrupting mid-push is safe
+  (GitHub receive-pack atomic; 48 process-kills today lost nothing).
+- (iv) cap is bounded on BOTH sides — too HIGH re-creates (iii)-alone's harms in
+  slices: FGS+WifiLock battery duty-cycle = cap × attempt frequency; project_lock held
+  for the full cap → BUSY freeze visible to an active user; a cap above the OS kill
+  horizon (~5 min observed; MIUI kills through FGS per 0.52.23) means we never reach
+  our own clean bail+resume — always murdered mid-step instead; and on flapping
+  networks (4 subnets today) long attempts sample fewer good windows → slower
+  convergence; user-tap Sync also blocks to the cap. Sweet spot: > healthy promote
+  time (seconds–2 min; chunks ran ~13 s) and < kill horizon → **~3–4 min**, resume
+  cheap post-phase-A.
+
+**Adaptive-cap design (Kent's ask, 2026-07-09): measure instead of guess.**
+Every attempt ends one of three distinguishable ways; record all three per project
+(persist beside wan_state.json) + one always-emit summary line per attempt (outcome,
+duration, sub-step durations, bytes moved):
+- COMPLETED → duration into a success-distribution; cap floor = success p95 × margin.
+- BAILED-AT-CAP while still moving bytes → "too low" signal; grow cap (multiplicative).
+- OS-KILLED (reconcile sees interrupted mid-flight; today's counter = 48) → "too high"
+  signal — our cap never fired; each kill's process uptime is a free measurement of
+  that device's kill horizon → cap ceiling = learned horizon × 0.8.
+Cadence half of the log-die-off idea already exists (wan_backoff curve + record_success
+/nudge reset = wait longer while failing, probe eagerly after success); this extends
+the same philosophy to the cap value.
+**Scoping (Kent, 2026-07-09):** $AZT_HOME state is per-device by construction, so all
+of this is device-private. Within the device: kill horizon + network health are
+DEVICE-level (OS/spec properties — merge is memory-gated, MIUI kill policy varies);
+promote sub-step durations are PROJECT-level (repo/LIFT size). Never machine-share
+tuning numbers across devices (specs differ). Committing telemetry into the repo:
+triage value, but a stats-commit-per-attempt is a feedback loop (sync generates
+commits that need syncing — nml's disease). If ever committed: piggyback on commits
+already happening, never standalone. Near-term: device-local only + include the stats
+JSON in the diagnostics bundle (prepare_share_bundle already ships snapshot + logs).
+**Preferred reframe: watchdog on STALL, not wall-clock.** Kill on "no sideband/byte
+progress for ~60 s" (dulwich fetch/push expose progress callbacks). Correct in both
+directions by construction — slow-but-moving on weak radio never cut (no too-low
+mode); hung socket cut in ~60 s (no too-high mode). The adaptive wall-clock cap then
+demotes to a coarse backstop whose exact value barely matters. **Field workaround to try
+now:** keep the collab app foregrounded on device 1 (screen on) and tap Sync — pinning
+the process past 5 min may let one promote finish; the push itself is a near-empty
+pack since all objects are server-side.
+
+## 2026-07-10 state — device 2 on 0.53.7; promote STILL the only blocker
+
+Device 2 (aztobt2-ui, db033cd4) log through 02:33: upgraded 0.52.31 → **0.53.7** at
+~02:05 (both phones now current-ish; NOT the 0.53.8 empty-merge build, which is a
+different project pair 'en' and irrelevant here). Both phones **LAN-converged at
+3cefc3e0, at_risk=0** all night (every contact `already at 3cefc3e0 — no-op`).
+**Server topic ref now carries device 1's objects** — `wan_unshared` fell 2368 → **2276**
+with a new `exclude=2 github ref(s)`, i.e. device 1's completed phase-A `azt-pending-nml`
+ref is on the server and counted. **But `main` still = 7c42ae48** (behind): the
+topic→main **promote never completes** — device-2 process killed every ~5 min (01:55,
+02:05, 02:10, 02:21…), same phase-b hang family. 0.53.7 does NOT contain the promote
+fix (still in STILL-OPEN candidates i/iii + stall-watchdog). Device 2 also wastefully
+re-uploads the same backlog up ITS OWN topic ref (`server_topic_tip='(none)'`, restart
+each boot) — pointless (device 1's ref already has every object) and its uplink keeps
+dying; harmless churn. **Conclusion unchanged: data 100% safe + converged on LAN; only
+the github `main` pointer is stale, and stays stale until the promote-step fix ships.**
+Next action is code (finite phase-b fetch / stall-watchdog / keep promote off idle-stop),
+not more field waiting — the upload is done, only the flip is stuck.
+
+## FIX SHIPPED (0.53.9, 2026-07-10) — phase-b fetch-skip; promote should now complete
+
+Root cause pinned in code: the promote loop's **phase-b** step
+(`repo.py` `_push_step_locked`, ~:5277) ran an UNCONDITIONAL `porcelain.fetch` of
+`main`. `main` hadn't moved in days (nothing to pull), but the fetch hung anyway —
+`socket.setdefaulttimeout` is per-`recv`, not wall-clock, so `_socket_timeout(60)`
+does not bound it. That is *exactly* the hang `_ls_remote_main_tip` was written to
+kill (its docstring names this device) — but the peek-and-skip guard had only been
+wired into the **pre-sync** fetch, never the phase-b promote fetch. So the log
+stopped at "phase-b begin" forever and `main` never advanced.
+
+Fix (0.53.9, daemon-only, no wire change): wire the same `_ls_remote_main_tip`
+peek+skip into phase-b. When the remote `main` tip == our tracking mirror (common
+case), skip the fetch and go straight to Phase C (push merge commit to main — a
+near-empty pack, all objects already server-side from Phase A). Promote now
+completes in seconds instead of hanging minutes, so the idle-stop also stops
+killing it mid-flight (one change fixes both symptoms). Expect on next drain
+after deploy: `phase-b: fetch skipped … == mirror` → `phase-c: pushing` →
+`phase-c: push done` → `PUSHED` → topic branch deleted (Phase D) → `origin/main`
+= `3cefc3e0` → fully converged, `wan_unshared` → 0.
+
+**Deferred (no longer required):** stall-watchdog on transfers + keeping the whole
+promote off idle-stop — the promote is now fast enough that neither is needed;
+keep as hardening only if a future slow-network case reintroduces a long promote.
+
+**Deploy target:** whichever device is doing the promote (device 1 aztobt1-sudo has
+the completed topic ref; device 2's own topic upload is redundant). Both should get
+the 0.53.9 APK. Watch the daemon log for the phase-c trace chain above.
+
 **But .30's first-parent-only rule regressed device 2** (aztobt2-ui, empty topic ref →
 chunk base = old origin/main `7c42ae48`, which is OFF the merge spine): `_pick_intermediate_sha`
 returned the tip → estimate `11900 objects, 9.3 GB` → pre-shrink 50→1 → still the whole

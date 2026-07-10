@@ -832,6 +832,107 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
                   file=sys.stderr, flush=True)
             return True
 
+        # Ancestry short-circuits — never mint an empty-diff merge
+        # commit when one side already contains the other. A merge
+        # of two commits where one is an ancestor of the other has
+        # a tree identical to a parent (writes_done=0); such commits
+        # ping-pong between LAN peers, growing parallel empty-merge
+        # chains (the 0.46.x loop family — the github phase-b sync
+        # path guards the same way at repo.py). Only applied on a
+        # clean working tree (``not snapshot``): with pending edits
+        # the merge is legitimate (non-empty) and the reapply path
+        # below must run. Neither branch mutates the working tree,
+        # so there is no data-loss surface here.
+        if not snapshot:
+            try:
+                peer_in_local = _repo_mod._is_ancestor(
+                    repo, peer_head, local_head)
+            except Exception:
+                peer_in_local = False
+            if peer_in_local:
+                # We already contain the peer's history — local is
+                # strictly ahead. Skip the merge; push our head so
+                # THEY fast-forward to us (HEAD descends from
+                # peer_head, so it's a valid FF for the peer).
+                print(f'[lan-merge] {pid[:8]!r}: local '
+                      f'{local_head[:12]!r} already contains peer '
+                      f'{peer_head[:12]!r} — FF-push, no merge commit',
+                      file=sys.stderr, flush=True)
+                try:
+                    repo.close()
+                except Exception:
+                    pass
+                try:
+                    porcelain.push(
+                        project.working_dir,
+                        remote_location=url,
+                        refspecs=[b'HEAD:refs/heads/main'],
+                        pool_manager=pm,
+                    )
+                except Exception as ex:
+                    print(f'[lan-merge] FF-push to {pid[:8]!r} '
+                          f'failed: {ex!r}',
+                          file=sys.stderr, flush=True)
+                    return False
+                print(f'[lan-push] FF-pushed {project.langcode!r} → '
+                      f'{pid[:8]!r} at {host}:{port} (no merge)',
+                      file=sys.stderr, flush=True)
+                return True
+            try:
+                local_in_peer = _repo_mod._is_ancestor(
+                    repo, local_head, peer_head)
+            except Exception:
+                local_in_peer = False
+            if local_in_peer:
+                # Peer is strictly ahead and contains all our work.
+                # Do NOT merge and do NOT push a stale head. We are
+                # behind; the peer's own fan-out will deliver its
+                # head to us through the normal receive-pack path,
+                # which advances our working tree via the
+                # well-guarded ``_reset_working_tree_after_receive``.
+                # Advancing ourselves here would mean a hard reset in
+                # this less-guarded path — avoid it. Convergence is
+                # reached; report success.
+                print(f'[lan-merge] {pid[:8]!r}: peer '
+                      f'{peer_head[:12]!r} contains local '
+                      f'{local_head[:12]!r} — we are behind; no '
+                      f'merge, peer receive-pack will catch us up',
+                      file=sys.stderr, flush=True)
+                try:
+                    repo.close()
+                except Exception:
+                    pass
+                return True
+            # Divergent history but IDENTICAL trees — neither head is
+            # an ancestor of the other, yet their content matches. The
+            # empty-merge ping-pong (F8): a stale peer (pre-0.46.5)
+            # keeps minting content-identical "Merge origin/main"
+            # commits; three-way-merging them here would mint YET
+            # ANOTHER empty-diff commit and feed the loop (history
+            # bloat — wan_unshared/at_risk climb — and false reload
+            # popups). We can't FF either way (no ancestry), so NO-OP:
+            # don't merge, don't push. Heads stay divergent but
+            # content-identical; the next REAL edit on either side
+            # produces a non-empty merge that converges them. This is
+            # our immunity even when the peer generator isn't updated
+            # (fixing the generator = updating that stale peer).
+            try:
+                trees_equal = (repo[local_head].tree
+                               == repo[peer_head].tree)
+            except Exception:
+                trees_equal = False
+            if trees_equal:
+                print(f'[lan-merge] {pid[:8]!r}: divergent heads '
+                      f'{local_head[:12]!r}/{peer_head[:12]!r} have '
+                      f'identical trees — empty-merge loop averted; '
+                      f'no merge, no push',
+                      file=sys.stderr, flush=True)
+                try:
+                    repo.close()
+                except Exception:
+                    pass
+                return True
+
         # Memory pre-flight — same gate the github merge path uses
         # so we don't OOM-kill the :provider service mid-merge on a
         # low-memory device. Returns a Status if memory is below

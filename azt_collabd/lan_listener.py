@@ -1557,19 +1557,70 @@ def _build_server(port):
 
 
 def _outward_ip_guess():
-    """Best-effort: open a UDP socket to a non-routed destination and
-    read back the local socket's IP. Avoids parsing /proc/net/route
-    and works the same on Android and desktop. Returns '0.0.0.0' if
-    the trick fails (offline machine)."""
+    """Best-effort local IP for the advertised endpoint (settings-UI
+    line + pairing QR).
+
+    Step 1: UDP-connect to a non-routed destination and read back the
+    local socket's IP — resolves to the DEFAULT-ROUTE interface.
+    Avoids parsing /proc/net/route and works the same on Android and
+    desktop. Step 2 (0.53.6): when there IS no default route — the
+    field case is a hotspot-HOST desktop with its uplink unplugged
+    (repro 2026-07-07: QR advertised '0.0.0.0' and the phone at
+    10.42.0.100 had nothing to connect to; the host was 10.42.0.1) —
+    enumerate interface addresses via SIOCGIFCONF and pick the first
+    private non-loopback one. Linux-only ioctl, guarded; other
+    platforms keep the old '0.0.0.0' fallback. (A multi-homed host
+    whose default route is NOT the drill network still advertises the
+    wrong IP — the real fix is advertising all addresses in the QR,
+    tracked in agenda/local_lan_sync_stub.md § Pairing.)"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(('192.0.2.1', 53))  # TEST-NET-1, never routed
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
         finally:
             s.close()
+        if ip and not ip.startswith('127.') and ip != '0.0.0.0':
+            return ip
     except OSError:
-        return '0.0.0.0'
+        pass
+    for ip in _interface_ipv4s():
+        return ip
+    return '0.0.0.0'
+
+
+def _interface_ipv4s():
+    """Non-loopback IPv4 addresses of local interfaces, private
+    (RFC 1918) addresses first. Empty list when enumeration isn't
+    available (non-Linux without a default route)."""
+    addrs = []
+    try:
+        import array
+        import fcntl
+        import struct
+        bufsize = 32 * 40                  # 32 ifreq slots, 64-bit
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            buf = array.array('B', b'\0' * bufsize)
+            out = fcntl.ioctl(
+                s.fileno(), 0x8912,        # SIOCGIFCONF
+                struct.pack('iL', bufsize, buf.buffer_info()[0]))
+            outbytes = struct.unpack('iL', out)[0]
+            data = buf.tobytes()[:outbytes]
+            for i in range(0, outbytes, 40):
+                ip = socket.inet_ntoa(data[i + 20:i + 24])
+                if not ip.startswith('127.') and ip != '0.0.0.0':
+                    addrs.append(ip)
+        finally:
+            s.close()
+    except Exception:
+        return []
+
+    def _private(ip):
+        return (ip.startswith('10.') or ip.startswith('192.168.')
+                or any(ip.startswith(f'172.{n}.')
+                       for n in range(16, 32)))
+    return sorted(set(addrs), key=lambda ip: (not _private(ip), ip))
 
 
 def start():

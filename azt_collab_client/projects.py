@@ -170,6 +170,14 @@ class ProjectStatus:
     # yet (pre-init, or pre-first-commit project). Since 0.45.45.
     # See CLIENT_INTEGRATION.md § 17b Background refresh obligation.
     head_sha: str = ''
+    # LIFT blob SHA at HEAD (F3, since 0.53.8). Content-identity
+    # signal for desktop whole-file editors: compare against the blob
+    # at the editor's base to tell a benign HEAD advance (LIFT bytes
+    # unchanged) from a real peer change, instead of relying on file
+    # stat (which a hard-reset receive bumps even for identical
+    # content). Empty when HEAD has no LIFT path yet or on a
+    # pre-0.53.8 daemon.
+    lift_blob_sha: str = ''
     # Foreign-device topic-branch orphan count. Number of
     # ``refs/remotes/origin/azt-pending-*`` refs whose
     # device-name suffix isn't this daemon's — i.e. cross-device
@@ -214,6 +222,7 @@ class ProjectStatus:
             lan_allow_sync=bool(d.get('lan_allow_sync', False)),
             lan_pushed_sha=str(d.get('lan_pushed_sha', '') or ''),
             head_sha=str(d.get('head_sha', '') or ''),
+            lift_blob_sha=str(d.get('lift_blob_sha', '') or ''),
             foreign_topic_orphan_count=int(
                 d.get('foreign_topic_orphan_count', 0) or 0),
         )
