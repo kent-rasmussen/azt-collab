@@ -608,6 +608,37 @@ def test_identical_unannotated_duplicate_glosses_dedupe():
     assert glosses[0].find('text').text == 'cat'
 
 
+def test_shared_pollution_is_repair_not_conflict():
+    """Entries that are IDENTICAL on both sides but carry legacy
+    duplicate same-lang glosses get sweep-annotated as REPAIRS,
+    not conflicts — nothing diverged between these two devices.
+    Pre-0.54.4 every merge of such a database reported
+    ``conflicts=~301`` forever (field repro 2026-07-11), and would
+    have kept doing so on matched versions because the canon-equal
+    path strips the prior round's annotations before the sweep
+    re-adds them."""
+    dup = ('<sense id="s1">'
+           '<gloss lang="swh"><text>mke</text></gloss>'
+           '<gloss lang="swh"><text>mwanamke</text></gloss>'
+           '</sense>')
+    base = _lift([_entry_with('aaa')])
+    doc = _lift([_entry_with('aaa', extra=dup)])
+    out = lm.three_way_merge(base, doc, doc)
+    assert out.conflicts == [], \
+        'identical sides cannot conflict — shared pollution is a repair'
+    assert out.repairs >= 1
+    root = ET.fromstring(out.merged_bytes)
+    glosses = root.findall('entry/sense/gloss')
+    assert len(glosses) == 2, \
+        'divergent copies stay (annotated) — repair is visible, not lossy'
+    # Sanity: a GENUINE divergence on the same polluted entry still
+    # reports a conflict.
+    ours = _lift([_entry_with('aaa', lex='kat', extra=dup)])
+    theirs = _lift([_entry_with('aaa', lex='qat', extra=dup)])
+    out2 = lm.three_way_merge(base, ours, theirs)
+    assert any(c.kind == 'modify-modify' for c in out2.conflicts)
+
+
 def test_conflict_pair_remerge_converges_no_growth():
     """Re-merging a result that carries an annotated conflict pair
     against the same theirs must not grow the pair (no third

@@ -41,9 +41,16 @@
      result as once; add to the daemon test suite (which is green 20/20 as of
      07-07 — extend it).
 - **Deadline:** 2026-07-15 (Kent leaves for Cameroon; HARD stop 07-17)
-- **Waiting on:** Nothing — DONE 2026-07-10 (Kent: "call those done… until
-  a bug shows up"). pytest green (27/27 merge tests); field-verified live in
-  the 13:24 karlap↔phone merge. Reopen on any new duplicate-form sighting.
+- **Waiting on:** Nothing — DONE 2026-07-10; follow-ups from the 07-11 A3
+  drills CLOSED 2026-07-11 with the matched-version drill on 0.54.4:
+  both directions `conflicts=0, repairs=302` (desktop merge `000ecf9c`,
+  phone merge mirrored), delivery `1/1`, no DivergedBranches, no growth.
+  The classification fix (0.54.4) is what turned the perpetual
+  `conflicts=301` into honestly-reported repairs. Reopen on any new
+  duplicate-form sighting or a diamond that fails to settle. Residuals
+  filed elsewhere: merge-repair log chattiness (~300 lines per merge on a
+  polluted file) → log-cleanup candidate; honest LAN-unshared fallback →
+  own agenda item.
 
 ## Field evidence 2026-07-11 ~17:42 (A3 no-clobber drill, wifi-off divergence) — for reopen judgment
 
@@ -63,6 +70,52 @@ Both sides refused force-overwrite and merged ✓ (no data loss observed). But:
    of legacy duplicates (outside merge) wanted before the workshop.
 3. Transient `MissingCommitError` in the lan-unshared walk during the window
    (peer head not yet fetched) — handled (→0) but noisy.
+
+## Second round 17:57–17:59 — analysis (settles the reopen judgment)
+
+What the round proves, good news first:
+
+- **No multiplication.** Copies stay at 2–3 per entry across repeated merges,
+  even mixed-version. The ×29 growth engine is dead. No data loss either
+  round.
+- **Asymmetry cause CONFIRMED: the phone runs pre-0.54.0 merge code.** Its
+  17:58:36 merge emitted zero `[merge-repair]` lines on the same polluted
+  entries (impossible on 0.54.x) → conflicts=0. Not a new-merge bug.
+
+The mechanism of the repeating 301 (the "annotation ping-pong"):
+
+- Desktop 0.54.x annotates the ~290 legacy gloss-dupe entries →
+  `conflicts=301`. That state reaches the phone; the phone's OLD merge's
+  canon-equal path (0.45.34 self-heal) STRIPS the annotations as
+  false-positives → desktop's next merge re-annotates the same 301 → repeat
+  every A3 round. Diamond persisted this round
+  (`DivergedBranches(0dc22f87, 3a336fca)`); desktop HEAD stayed 3a336fca —
+  the phone's push didn't clobber (wire CAS refused), though the phone
+  LOGGED "pushed merged … 1/1 delivered" — a false-success report worth a
+  look (phone-side, may vanish with the rebuild).
+- **Matched 0.54.x versions will converge in representation** (both sides
+  deterministically produce the annotated tree: canon-equal comparison
+  strips, in-merge normalize re-annotates → same bytes) — BUT the per-merge
+  conflict scan will still COUNT those re-annotations, so every merge of the
+  polluted database reports `conflicts=301` forever until the dupes are
+  actually resolved. Two candidate fixes for the follow-up:
+  1. **Classification:** invariant-sweep annotations on entries that were
+     canon-EQUAL between the two sides should count as `repairs`, not
+     `conflicts` (they represent pre-existing pollution, not divergence
+     between these two devices). Stops the perpetual "301 conflicts" noise.
+  2. **The scrub:** a one-time daemon-side (or azt-side) pass that resolves
+     the legacy gloss duplicates for real (they're mostly 2–3 divergent swh
+     glosses per entry — needs a policy: keep-first? human review?). This is
+     the actual cure; #1 is the honest reporting while they exist.
+
+Next steps, in order: ~~implement #1 (repair-vs-conflict classification)~~
+DONE 0.54.4 (canon-equal sides skip the conflict scan; sweep annotations
+count as `repairs`; test `test_shared_pollution_is_repair_not_conflict`) →
+rebuild phone server APK (kills the ping-pong, the diamond asymmetry, and
+the phone's false "pushed/delivered" success report) → matched-version A3
+re-drill expecting `conflicts=0, repairs≈301`, diamond settling in one
+merge-of-merges round. Scrub (#2) MOOT for Demo_en — Kent 2026-07-11:
+"testing scrap"; revisit only if a real project shows legacy gloss dupes.
 
 ## Plans
 

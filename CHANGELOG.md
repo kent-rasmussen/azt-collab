@@ -9,6 +9,31 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.4 — merge: shared pollution counts as repairs, not conflicts
+
+Field repro (A3 drill rounds, 2026-07-11, →
+`agenda/lift_merge_robustness.md` § second round): ~290 Demo_en
+entries carry legacy duplicate same-lang glosses that are IDENTICAL
+on both devices. The 0.54.0 invariant sweep annotates them (correct
+— the pollution is real and should be visible), but the per-entry
+conflict scan then counted those sweep annotations as
+`modify-modify` conflicts: every merge reported `conflicts=301`
+even though nothing diverged between the two devices — and would
+forever, since the canon-equal path strips the previous round's
+annotations before the sweep re-adds them.
+
+Fix: entries whose two sides are canon-equal skip the conflict scan
+entirely — nothing diverged, so annotations present there are
+invariant repairs (already counted in `MergeResult.repairs`), not
+conflicts. Genuine divergence on a polluted entry still reports
+normally. Expected matched-version A3 behavior on a polluted
+database: `conflicts=0`, `repairs≈301`, byte-stable merge output.
+
+(The mixed-version annotation ping-pong observed in the same drill
+— old-code peer strips annotations, new-code peer re-adds — is not
+a code fix; it ends when the peer APK is rebuilt with the current
+merge.)
+
 ## 0.54.3 — LAN fan-out no longer dials stale peer addresses; listener keeps its port across restarts
 
 Field repro (karlap desktop, 2026-07-11, →

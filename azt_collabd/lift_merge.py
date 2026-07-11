@@ -1504,6 +1504,19 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
         # entries — same fallback the historical pre-0.35.2 merge
         # always used. ``_merge_pair`` handles the synthetic guid
         # suffix in that fallback to keep the document valid.
+        # Repair-vs-conflict classification (0.54.4): when the two
+        # sides are semantically IDENTICAL, nothing diverged between
+        # these two devices — any annotations the invariant sweep
+        # adds below are repairs of pre-existing pollution, not
+        # merge conflicts, and must not be reported as conflicts.
+        # Field repro 2026-07-11: ~290 entries with legacy duplicate
+        # glosses, identical on both phones, made every merge report
+        # ``conflicts=301`` forever (and would keep doing so even on
+        # matched versions, since the canon-equal path strips the
+        # previous round's annotations before the sweep re-adds
+        # them). They are counted in ``MergeResult.repairs`` instead.
+        sides_equal = _canon_clean(o) == _canon_clean(t)
+
         merged = _merge_pair(b, o, t, parent_allows_multi=True)
         if isinstance(merged, _Escalate):
             # Shouldn't happen at the entry level (lift allows
@@ -1526,17 +1539,21 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
             repairs += _normalize_entry(elem, path=path)
 
         # Did this merge produce a conflict? Look for the marker
-        # annotation anywhere in the merged result.
+        # annotation anywhere in the merged result. Skipped when
+        # the sides were canon-equal — any annotations present then
+        # are invariant-sweep repairs of shared pollution, already
+        # counted in ``repairs`` (see ``sides_equal`` above).
         conflict_paths = []
         kind = ''
-        for elem in merged:
-            for ann in elem.iter('annotation'):
-                if ann.attrib.get('name') == CONFLICT_ANNOTATION_NAME:
-                    conflict_paths = _collect_conflict_paths(elem)
-                    kind = 'add-add' if b is None else 'modify-modify'
+        if not sides_equal:
+            for elem in merged:
+                for ann in elem.iter('annotation'):
+                    if ann.attrib.get('name') == CONFLICT_ANNOTATION_NAME:
+                        conflict_paths = _collect_conflict_paths(elem)
+                        kind = 'add-add' if b is None else 'modify-modify'
+                        break
+                if kind:
                     break
-            if kind:
-                break
 
         # Add the entry-level conflict marker + trait so peers can
         # detect "this entry needs attention" without scanning the
