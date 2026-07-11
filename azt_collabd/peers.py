@@ -269,6 +269,36 @@ def set_static_endpoints(peer_id, endpoints):
     return out
 
 
+def demote_static_endpoint(peer_id, endpoint):
+    """Move *endpoint* (``'host:port'``) to the TAIL of the peer's
+    ``static_endpoints`` (and legacy ``endpoints``) lists. Called by
+    the fan-out path after a connect to that address failed
+    (refused / connect-timeout), so the next fallback resolution —
+    which reads the lists head-first — tries a different candidate
+    instead of re-dialing a dead address forever (stale-peer-address
+    incidents 2026-07-10/11). No-op when the endpoint isn't listed
+    or is already last. Returns True when something moved."""
+    moved = False
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if peer_id not in peers:
+            return False
+        entry = _normalize_entry(peers[peer_id])
+        for key in ('static_endpoints', 'endpoints'):
+            current = [str(e) for e in (entry.get(key) or []) if e]
+            if endpoint in current and current[-1] != endpoint:
+                entry[key] = ([e for e in current if e != endpoint]
+                              + [endpoint])
+                moved = True
+        if not moved:
+            return False
+        peers[peer_id] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    return True
+
+
 def set_peer_last_seen_main(peer_id, langcode, sha):
     """Record a paired peer's ``refs/heads/main`` SHA for a given
     project, as last observed via ls-remote or verified push.

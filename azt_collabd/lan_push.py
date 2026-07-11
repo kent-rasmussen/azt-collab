@@ -28,6 +28,8 @@ import hashlib
 import ssl
 import sys
 import tempfile
+import threading
+import time as _time_mod
 
 from . import lan_discovery as _lan_discovery
 from . import peer_id as _peer_id
@@ -319,10 +321,39 @@ def _push_to_peer(project, peer_entry):
         # string is the most portable signal across urllib3 +
         # dulwich + ssl stacks.
         msg = str(ex)
+        # Connect-phase timeouts join the recovery path (0.54.3):
+        # dialing an address from a previous network life (e.g. a
+        # hotspot-era 10.42.0.x ghost) produces ConnectTimeoutError,
+        # not ECONNREFUSED — pre-0.54.3 that skipped this whole
+        # block, so the stale address was never invalidated OR
+        # demoted and got re-dialed every fan-out (field repro
+        # 2026-07-11, agenda/lan_stale_peer_address.md). Matching is
+        # deliberately connect-phase only ('connect timeout' /
+        # ConnectTimeoutError) — a READ timeout mid-transfer means
+        # the address was fine.
+        _is_connect_timeout = ('ConnectTimeoutError' in msg
+                               or 'connect timeout' in msg)
         if ('Connection refused' in msg
                 or 'Errno 111' in msg
-                or 'NewConnectionError' in msg):
+                or 'NewConnectionError' in msg
+                or _is_connect_timeout):
             _lan_discovery.invalidate_endpoint(pid)
+            # Demote the dialed address in the persisted fallback
+            # lists so the next resolution (mDNS-miss path) tries a
+            # different candidate instead of the same dead head.
+            # Skip when THIS device has no network at all
+            # (ENETUNREACH) — the address may be fine.
+            if not ('Errno 101' in msg
+                    or 'Network is unreachable' in msg):
+                try:
+                    if _peers.demote_static_endpoint(
+                            pid, f'{host}:{port}'):
+                        print(f'[lan-push] demoted stale endpoint '
+                              f'{host}:{port} for {pid[:8]!r}',
+                              file=sys.stderr, flush=True)
+                except Exception as dem_ex:
+                    print(f'[lan-push] endpoint demotion failed: '
+                          f'{dem_ex!r}', file=sys.stderr, flush=True)
             # Distinguish "this device has no network at all"
             # (errno 101 ENETUNREACH — no default route on any
             # interface) from "peer specifically unreachable on
@@ -348,6 +379,10 @@ def _push_to_peer(project, peer_entry):
                 cause = (f'{host}:{port} refused the connection '
                          f'(ECONNREFUSED) — peer daemon / listener '
                          f'is down or rebound to a different port')
+            elif _is_connect_timeout:
+                cause = (f'connect to {host}:{port} timed out — '
+                         f'address is likely stale (recorded on a '
+                         f'previous network) or the peer is asleep')
             else:
                 cause = 'unspecified connection failure'
             print(f'[lan-push] {pid[:8]!r} at {host}:{port} '
@@ -1358,6 +1393,12 @@ def share_declined(peer_id, langcode):
     return 200 <= status < 300
 
 
+# Per-peer sweep debounce — see the ``sweep_peer`` docstring.
+_sweep_last_start = {}
+_sweep_gate_lock = threading.Lock()
+_SWEEP_DEBOUNCE_S = 8.0
+
+
 def sweep_peer(peer_id, exclude_langcode=''):
     """Push every shared project with *peer_id* where the peer
     isn't already at our HEAD. Used by:
@@ -1376,8 +1417,26 @@ def sweep_peer(peer_id, exclude_langcode=''):
 
     Returns a dict ``{langcode: bool}`` of per-project outcomes.
     Empty dict if the peer isn't paired or we don't share anything
-    with them. Per-project failures are isolated and logged."""
+    with them, or when a sweep for this peer started within the
+    debounce window. Per-project failures are isolated and logged.
+
+    Debounce (0.54.3): a daemon restart fires the listener-bind
+    sweep AND the first mDNS-arrival sweep within the same second;
+    both peeked "peer behind" and both pushed, producing doubled
+    ``advanced`` / ``1/1 delivered`` log lines and a wasted
+    duplicate pack upload (field log 2026-07-11 17:14). One sweep
+    per peer per window is enough — the triggers all mean the same
+    thing ("peer just became reachable / we just came up")."""
     from . import projects as _proj
+    now = _time_mod.monotonic()
+    with _sweep_gate_lock:
+        last = _sweep_last_start.get(peer_id, 0.0)
+        if now - last < _SWEEP_DEBOUNCE_S:
+            print(f'[lan-sweep] {peer_id[:8]!r}: debounced '
+                  f'(a sweep started {now - last:.1f}s ago)',
+                  file=sys.stderr, flush=True)
+            return {}
+        _sweep_last_start[peer_id] = now
     entry = _peers.get_peer(peer_id)
     if entry is None:
         return {}

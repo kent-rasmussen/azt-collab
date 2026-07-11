@@ -25,7 +25,12 @@
      empty allowlist (listener should 503, not reject); repo-open OSError ≠
      NOT_A_REPO (must not advance wan_backoff).
 - **Deadline:** 2026-07-15 (before Cameroon; HARD stop 07-17)
-- **Waiting on:** Nothing
+- **Waiting on:** Nothing — DONE 2026-07-10 (Kent: "call those done… until
+  a bug shows up"). 0.54.1 live on karlap; fd-boundedness watch continues
+  informally with the monitor one-liners in Notes. Reopen on any EMFILE /
+  climbing-fd sighting. Known follow-ups if reopened: wan_backoff shouldn't
+  advance on OSError-class repo-open failures; auto-init (porcelain.init)
+  repos in recovery paths untracked.
 
 ## Plans
 

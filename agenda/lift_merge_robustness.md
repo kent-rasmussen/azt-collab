@@ -41,8 +41,28 @@
      result as once; add to the daemon test suite (which is green 20/20 as of
      07-07 — extend it).
 - **Deadline:** 2026-07-15 (Kent leaves for Cameroon; HARD stop 07-17)
-- **Waiting on:** Kent — pytest run + field verification of the 0.54.0 fix
-  (implemented 2026-07-10, uncommitted)
+- **Waiting on:** Nothing — DONE 2026-07-10 (Kent: "call those done… until
+  a bug shows up"). pytest green (27/27 merge tests); field-verified live in
+  the 13:24 karlap↔phone merge. Reopen on any new duplicate-form sighting.
+
+## Field evidence 2026-07-11 ~17:42 (A3 no-clobber drill, wifi-off divergence) — for reopen judgment
+
+Both sides refused force-overwrite and merged ✓ (no data loss observed). But:
+1. **Concurrent-merge diamond:** phone merged local=18618b/peer=5218fd →
+   4d287c4c (conflicts=0) and pushed it; desktop merged local=5218fd/
+   peer=18618b → 6e45a17e (conflicts=301); desktop's post-merge push failed
+   `DivergedBranches(4d287c4c, 6e45a17e)`. Verify the NEXT round converges
+   (merge-of-merges) and can't livelock with both sides re-merging forever.
+2. **Asymmetric outcomes on the same pair:** conflicts=0 one direction, 301
+   the other. The desktop side's merge-repair annotated **302 divergent
+   same-lang gloss copies as conflict** across ~290 entries (mostly swh, some
+   es/fr) — reads as the LEGACY union-merge duplicate-gloss corruption
+   (wife-entry disease, database-wide in Demo_en glosses) surfacing through
+   the shipped repair. Questions: why one direction only; where do these
+   conflict annotations surface for user review in azt; is a one-time scrub
+   of legacy duplicates (outside merge) wanted before the workshop.
+3. Transient `MissingCommitError` in the lan-unshared walk during the window
+   (peer head not yet fetched) — handled (→0) but noisy.
 
 ## Plans
 

@@ -1705,15 +1705,59 @@ def _interface_ipv4s():
     return sorted(set(addrs), key=lambda ip: (not _private(ip), ip))
 
 
+def _port_memo_path():
+    return os.path.join(_paths.azt_home(), 'lan_listener_port')
+
+
+def _read_preferred_port():
+    """Last successfully-bound listener port, or 0 (= let the OS
+    pick). Re-binding the same port across daemon restarts keeps
+    every peer's cached / persisted endpoint for us valid — a
+    respawn no longer strands peers dialing the old port until
+    their discovery catches up (stale-peer-address incidents
+    2026-07-10/11)."""
+    try:
+        with open(_port_memo_path()) as f:
+            p = int(f.read().strip())
+        return p if 1024 < p < 65536 else 0
+    except Exception:
+        return 0
+
+
+def _write_preferred_port(port):
+    try:
+        tmp = f'{_port_memo_path()}.tmp'
+        with open(tmp, 'w') as f:
+            f.write(str(int(port)))
+        os.replace(tmp, _port_memo_path())
+    except Exception as ex:
+        print(f'[lan-listener] port memo write failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
 def start():
-    """Start the listener on an OS-assigned port. Idempotent — a
-    second call while running returns the existing endpoint."""
+    """Start the listener, preferring the previously-bound port
+    (see ``_read_preferred_port``) and falling back to an
+    OS-assigned one when it's taken. Idempotent — a second call
+    while running returns the existing endpoint."""
     with _LOCK:
         if _STATE['server'] is not None:
             return _STATE['bound']
-        srv = _build_server(0)
+        srv = None
+        preferred = _read_preferred_port()
+        if preferred:
+            try:
+                srv = _build_server(preferred)
+            except OSError as ex:
+                print(f'[lan-listener] previous port {preferred} '
+                      f'unavailable ({ex!r}); binding ephemeral',
+                      file=sys.stderr, flush=True)
+                srv = None
+        if srv is None:
+            srv = _build_server(0)
         host = _outward_ip_guess()
         port = srv.server_address[1]
+        _write_preferred_port(port)
         thread = threading.Thread(
             target=srv.serve_forever, name='lan-listener',
             daemon=True)

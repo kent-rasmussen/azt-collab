@@ -234,6 +234,34 @@ def invalidate_endpoint(peer_id_hex):
         _endpoints.pop(peer_id_hex, None)
 
 
+def _clear_unreachable_on_announcement(peer_id_hex):
+    """A peer that is ANNOUNCING on mDNS is not absent — clear
+    lan_push's recently-unreachable fast-fail gate if it's set.
+
+    The arrival path already clears the gate (0.50.49), but a
+    re-announcement at an endpoint we already hold is NOT an
+    arrival, and NsdManager often never fires a fresh
+    found/resolve for a same-name service that rebinds — so on the
+    phone side the gate stayed set while the desktop announced its
+    post-restart port the whole time, and every sweep fast-fail
+    skipped it (`lan_unshared` climbed 11 → 12+; field repro
+    2026-07-11 ~17:19, agenda/lan_stale_peer_address.md). Worst
+    case of clearing on every announcement: a peer whose daemon
+    announces but whose listener is wedged costs one real connect
+    attempt per fan-out instead of a microsecond skip — bounded,
+    and endpoint demotion keeps that attempt from re-dialing a
+    known-dead address."""
+    try:
+        from . import lan_push as _lan_push
+        if _lan_push._recently_unreachable(peer_id_hex):
+            _lan_push._record_reachable(peer_id_hex)
+            print(f'[lan-discovery] {peer_id_hex[:8]!r} announced '
+                  f'while marked unreachable — cleared fast-fail '
+                  f'gate', file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def _persist_resolved_endpoint(peer_id_hex, host, port):
     """Write a freshly-resolved ``host:port`` into the paired-peer
     record's ``static_endpoints`` (a no-op if the peer isn't
@@ -400,8 +428,27 @@ def _zc_listener_class():
                   + (f' name={device_name!r}' if device_name else '')
                   + (' [arrival]' if is_arrival else ''),
                   file=sys.stderr, flush=True)
+            _clear_unreachable_on_announcement(peer_id)
             if is_arrival:
                 _fire_arrival(peer_id)
+            # Persist the freshly-resolved endpoint into the
+            # paired-peer record's ``static_endpoints`` — SAME call
+            # the Android NSD path makes in ``onServiceResolved``.
+            # Pre-0.54.3 only the NSD path persisted, so a
+            # DESKTOP's static fallback stayed frozen at pair-time
+            # forever; when the 5-min mDNS cache expired, fan-out
+            # fell back to an address from a previous network life
+            # (field repro 2026-07-11: pushed to hotspot ghost
+            # 10.42.0.100:40425 while the phone was announcing
+            # 192.168.10.23:39391 — see
+            # agenda/lan_stale_peer_address.md).
+            try:
+                _persist_resolved_endpoint(
+                    peer_id, host, int(info.port))
+            except Exception as ex:
+                print(f'[lan-discovery] persist resolved endpoint '
+                      f'{peer_id[:8]!r} failed: {ex!r}',
+                      file=sys.stderr, flush=True)
 
         def _forget(self, name):
             # We don't carry a name→peer_id map; the next browse pass
@@ -572,6 +619,7 @@ def _build_resolve_listener_class():
                          if device_name else '')
                       + (' [arrival]' if is_arrival else ''),
                       file=sys.stderr, flush=True)
+                _clear_unreachable_on_announcement(peer_id)
                 if is_arrival:
                     _fire_arrival(peer_id)
                 # Persist the freshly-resolved endpoint into the

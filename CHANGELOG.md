@@ -9,6 +9,80 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.3 — LAN fan-out no longer dials stale peer addresses; listener keeps its port across restarts
+
+Field repro (karlap desktop, 2026-07-11, →
+`agenda/lan_stale_peer_address.md`): fan-out pushed to
+`10.42.0.100:40425` — the phone's address from an earlier
+HOTSPOT pairing (NetworkManager sharing subnet) — and hung to
+ConnectTimeout, while the phone was right there announcing
+`192.168.10.23:39391`. `lan_unshared=3` sat undelivered with the
+recorder open. Same family as the 2026-07-10 phone-side variant
+(kept dialing the desktop's dead pre-restart port 35205) and kin
+of 0.53.6/0.53.7.
+
+Three cooperating causes, all fixed:
+
+- **Desktop discovery never persisted resolved endpoints.**
+  `_persist_resolved_endpoint` (which drifts the paired peer's
+  `static_endpoints` head forward to the freshest resolution) was
+  only wired into the Android NSD `onServiceResolved` — the
+  zeroconf `_record` path lacked the call, so a desktop's static
+  fallback stayed frozen at pair-time (the hotspot ghost). When
+  the 5-min mDNS cache expired, `_resolve_endpoint` fell back to
+  that frozen head. Now both discovery paths persist identically.
+- **Connect-timeouts bypassed the whole recovery block.** The
+  fan-out failure handler only recognized
+  refused/`NewConnectionError`; a stale-subnet address produces
+  `ConnectTimeoutError`, which skipped cache invalidation, the
+  unreachable fast-fail gate, and the discovery-restart
+  escalation. Connect-phase timeouts (deliberately NOT read
+  timeouts) now take the same path, with their own typed cause
+  line.
+- **Nothing demoted a failing fallback endpoint.** New
+  `peers.demote_static_endpoint` moves the dialed `host:port` to
+  the TAIL of `static_endpoints`/`endpoints` on connect failure
+  (skipped when THIS device has no network — ENETUNREACH), so the
+  next resolution tries a different candidate instead of the same
+  dead head forever.
+
+The phone-side mirror (same day, ~17:19) added a fourth: after the
+desktop's restart changed its listener port, the phone's pushes
+failed and set the recently-unreachable fast-fail gate — which then
+**skipped every subsequent push while the desktop announced its new
+port the whole time** (`lan_unshared` climbed 11 → 12+). The
+arrival path has cleared the gate since 0.50.49, but a
+re-announcement at an already-held endpoint is not an "arrival",
+and NsdManager often never fires a fresh resolve for a same-name
+rebind. New `_clear_unreachable_on_announcement`: ANY mDNS
+announcement from a gated peer clears the gate, on both discovery
+paths. Worst case (announcing daemon, wedged listener) is one real
+connect attempt per fan-out instead of a microsecond skip.
+
+Also fixed while in there: the doubled `advanced` / `1/1 delivered`
+log lines after a restart were real duplicate work — the
+listener-bind sweep and the first mDNS-arrival sweep racing with no
+in-flight guard. `sweep_peer` now debounces per peer (8 s window);
+all its triggers mean the same "peer just became reachable".
+
+Plus the restart-hardening that shrinks the whole class:
+
+- **Listener port persistence.** The LAN listener memoizes its
+  bound port (`$AZT_HOME/lan_listener_port`) and re-binds it on
+  the next start when free (ephemeral fallback when taken). A
+  daemon respawn no longer invalidates every peer's cached and
+  persisted endpoint at once — which is exactly what stranded the
+  phone on 35205 for minutes on 2026-07-10, and what makes
+  hand-configured `static_endpoints` (hotspot-host fallback,
+  Cameroon topology) survive restarts.
+
+Tests: `tests/test_lan_stale_endpoint.py` — demotion semantics,
+resolution-order regression (ghost head → demoted → fresh head),
+`_persist_resolved_endpoint` drift + idempotence + unpaired no-op,
+port-memo roundtrip/garbage. Remaining field verification: restart
+the desktop daemon mid-session and confirm phone→desktop delivery
+recovers within one burst/arrival cycle.
+
 ## 0.54.2 — French catalog: 27 missing msgids filled (LAN share offers, repo-access popup, share helpers, paired-phones popup)
 
 `tests/test_translation_coverage.py` had been failing on 31 Python
