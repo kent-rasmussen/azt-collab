@@ -1507,6 +1507,13 @@ def _refresh_peer_last_seen_after_receive(langcode, new_head_sha_hex):
             try:
                 _peers.set_peer_last_seen_main(
                     pid, langcode, peer_sha)
+                # The peer is AT our new head — that's confirmed
+                # containment of our own commit; record the
+                # covered-local coverage the sync-status walkers
+                # fall back to when this peer's head later moves
+                # somewhere we haven't fetched.
+                _peers.set_peer_covered_local(
+                    pid, langcode, peer_sha)
                 matched.append(pid[:8])
             except Exception as ex:
                 print(f'[lan-listener] post-receive refresh '

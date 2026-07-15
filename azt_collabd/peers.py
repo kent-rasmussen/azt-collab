@@ -110,6 +110,12 @@ def _normalize_entry(entry):
         for k, v in raw_lsm.items():
             if isinstance(k, str) and isinstance(v, str) and v:
                 last_seen_main[k] = v
+    raw_lcl = entry.get('last_covered_local') or {}
+    last_covered_local = {}
+    if isinstance(raw_lcl, dict):
+        for k, v in raw_lcl.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                last_covered_local[k] = v
     return {
         'device_name': str(entry.get('device_name', '') or ''),
         'fp': str(entry.get('fp', '') or ''),
@@ -135,6 +141,18 @@ def _normalize_entry(entry):
         # the peer *has*, producing false-positive LANOK on
         # diverged histories.
         'last_seen_main': last_seen_main,
+        # Per-project SHA of OUR OWN commit last CONFIRMED contained
+        # in this peer's state (verified push, no-op "already at",
+        # peer-contains-local ancestry check, post-receive peek).
+        # Unlike ``last_seen_main`` — which may be a peer-side
+        # commit we never fetched — this is always a commit WE
+        # hold, so the sync-status walkers can fall back to it when
+        # the peer's head isn't in our object store. Without the
+        # fallback, an unknown peer head made the walkers return 0
+        # (OK-on-uncertainty) and the indicator claimed "all
+        # shared" over pending local commits (field catch
+        # 2026-07-11). Keyed by langcode. Since 0.54.5.
+        'last_covered_local': last_covered_local,
     }
 
 
@@ -329,6 +347,55 @@ def set_peer_last_seen_main(peer_id, langcode, sha):
     return True
 
 
+def set_peer_covered_local(peer_id, langcode, sha):
+    """Record that *sha* — one of OUR OWN commits — is confirmed
+    contained in *peer_id*'s state for *langcode*. Called from the
+    delivery-confirmation paths (verified push, "already at" no-op,
+    peer-contains-local ancestry check, post-receive peek match).
+    The sync-status walkers fall back to this when the peer's
+    ``last_seen_main`` isn't in our object store — see
+    ``_normalize_entry``. Same contract as
+    ``set_peer_last_seen_main``: only call on actual observations;
+    empty args are no-ops."""
+    if not peer_id or not langcode or not sha:
+        return False
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if peer_id not in peers:
+            return False
+        entry = _normalize_entry(peers[peer_id])
+        covered = dict(entry.get('last_covered_local') or {})
+        covered[str(langcode)] = str(sha)
+        entry['last_covered_local'] = covered
+        peers[peer_id] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    return True
+
+
+def peer_coverage_for(langcode):
+    """Return ``[(last_seen_main_sha, last_covered_local_sha)]`` —
+    one tuple per paired peer that has at least one of the two
+    recorded for *langcode* (either element may be ``''``). The
+    sync-status walkers exclude the peer's main when they hold it,
+    else fall back to the covered-local commit; a peer with
+    neither usable contributes no exclusion (honest LAN-N)."""
+    if not langcode:
+        return []
+    with _LOCK:
+        data = _load_raw()
+    out = []
+    for entry in (data.get('peers') or {}).values():
+        norm = _normalize_entry(entry)
+        main = (norm.get('last_seen_main') or {}).get(langcode, '')
+        covered = (norm.get('last_covered_local') or {}).get(
+            langcode, '')
+        if main or covered:
+            out.append((main, covered))
+    return out
+
+
 def peers_sharing_project(langcode):
     """Return the list of ``peer_id``s whose ``shared_projects`` list
     contains *langcode*. Used by post-publish fan-out and other paths
@@ -347,27 +414,6 @@ def peers_sharing_project(langcode):
         norm = _normalize_entry(entry)
         if langcode in norm['shared_projects']:
             out.append(str(peer_id))
-    return out
-
-
-def peer_main_shas_for(langcode):
-    """Return the list of paired peers' last-observed main SHAs
-    for *langcode*. Used by ``_lan_unshared`` and ``_at_risk`` to
-    compute the exclude set: a commit reachable from any of these
-    SHAs is proven-present on at least one paired peer. Empty list
-    when nothing observed yet (initial state, or pre-migration
-    data).
-    """
-    if not langcode:
-        return []
-    with _LOCK:
-        data = _load_raw()
-    out = []
-    for entry in (data.get('peers') or {}).values():
-        norm = _normalize_entry(entry)
-        sha = (norm.get('last_seen_main') or {}).get(langcode, '')
-        if sha:
-            out.append(sha)
     return out
 
 

@@ -9,6 +9,55 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.6 — client: `pick_project(python_exe=…)`
+
+`pick_project()` gains the same `python_exe` override `open_server_ui`
+got in 0.53.4, for the same reason: the picker (`python -m azt_collabd
+projects`) is a Kivy app, and a non-Kivy host (desktop A-Z+T, tkinter
+venv) must be able to spawn it with a Kivy-capable interpreter. Desktop
+azt's LiftChooser "Get a project from your team" button (azt 1.10.2)
+drives this through azt's existing interpreter-candidate loop.
+Android path unchanged.
+
+## 0.54.5 — honest LAN-unshared fallback: unknown peer head degrades to last confirmed coverage, not to "all shared"
+
+Field catch (Kent, 2026-07-11): with the phone off the network and
+its recorded head (`last_seen_main`) pointing at a commit the desktop
+never fetched, the `lan_unshared`/`at_risk` walkers hit
+`MissingCommitError` and returned 0 — OK-on-uncertainty inverted into
+the indicator claiming "all shared" while six fresh local commits sat
+undelivered. The failure default was indistinguishable from genuine
+convergence, and the (rate-limited) error line printed once while
+every subsequent poll silently repeated the wrong 0.
+
+Fix:
+
+- **New per-peer, per-project `last_covered_local`** in `peers.json`:
+  the last of OUR OWN commits confirmed contained in the peer —
+  written on every delivery-confirmation path (verified push,
+  "already at" no-op, peer-contains-local ancestry check, listener
+  post-receive peek match). Unlike `last_seen_main` (which may be a
+  peer-side commit we never fetched), this is always a commit we
+  hold.
+- **`repo._peer_exclude_shas`** (shared by `_lan_unshared` and
+  `_at_risk`): exclude the peer's main when it's in our object
+  store; fall back to `last_covered_local` when it isn't; a peer
+  with neither usable contributes NO exclusion. The walkers no
+  longer construct exclude sets that can raise `MissingCommitError`.
+- Resulting semantics: unknown peer head → **"N commits since the
+  last confirmed coverage"** (the field case would have read
+  LAN-6/at-risk-6); peers paired but nothing ever confirmed → the
+  full walk-from-HEAD count (nothing is confirmed shared); no peers
+  paired → 0 (unchanged convention: no LAN destination to be behind
+  on). Walk-count log lines note fallback/unusable peers.
+
+Tests: `tests/test_lan_unshared_honest.py` — peer-at-head 0,
+unknown-head→covered fallback (the field shape), unknown-head no
+coverage → full count, no-peers 0, setter/reader/normalization.
+peers.json change is additive; old entries read as
+"no coverage recorded" and start accumulating on the next confirmed
+delivery. No wire-format change.
+
 ## 0.54.4 — merge: shared pollution counts as repairs, not conflicts
 
 Field repro (A3 drill rounds, 2026-07-11, →

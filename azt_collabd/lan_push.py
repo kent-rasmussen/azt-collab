@@ -229,7 +229,7 @@ def _push_to_peer(project, peer_entry):
     # peer's main SHA we record it. Drives the honest
     # ``lan_unshared`` and ``at_risk`` counts (since 0.47.0; was
     # the conflated ``unshared_commits`` pre-0.47) — see
-    # ``repo._lan_unshared`` and ``peers.peer_main_shas_for``.
+    # ``repo._lan_unshared`` and ``peers.peer_coverage_for``.
     if pre_peer_head:
         try:
             _peers.set_peer_last_seen_main(
@@ -252,6 +252,14 @@ def _push_to_peer(project, peer_entry):
             from . import projects as _projects
             _projects.set_last_lan_pushed_sha(
                 project.langcode, local_head)
+        except Exception:
+            pass
+        # Confirmed containment of OUR commit — record the
+        # covered-local coverage the sync-status walkers fall
+        # back to when the peer's head isn't in our store.
+        try:
+            _peers.set_peer_covered_local(
+                pid, project.langcode, local_head)
         except Exception:
             pass
         _consec_failures.pop(pid, None)  # success: reset counter
@@ -500,6 +508,14 @@ def _push_to_peer(project, peer_entry):
                 pid, project.langcode, local_head)
         except Exception as ex:
             print(f'[lan-push] set_peer_last_seen_main raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+        # Verified delivery of OUR commit — record covered-local
+        # coverage for the walkers' unknown-peer-head fallback.
+        try:
+            _peers.set_peer_covered_local(
+                pid, project.langcode, local_head)
+        except Exception as ex:
+            print(f'[lan-push] set_peer_covered_local raised: '
                   f'{ex!r}', file=sys.stderr, flush=True)
         # peer_main_shas changed → lan_unshared / at_risk on our side
         # just dropped (and the peer's project_status also changed,
@@ -933,6 +949,17 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
                       f'{local_head[:12]!r} — we are behind; no '
                       f'merge, peer receive-pack will catch us up',
                       file=sys.stderr, flush=True)
+                # Ancestry just PROVED the peer contains our head —
+                # record covered-local coverage for the walkers'
+                # unknown-peer-head fallback.
+                try:
+                    _peers.set_peer_covered_local(
+                        pid, project.langcode,
+                        local_head.decode('ascii', 'replace')
+                        if isinstance(local_head, bytes)
+                        else str(local_head))
+                except Exception:
+                    pass
                 try:
                     repo.close()
                 except Exception:

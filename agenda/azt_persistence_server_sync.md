@@ -11,7 +11,11 @@
   `CLIENT_INTEGRATION.md`. AZT's edits persist and converge through the daemon without
   data loss under concurrent merges.
 - **Deadline:** before [[azt_run_with_server]] ships (prerequisite).
-- **Waiting on:** fix from azt team
+- **Waiting on:** Nothing — DONE 2026-07-11 (the "fix from azt team" was
+  contract §5 in-place reload = A5, shipped azt 1.10.0 and field-drilled;
+  submit_file SERVER_ERROR mystery quiet through 07-11; remaining field-only
+  watchers [WAN pack budget vs WAVs, bulk-ASR churn, commit cadence] moved to
+  CABTAL2026 PLAN goal-2 standing watch items)
 
 ## Decisions (Phase 0 output, locked with Kent 2026-07-06)
 

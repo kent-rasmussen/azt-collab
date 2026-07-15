@@ -2349,6 +2349,47 @@ def _wan_unshared(repo, branch):
         return 0
 
 
+def _peer_exclude_shas(repo, langcode):
+    """Build the walker exclude list from paired peers' coverage
+    records: each peer's ``last_seen_main`` when we HOLD that
+    commit, else its ``last_covered_local`` (one of our own
+    commits, verified delivered — always holdable). Returns
+    ``(excludes, n_pairs, n_fallback, n_unusable)``.
+
+    Pre-0.54.5 the walkers excluded ``last_seen_main`` blindly; a
+    peer head we never fetched made ``repo.get_walker`` raise
+    ``MissingCommitError`` and the helpers returned 0 —
+    OK-on-uncertainty inverted into "all shared" over pending
+    local commits (field catch 2026-07-11: phone offline with an
+    unfetched head, six fresh desktop commits, indicator LANOK).
+    With the fallback, that case reads "N commits since the last
+    CONFIRMED coverage" instead."""
+    from . import peers as _peers
+    pairs = _peers.peer_coverage_for(langcode)
+    excludes = []
+    n_fallback = 0
+    n_unusable = 0
+    for main_hex, covered_hex in pairs:
+        try:
+            main_b = main_hex.encode('ascii') if main_hex else None
+        except Exception:
+            main_b = None
+        if main_b is not None and main_b in repo.object_store:
+            excludes.append(main_b)
+            continue
+        try:
+            cov_b = (covered_hex.encode('ascii')
+                     if covered_hex else None)
+        except Exception:
+            cov_b = None
+        if cov_b is not None and cov_b in repo.object_store:
+            excludes.append(cov_b)
+            n_fallback += 1
+        else:
+            n_unusable += 1
+    return excludes, len(pairs), n_fallback, n_unusable
+
+
 def _lan_unshared(repo, branch, langcode):
     """Count commits reachable from ``refs/heads/<branch>`` that
     are NOT reachable from any paired-and-sharing peer's
@@ -2370,36 +2411,41 @@ def _lan_unshared(repo, branch, langcode):
             _walk_count_log(repo, 'lan-unshared',
                 f'branch={branch!r}: no local ref → 0')
             return 0
-        peer_shas = []
         try:
-            from . import peers as _peers
-            for sha_hex in _peers.peer_main_shas_for(langcode):
-                try:
-                    peer_shas.append(sha_hex.encode('ascii'))
-                except Exception:
-                    continue
+            excludes, n_pairs, n_fallback, n_unusable = \
+                _peer_exclude_shas(repo, langcode)
         except Exception as ex:
             _walk_count_log(repo, 'lan-unshared',
-                f'branch={branch!r}: peer_main_shas raised '
+                f'branch={branch!r}: peer coverage raised '
                 f'{ex!r} → 0')
             return 0
-        if not peer_shas:
-            # No paired peers paired for this project — the LAN
-            # channel has no "expected destination" to be behind
-            # on. Convention: 0, so the renderer doesn't show
-            # "LAN-N" for a user who hasn't paired anyone yet.
+        if n_pairs == 0:
+            # No paired peers with any observation for this project
+            # — the LAN channel has no "expected destination" to be
+            # behind on. Convention: 0, so the renderer doesn't
+            # show "LAN-N" for a user who hasn't paired anyone yet.
             _walk_count_log(repo, 'lan-unshared',
                 f'branch={branch!r} local={local_sha[:12]!r}: '
                 f'no paired peers → 0')
             return 0
         try:
+            # ``excludes`` may be EMPTY here (peers exist but none
+            # of their heads is in our store and no delivery was
+            # ever confirmed): the honest answer is the full
+            # walk-from-HEAD count — nothing is confirmed shared —
+            # NOT the old OK-on-uncertainty 0.
             walker = repo.get_walker(
-                include=[local_sha], exclude=peer_shas)
+                include=[local_sha], exclude=excludes)
             n = sum(1 for _ in walker)
             _walk_count_log(repo, 'lan-unshared',
                 f'branch={branch!r} local={local_sha[:12]!r} '
-                f'peers={len(peer_shas)}: walk excluding peers '
-                f'→ {n}')
+                f'peers={n_pairs}: walk excluding '
+                f'{len(excludes)} covered'
+                + (f' ({n_fallback} via covered-local fallback)'
+                   if n_fallback else '')
+                + (f' ({n_unusable} peer(s) unusable — counting '
+                   f'as uncovered)' if n_unusable else '')
+                + f' → {n}')
             return n
         except Exception as ex:
             _walk_count_log(repo, 'lan-unshared',
@@ -2436,25 +2482,23 @@ def _at_risk(repo, branch, langcode):
         except KeyError:
             return 0
         # Peer check first: if no peers, at_risk = 0 by convention.
-        peer_shas = []
         try:
-            from . import peers as _peers
-            for sha_hex in _peers.peer_main_shas_for(langcode):
-                try:
-                    peer_shas.append(sha_hex.encode('ascii'))
-                except Exception:
-                    continue
+            peer_excludes, n_pairs, n_fallback, n_unusable = \
+                _peer_exclude_shas(repo, langcode)
         except Exception:
-            pass
-        if not peer_shas:
+            peer_excludes, n_pairs, n_fallback, n_unusable = \
+                [], 0, 0, 0
+        if n_pairs == 0:
             _walk_count_log(repo, 'at-risk',
                 f'branch={branch!r} local={local_sha[:12]!r}: '
                 f'no paired peers → 0 (lan_unshared convention)')
             return 0
-        # Combine peer SHAs and origin tracking refs into one
-        # exclude set. The walker counts commits not reachable
-        # from ANY of them.
-        excludes = list(peer_shas)
+        # Combine peer coverage SHAs and origin tracking refs into
+        # one exclude set. The walker counts commits not reachable
+        # from ANY of them. Same covered-local fallback semantics
+        # as ``_lan_unshared`` — an unfetched peer head degrades to
+        # its last confirmed coverage, never to "covers everything".
+        excludes = list(peer_excludes)
         for ref in (b'refs/remotes/origin/main',
                     b'refs/remotes/origin/master'):
             try:
@@ -2473,8 +2517,11 @@ def _at_risk(repo, branch, langcode):
             _walk_count_log(repo, 'at-risk',
                 f'branch={branch!r} local={local_sha[:12]!r} '
                 f'excludes={len(excludes)} '
-                f'(peers={len(peer_shas)}): '
-                f'walk excluding union → {n}')
+                f'(peers={n_pairs}'
+                + (f', {n_fallback} covered-local fallback'
+                   if n_fallback else '')
+                + (f', {n_unusable} unusable' if n_unusable else '')
+                + f'): walk excluding union → {n}')
             return n
         except Exception as ex:
             _walk_count_log(repo, 'at-risk',

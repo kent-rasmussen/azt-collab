@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.4"
+__version__ = "0.54.6"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -339,12 +339,15 @@ def _open_server_ui_android(on_status):
 _AZT_PICK_REQ_CODE = 0x4747  # arbitrary; uniquely ours within the recorder
 
 
-def pick_project(timeout_seconds=None):
+def pick_project(timeout_seconds=None, python_exe=None):
     """Launch the project-picker helper and return the selected
     project. Blocks until the picker window closes.
 
     Desktop: spawns ``python -m azt_collabd projects`` as a subprocess
-    and parses ``AZT_PICK\\t<path>`` from its stdout.
+    and parses ``AZT_PICK\\t<path>`` from its stdout. ``python_exe``
+    (0.54.6) overrides the interpreter for the spawn — the picker is a
+    Kivy app, and a non-Kivy host (desktop A-Z+T, tkinter) passes a
+    Kivy-capable python here, exactly as with ``open_server_ui``.
 
     Android: dispatches an Intent to the standalone server APK's
     PickerActivity and waits on ``onActivityResult`` for the chosen
@@ -368,17 +371,17 @@ def pick_project(timeout_seconds=None):
     platform = _plat()
     if platform == 'android':
         return _pick_project_android(timeout_seconds)
-    return _pick_project_desktop(timeout_seconds)
+    return _pick_project_desktop(timeout_seconds, python_exe)
 
 
-def _pick_project_desktop(timeout_seconds):
+def _pick_project_desktop(timeout_seconds, python_exe=None):
     import os
     import subprocess
     import sys as _sys
     from ._spawn import build_spawn_env
     try:
         proc = subprocess.Popen(
-            [_sys.executable, '-m', 'azt_collabd', 'projects'],
+            [python_exe or _sys.executable, '-m', 'azt_collabd', 'projects'],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -273,6 +273,25 @@ gets an empty path. Don't drop the user on an empty / broken main
 screen — close the app. Next launch is a clean retry, and that's a
 better UX than "the app loaded but I can't do anything".
 
+### 5a. Non-Kivy desktop hosts: pass ``python_exe`` (0.54.6+)
+
+The desktop picker (``python -m azt_collabd projects``) is a Kivy
+app. A Kivy host (recorder, viewer) calls ``pick_project()`` bare and
+nothing changes for it — the parameter is optional and the default
+(``sys.executable``) is the pre-0.54.6 behavior, so existing peers
+need no code change. A **non-Kivy** desktop host (tkinter A-Z+T)
+must pass a Kivy-capable interpreter, exactly as with
+``open_server_ui(python_exe=…)`` (0.53.4):
+
+```python
+result = pick_project(python_exe=kivy_python)   # 0.54.6+
+```
+
+Try candidates in order (env override, own interpreter, suite venvs)
+and fall back on ``TypeError`` for clients older than 0.54.6 — see
+``azt/backend/core/collab.py::pick_team_project`` for the reference
+loop. Android is unaffected (the Intent path ignores the parameter).
+
 Pattern for your peer's picker result handler (recorder, viewer,
 future peers — adapt to your screen names):
 

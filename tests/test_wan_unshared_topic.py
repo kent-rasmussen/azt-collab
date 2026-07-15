@@ -156,7 +156,10 @@ def test_at_risk_excludes_topic_tips(tmp_path, monkeypatch):
     r.refs[_ORIGIN_MAIN] = c[0]
     r.refs[_TOPIC] = c[3]
     from azt_collabd import peers as _peers
+    # 0.54.5: the walkers read peer coverage via
+    # ``peer_coverage_for`` (main, covered_local) pairs, not the
+    # bare ``peer_main_shas_for`` list.
     monkeypatch.setattr(
-        _peers, 'peer_main_shas_for',
-        lambda langcode: [c[0].decode('ascii')])
+        _peers, 'peer_coverage_for',
+        lambda langcode: [(c[0].decode('ascii'), '')])
     assert azt_repo._at_risk(r, 'main', 'nml') == 2
