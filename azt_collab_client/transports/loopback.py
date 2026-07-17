@@ -185,11 +185,14 @@ class LoopbackTransport(Transport):
                 if hasattr(os, 'setsid'):
                     kwargs['start_new_session'] = True
                 elif sys.platform == 'win32':
-                    # Detach: without these the daemon shares the parent's
-                    # console/process group, dying with the console window
-                    # or a stray Ctrl+C (2026-07-16).
+                    # CREATE_NO_WINDOW, NOT DETACHED_PROCESS: both detach
+                    # from the parent's console/Ctrl+C, but DETACHED gives
+                    # the daemon NO console — so every console-subsystem
+                    # child IT spawns allocated a new visible one (blank
+                    # windows popping during pair/clone, 2026-07-17).
+                    # NO_WINDOW gives an invisible console children inherit.
                     kwargs['creationflags'] = (
-                        subprocess.DETACHED_PROCESS
+                        subprocess.CREATE_NO_WINDOW
                         | subprocess.CREATE_NEW_PROCESS_GROUP)
                 subprocess.Popen(
                     [sys.executable, '-m', 'azt_collabd'], **kwargs)
