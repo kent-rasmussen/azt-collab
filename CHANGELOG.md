@@ -24,6 +24,16 @@ picker subprocess (Kivy honors the flag by presence, so the picker's
 setdefault made its console impossible to un-silence — which hid a
 silent picker death on Windows, 2026-07-16).
 
+FEATURE (QR scanning on desktop): `qr_scan` gains a desktop branch —
+webcam preview + OpenCV's built-in QRCodeDetector, same single-shot
+callback contract and Kivy-main-thread delivery as the Android/ZXing
+path; Esc or closing the preview cancels. `available()` is now
+"Android with jnius, OR desktop with cv2 importable" (find_spec probe,
+still cheap), so the pairing Scan affordance lights up on laptops with
+`opencv-python` installed and stays hidden otherwise. Enables
+desktop-as-joiner LAN pairing (scan a phone's pairing QR from a
+laptop) — previously Android-only by implementation, not necessity.
+
 FIX (loopback — first contact now auto-spawns; Windows daemon detached):
 `health()` lacked the spawn-retry that `call()` has, so the FIRST rpc a
 fresh install makes died with "server.json not found — start the

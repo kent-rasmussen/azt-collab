@@ -58,20 +58,22 @@ _ZXING_REQUEST_CODE = 0x0000c0de
 def available():
     """True if QR scanning is callable on this platform.
 
-    Cheap; the heaviest thing it does is ``import jnius`` (already
-    imported on Android, ImportError on desktop). Doesn't actually
-    touch ZXing classes — those resolve lazily inside ``scan_qr``."""
+    Android: needs jnius (ZXing resolves lazily inside ``scan_qr``).
+    Desktop (0.54.6): needs ``opencv-python`` (cv2 supplies both webcam
+    capture and a built-in QRCodeDetector) — probed via ``find_spec``,
+    so this stays cheap (no actual cv2 import until a scan starts)."""
     try:
         from kivy.utils import platform
     except Exception:
         return False
-    if platform != 'android':
-        return False
-    try:
-        import jnius  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    if platform == 'android':
+        try:
+            import jnius  # noqa: F401
+        except ImportError:
+            return False
+        return True
+    from importlib.util import find_spec
+    return find_spec('cv2') is not None
 
 
 def scan_qr(on_result, on_cancel=None, prompt=''):
@@ -108,6 +110,11 @@ def scan_qr(on_result, on_cancel=None, prompt=''):
               file=sys.stderr, flush=True)
         if on_cancel is not None:
             on_cancel()
+        return
+
+    from kivy.utils import platform as _platform
+    if _platform != 'android':
+        _scan_qr_desktop(on_result, on_cancel, prompt)
         return
 
     from jnius import autoclass
@@ -231,3 +238,111 @@ def scan_qr(on_result, on_cancel=None, prompt=''):
               file=sys.stderr, flush=True)
         if on_cancel is not None:
             Clock.schedule_once(lambda _dt: on_cancel(), 0)
+
+
+# ── desktop (0.54.6): webcam capture + OpenCV's built-in QR decoder ──
+
+_desktop_scan_thread = None  # one scan at a time; a Thread object (not a
+#                              bool) so a dead/wedged worker can't block
+#                              scanning forever — is_alive() is the guard
+
+
+def _scan_qr_desktop(on_result, on_cancel, prompt):
+    """Desktop ``scan_qr``: open the webcam in a small preview window,
+    decode with ``cv2.QRCodeDetector``, deliver the SAME single-shot
+    callback contract as the Android path (callbacks on the Kivy main
+    thread via ``Clock.schedule_once``). Esc or closing the preview
+    window cancels. All cv2 GUI calls stay on ONE worker thread (cv2's
+    HighGUI requirement); the Kivy UI keeps running meanwhile."""
+    global _desktop_scan_thread
+    from kivy.clock import Clock
+
+    def _deliver(cb, *args):
+        if cb is not None:
+            Clock.schedule_once(lambda _dt: cb(*args), 0)
+
+    if _desktop_scan_thread is not None and _desktop_scan_thread.is_alive():
+        print('[qr_scan] desktop scan already running; ignoring',
+              file=sys.stderr, flush=True)
+        return
+
+    def _worker():
+        import cv2
+        window = prompt or 'Scan QR code  (Esc to cancel)'
+        cap = None
+        try:
+            for index in (0, 1):  # first camera, else second
+                if sys.platform == 'win32':
+                    # CAP_DSHOW: avoids the multi-second MSMF probe delay
+                    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+                else:
+                    cap = cv2.VideoCapture(index)
+                if cap.isOpened():
+                    break
+                cap.release()
+                cap = None
+            if cap is None:
+                print('[qr_scan] no webcam could be opened',
+                      file=sys.stderr, flush=True)
+                _deliver(on_cancel)
+                return
+            detector = cv2.QRCodeDetector()
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    print('[qr_scan] webcam stopped supplying frames',
+                          file=sys.stderr, flush=True)
+                    _deliver(on_cancel)
+                    return
+                try:
+                    text, points, _ = detector.detectAndDecode(frame)
+                except cv2.error:
+                    text, points = '', None
+                if points is not None:
+                    # show the user what the detector is looking at
+                    import numpy as _np
+                    cv2.polylines(frame, [_np.int32(points)], True,
+                                  (0, 255, 0), 2)
+                cv2.imshow(window, frame)
+                if text:
+                    print('[qr_scan] desktop decode OK',
+                          file=sys.stderr, flush=True)
+                    _deliver(on_result, text)
+                    return
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # Esc
+                    _deliver(on_cancel)
+                    return
+                try:
+                    if cv2.getWindowProperty(
+                            window, cv2.WND_PROP_VISIBLE) < 1:
+                        _deliver(on_cancel)  # window closed via [X]
+                        return
+                except cv2.error:
+                    _deliver(on_cancel)
+                    return
+        except Exception as ex:
+            print(f'[qr_scan] desktop scan failed: '
+                  f'{type(ex).__name__}: {ex}',
+                  file=sys.stderr, flush=True)
+            _deliver(on_cancel)
+        finally:
+            # Aggressive teardown: Windows camera handles are notorious
+            # for lingering (a half-released device makes the NEXT scan's
+            # VideoCapture fail until the process exits, 2026-07-17), and
+            # HighGUI needs its event pump run for destroy to take.
+            try:
+                import cv2 as _cv2
+                if cap is not None:
+                    cap.release()
+                    del cap
+                _cv2.destroyAllWindows()
+                for _ in range(4):
+                    _cv2.waitKey(1)  # pump events so destroy processes
+            except Exception:
+                pass
+
+    import threading
+    _desktop_scan_thread = threading.Thread(target=_worker, daemon=True,
+                                            name='qr_scan_desktop')
+    _desktop_scan_thread.start()
