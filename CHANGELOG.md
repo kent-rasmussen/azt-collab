@@ -24,6 +24,14 @@ picker subprocess (Kivy honors the flag by presence, so the picker's
 setdefault made its console impossible to un-silence — which hid a
 silent picker death on Windows, 2026-07-16).
 
+FIX (Windows — `$AZT_HOME` had no Windows convention): both paths.py
+twins (client + daemon, duplicated intentionally) fell through to the
+XDG fallback on Windows, yielding `C:\Users\X/.local/share\azt` (mixed
+separators, wrong location — the source of the server.json
+FileNotFoundError, 2026-07-16). Windows now uses `%LOCALAPPDATA%\azt`,
+with a one-time relocation of any daemon state already written to the
+chimera path. `AZT_HOME` env override unchanged.
+
 FIX (Windows — settings UI and picker died at startup):
 `icon_path()` now returns forward-slash paths. Icon paths are
 string-formatted into KV source (`#:set SHARE_ICON '…'`), where a

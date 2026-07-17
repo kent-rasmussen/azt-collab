@@ -110,6 +110,9 @@ def azt_home():
     if android_dir:
         _AZT_HOME_CACHE = os.path.join(android_dir, 'azt')
         return _AZT_HOME_CACHE
+    if sys.platform == 'win32':
+        _AZT_HOME_CACHE = _windows_azt_home()
+        return _AZT_HOME_CACHE
     if sys.platform == 'darwin':
         _AZT_HOME_CACHE = os.path.expanduser(
             '~/Library/Application Support/azt')
@@ -118,6 +121,24 @@ def azt_home():
         '~/.local/share')
     _AZT_HOME_CACHE = os.path.join(xdg, 'azt')
     return _AZT_HOME_CACHE
+
+
+def _windows_azt_home():
+    """``%LOCALAPPDATA%\\azt``. Mirrored in azt_collab_client/paths.py
+    (duplicated intentionally — keep in step). Before 0.54.6 there was no
+    Windows branch and the XDG fallback produced
+    ``C:\\Users\\X/.local/share\\azt``; relocate any state written there."""
+    base = (os.environ.get('LOCALAPPDATA')
+            or os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
+    home = os.path.join(base, 'azt')
+    legacy = os.path.join(os.path.expanduser('~/.local/share'), 'azt')
+    if os.path.isdir(legacy) and not os.path.isdir(home):
+        try:
+            os.makedirs(base, exist_ok=True)
+            os.replace(legacy, home)
+        except OSError:
+            home = legacy  # couldn't move: keep using the old spot
+    return home
 
 
 def server_info_path():

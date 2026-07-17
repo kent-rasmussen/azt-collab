@@ -47,6 +47,24 @@ def _android_files_dir():
     return None
 
 
+def _windows_azt_home():
+    """``%LOCALAPPDATA%\\azt``. Before 0.54.6 there was no Windows branch
+    at all and the XDG fallback produced ``C:\\Users\\X/.local/share\\azt``
+    (mixed separators; wrong convention). If a daemon already wrote state
+    there, relocate it once so nothing is orphaned."""
+    base = (os.environ.get('LOCALAPPDATA')
+            or os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
+    home = os.path.join(base, 'azt')
+    legacy = os.path.join(os.path.expanduser('~/.local/share'), 'azt')
+    if os.path.isdir(legacy) and not os.path.isdir(home):
+        try:
+            os.makedirs(base, exist_ok=True)
+            os.replace(legacy, home)
+        except OSError:
+            home = legacy  # couldn't move: keep using the old spot
+    return home
+
+
 def azt_home():
     p = os.environ.get('AZT_HOME')
     if p:
@@ -54,6 +72,8 @@ def azt_home():
     android_dir = _android_files_dir()
     if android_dir:
         return os.path.join(android_dir, 'azt')
+    if sys.platform == 'win32':
+        return _windows_azt_home()
     if sys.platform == 'darwin':
         return os.path.expanduser('~/Library/Application Support/azt')
     xdg = os.environ.get('XDG_DATA_HOME') or os.path.expanduser(
