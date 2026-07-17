@@ -43,12 +43,30 @@ class LoopbackTransport(Transport):
     # ── public Transport API ────────────────────────────────────────
 
     def health(self):
-        info = self._read_server_info()
+        # Auto-spawn on first contact, same as call(): health is often the
+        # FIRST rpc a fresh install makes, and without this it surfaced
+        # "server.json not found — start the service" instead of just
+        # starting it (Windows first-run, 2026-07-16).
+        try:
+            info = self._read_server_info()
+        except ServerUnavailable:
+            if not self._spawn_server():
+                raise
+            info = self._read_server_info()
         url = f'http://127.0.0.1:{info["port"]}/v1/health'
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 return json.loads(resp.read())
         except (urllib.error.URLError, OSError) as e:
+            if self._spawn_server():
+                try:
+                    info = self._read_server_info()
+                    url = f'http://127.0.0.1:{info["port"]}/v1/health'
+                    with urllib.request.urlopen(url, timeout=5) as resp:
+                        return json.loads(resp.read())
+                except Exception as e2:
+                    raise ServerUnavailable(
+                        f'health check failed after spawn: {e2}')
             raise ServerUnavailable(f'health check failed: {e}')
 
     def call(self, method, path, body=None, timeout=_DEFAULT_TIMEOUT):
@@ -166,6 +184,13 @@ class LoopbackTransport(Transport):
                 }
                 if hasattr(os, 'setsid'):
                     kwargs['start_new_session'] = True
+                elif sys.platform == 'win32':
+                    # Detach: without these the daemon shares the parent's
+                    # console/process group, dying with the console window
+                    # or a stray Ctrl+C (2026-07-16).
+                    kwargs['creationflags'] = (
+                        subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP)
                 subprocess.Popen(
                     [sys.executable, '-m', 'azt_collabd'], **kwargs)
             except OSError as ex:

@@ -24,6 +24,15 @@ picker subprocess (Kivy honors the flag by presence, so the picker's
 setdefault made its console impossible to un-silence — which hid a
 silent picker death on Windows, 2026-07-16).
 
+FIX (loopback — first contact now auto-spawns; Windows daemon detached):
+`health()` lacked the spawn-retry that `call()` has, so the FIRST rpc a
+fresh install makes died with "server.json not found — start the
+service: python -m azt_collabd" instead of just starting it (Windows
+first-run, 2026-07-16; invisible on machines with a daemon already
+running). And the auto-spawned daemon had no Windows detachment
+(POSIX-only `start_new_session`) — it shared the parent's console and
+died with it; now `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
+
 FIX (Windows — `$AZT_HOME` had no Windows convention): both paths.py
 twins (client + daemon, duplicated intentionally) fell through to the
 XDG fallback on Windows, yielding `C:\Users\X/.local/share\azt` (mixed
