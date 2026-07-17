@@ -38,7 +38,11 @@ static "can take a minute or two" hint, so a multi-minute first
 copy visibly moves (field, 2026-07-17: users despair at a
 motionless spinner). Reverts to the hint whenever no clone is
 active. Older daemons without the endpoint degrade to the hint.
-Contract: CLIENT_INTEGRATION.md § 17d/LAN API list.
+Contract: CLIENT_INTEGRATION.md § 17d/LAN API list. The picker's
+GitHub-clone overlay gets the same treatment — the clone job has
+streamed progress lines since 0.18.x, but the picker never passed
+``on_progress``; its "Cloning <url>…" overlay now shows the live
+sideband line beneath the title.
 
 FEATURE (picker — Restart server button): sits beside Share
 diagnostics in the picker footer, same dim styling. The honest

@@ -1105,9 +1105,28 @@ class PickerApp(App):
         loading_label.bind(width=lambda w, val: setattr(
             w, 'text_size', (val, None)))
         box.add_widget(loading_label)
+        # Live-progress line (git sideband via the clone job's
+        # progress poll) — empty until the first line arrives, so
+        # non-clone uses of the overlay look unchanged.
+        progress_label = Label(
+            text='', halign='center', valign='middle',
+            color=theme.TEXT_DIM, font_size=sp(12),
+            font_name=self._font_name,
+            size_hint_y=None, height=dp(36))
+        progress_label.bind(width=lambda w, val: setattr(
+            w, 'text_size', (val, None)))
+        box.add_widget(progress_label)
         view.add_widget(box)
         view.open()
         self._loading_overlay = view
+        self._loading_progress_label = progress_label
+
+    def _set_loading_progress(self, text):
+        """Update the overlay's dim progress line (Kivy main thread
+        only — clone workers marshal through Clock)."""
+        lbl = getattr(self, '_loading_progress_label', None)
+        if lbl is not None:
+            lbl.text = str(text or '')
 
     def _dismiss_loading_overlay(self):
         if self._loading_overlay is not None:
@@ -1116,6 +1135,7 @@ class PickerApp(App):
             except Exception:
                 pass
             self._loading_overlay = None
+        self._loading_progress_label = None
 
     # ── ProjectPickerScreen host contract ─────────────────────────────
     def list_projects(self):
@@ -1291,9 +1311,16 @@ class PickerApp(App):
                 dest = os.path.join(
                     azt_collabd.paths.azt_home(),
                     'projects', repo_name)
-                resp = clone_project(url, dest,
-                                     langcode=chosen_langcode,
-                                     vernlang=chosen_vernlang)
+                resp = clone_project(
+                    url, dest,
+                    langcode=chosen_langcode,
+                    vernlang=chosen_vernlang,
+                    # Job progress lines (git sideband) onto the
+                    # loading overlay — same despair-prevention as
+                    # the LAN receive popup (0.54.7); marshal to the
+                    # main thread, we're on a worker here.
+                    on_progress=lambda line: Clock.schedule_once(
+                        lambda dt: self._set_loading_progress(line), 0))
             except Exception as ex:
                 err_str = str(ex)
                 print(f'[picker_app] clone exception: {err_str}',
