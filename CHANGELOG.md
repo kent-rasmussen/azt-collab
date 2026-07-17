@@ -19,6 +19,11 @@ azt's LiftChooser "Get a project from your team" button (azt 1.10.2)
 drives this through azt's existing interpreter-candidate loop.
 Android path unchanged.
 
+Also: `KIVY_NO_CONSOLELOG=0` now means "Kivy console logs ON" for the
+picker subprocess (Kivy honors the flag by presence, so the picker's
+setdefault made its console impossible to un-silence — which hid a
+silent picker death on Windows, 2026-07-16).
+
 ## 0.54.5 — honest LAN-unshared fallback: unknown peer head degrades to last confirmed coverage, not to "all shared"
 
 Field catch (Kent, 2026-07-11): with the phone off the network and

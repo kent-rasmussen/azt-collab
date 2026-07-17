@@ -20,8 +20,14 @@ import os
 import sys
 
 # Quiet Kivy console logging so stdout stays clean for the AZT_PICK
-# sentinel line. Must be set before importing kivy.
-os.environ.setdefault('KIVY_NO_CONSOLELOG', '1')
+# sentinel line. Must be set before importing kivy. NOTE: Kivy honors
+# this flag by PRESENCE, not value — so an explicit '0' is our own
+# debug convention meaning "logs ON" (remove the flag entirely); it
+# hid a silent picker death on Windows, 2026-07-16.
+if os.environ.get('KIVY_NO_CONSOLELOG') == '0':
+    del os.environ['KIVY_NO_CONSOLELOG']
+else:
+    os.environ.setdefault('KIVY_NO_CONSOLELOG', '1')
 
 from kivy.app import App
 from kivy.clock import Clock
