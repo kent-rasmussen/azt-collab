@@ -74,6 +74,11 @@ def _find_font(filename):
         os.path.join('/usr/share/fonts/opentype/charis', filename),
         os.path.join(os.path.expanduser('~'), '.fonts', filename),
         os.path.join(os.path.expanduser('~'), '.local/share/fonts', filename),
+        # Windows: machine-wide and per-user font installs (2026-07-16)
+        os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts',
+                     filename),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft',
+                     'Windows', 'Fonts', filename),
     ]
     for path in candidates:
         if os.path.exists(path):

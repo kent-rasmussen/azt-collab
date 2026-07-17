@@ -38,5 +38,12 @@ def icon_path(name):
         os.path.join(_ASSETS, name + '.png'),
     ):
         if os.path.isfile(candidate):
-            return candidate
+            # Forward slashes ALWAYS: these paths get string-formatted
+            # into KV source (e.g. ``#:set SHARE_ICON '{share_icon}'``),
+            # where a backslashed Windows path parses as broken Python
+            # string escapes — ``C:\Users\…`` → "SyntaxError: truncated
+            # \UXXXXXXXX escape", killing the settings UI AND the picker
+            # (which imports it) on Windows, 2026-07-16. Kivy accepts
+            # forward slashes on every platform.
+            return candidate.replace(os.sep, '/')
     return ''

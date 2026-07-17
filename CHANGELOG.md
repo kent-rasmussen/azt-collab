@@ -24,6 +24,16 @@ picker subprocess (Kivy honors the flag by presence, so the picker's
 setdefault made its console impossible to un-silence — which hid a
 silent picker death on Windows, 2026-07-16).
 
+FIX (Windows — settings UI and picker died at startup):
+`icon_path()` now returns forward-slash paths. Icon paths are
+string-formatted into KV source (`#:set SHARE_ICON '…'`), where a
+backslashed Windows path parses as broken Python string escapes
+(`C:\Users\…` → "SyntaxError: truncated \UXXXXXXXX escape"). The
+picker imports the settings KV, so both Kivy subprocesses were dead
+on any Windows clone that ships the icon assets. (Linux was immune
+twice over: no backslashes, and older clones without the assets
+resolve `''`.)
+
 ## 0.54.5 — honest LAN-unshared fallback: unknown peer head degrades to last confirmed coverage, not to "all shared"
 
 Field catch (Kent, 2026-07-11): with the phone off the network and
