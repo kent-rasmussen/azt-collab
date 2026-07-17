@@ -43,8 +43,18 @@ def _locate_azt_collabd_parent():
 
 
 def build_spawn_env(extra_path=''):
-    """Return an env dict for Popen with PYTHONPATH prepended if needed."""
+    """Return an env dict for Popen with PYTHONPATH prepended if needed.
+
+    Also forces the child's stdio to UTF-8: on Windows, a child whose
+    stdout/stderr is a PIPE gets the ANSI code page (cp1252), and our
+    log lines are full of '→' (U+2192) — the first such print raised
+    UnicodeEncodeError and killed the picker subprocess, silently
+    (field 2026-07-17: change-project picker "flash"). Console runs
+    were immune (Windows console I/O is UTF-8 in Python 3.6+), which
+    is why ``python -m azt_collabd`` by hand never showed it. Every
+    reader of these pipes already decodes UTF-8."""
     env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
     parent = extra_path or _locate_azt_collabd_parent()
     if parent:
         existing = env.get('PYTHONPATH', '')

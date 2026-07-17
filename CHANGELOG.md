@@ -9,7 +9,10 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.54.7 — honest failure messages (LAN + GitHub clone) + live clone progress
+## 0.54.9 — honest failure messages (LAN + GitHub clone) + live clone progress
+
+(0.54.7/0.54.8 were taken by already-compiled builds; this block
+shipped as 0.54.9.)
 
 FIX (LAN — honest error when THIS side's TLS is broken): a local
 SSL failure (identity files missing/unreadable — `SSLError(
@@ -43,6 +46,30 @@ GitHub-clone overlay gets the same treatment — the clone job has
 streamed progress lines since 0.18.x, but the picker never passed
 ``on_progress``; its "Cloning <url>…" overlay now shows the live
 sideband line beneath the title.
+
+FIX (Windows — picker died on the first '→' it printed): a child
+whose stdio is a PIPE gets the ANSI code page (cp1252) on Windows,
+and our log lines are full of U+2192 — the first such print raised
+UnicodeEncodeError (encodings\cp1252.py) and killed the picker
+subprocess. Console runs were immune (Windows console I/O is UTF-8),
+so `python -m azt_collabd` by hand always worked — the failure only
+appeared when spawned from desktop azt, and mid-session state made a
+'→' print near-certain (change-project "flash", field 2026-07-17).
+`build_spawn_env` now forces PYTHONIOENCODING=utf-8 for every child
+(picker + daemon auto-spawn); readers already decode UTF-8.
+
+FIX (picker spawn — a crash no longer masquerades as a cancel):
+`pick_project`'s desktop path mapped exit code 1 straight to
+'cancelled', so a picker that died with a traceback looked exactly
+like the user closing the window — no popup, no evidence, and the
+host's interpreter-candidate loop stopped instead of trying its next
+python. rc 0/1 now counts as cancel only when stderr shows no
+traceback; otherwise `spawn_exited` carries a 2000-char stderr tail
+(the evidence that identified the cp1252 bug above). `detail` +
+`returncode` ride along even on cancel; the spawn re-enables the
+picker's console logging (KIVY_NO_CONSOLELOG=0) so a host that
+defensively exports =1 for its own process (desktop azt) no longer
+mutes its child's last words.
 
 FEATURE (picker — Restart server button): sits beside Share
 diagnostics in the picker footer, same dim styling. The honest

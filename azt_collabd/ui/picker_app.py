@@ -1317,7 +1317,7 @@ class PickerApp(App):
                     vernlang=chosen_vernlang,
                     # Job progress lines (git sideband) onto the
                     # loading overlay — same despair-prevention as
-                    # the LAN receive popup (0.54.7); marshal to the
+                    # the LAN receive popup (0.54.9); marshal to the
                     # main thread, we're on a worker here.
                     on_progress=lambda line: Clock.schedule_once(
                         lambda dt: self._set_loading_progress(line), 0))
