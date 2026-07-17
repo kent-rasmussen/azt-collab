@@ -46,6 +46,7 @@ import shutil
 import socket
 import ssl
 import sys
+import time as _time
 
 from . import lan_discovery as _lan_discovery
 from . import pending_decisions as _pending
@@ -101,6 +102,35 @@ def _looks_like_timeout(exc):
         cur = getattr(cur, '__cause__', None) \
             or getattr(cur, '__context__', None)
     return False
+
+
+def _is_local_tls_error(err):
+    """True when the error text shows THIS side's TLS layer failing on a
+    missing/unreadable local file (ssl wrapping FileNotFoundError — the
+    LAN-identity peer_id/peer.crt files, typically) rather than any
+    network exchange. This probes an exception repr we composed
+    ourselves — never translated text — so the structured-Results rule
+    is intact; classifying at the raise site would be cleaner but the
+    exception arrives pre-stringified through dulwich/urllib3 wrapping.
+    Field repro 2026-07-17: SSLError(FileNotFoundError(2, ...)) reported
+    as 'peer didn't respond' and sent the user chasing Wi-Fi."""
+    if 'SSLError' not in err:
+        return False
+    return ('FileNotFoundError' in err or 'No such file' in err
+            or 'PermissionError' in err)
+
+
+def _is_not_shared(err):
+    """True when the error text shows the peer ANSWERED but its
+    listener refused to serve the repo: dulwich raises
+    ``NotGitRepository()`` on the listener's 404, which the peer sends
+    both for "project not in any paired peer's shared_projects
+    allowlist" and "project not registered here" (see
+    ``lan_listener`` ``open_repository``). Same probe-our-own-repr
+    caveat as ``_is_local_tls_error`` above. Field repro 2026-07-17:
+    reported as 'peer didn't respond' when the phone had answered and
+    the fix was sharing the project on the phone."""
+    return 'NotGitRepository' in err
 
 
 def _resolve_endpoint(peer_entry):
@@ -232,6 +262,41 @@ def _find_lift_in(working_dir):
     return ''
 
 
+# Last-line progress of the clone currently in flight, for the
+# ``GET /v1/lan/clone/progress`` poll (the receive popup shows it so
+# a multi-minute first copy doesn't look hung). One slot, not
+# per-langcode: user-gestured receives are serial in practice, and a
+# wrong-but-live line beats a frozen screen if two ever overlap.
+_PROGRESS = {'active': False, 'langcode': '', 'text': '', 'ts': 0.0}
+
+
+def clone_progress():
+    """Snapshot of the in-flight clone's progress (see _PROGRESS)."""
+    return dict(_PROGRESS)
+
+
+class _ProgressStream:
+    """``errstream`` for ``porcelain.clone``: dulwich writes the
+    server's sideband-2 progress here (``Counting objects: 12%
+    (n/m)\\r``-style, CR-redrawn). Keeps only the newest line."""
+
+    def write(self, data):
+        try:
+            text = (data.decode('utf-8', 'replace')
+                    if isinstance(data, bytes) else str(data))
+        except Exception:
+            return 0
+        for piece in text.replace('\r', '\n').split('\n'):
+            piece = piece.strip()
+            if piece:
+                _PROGRESS['text'] = piece
+                _PROGRESS['ts'] = _time.time()
+        return len(data) if data else 0
+
+    def flush(self):
+        pass
+
+
 def _do_lan_clone(host, port, langcode, expected_fp, dest_dir):
     """Run the actual ``porcelain.clone``. Returns ``(lift_path,
     error_str)`` — empty error means success."""
@@ -251,9 +316,12 @@ def _do_lan_clone(host, port, langcode, expected_fp, dest_dir):
         except OSError as ex:
             return '', f'wipe_dest_failed: {ex}'
     os.makedirs(dest_dir, exist_ok=True)
+    _PROGRESS.update(active=True, langcode=langcode, text='',
+                     ts=_time.time())
     try:
         with _socket_timeout(_LAN_CLONE_TIMEOUT_S):
-            porcelain.clone(url, dest_dir, pool_manager=pm)
+            porcelain.clone(url, dest_dir, pool_manager=pm,
+                            errstream=_ProgressStream())
     except TypeError:
         # dulwich without pool_manager kwarg — same fallback as
         # lan_push. Refuse rather than fall back to unpinned TLS.
@@ -262,6 +330,8 @@ def _do_lan_clone(host, port, langcode, expected_fp, dest_dir):
         if _looks_like_timeout(ex):
             return '', f'clone_timed_out: {ex!r}'
         return '', f'clone_failed: {ex!r}'
+    finally:
+        _PROGRESS['active'] = False
     lift_path = _find_lift_in(dest_dir)
     if not lift_path:
         return '', 'no_lift_in_clone'
@@ -283,6 +353,8 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         the result *also* carries one of the success codes above.
       - ``LAN_REMOTE_CONFLICT``: stashed as a pending decision;
         result carries the success code.
+      - ``LAN_PROJECT_NOT_SHARED``: peer answered but refused to
+        serve the repo (not shared with us / not registered there).
       - ``LAN_PEER_UNREACHABLE``: no endpoint resolved or clone
         connection failed.
       - ``SERVER_ERROR``: anything else.
@@ -354,11 +426,19 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
                            incoming_url=incoming_url)
         return result
 
-    # No existing project: fresh LAN clone.
+    # No existing project: fresh LAN clone. Log start + outcome —
+    # the transfer can run minutes behind a spinner, and until
+    # 2026-07-17 the daemon log was silent for its whole duration
+    # (an in-progress clone was indistinguishable from nothing
+    # happening).
     dest_dir = _project_dest_dir(langcode)
+    print(f'[lan-clone] start: {langcode!r} from {peer_id!r} '
+          f'at {host}:{port}', file=sys.stderr, flush=True)
     lift_path, err = _do_lan_clone(
         host, port, langcode, expected_fp, dest_dir)
     if err:
+        print(f'[lan-clone] failed: {langcode!r} from {peer_id!r}: '
+              f'{err}', file=sys.stderr, flush=True)
         # Distinguish "connection stalled mid-transfer" from "could
         # not resolve / connect at all" so the UI can route the
         # right user-facing prompt. ``_do_lan_clone`` tags the
@@ -368,6 +448,12 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
                        langcode=langcode,
                        timeout_s=_LAN_CLONE_TIMEOUT_S,
                        detail=err)
+        elif _is_local_tls_error(err):
+            result.add(_S.LAN_LOCAL_TLS_ERROR, peer_id=peer_id,
+                       detail=err)
+        elif _is_not_shared(err):
+            result.add(_S.LAN_PROJECT_NOT_SHARED, peer_id=peer_id,
+                       langcode=langcode, detail=err)
         else:
             result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
                        detail=err)
@@ -416,6 +502,8 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         _peers.add_shared_project(peer_id, langcode)
     except Exception:
         pass
+    print(f'[lan-clone] done: {langcode!r} from {peer_id!r} → '
+          f'{lift_path!r}', file=sys.stderr, flush=True)
     result.add(_S.LAN_PROJECT_CLONED,
                langcode=langcode, peer_id=peer_id,
                device_name=entry.get('device_name', ''))

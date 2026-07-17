@@ -2951,7 +2951,9 @@ share gestures. Routing rules:
 |---|---|---|
 | ``S.LAN_PAIRED`` | ``lan_pair_accept`` succeeded. | Toast / log; show updated paired-devices list. |
 | ``S.LAN_UNPAIRED`` | ``lan_unpair`` succeeded. | Same. |
-| ``S.LAN_PEER_UNREACHABLE`` | ``lan_clone`` / fan-out couldn't resolve an endpoint or the connection failed at TLS / TCP. Params: ``peer_id``, optional ``detail``. | Translated toast ("Couldn't reach <device> over local network — make sure they're both on the same Wi-Fi"). |
+| ``S.LAN_PEER_UNREACHABLE`` | ``lan_clone`` / fan-out couldn't resolve an endpoint or the connection genuinely failed at TCP / network level. Since 0.54.6 this NO LONGER covers two cases that used to fall through to it: a local TLS-identity fault (→ ``LAN_LOCAL_TLS_ERROR``) and the peer answering but refusing the repo (→ ``LAN_PROJECT_NOT_SHARED``). Params: ``peer_id``, optional ``detail``. | Translated toast ("Couldn't reach <device> over local network — make sure they're both on the same Wi-Fi"). |
+| ``S.LAN_LOCAL_TLS_ERROR`` | THIS device's TLS layer failed on a missing/unreadable local file (LAN-identity ``peer_id``/``peer.crt``) before any network exchange (0.54.6). Params: ``peer_id``, ``detail``. | Popup that blames THIS device, not the network: "restart the collaboration service and try again; share diagnostics if it persists." Do NOT show the unreachable wording. |
+| ``S.LAN_PROJECT_NOT_SHARED`` | The peer ANSWERED but its listener refused to serve the repo — not in its share allowlist for any paired peer, or not registered there (0.54.6). Params: ``peer_id``, ``langcode``, ``detail``. | Popup: "the other device answered but is not offering this project — share it on the other device, then try again." Do NOT show the unreachable wording. |
 | ``S.LAN_FP_MISMATCH`` | A paired peer's TLS-cert fingerprint differs from the value recorded in ``peers.json`` — possible MITM or device re-pair. Currently logged daemon-side; emitted as a typed Result code in a future tightening pass (CHANGELOG 0.45.0 § Known gaps). | When peers see it surface in a ``Result``: surface a SECURITY-FLAVOURED toast — "<device>'s identity changed; re-pair to confirm." Do NOT silently auto-rotate the stored fingerprint. |
 | ``S.LAN_TOGGLE_OFF`` | The user invoked a LAN op (``lan_clone``, ``send_share_offer``, …) with the daemon-wide LAN toggle off. (0.45.39+.) | Toast "Turn LAN sync on first" + ``open_server_ui()`` so the user lands on the toggle. |
 | ``S.LAN_PROJECT_CLONED`` | ``lan_clone`` performed a fresh clone from a peer. Params: ``langcode``, ``peer_id``, ``device_name``. | Translate to status line; pickup follows — the daemon stamps ``last_project`` so the peer's next picker resume lands in the new project. |
@@ -2968,6 +2970,7 @@ share gestures. Routing rules:
 from azt_collab_client import S
 S.LAN_PAIRED / S.LAN_UNPAIRED
 S.LAN_PEER_UNREACHABLE / S.LAN_FP_MISMATCH / S.LAN_TOGGLE_OFF
+S.LAN_LOCAL_TLS_ERROR / S.LAN_PROJECT_NOT_SHARED
 S.LAN_PROJECT_CLONED / S.LAN_PROJECT_REOPENED
 S.LAN_PROJECT_COLLISION_UNRELATED
 S.LAN_ADOPT_ORIGIN_NEEDED / S.LAN_PROJECT_ADOPTED_REMOTE
@@ -3386,6 +3389,12 @@ Field shapes worth knowing:
   ``LAN_PAIRED`` + the recorded peer entry.
 - ``lan_clone(peer_id, langcode, remote_url='', vernlang='')``
   → ``Result`` (see § 17d for codes).
+- ``lan_clone_progress()`` → ``{active, langcode, text, ts}``
+  (empty dict on transport failure) — last git sideband progress
+  line of the clone the daemon is running right now (0.54.6).
+  Poll it (~1 s) from the receive UI while ``lan_clone`` runs on
+  a worker thread, so a multi-minute first copy shows movement;
+  ``active`` False means show your static hint instead.
 - ``lan_pending()`` → list of ``{id, kind, params, created_at}``.
   ``kind`` is one of ``share_offer`` / ``adopt_origin`` /
   ``remote_conflict``.

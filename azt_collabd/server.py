@@ -756,6 +756,16 @@ def _h_lan_pending(_body):
     return 200, {"ok": True, "decisions": _pending.list_all()}
 
 
+def _h_lan_clone_progress(_body):
+    """``GET /v1/lan/clone_progress`` — last sideband progress line
+    of the LAN clone currently in flight (captured by
+    ``lan_clone._ProgressStream``). The receive popup polls this so
+    a multi-minute first copy shows movement instead of a static
+    spinner. Response: ``{ok: True, active, langcode, text, ts}``."""
+    from . import lan_clone as _lan_clone_mod
+    return 200, {"ok": True, **_lan_clone_mod.clone_progress()}
+
+
 def _h_lan_nearby_unpaired(_body):
     """Return mDNS-discovered devices NOT in our peers.json.
     Powers the peer-side "Nearby (unpaired)" list with Pair
@@ -4667,6 +4677,8 @@ def dispatch(method, path, body):
             return _h_lan_get_toggle(body)
         if path == '/v1/lan/pending':
             return _h_lan_pending(body)
+        if path == '/v1/lan/clone_progress':
+            return _h_lan_clone_progress(body)
         if path == '/v1/lan/nearby_unpaired':
             return _h_lan_nearby_unpaired(body)
         if path == '/v1/projects':

@@ -242,6 +242,15 @@ _HANDLERS = {
         'Copying the project timed out. Is the other phone still '
         'nearby and on the same Wi-Fi? Try again when both phones '
         'are close together.'),
+    S.LAN_LOCAL_TLS_ERROR:    lambda p: _tr(
+        'This device could not make the secure connection — its own '
+        'sharing-identity files are missing or damaged. This is not '
+        'a network problem; restart the collaboration service and '
+        'try again.'),
+    S.LAN_PROJECT_NOT_SHARED: lambda p: _tr(
+        'The other device answered, but it is not offering this '
+        'project to this device. On the other device, open the '
+        'project and share it with this device, then try again.'),
     S.LAN_FP_MISMATCH:        lambda p: _tr(
         'A paired device presented an unexpected security '
         'fingerprint. It may have been reinstalled; re-pair from '

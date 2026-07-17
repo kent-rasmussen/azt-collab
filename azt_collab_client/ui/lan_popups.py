@@ -376,7 +376,7 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
     so the picker can still show something useful. No-op +
     ``on_status`` toast if QR scanning isn't available."""
     from . import qr_scan
-    from .. import lan_pair_accept, lan_clone, S
+    from .. import lan_pair_accept, lan_clone, lan_clone_progress, S
     from ..status import Result, Status
 
     def _emit_status(text):
@@ -465,6 +465,26 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
         def _set_phase(label_text):
             phase_label.text = label_text
 
+        # Live transfer progress: poll the daemon's clone-progress
+        # slot and surface the git sideband line ("Counting objects:
+        # 12% (n/m)") in place of the static hint — a first copy can
+        # run minutes, and an unmoving screen reads as hung (field,
+        # 2026-07-17). RPC on the Kivy clock follows the
+        # pair-request poll pattern (cheap loopback/CP call); the
+        # daemon's HTTP server is threaded, so this gets through
+        # while the clone RPC is still occupying its own thread.
+        sub_default = sub_label.text
+        def _poll_progress(_dt):
+            try:
+                snap = lan_clone_progress()
+            except Exception:
+                return
+            if snap.get('active') and snap.get('text'):
+                sub_label.text = snap['text']
+            else:
+                sub_label.text = sub_default
+        progress_poll_ev = Clock.schedule_interval(_poll_progress, 1.0)
+
         def _worker():
             # Pair always happens first. Even an unpaired peer who
             # only wanted to clone needs to be paired so the cert
@@ -509,6 +529,10 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
 
         def _finish_on_main(result):
             try:
+                progress_poll_ev.cancel()
+            except Exception:
+                pass
+            try:
                 progress_popup.dismiss()
             except Exception:
                 pass
@@ -528,6 +552,34 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                         'other phone still nearby and on the same '
                         'Wi-Fi? Try the scan again when both '
                         'phones are close together.'),
+                    font_name)
+            elif (not got_project
+                    and result.has(S.LAN_LOCAL_TLS_ERROR)):
+                # OUR side's TLS/identity is broken — saying "the other
+                # phone did not respond" here sent the user chasing
+                # Wi-Fi when the peer had answered fine (2026-07-17).
+                _show_lan_failure_popup(
+                    _tr('Sharing setup problem on THIS device'),
+                    _tr('This device could not make the secure '
+                        'connection — its own sharing-identity files '
+                        'are missing or damaged. This is not a network '
+                        'problem. Restart the collaboration service '
+                        'and try again; if it keeps happening, share '
+                        'diagnostics from the settings screen.'),
+                    font_name)
+            elif (not got_project
+                    and result.has(S.LAN_PROJECT_NOT_SHARED)):
+                # The peer ANSWERED; its listener refused the repo
+                # (not in its share allowlist, or not registered
+                # there). "Did not respond" here blamed the network
+                # when the fix is on the other device (2026-07-17).
+                _show_lan_failure_popup(
+                    _tr('The other phone is not sharing this project'),
+                    _tr('The other phone answered, but it is not '
+                        'offering this project to this device. On '
+                        'the other phone, open the project and '
+                        'share it with this device, then try '
+                        'again.'),
                     font_name)
             elif (not got_project
                     and result.has(S.LAN_PEER_UNREACHABLE)):

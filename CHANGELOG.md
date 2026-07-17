@@ -9,6 +9,45 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.7 — LAN: honest failure messages + live clone progress
+
+FIX (LAN — honest error when THIS side's TLS is broken): a local
+SSL failure (identity files missing/unreadable — `SSLError(
+FileNotFoundError…)`) was classified as `LAN_PEER_UNREACHABLE`, so the
+UI told the user "the other phone did not respond on this network"
+while the peer had answered fine (field, 2026-07-17 — sent the user
+chasing Wi-Fi). New typed code `LAN_LOCAL_TLS_ERROR` (daemon + client
+mirror + translation + FR catalog), classified in `lan_clone`'s error
+triage, with a popup that names the actual problem and the remedy.
+
+FIX (LAN — honest error when the peer refuses the repo): a LAN clone
+answered by the peer's listener with its 404 (`NotGitRepository()` —
+project not in its share allowlist, or not registered there) was also
+classified `LAN_PEER_UNREACHABLE` ("did not respond on this network").
+New typed code `LAN_PROJECT_NOT_SHARED` (daemon + client mirror +
+translation + FR catalog), classified in `lan_clone`'s error triage,
+with a popup that says the phone answered and that the fix is to share
+the project on the other device (field, 2026-07-17).
+
+FEATURE (LAN — live progress on the receive popup): the daemon
+captures dulwich's sideband progress ("Counting objects: 12%
+(n/m)") into a one-slot state, exposed as `GET
+/v1/lan/clone_progress` + client `lan_clone_progress()`; the
+receive popup polls it at 1 Hz and shows the line in place of the
+static "can take a minute or two" hint, so a multi-minute first
+copy visibly moves (field, 2026-07-17: users despair at a
+motionless spinner). Reverts to the hint whenever no clone is
+active. Older daemons without the endpoint degrade to the hint.
+Contract: CLIENT_INTEGRATION.md § 17d/LAN API list.
+
+OBSERVABILITY (LAN): `lan_clone` now logs start / failed / done — a
+multi-minute transfer ran with zero daemon-log evidence, so an
+in-progress clone was indistinguishable from nothing happening
+(field, 2026-07-17). And the LAN listener logs each git
+smart-protocol request with the requester's address; previously a
+serve of `/X.git` was unattributable when more than one paired
+machine was on the LAN.
+
 ## 0.54.6 — client: `pick_project(python_exe=…)`
 
 `pick_project()` gains the same `python_exe` override `open_server_ui`

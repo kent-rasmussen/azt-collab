@@ -972,6 +972,14 @@ def _peer_acl_middleware(app):
         # so the dulwich app simply returns 404 for a URL outside
         # that set. Future-harden by re-adding the per-peer ACL
         # once client identity is signature-verified in the body.
+        # Log who is asking — TLS gives no per-request identity, so
+        # the remote address is the only requester signal we have,
+        # and without it a serve of ``/X.git`` is unattributable in
+        # the daemon log (field, 2026-07-17: could not tell which of
+        # two paired machines fetched a project).
+        print(f'[lan-listener] {method} {path_info} from '
+              f'{environ.get("REMOTE_ADDR", "?")}',
+              file=sys.stderr, flush=True)
         return app(environ, start_response)
     return wrapped
 

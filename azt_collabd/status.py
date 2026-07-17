@@ -342,6 +342,22 @@ LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
 # the UI can prompt "is the other phone still nearby?" instead of
 # waiting on the RPC's 300 s default.
 LAN_CLONE_TIMEOUT = 'LAN_CLONE_TIMEOUT'
+# THIS side's TLS layer failed before any network exchange — e.g. the
+# local LAN-identity files (peer_id / peer.crt) are missing or unreadable
+# (ssl wraps the FileNotFoundError). Distinct from LAN_PEER_UNREACHABLE:
+# blaming the peer/network for a local setup fault sent the user
+# checking Wi-Fi when the phone had answered fine (field, 2026-07-17).
+# Params: ``peer_id``, ``detail``.
+LAN_LOCAL_TLS_ERROR = 'LAN_LOCAL_TLS_ERROR'
+# The peer ANSWERED but its listener refused to serve the repo —
+# dulwich surfaces the listener's 404 as ``NotGitRepository()``. On the
+# peer that means the project is not in any paired peer's
+# shared_projects allowlist there, or isn't registered there at all
+# (see ``lan_listener`` ``open_repository``). Distinct from
+# LAN_PEER_UNREACHABLE: "did not respond on this network" points at
+# Wi-Fi when the fix is to share the project on the other device
+# (field, 2026-07-17). Params: ``peer_id``, ``langcode``, ``detail``.
+LAN_PROJECT_NOT_SHARED = 'LAN_PROJECT_NOT_SHARED'
 
 # Combined-pair-share-clone flow (parked spec § "Combined scan flow",
 # 0.45.0). The same scan gesture that pairs two phones also clones

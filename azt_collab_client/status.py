@@ -224,6 +224,14 @@ LAN_TOGGLE_OFF = 'LAN_TOGGLE_OFF'
 # Socket timeout during the LAN clone's packfile transfer.
 # Params: peer_id, langcode, timeout_s. See azt_collabd/status.py.
 LAN_CLONE_TIMEOUT = 'LAN_CLONE_TIMEOUT'
+# THIS side's TLS layer failed on a missing/unreadable local file
+# (LAN-identity peer_id/peer.crt, typically) — NOT a network/peer
+# problem. Params: peer_id, detail. See azt_collabd/status.py.
+LAN_LOCAL_TLS_ERROR = 'LAN_LOCAL_TLS_ERROR'
+# The peer answered but its listener refused to serve the repo (not
+# shared with this device / not registered there). Params: peer_id,
+# langcode, detail. See azt_collabd/status.py.
+LAN_PROJECT_NOT_SHARED = 'LAN_PROJECT_NOT_SHARED'
 
 # Combined-pair-share-clone flow codes — see ``azt_collabd/status.py``
 # for the full per-code rationale.

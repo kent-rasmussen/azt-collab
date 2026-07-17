@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.6"
+__version__ = "0.54.7"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1173,6 +1173,26 @@ def lan_clone(peer_id, langcode, remote_url='', vernlang='',
             'SERVER_ERROR',
             {'error': resp.get('error', 'unknown')})])
     return Result.from_dict(resp.get('result') or {})
+
+
+def lan_clone_progress():
+    """Last sideband progress line of the LAN clone the daemon is
+    running right now (``Counting objects: 12% (n/m)``-style, from
+    the sharing peer via dulwich). Query-shaped: returns a dict
+    ``{active: bool, langcode: str, text: str, ts: float}``; empty
+    dict on transport failure. The receive popup polls this while
+    ``lan_clone`` runs on its worker thread, so a multi-minute
+    first copy shows movement instead of a static spinner."""
+    try:
+        resp = call('GET', '/v1/lan/clone_progress')
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return {'active': bool(resp.get('active')),
+            'langcode': str(resp.get('langcode', '') or ''),
+            'text': str(resp.get('text', '') or ''),
+            'ts': float(resp.get('ts', 0.0) or 0.0)}
 
 
 def lan_pending():
@@ -2963,7 +2983,8 @@ __all__ = [
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
-    'lan_clone', 'lan_pending', 'lan_accept_offer',
+    'lan_clone', 'lan_clone_progress', 'lan_pending',
+    'lan_accept_offer',
     'lan_decline_offer', 'lan_adopt_origin', 'lan_resolve_conflict',
     'lan_pair_request_send', 'lan_pair_request_resolve',
     'lan_pair_request_status', 'lan_nearby_unpaired',
