@@ -379,6 +379,12 @@ def _pick_project_desktop(timeout_seconds, python_exe=None):
     import subprocess
     import sys as _sys
     from ._spawn import build_spawn_env
+    env = build_spawn_env()
+    # Hosts that defensively export KIVY_NO_CONSOLELOG=1 for their own
+    # process (desktop azt does) would silence the picker child too —
+    # which is exactly the process whose stderr we capture for crash
+    # evidence. '0' is the picker's logs-ON convention (0.54.6).
+    env['KIVY_NO_CONSOLELOG'] = '0'
     try:
         proc = subprocess.Popen(
             [python_exe or _sys.executable, '-m', 'azt_collabd', 'projects'],
@@ -387,7 +393,7 @@ def _pick_project_desktop(timeout_seconds, python_exe=None):
             stderr=subprocess.PIPE,
             close_fds=True,
             start_new_session=hasattr(os, 'setsid'),
-            env=build_spawn_env(),
+            env=env,
         )
     except OSError as ex:
         return {'ok': False, 'error': 'spawn_failed', 'detail': str(ex)}
@@ -399,6 +405,7 @@ def _pick_project_desktop(timeout_seconds, python_exe=None):
         return {'ok': False, 'error': 'timeout'}
     rc = proc.returncode
     out = (stdout or b'').decode('utf-8', 'replace')
+    err = (stderr or b'').decode('utf-8', 'replace').strip()
     for line in out.splitlines():
         if line.startswith('AZT_PICK\t'):
             parts = line.split('\t')
@@ -406,14 +413,21 @@ def _pick_project_desktop(timeout_seconds, python_exe=None):
             langcode = parts[2].strip() if len(parts) > 2 else ''
             if path:
                 return {'ok': True, 'path': path, 'langcode': langcode}
-    if rc == 0:
-        # Process exited 0 but no AZT_PICK line — treat as cancelled.
-        return {'ok': False, 'error': 'cancelled'}
-    if rc == 1:
-        return {'ok': False, 'error': 'cancelled'}
-    err = (stderr or b'').decode('utf-8', 'replace').strip()[:200]
+    # A crash must not masquerade as a cancel: rc 1 used to map
+    # straight to 'cancelled', so a picker that died with a traceback
+    # was indistinguishable from the user closing the window — no
+    # error anywhere, and the host's interpreter-candidate loop
+    # stopped instead of trying its next python (field 2026-07-17,
+    # Windows: "a flash and returned None"). Real cancels exit
+    # quietly; rc 0/1 counts as a cancel only when stderr shows no
+    # crash. ``detail`` rides along even on cancel so hosts can log
+    # what the subprocess said.
+    crashed = 'Traceback' in err
+    if rc in (0, 1) and not crashed:
+        return {'ok': False, 'error': 'cancelled',
+                'returncode': rc, 'detail': err[-500:]}
     return {'ok': False, 'error': 'spawn_exited',
-            'returncode': rc, 'detail': err}
+            'returncode': rc, 'detail': err[-2000:]}
 
 
 def _pick_project_android(timeout_seconds):
