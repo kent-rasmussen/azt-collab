@@ -9,7 +9,7 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.54.7 — LAN: honest failure messages + live clone progress
+## 0.54.7 — honest failure messages (LAN + GitHub clone) + live clone progress
 
 FIX (LAN — honest error when THIS side's TLS is broken): a local
 SSL failure (identity files missing/unreadable — `SSLError(
@@ -39,6 +39,31 @@ copy visibly moves (field, 2026-07-17: users despair at a
 motionless spinner). Reverts to the hint whenever no clone is
 active. Older daemons without the endpoint degrade to the hint.
 Contract: CLIENT_INTEGRATION.md § 17d/LAN API list.
+
+FEATURE (picker — Restart server button): sits beside Share
+diagnostics in the picker footer, same dim styling. The honest
+failure popups tell users to "restart the collaboration service";
+this is the no-shell way to do it (wraps the client's
+`restart_server()`; feedback rides the button label). Also how a
+field machine picks up a just-pulled azt-collab without finding the
+sync-settings screen.
+
+FIX (GitHub clone — "no .lift found" no longer swallows real
+failures): the daemon marks a clone job DONE even when the clone
+itself FAILED (the failure is typed inside the job's `result`), and
+the client's `clone_project` flattened every DONE-without-lift into
+`'no_lift_found'` — a repo-permissions failure surfaced as "No .lift
+file found in cloned repository" on a repo that has one (field,
+2026-07-17). `clone_project` now derives the error from the typed
+codes (`clone_auth_required` / `clone_failed` / `repo_empty` /
+`no_lift_found`) and decodes `result` into a real `Result` per its
+own contract — which also brings the picker's CLONE_AUTH_REQUIRED
+auth-modal routing back to life (it read `.statuses` off what was
+actually a raw wire dict, so the auth branch never fired). New typed
+`REPO_EMPTY` (daemon + mirror + translation + FR catalog)
+distinguishes "clone landed but repo is empty — first upload may not
+have finished" from a genuine content problem; the picker shows the
+translated wording for both content-shaped outcomes.
 
 OBSERVABILITY (LAN): `lan_clone` now logs start / failed / done — a
 multi-minute transfer ran with zero daemon-log evidence, so an

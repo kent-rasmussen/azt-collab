@@ -1342,10 +1342,12 @@ class PickerApp(App):
                     auth_status = st
                     break
         # Fallback: when the daemon's worker didn't run far enough to
-        # attach CLONE_AUTH_REQUIRED (result is None) but the error
-        # string itself smells like auth/not-found, still surface the
-        # auth modal — the user's likely problem is the same.
-        if auth_status is None and result is None:
+        # attach CLONE_AUTH_REQUIRED (no typed statuses arrived) but
+        # the error string itself smells like auth/not-found, still
+        # surface the auth modal — the user's likely problem is the
+        # same.
+        if auth_status is None \
+                and not getattr(result, 'statuses', None):
             msg = (err or '').lower()
             if any(k in msg for k in (
                     '401', '403', '404',
@@ -1359,6 +1361,14 @@ class PickerApp(App):
                 extra_button=(_tr('Open settings'),
                               lambda: self.go_config()))
             return
+        # Content-shaped outcomes get their own translated wording —
+        # "Clone failed: no_lift_found" mislabeled every failure as a
+        # content problem before the client derived typed errors
+        # (field, 2026-07-17).
+        for st in getattr(result, 'statuses', []) or []:
+            if st.code in (S.REPO_EMPTY, S.LIFT_NOT_FOUND):
+                self._show_error(translate_status(st))
+                return
         self._show_error(_tr('Clone failed: {error}').format(error=err))
 
     # ── Create flow: "Start New" ──────────────────────────────────────

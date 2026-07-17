@@ -646,6 +646,12 @@ msgstr "Impossible de joindre le service AZT Collab. Veuillez confirmer que l'ap
 msgid "Restart server"
 msgstr "Redémarrer le service"
 
+msgid "Restarting…"
+msgstr "Redémarrage…"
+
+msgid "Could not restart the server"
+msgstr "Impossible de redémarrer le service"
+
 msgid "Could not reach the sync service to restart it."
 msgstr "Impossible de joindre le service de synchronisation pour le redémarrer."
 
@@ -1337,6 +1343,14 @@ msgstr ""
 "L'autre appareil a répondu, mais il ne propose pas ce projet à cet "
 "appareil. Sur l'autre appareil, ouvrez le projet et partagez-le avec "
 "cet appareil, puis réessayez."
+
+msgid ""
+"The repository was found but is empty — the project’s first upload may "
+"not have finished. Ask the project owner to publish it, then try again."
+msgstr ""
+"Le dépôt a été trouvé mais il est vide — le premier envoi du projet "
+"n'est peut-être pas terminé. Demandez au propriétaire du projet de le "
+"publier, puis réessayez."
 
 # Pair-flow informational/failure popups (0.50.10 / 0.50.11).
 msgid "Paired, but no project came with this QR"

@@ -179,6 +179,10 @@ _HANDLERS = {
     S.CLONED:                 lambda p: _fmt(_tr('Cloned to {dir}'), p),
     S.LIFT_FOUND:             lambda p: _fmt(_tr('Found: {file}'), p),
     S.LIFT_NOT_FOUND:         lambda p: _tr('No .lift file found in cloned repository.'),
+    S.REPO_EMPTY:             lambda p: _tr(
+        'The repository was found but is empty — the project’s first '
+        'upload may not have finished. Ask the project owner to '
+        'publish it, then try again.'),
     S.ON_BRANCH:              lambda p: _fmt(_tr('On branch {branch}.'), p),
     S.STAGED_ALL:             lambda p: _tr('Staged all changes.'),
     S.OPEN_PR:                lambda p: _tr('Open your git host to create a pull request.'),

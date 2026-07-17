@@ -52,6 +52,12 @@ PULLED = 'PULLED'
 CLONED = 'CLONED'
 LIFT_FOUND = 'LIFT_FOUND'
 LIFT_NOT_FOUND = 'LIFT_NOT_FOUND'
+# Clone landed but the repository is EMPTY (no files at all) — usually
+# the project's first upload never completed, often a permissions
+# failure on the owner's side. Distinct from LIFT_NOT_FOUND (repo has
+# content, none of it .lift): "no .lift found" on an empty repo sent a
+# user hunting a content problem that wasn't one (field, 2026-07-17).
+REPO_EMPTY = 'REPO_EMPTY'
 ON_BRANCH = 'ON_BRANCH'
 STAGED_ALL = 'STAGED_ALL'
 OPEN_PR = 'OPEN_PR'

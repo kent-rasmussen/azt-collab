@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.7"
+__version__ = "0.54.8"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1943,20 +1943,47 @@ def clone_project(remote_url, dest_dir, on_progress=None,
                     pass
         state = resp.get('state', 'CLONING')
         if state == 'DONE':
-            return {'ok': bool(resp.get('lift_path')),
-                    'lift_path': resp.get('lift_path', ''),
+            result = Result.from_dict(resp.get('result') or {})
+            lift_path = resp.get('lift_path', '')
+            # Honest error derivation: the daemon marks a clone job
+            # DONE even when the clone itself FAILED (the failure is
+            # typed inside ``result``), so a flat 'no_lift_found'
+            # here swallowed auth/permission failures — a user was
+            # told "no .lift found" when the real problem was repo
+            # access (field, 2026-07-17). Route off the typed codes;
+            # 'no_lift_found' now means what it says: clone landed,
+            # repo has files, none of them is a .lift.
+            if lift_path:
+                err = ''
+            elif result.has(S.CLONE_AUTH_REQUIRED):
+                err = 'clone_auth_required'
+            elif result.has(S.CLONE_FAILED):
+                detail = next((st.params.get('error', '')
+                               for st in result.statuses
+                               if st.code == S.CLONE_FAILED), '')
+                err = ('clone_failed: ' + detail) if detail \
+                    else 'clone_failed'
+            elif result.has(S.REPO_EMPTY):
+                err = 'repo_empty'
+            else:
+                err = 'no_lift_found'
+            return {'ok': bool(lift_path),
+                    'lift_path': lift_path,
                     # Canonical langcode from the daemon's
                     # ``projects.json`` (set on auto-register after
                     # clone). Pass-through so peers can stamp it on
                     # the picker's result Intent without re-deriving
                     # — see CHANGELOG TODO closed in 0.18.1.
                     'langcode': resp.get('langcode', ''),
-                    'result': resp.get('result'),
-                    'error': '' if resp.get('lift_path') else 'no_lift_found'}
+                    # Decoded per this function's contract (a
+                    # ``Result``, not the wire dict — the picker's
+                    # auth routing reads ``.statuses``).
+                    'result': result,
+                    'error': err}
         if state == 'FAILED':
             return {'ok': False,
                     'error': resp.get('error', 'clone_failed'),
-                    'result': resp.get('result')}
+                    'result': Result.from_dict(resp.get('result') or {})}
 
 
 def clone_project_start(remote_url, dest_dir, langcode='',

@@ -851,6 +851,17 @@ def _find_lift(directory):
     return None
 
 
+def _worktree_has_files(directory):
+    """True when the working tree holds any non-hidden file at all —
+    separates "repo with content but no .lift" (LIFT_NOT_FOUND) from
+    "empty repo" (REPO_EMPTY) after a clone."""
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        if any(not f.startswith('.') for f in files):
+            return True
+    return False
+
+
 # ── Repo fd hygiene ──────────────────────────────────────────────────────
 #
 # A dulwich ``Repo`` holds open file descriptors (pack files, index)
@@ -2825,8 +2836,14 @@ def _clone_repo_locked(remote_url, dest_dir, username, token, on_progress):
     lift_path = _find_lift(dest_dir)
     if lift_path:
         result.add(S.LIFT_FOUND, file=os.path.basename(lift_path))
-    else:
+    elif _worktree_has_files(dest_dir):
         result.add(S.LIFT_NOT_FOUND)
+    else:
+        # Empty clone ≠ bad content: the usual story is the project's
+        # first upload never completed (often a permissions failure on
+        # the owner's side), so don't tell the user their repo lacks a
+        # .lift when it lacks EVERYTHING (field, 2026-07-17).
+        result.add(S.REPO_EMPTY)
     return lift_path, result
 
 

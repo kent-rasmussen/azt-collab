@@ -41,6 +41,9 @@ PULLED = 'PULLED'
 CLONED = 'CLONED'
 LIFT_FOUND = 'LIFT_FOUND'
 LIFT_NOT_FOUND = 'LIFT_NOT_FOUND'
+# Clone landed but the repo is empty (no files at all) — usually the
+# first upload never completed. See azt_collabd/status.py.
+REPO_EMPTY = 'REPO_EMPTY'
 ON_BRANCH = 'ON_BRANCH'
 STAGED_ALL = 'STAGED_ALL'
 OPEN_PR = 'OPEN_PR'

@@ -207,29 +207,46 @@ _KV_TEMPLATE = '''
                     height: dp(22)
                     halign: 'center'
                     text_size: self.size
-                Button:
-                    # Diagnostic affordance. Always visible — the
-                    # user we're targeting here is the one stuck on
-                    # an empty picker who can't reach the gear-→
-                    # settings → Share-daemon-log path (recorder
-                    # picker's gear navigates to the recorder's own
-                    # settings, which doesn't host that button; the
-                    # server-APK picker's gear does but only if the
-                    # daemon-log-to-file toggle is already on). This
-                    # button ships a daemon-built registry/filesystem
-                    # snapshot every time, plus the log file when
-                    # it exists.
-                    id: share_diag_btn
-                    text: _('Share diagnostics')
+                BoxLayout:
+                    orientation: 'horizontal'
                     size_hint_y: None
                     height: dp(28)
-                    font_size: sp(12)
-                    font_name: FONT
-                    background_normal: ''
-                    background_down: ''
-                    background_color: T.TRANSPARENT
-                    color: T.TEXT_DIM
-                    on_release: root.share_diagnostics()
+                    Button:
+                        # Diagnostic affordance. Always visible — the
+                        # user we're targeting here is the one stuck on
+                        # an empty picker who can't reach the gear-→
+                        # settings → Share-daemon-log path (recorder
+                        # picker's gear navigates to the recorder's own
+                        # settings, which doesn't host that button; the
+                        # server-APK picker's gear does but only if the
+                        # daemon-log-to-file toggle is already on). This
+                        # button ships a daemon-built registry/filesystem
+                        # snapshot every time, plus the log file when
+                        # it exists.
+                        id: share_diag_btn
+                        text: _('Share diagnostics')
+                        font_size: sp(12)
+                        font_name: FONT
+                        background_normal: ''
+                        background_down: ''
+                        background_color: T.TRANSPARENT
+                        color: T.TEXT_DIM
+                        on_release: root.share_diagnostics()
+                    Button:
+                        # First-line remedy affordance: the honest
+                        # failure popups say "restart the
+                        # collaboration service" — this is the
+                        # no-shell way to do that, next to the
+                        # diagnostics it pairs with.
+                        id: restart_server_btn
+                        text: _('Restart server')
+                        font_size: sp(12)
+                        font_name: FONT
+                        background_normal: ''
+                        background_down: ''
+                        background_color: T.TRANSPARENT
+                        color: T.TEXT_DIM
+                        on_release: root.restart_daemon()
 '''
 
 
@@ -445,6 +462,26 @@ class ProjectPickerScreen(Screen):
         share_diagnostics_action(
             on_error=lambda msg: self._show_popup(
                 _tr('Diagnostics'), msg))
+
+    def restart_daemon(self):
+        """Bounce the daemon from the picker — the no-shell way to
+        follow the failure popups that say "restart the collaboration
+        service" (and to pick up a just-updated azt-collab). Feedback
+        rides the button label; the daemon accepts, flushes the
+        response, and re-execs (loopback) / respawns on next call
+        (Android ContentProvider)."""
+        from .. import restart_server
+        from ..translate import tr as _tr
+        from kivy.clock import Clock
+        btn = self.ids.get('restart_server_btn')
+        r = restart_server()
+        ok = bool(r is not None and r.has('RESTARTING'))
+        if btn is not None:
+            btn.text = (_tr('Restarting…') if ok
+                        else _tr('Could not restart the server'))
+            Clock.schedule_once(
+                lambda _dt: setattr(btn, 'text', _tr('Restart server')),
+                3.0)
 
     def _show_popup(self, title, msg):
         """Minimal popup for share-diagnostics error feedback. The
