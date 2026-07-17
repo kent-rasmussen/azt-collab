@@ -47,21 +47,61 @@ def _android_files_dir():
     return None
 
 
+def _windows_appdata_bases():
+    """Per-user data-dir candidates, best first, EXISTING dirs only.
+    Env vars are conveniences and machines exist without %LOCALAPPDATA%
+    (seen 2026-07-16); the shell API is authoritative and
+    env-independent. None of these are OneDrive-synced locations.
+    A LIST (not one winner) so _windows_azt_home can pin to wherever a
+    home already exists."""
+    bases = []
+    try:
+        import ctypes  # CSIDL_LOCAL_APPDATA == 28
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(
+                None, 28, None, 0, buf) == 0:
+            bases.append(buf.value)
+    except Exception:
+        pass
+    appdata = os.environ.get('APPDATA', '')
+    bases += [
+        os.environ.get('LOCALAPPDATA'),
+        os.path.join(os.path.dirname(appdata), 'Local')
+            if appdata else None,
+        appdata or None,  # Roaming: fine for this small state
+        os.path.join(os.environ.get('USERPROFILE', ''),
+                     'AppData', 'Local')
+            if os.environ.get('USERPROFILE') else None,
+        os.path.expanduser('~'),  # floor: always exists
+    ]
+    out = []
+    for b in bases:
+        if b and os.path.isdir(b) and b not in out:
+            out.append(b)
+    return out or [os.path.expanduser('~')]
+
+
 def _windows_azt_home():
-    """``%LOCALAPPDATA%\\azt``. Before 0.54.6 there was no Windows branch
-    at all and the XDG fallback produced ``C:\\Users\\X/.local/share\\azt``
-    (mixed separators; wrong convention). If a daemon already wrote state
-    there, relocate it once so nothing is orphaned."""
-    base = (os.environ.get('LOCALAPPDATA')
-            or os.path.join(os.path.expanduser('~'), 'AppData', 'Local'))
-    home = os.path.join(base, 'azt')
+    """``<per-user appdata>\\azt``, SELF-PINNING: an ``azt`` home already
+    existing under ANY candidate base is adopted as-is, so the location
+    is fixed by first creation and immune to environment drift between
+    runs (env vars appearing/disappearing, launch-context differences).
+    Only when no home exists anywhere is one placed at the best
+    candidate. Pre-0.54.6 there was no Windows branch at all (the XDG
+    fallback produced ``C:\\Users\\X/.local/share\\azt``); state written
+    there is relocated once."""
+    bases = _windows_appdata_bases()
+    for b in bases:
+        home = os.path.join(b, 'azt')
+        if os.path.isdir(home):
+            return home  # pinned by prior use
+    home = os.path.join(bases[0], 'azt')
     legacy = os.path.join(os.path.expanduser('~/.local/share'), 'azt')
-    if os.path.isdir(legacy) and not os.path.isdir(home):
+    if os.path.isdir(legacy):
         try:
-            os.makedirs(base, exist_ok=True)
             os.replace(legacy, home)
         except OSError:
-            home = legacy  # couldn't move: keep using the old spot
+            return legacy  # couldn't move: keep using the old spot
     return home
 
 
