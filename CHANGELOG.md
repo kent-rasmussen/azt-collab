@@ -9,6 +9,19 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.18 — picker fits landscape/desktop windows
+
+UX (project picker on a computer; field 2026-07-21): the header
+logo was a fixed dp(240) square — about a third of a portrait
+phone's height, but it devoured a landscape desktop window and
+pushed the project list below the fold with no visible way to
+scroll. The logo is now capped at 28% of the window height (never
+larger than the original 240dp, so phones are pixel-identical), and
+the picker's ScrollView gets a visible draggable scrollbar
+(`scroll_type: ['bars','content']`, 10dp bar) for mouse users —
+wheel scrolling already worked, but nothing showed that the list
+continued. langpicker screens already cap by content; unchanged.
+
 ## 0.54.17 — keep the presplash up until the UI can respond
 
 UX (server-APK picker; field 2026-07-21: "hard to think that the

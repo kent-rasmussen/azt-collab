@@ -77,7 +77,13 @@ _KV_TEMPLATE = '''
             Image:
                 source: app.icon
                 size_hint: None, None
-                size: dp(240), dp(240)
+                # Cap by window HEIGHT, not a fixed dp: dp(240) is
+                # fine on a portrait phone (~1/3 of height) but on a
+                # landscape desktop window it devoured the height and
+                # pushed the project list below the fold (field
+                # 2026-07-21). 28% of the screen height, never larger
+                # than the original 240dp.
+                size: min(dp(240), root.height * 0.28), min(dp(240), root.height * 0.28)
                 pos_hint: {{'center_x': 0.5}}
                 allow_stretch: True
                 keep_ratio: True
@@ -106,6 +112,12 @@ _KV_TEMPLATE = '''
             ScrollView:
                 size_hint_y: 1
                 do_scroll_x: False
+                # Desktop affordance: a visible, draggable scrollbar
+                # (default is finger-drag-only content scrolling —
+                # invisible and awkward with a mouse). Wheel already
+                # works; 'bars' adds click-drag on the bar itself.
+                scroll_type: ['bars', 'content']
+                bar_width: dp(10)
                 BoxLayout:
                     orientation: 'vertical'
                     size_hint_y: None
