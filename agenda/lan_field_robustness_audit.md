@@ -263,7 +263,21 @@ every tick / burning backoff curves. Overlaps F4 (ghost registry
 entries) — fixing F4 shrinks this; the drain-side rule is still
 right independently.
 
-### F13 — SSL KEY_VALUES_MISMATCH surfaces as "not on the same network"  [OPEN — evidence needed]
+### F13 — SSL KEY_VALUES_MISMATCH surfaces as "not on the same network"  [SELF-HEAL SHIPPED 0.54.15 — classification half OPEN]
+Root cause CONFIRMED in code: `peer_id.ensure()` parsed key and
+cert independently and never cross-checked them; the pair is two
+separate atomic writes, so a crash / racing second daemon between
+them leaves new-key + old-cert that passes load and kills
+`load_cert_chain` later. SHIPPED 0.54.15: `ensure()` cross-checks
+and re-issues the cert from the EXISTING key (peer_id preserved,
+fingerprint changes, loud re-pair notice; tests). STILL OPEN:
+(a) the clone/hello error mapping that rendered a local TLS fault
+as "not on the same network" — fix the classification to a typed
+local-identity status; (b) the field Windows machine needs the
+update (or the manual delete-both-files recovery) + its version
+recorded. Note: openssl-based field forensics failed there
+(LibreSSL, no ed25519; md5-of-empty readings) — the daemon-side
+self-check IS the diagnostic now.
 Field 2026-07-21 ~13:00: clone from phone → computer failed with
 SSL `KEY_VALUES_MISMATCH`, shown to the user as "not on the same
 network". The computer is a FIELD machine (not karlap) — its

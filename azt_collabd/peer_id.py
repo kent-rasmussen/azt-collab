@@ -116,8 +116,11 @@ def _load_pem_x509_cert(cert_pem):
     return x509.load_pem_x509_certificate(cert_pem)
 
 
-def _generate():
-    """Generate a fresh ed25519 keypair + self-signed X.509 cert.
+def _generate(key=None):
+    """Generate an ed25519 keypair + self-signed X.509 cert — or,
+    when *key* (a loaded Ed25519PrivateKey) is passed, re-issue the
+    cert from that existing key (the KEY_VALUES_MISMATCH self-heal:
+    preserves peer_id, only the cert/fingerprint change).
     Returns ``(key_pem, cert_pem, cert_der, pubkey_raw)``. Raises
     ``ImportError`` if ``cryptography`` is unavailable; callers
     treat that as "LAN sync not available on this platform"."""
@@ -127,7 +130,8 @@ def _generate():
     from cryptography.x509.oid import NameOID
     import datetime
 
-    key = ed25519.Ed25519PrivateKey.generate()
+    if key is None:
+        key = ed25519.Ed25519PrivateKey.generate()
     pubkey = key.public_key()
     pubkey_raw = pubkey.public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -177,6 +181,15 @@ def _pem_to_der(cert_pem):
     return cert.public_bytes(serialization.Encoding.DER)
 
 
+def _pubkey_raw_from_cert_pem(cert_pem):
+    from cryptography.hazmat.primitives import serialization
+    cert = _load_pem_x509_cert(cert_pem)
+    return cert.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
 def _summary(pubkey_raw, cert_der, key_path, cert_path):
     return {
         'peer_id': pubkey_raw.hex(),
@@ -205,6 +218,7 @@ def ensure():
                     cert_pem = f.read()
                 pubkey_raw = _pubkey_raw_from_key_pem(key_pem)
                 cert_der = _pem_to_der(cert_pem)
+                cert_pub_raw = _pubkey_raw_from_cert_pem(cert_pem)
             except ImportError as ex:
                 raise RuntimeError(
                     f'cryptography unavailable: {ex!r}') from ex
@@ -212,6 +226,34 @@ def ensure():
                 raise RuntimeError(
                     f'peer_id files unreadable or corrupt: '
                     f'{ex!r}') from ex
+            if cert_pub_raw != pubkey_raw:
+                # KEY_VALUES_MISMATCH self-heal (0.54.15, audit
+                # F13): both files parse, but they're from
+                # DIFFERENT generations — the pair is two separate
+                # atomic writes, so a crash or a racing second
+                # daemon between them leaves new-key + old-cert.
+                # Left alone, ``ssl.load_cert_chain`` later dies
+                # with KEY_VALUES_MISMATCH deep inside whatever LAN
+                # op first touches TLS, and the failure gets
+                # misread as a network problem (field 2026-07-21,
+                # Windows machine: surfaced as "not on the same
+                # network"). Re-issue the cert from the EXISTING
+                # key: peer_id (the pubkey) is preserved, so
+                # peers.json entries keyed by it stay valid on both
+                # sides; the cert FINGERPRINT still changes, so
+                # peers that pinned the old cert will refuse this
+                # device until re-paired — say so loudly.
+                print(f'[peer_id] cert/key MISMATCH (pair from '
+                      f'different generations) — re-issuing cert '
+                      f'from the existing key. The fingerprint '
+                      f'changes: previously paired peers must '
+                      f're-pair with this device.',
+                      file=sys.stderr, flush=True)
+                key = _load_pem_private_key(key_pem)
+                key_pem, cert_pem, cert_der, pubkey_raw = \
+                    _generate(key=key)
+                _atomic_write(key_path, key_pem, mode=0o600)
+                _atomic_write(cert_path, cert_pem, mode=0o644)
             return _summary(pubkey_raw, cert_der, key_path, cert_path)
 
         try:

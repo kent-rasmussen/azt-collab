@@ -9,6 +9,27 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.16 — LAN identity KEY_VALUES_MISMATCH self-heal
+
+(Landed after 0.54.15 was already built and deployed; split out so
+the on-device 0.54.15 stays an honest label.)
+
+FIX (LAN identity KEY_VALUES_MISMATCH self-heal — audit F13): the
+peer_id/peer.crt pair is two separate atomic writes, so a crash or
+racing second daemon between them leaves new-key + old-cert. Both
+files parse individually, so `peer_id.ensure()` accepted the pair
+and `ssl.load_cert_chain` later died with KEY_VALUES_MISMATCH deep
+inside whatever LAN op first touched TLS — surfaced to the user as
+"not on the same network" (field 2026-07-21, Windows machine).
+`ensure()` now cross-checks cert-pubkey against key-pubkey and, on
+mismatch, re-issues the cert from the EXISTING key — peer_id is
+preserved (peers.json entries stay keyed correctly on both sides);
+the fingerprint necessarily changes, and the loud log line says
+previously paired peers must re-pair. Tests:
+`tests/test_peer_id_selfheal.py`. (The clone path's error
+classification — network-shaped wording for local TLS faults —
+remains open as audit F13's second half.)
+
 ## 0.54.15 — index-reset fix after fast-forward; cawl status log dedup
 
 FIX (fast-forward left a loaded index — one commit from reverting
