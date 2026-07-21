@@ -84,7 +84,28 @@ the phone and gets NotGitRepository over and over.
   (it is meaningful: peer may clone later — so probably skip, don't
   prune).
 
-### F5 — Large LAN push dies: SSLEOFError on git-receive-pack  [PARTIAL FIX 0.54.12 — abort trigger still unknown]
+### F5 — Large LAN push dies mid-exchange  [ROOT CAUSED — FIX SHIPPED 0.54.13, verify in field]
+CONFIRMED root cause (phone logcat 11:11 + 11:32, desktop git log):
+`GitProtocolError("('Connection aborted.', TimeoutError('The write
+operation timed out'))")` — **urllib3 keeps the CONNECT timeout on
+the socket for the whole request-SEND phase** (switches to the read
+timeout only before reading the response), so 0.54.12's connect=5
+capped every mid-upload socket write at 5 s; receiver backpressure
+tripped it, the phone aborted, the kernel flushed the buffered tail
++ FIN, and the peer ingested the COMPLETE pack, applied refs
+(desktop git log: phone's commits at HEAD), then broke its pipe
+writing report-status. Phone recorded failure → re-pushed every
+burst → peer traceback per attempt.
+SHIPPED 0.54.13: `_pinned_pool_manager` helper; peek pm (5, 10) vs
+push pm (30, 180) — connect is the per-write stall ceiling; plus
+delivered-despite-lost-response: on non-connect-class push error,
+re-peek and record success when peer main == pushed head (ends the
+re-push loop for ANY future lost-response cause).
+Pre-0.54.12 incarnation (07:47, SSLEOF at 8.5 s, unbounded pm) was
+the same shape with the VPN-recovery flake as the likely trigger +
+urllib3 default retries corrupting the follow-ups (fixed 0.54.12).
+Verify: phone APK ≥0.54.13 + desktop restart → expect `advanced` /
+`delivered, response lost` lines and lan_unshared → 0.
 ROOT CAUSE (desktop log, lines 1399–1489): attempt 1 (POST 07:47:17.9)
 was **fully ingested by the desktop** — dulwich 1.2.11 dechunked and
 processed the whole pack, reached `_report_status`, and died only

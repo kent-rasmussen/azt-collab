@@ -83,3 +83,35 @@ def test_import_origin_heads(tmp_path):
 def test_import_origin_heads_empty_and_none():
     assert _import_origin_heads(None, {}) == 0
     assert _import_origin_heads(None, None) == 0
+
+
+def test_add_extra_remote_dedupes_wan_normalized(tmp_path):
+    """Remote identity is wan_url-normalized (invariant #14): the
+    ssh spelling of the https origin is the SAME repo and must not
+    be stored as an extra (field 2026-07-21: dual_publish stored
+    baf's own git@ spelling as an extra → double push per sync)."""
+    from azt_collabd import projects
+
+    wd = tmp_path / 'proj'
+    wd.mkdir()
+    (wd / 'xx.lift').write_text('<lift/>')
+    projects.register(
+        langcode='xx',
+        working_dir=str(wd),
+        lift_path=str(wd / 'xx.lift'),
+        remote_url='https://github.com/owner/xx.git',
+    )
+
+    # Same repo, ssh spelling → refused.
+    projects.add_extra_remote('xx', 'git@github.com:owner/xx.git')
+    assert projects.get('xx').extra_remotes == []
+
+    # Genuinely different repo → accepted.
+    projects.add_extra_remote('xx', 'git@gitlab.com:owner/xx.git')
+    assert projects.get('xx').extra_remotes == [
+        'git@gitlab.com:owner/xx.git']
+
+    # Same repo as the existing extra, https spelling → refused.
+    projects.add_extra_remote('xx', 'https://gitlab.com/owner/xx.git')
+    assert projects.get('xx').extra_remotes == [
+        'git@gitlab.com:owner/xx.git']

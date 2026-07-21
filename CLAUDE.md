@@ -92,6 +92,20 @@ When adding a new suite component:
 
 13. **No duplicate same-lang forms in merge output — ever (0.54.0).** `_normalize_entry` runs on every entry of every `three_way_merge` output (all call sites): identical same-lang `<form>`/`<gloss>` duplicates collapse to the document-first node; duplicates inside a `<field type="…verification…">` union their python-list code content with **byte-identical semantics to azt's `Field.consolidate_forms_by_lang`** (first-seen order; a check verified to different values on the two sides is dropped — it must re-verify) — if you change one layer's union semantics you must change both; any other same-lang multiplicity survives only as an annotated `azt-lift-conflict` pair. Same-key children pair by content (`_pair_same_key`), not position, and one-sided children unchanged since base are honored as deletes — pre-0.54.0 positional pairing + base-blind keeps multiplied one duplicate per merge (field repro 2026-07-10: 'wife' entry, 29 same-lang forms in one verification field, one computer).
 
+14. **Remote identity is wan_url-normalized (0.54.11+).** Stored
+    remote URLs keep the user's spelling — an ssh `git@host:path`
+    origin stays ssh in `.git/config` / projects.json, because users
+    keep those for their own command-line auth. Every NETWORK use
+    converts through `repo.wan_url()` at call time (the daemon's
+    token auth is https-only; dulwich's SubprocessSSHVendor can't
+    take a password), and every place that COMPARES remote URLs
+    compares wan-normalized: the LAN share-offer conflict check,
+    `projects.add_extra_remote` dedup, and the extras push skip.
+    Two spellings of one repo are the SAME remote — never surface
+    them as a remote-conflict decision, never hold both as
+    origin + extra, never push twice. Don't add code that rewrites
+    a stored spelling or that compares remote URLs literally.
+
 ## Common commands
 
 ```bash

@@ -3,7 +3,18 @@
 - **Scope & relationships:** azt-collab/daemon (repo.py push paths). Related to `strip_lan_origin_if_present` (invariant 11 — LAN origins leaking into `.git/config`) and the topic-branch push architecture.
 - **Vision / done-criteria:** WAN pushes for the affected project succeed again; the daemon either normalizes or refuses SSH-shaped origin URLs with a typed Status instead of dying in `NotImplementedError`; root cause of how the SSH-shaped URL got into `.git/config` identified and closed.
 - **Deadline:** none
-- **Waiting on:** Nothing
+- **Waiting on:** Nothing — FIELD-VERIFIED 2026-07-21 ~11:32 (ready to close):
+  phone (0.54.12) drained the full backlog over the wan-normalized
+  URL — preseed batches, topic-push chunks, phase-B/C promote,
+  phase-D topic-branch delete — ending `wan_unshared=0, at_risk=0`,
+  `codes=['NOTHING_TO_COMMIT','PUSHED','EXTRA_REMOTE_PUSHED']`.
+  Residual observations: (a) baf carries an `extra_remotes` entry
+  that is the SAME repo in ssh spelling (dual-publish artifact of
+  the remote-conflict decision) — RESOLVED in 0.54.13 with no user
+  action needed: `add_extra_remote` refuses wan-equal duplicates and
+  `_push_extras_step` skips them at use, so the stored entry is
+  inert (CLAUDE.md invariant #14); (b) `azt-blob-seed-*` side refs
+  await the next daemon lifetime's janitor pass (by design).
 
 ## Plans
 

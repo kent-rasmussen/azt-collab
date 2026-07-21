@@ -5286,6 +5286,15 @@ def _push_extras_step(repo, project_dir, result):
         branch = 'main'
     refspec = _enc(f'refs/heads/{branch}:refs/heads/{branch}')
 
+    # Remote identity is wan_url-normalized (invariant #14): an
+    # extra that is the SAME repo as origin in another spelling is
+    # not a second remote — pushing it again is pure duplicate work
+    # (field 2026-07-21: baf carried its own ssh spelling as an
+    # extra after a dual_publish decision; every sync pushed twice).
+    # Skip at use so stale stored duplicates are inert without any
+    # user-side cleanup; add_extra_remote refuses new ones.
+    origin_wan = wan_url(_origin_config_url(repo))
+    pushed_wan = set()
     for extra_url in extras:
         extra_url = (extra_url or '').strip()
         if not extra_url:
@@ -5293,6 +5302,13 @@ def _push_extras_step(repo, project_dir, result):
         # Live-convert ssh-shaped extras like the primary; the stored
         # URL (and the one shown in statuses) stays as configured.
         push_url = wan_url(extra_url)
+        if (origin_wan and push_url == origin_wan) \
+                or push_url in pushed_wan:
+            print(f'[sync-extras] skipping {extra_url!r}: same repo '
+                  f'as origin/another extra (different spelling)',
+                  file=sys.stderr, flush=True)
+            continue
+        pushed_wan.add(push_url)
         git_user, token = get_sync_credentials(push_url)
         if not token:
             result.add(S.EXTRA_REMOTE_PUSH_FAILED,

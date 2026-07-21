@@ -1626,6 +1626,26 @@ def _build_server(port):
         daemon_threads = True
         allow_reuse_address = True
 
+        def handle_error(self, request, client_address):
+            # Quiet expected connection-lifecycle noise: peers
+            # abandon pooled connections and abort uploads as part
+            # of normal LAN churn (field 2026-07-21: a 30-line
+            # traceback per event buried the errors that mattered).
+            # One summary line for those classes; full traceback
+            # for anything genuinely unexpected.
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionResetError,
+                                BrokenPipeError,
+                                ConnectionAbortedError,
+                                TimeoutError,
+                                ssl.SSLEOFError,
+                                ssl.SSLError)):
+                print(f'[lan-listener] connection from '
+                      f'{client_address} dropped mid-request: '
+                      f'{exc!r}', file=sys.stderr, flush=True)
+                return
+            super().handle_error(request, client_address)
+
     srv = _ThreadedTLSGitServer(
         ('0.0.0.0', int(port)), _build_handler_class())
     srv.set_app(app)

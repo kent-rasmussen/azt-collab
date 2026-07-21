@@ -435,19 +435,23 @@ def clear_last_sync_error(langcode):
 
 def add_extra_remote(langcode, url):
     """Append *url* to this project's ``extra_remotes`` list,
-    preserving order and deduping. No-op if *url* equals the
-    project's primary ``remote_url`` (the user picked
-    ``dual_publish`` but the two URLs are identical — possibly
-    a re-pair race) or if *url* is already in the list. Used by
+    preserving order and deduping. No-op if *url* is the SAME REPO
+    as the primary ``remote_url`` or an existing extra — compared
+    ``wan_url``-normalized (CLAUDE.md invariant #14), so the ssh and
+    https spellings of one repo never coexist as origin + extra
+    (field 2026-07-21: a dual_publish resolution of a two-spellings
+    "conflict" stored ``git@github.com:…`` as an extra of its own
+    https origin and every sync pushed the repo twice). Used by
     KIND_REMOTE_CONFLICT mode ``dual_publish``."""
+    from .repo import wan_url as _wan
     def mut(d):
         if langcode not in d:
             return
         entry = d[langcode]
-        if str(entry.get('remote_url', '') or '') == url:
+        if _wan(str(entry.get('remote_url', '') or '')) == _wan(url):
             return
         extras = list(entry.get('extra_remotes') or [])
-        if url in extras:
+        if any(_wan(u) == _wan(url) for u in extras):
             return
         extras.append(url)
         entry['extra_remotes'] = extras

@@ -37,6 +37,22 @@ clear the failure counters, return success. Ends the re-push loop
 (and the peer-side traceback spam) whenever a response is lost for
 any future reason.
 
+POLICY (remote identity is wan_url-normalized — new CLAUDE.md
+invariant #14): an extra remote that is the same repo as origin in
+another spelling is not a second remote. `add_extra_remote` now
+dedupes wan-normalized (a dual_publish resolution of a two-spellings
+"conflict" had stored `git@github.com:…` as an extra of its own
+https origin), and `_push_extras_step` skips same-repo extras at use
+time so already-stored duplicates go inert with no user-side cleanup
+(field: baf pushed twice per sync). Stored spellings remain
+untouched throughout, per the 0.54.11 rule.
+
+Diagnosability: the LAN listener's socketserver-level handler now
+logs expected connection-lifecycle failures (reset / broken pipe /
+aborted upload / SSL EOF) as one summary line instead of a 30-line
+traceback per event; unexpected exception classes keep the full
+traceback.
+
 ## 0.54.12 — LAN dial hardening: bounded timeouts, no urllib3 retries on push
 
 FIX (LAN push corrupted by urllib3 retries): the push/merge-fetch
