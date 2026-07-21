@@ -298,22 +298,43 @@ def _apply_tree_to_workdir(repo, project_dir, old_sha, new_sha):
 
     # Reset the index to the new tree so subsequent status / commit
     # calls don't think the user has a giant diff to commit.
-    # ``repo.reset_index`` is the canonical dulwich API; if it
-    # raises (older dulwich, IO error), fall back to re-staging
-    # the working tree.
+    # ``repo.reset_index`` existed through dulwich 0.2x; dulwich
+    # ≥1.2 removed it — ``dulwich.index.build_index_from_tree`` is
+    # the long-stable replacement, and it also CHECKS OUT the full
+    # tree, which repairs working-tree paths this function's
+    # old→new diff writer skipped when the tree wasn't actually at
+    # ``old_sha`` (e.g. a queued post-receive reset never ran).
+    #
+    # NEVER fall back to ``_stage_all`` here: the working tree is
+    # only guaranteed to match ``new_sha`` for the paths just
+    # written; staging everything else captures whatever stale
+    # bytes are lying around, and the NEXT commit then pushes
+    # superseded content over the converged tip. Field repro
+    # 2026-07-21 (desktop, 38b7326→3ce45180 fast-forward on
+    # dulwich 1.2.11): the old fallback staged 79 stale files —
+    # one commit away from reverting the day's convergence. A
+    # loud trace + honest giant status diff beats that.
     try:
         repo.reset_index(new_commit.tree)
         return
+    except AttributeError:
+        pass  # dulwich ≥1.2 — use the index API below.
     except Exception as ex:
         lift_merge.trace(
             f'[sync-trace] _apply_tree_to_workdir reset_index '
-            f'failed, falling back to _stage_all: {ex!r}')
+            f'failed: {ex!r}; trying build_index_from_tree')
     try:
-        _stage_all(repo, project_dir)
+        from dulwich.index import build_index_from_tree
+        build_index_from_tree(
+            repo.path, repo.index_path(),
+            repo.object_store, new_commit.tree)
     except Exception as ex:
         lift_merge.trace(
-            f'[sync-trace] _apply_tree_to_workdir index fallback '
-            f'failed: {ex!r}')
+            f'[sync-trace] _apply_tree_to_workdir '
+            f'build_index_from_tree failed: {ex!r}; index left '
+            f'stale — status will show a large diff until the '
+            f'next successful reset (NOT staging as fallback; '
+            f'see comment)')
 
 
 def _walk_tree(repo, tree_sha, prefix=b''):

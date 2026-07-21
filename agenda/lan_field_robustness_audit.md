@@ -106,6 +106,21 @@ the same shape with the VPN-recovery flake as the likely trigger +
 urllib3 default retries corrupting the follow-ups (fixed 0.54.12).
 Verify: phone APK ≥0.54.13 + desktop restart → expect `advanced` /
 `delivered, response lost` lines and lan_unshared → 0.
+Field pass 2026-07-21 12:42–12:44 (both sides on 0.54.14): no
+write-timeout aborts; desktop's baf `lan_unshared=0` via the
+covered-local coverage — the phone's deliveries are recorded.
+Remaining churn in that window was a genuine phone wifi blip at
+12:43:18 (ENETUNREACH on everything + DNS dead + offline=True,
+recovered by 12:43:42) that RST a desktop merge-fetch mid-
+negotiation ("Length of pkt read 002b does not match length prefix
+0032" on the phone listener = truncated request, not a code bug).
+Residual noise item (fold into F7): tracebacks raised inside
+wsgiref's ServerHandler (BrokenPipe at response write, truncated
+request bodies) bypass the socketserver-level `handle_error`
+quieting shipped in 0.54.14 — they print via
+`wsgiref.handlers.BaseHandler.log_exception`. Quieting those needs
+a ServerHandler-level override; only worth it if the noise keeps
+hurting diagnosis.
 ROOT CAUSE (desktop log, lines 1399–1489): attempt 1 (POST 07:47:17.9)
 was **fully ingested by the desktop** — dulwich 1.2.11 dechunked and
 processed the whole pack, reached `_report_status`, and died only
@@ -213,6 +228,80 @@ archaeology. Violates the always-emit-summary rule
 (feedback_always_emit_summary).
 - Proposed rule: one line at dial time per peer (`sweeping <peer> at
   <endpoint>, N project(s)`), one at outcome. Bounded, greppable.
+
+### F9 — LAN push mid-WAN-recovery shipped an older tip  [CLOSED — benign, no fix]
+Suspected phone-main regression / interim-HEAD race resolved by the
+12:57 desktop Sync: `3ce45180` is a DESCENDANT of `38b7326` (the
+desktop FF'd 38b→3ce), so the LAN push during the phone's long WAN
+recovery delivered an older point on the same line, not another
+branch and not a regression. The FF-guard's "NOT ancestor" line was
+the normal peer-is-ahead case reading confusingly. No code change;
+keep the log-reading lesson: "peer NOT ancestor of local" ≠
+divergence — it also fires when the peer is strictly ahead.
+
+### F10 — dulwich ≥1.2 removed Repo.reset_index; _stage_all fallback stages stale bytes  [FIX SHIPPED 0.54.15]
+The FF path's index reset AttributeError'd on dulwich 1.2.11 and
+fell back to `_stage_all`, staging 79 stale files on the desktop —
+one commit away from reverting the day's convergence (defused
+manually with `git reset --hard HEAD`). Now uses
+`build_index_from_tree` (also repairs skipped stale worktree paths);
+stage-everything fallback removed.
+
+### F11 — cawl cache_status log spam  [FIX SHIPPED 0.54.15]
+"bug" breadcrumb fired every 30 s on the benign warm-restart state;
+response line printed identically on every poll. Now: violation-only
++ once-per-process for the breadcrumb; transitions-only for the
+response line.
+
+### F12 — drain churn on config-class results  [OPEN]
+Desktop drains `['nml', 'en']` every tick forever, each returning
+NO_REMOTE; phone drains ghost `en` (registry entry, no repo) into
+NOT_A_REPO + a 23 h wan_backoff with 25 consecutive "failures".
+Config-class outcomes (NO_REMOTE / NOT_A_REPO) should clear
+pending_push (or mark the project undrainable) instead of recycling
+every tick / burning backoff curves. Overlaps F4 (ghost registry
+entries) — fixing F4 shrinks this; the drain-side rule is still
+right independently.
+
+### F13 — SSL KEY_VALUES_MISMATCH surfaces as "not on the same network"  [OPEN — evidence needed]
+Field 2026-07-21 ~13:00: clone from phone → computer failed with
+SSL `KEY_VALUES_MISMATCH`, shown to the user as "not on the same
+network". The computer is a FIELD machine (not karlap) — its
+azt-collab version is unknown and may predate the 0.54.x honest-TLS
+work entirely; establish its version before attributing the
+misclassification to current code. KEY_VALUES_MISMATCH comes from `load_cert_chain` when
+`peer.crt` no longer matches `peer_id` — a LOCAL identity
+corruption on whichever side raised it, before any network I/O, so
+the network-shaped message is a misclassification (0.54.9's honest
+local-TLS error covered missing/unreadable files on the push path;
+the cert≠key case and the CLONE path's mapping are gaps). Two
+questions to answer before fixing: (a) which side raised it and do
+its identity files actually mismatch; (b) how they got out of sync
+(suspect: two daemon processes racing identity eager-init during
+today's restart churn — each writes peer_id/peer.crt non-atomically
+as a pair?). Note: healing by regeneration changes the cert
+fingerprint → all pairings break and must be re-paired; the fix
+must at minimum be a typed, honest status naming THIS device's
+identity as broken + the re-pair consequence.
+
+### F14 — LAN clone declares "doesn't respond on the network" mid-transfer  [OPEN — evidence needed]
+Field 2026-07-21 ~13:1x, phone→phone clone: paired fine, data
+visibly streaming, then the terminal "this phone doesn't respond on
+the network" popup. Two candidate mechanisms (need the log to pick):
+(a) the clone's bounded wall-clock (`lan_clone` `_CLONE_TIMEOUT`
+family) tripping on a big project over phone-to-phone wifi — a cap
+sized for pathology, hit by legitimate slowness; (b) a transient
+wifi drop mid-stream classified as peer-dead. Design rule (Kent,
+2026-07-21): liveness during a long transfer is judged by PROGRESS
+— time out only when no bytes arrive for N seconds (stall
+detection), not on total elapsed time; and a mid-transfer
+connection break on a peer that is still mDNS-announced is
+"interrupted — retrying", never "doesn't respond on the network".
+Constraint: dulwich clone is not resumable, so a retry restarts the
+copy — retry policy must say so honestly rather than looping
+silently on a huge project. Evidence needed: receiving phone's log
+around the failure (clone begin / timeout / error lines) + the
+exact popup msgid to locate the mapping.
 
 ## Plans
 

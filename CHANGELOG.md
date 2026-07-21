@@ -9,7 +9,35 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.54.13 — LAN push write-timeout root cause + delivered-despite-lost-response
+## 0.54.15 — index-reset fix after fast-forward; cawl status log dedup
+
+FIX (fast-forward left a loaded index — one commit from reverting
+convergence): `_apply_tree_to_workdir` called `repo.reset_index`,
+which dulwich ≥1.2 removed; the AttributeError fell back to
+`_stage_all`, which stages whatever the working tree holds for paths
+OUTSIDE the old→new diff this function writes — stale bytes when a
+queued post-receive reset never ran. Field repro 2026-07-21
+(desktop, 38b7326→3ce45180 FF on dulwich 1.2.11): 79 stale files
+staged; the next commit/Sync would have pushed superseded content
+over the converged tip. Now: `reset_index` when present, else
+`dulwich.index.build_index_from_tree` (long-stable API; also checks
+out the full tree, repairing skipped stale paths); the `_stage_all`
+fallback is REMOVED — on total failure the index is left stale with
+a loud trace (an honest giant status diff beats a silent revert).
+
+FIX (log spam — user complaint): the `[cawl] cache_status` pair
+printed on every ~30 s peer poll. The "bug" breadcrumb was firing on
+the BENIGN warm-restart state (disk cache full, nothing fetched this
+session → last_source legitimately empty); it now fires only on a
+real 0.50.30 contract violation (bytes fed this session without a
+source tag), once per process. The response line logs transitions
+only (per-repo payload snapshot), keeping the diagnostic value
+without hundreds of identical lines per field session.
+
+## 0.54.14 — LAN push write-timeout root cause + delivered-despite-lost-response
+
+(0.54.13 was taken by an already-compiled build mid-iteration; this
+block shipped as 0.54.14.)
 
 ROOT CAUSE of the 0.54.12 LAN push failures (F5 closed): urllib3
 keeps the CONNECT timeout on the socket for the entire request-SEND

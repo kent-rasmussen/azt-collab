@@ -113,6 +113,15 @@ _GITHUB_TREE_URL = (
 _RAW_URL_TEMPLATE = (
     'https://raw.githubusercontent.com/{repo}/HEAD/{path}')
 
+# cache_status log dedup (0.54.15). The status endpoint is polled
+# every ~30 s by peers; logging every response flooded field logs
+# with hundreds of identical lines per hour (user complaint
+# 2026-07-21). We keep the diagnostic value by logging only
+# TRANSITIONS: per-repo snapshot of the last payload logged, and a
+# once-per-process latch for the contract-violation breadcrumb.
+_STATUS_LAST_LOGGED = {}
+_STATUS_BUG_LOGGED = set()
+
 
 # Coalesce concurrent fetches per cache file: two peers asking
 # for the same resource at the same time shouldn't both hit the
@@ -925,9 +934,23 @@ def cache_status(repo):
         # empty indicator. Empty stays valid for the "no fetch
         # has happened yet this session" initial state.
         if last_source == '' and cached > 0:
-            print(f'[cawl] cache_status bug: cached={cached} but '
-                  f'last_source is empty (repo={repo!r})',
-                  file=sys.stderr, flush=True)
+            # Two very different cases share this shape. A daemon
+            # restart over a warm disk cache is BENIGN: cached
+            # counts on-disk files while nothing has been fetched
+            # this session, so last_source is legitimately empty —
+            # pre-0.54.15 this printed the "bug" line on every 30 s
+            # poll forever. The 0.50.30 contract violation is only
+            # when this SESSION fed bytes (from_* > 0) without
+            # tagging a source — log that, once per process.
+            session_fed = (int(pf.get('from_cache', 0) or 0)
+                           + int(pf.get('from_lan', 0) or 0)
+                           + int(pf.get('from_upstream', 0) or 0))
+            if session_fed > 0 and repo not in _STATUS_BUG_LOGGED:
+                _STATUS_BUG_LOGGED.add(repo)
+                print(f'[cawl] cache_status bug: cached={cached} '
+                      f'fed this session={session_fed} but '
+                      f'last_source is empty (repo={repo!r})',
+                      file=sys.stderr, flush=True)
             last_source = 'unknown'
         response = {
             'cached': cached, 'total': pf['requested'],
@@ -941,21 +964,26 @@ def cache_status(repo):
         # Diagnostic: log the actual outbound response so we can
         # tell whether the empty ``last_source`` a peer reports is
         # what the daemon ACTUALLY sent or whether the peer
-        # rewrote / dropped the field. If the daemon log shows
-        # ``last_source='cache'`` on the wire and the peer's
-        # `[cache-status]` line shows ``last_source=''``, the
-        # bug is post-daemon. 0.50.35 — intentionally always-on
-        # for now; we can rate-limit or remove after the empty-
-        # ``last_source`` field investigation resolves.
-        print(f'[cawl] cache_status response: '
-              f"repo={repo!r} cached={response['cached']} "
-              f"last_source={response['last_source']!r} "
-              f"from_cache={response['from_cache']} "
-              f"from_lan={response['from_lan']} "
-              f"from_upstream={response['from_upstream']} "
-              f"offline={response['offline']} "
-              f"finished={response['finished']}",
-              file=sys.stderr, flush=True)
+        # rewrote / dropped the field. 0.50.35 made this always-on
+        # for the empty-``last_source`` investigation (resolved:
+        # warm-restart state, see above); 0.54.15 logs TRANSITIONS
+        # only — the ~30 s poll otherwise repeats an identical line
+        # hundreds of times per field session.
+        snapshot = (response['cached'], response['last_source'],
+                    response['from_cache'], response['from_lan'],
+                    response['from_upstream'], response['offline'],
+                    response['finished'])
+        if _STATUS_LAST_LOGGED.get(repo) != snapshot:
+            _STATUS_LAST_LOGGED[repo] = snapshot
+            print(f'[cawl] cache_status response: '
+                  f"repo={repo!r} cached={response['cached']} "
+                  f"last_source={response['last_source']!r} "
+                  f"from_cache={response['from_cache']} "
+                  f"from_lan={response['from_lan']} "
+                  f"from_upstream={response['from_upstream']} "
+                  f"offline={response['offline']} "
+                  f"finished={response['finished']}",
+                  file=sys.stderr, flush=True)
         return response
     return {
         'cached': _walk_image_count(repo),
