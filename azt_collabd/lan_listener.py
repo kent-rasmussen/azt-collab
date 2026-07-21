@@ -604,9 +604,18 @@ def _handle_share_offer(environ, start_response, peer_id,
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
                               {'ok': True, 'dispatch': 'no_url'})
-    if local_url == repo_url:
+    from .repo import wan_url as _wan_url
+    if _wan_url(local_url) == _wan_url(repo_url):
+        # Compare wan-normalized so ``git@github.com:o/r.git`` and
+        # ``https://github.com/o/r.git`` — the SAME repo in two
+        # spellings — never surface as a remote-conflict decision
+        # (field repro 2026-07-21: baf, phone popped "two remotes"
+        # over one repo). Each side keeps its own stored spelling.
+        spelling = ('' if local_url == repo_url
+                    else ' (same repo, different spelling)')
         print(f'[lan-listener] share-offer from {peer_id[:8]!r} '
-              f'for {langcode!r}: remote_url matches local; no-op',
+              f'for {langcode!r}: remote_url matches local'
+              f'{spelling}; no-op',
               file=sys.stderr, flush=True)
         return _json_response(start_response, '200 OK',
                               {'ok': True, 'dispatch': 'noop'})

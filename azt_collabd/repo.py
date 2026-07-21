@@ -1008,6 +1008,138 @@ def _host_matches_known_lan_peer(host):
     return False
 
 
+def wan_url(url):
+    """Return *url* in the https form the daemon's WAN git ops need.
+
+    The daemon authenticates to github/gitlab with a token over HTTPS
+    (dulwich ``username``/``password``); it holds no SSH keys, and
+    dulwich's ``SubprocessSSHVendor`` cannot take a password — so an
+    ssh-shaped origin kills every WAN fetch/pull/push with
+    ``NotImplementedError('Setting password not supported...')``
+    (field repro 2026-07-21: baf, ``git@github.com:audioword-ui/
+    baf.git``). Users legitimately keep ssh remotes for their own
+    command-line auth, so STORED URLs (``.git/config``,
+    projects.json) are deliberately left untouched; every network
+    call site converts through here at use time instead.
+
+      git@github.com:owner/repo.git   → https://github.com/owner/repo.git
+      ssh://git@host[:port]/o/r.git   → https://host/o/r.git
+      git+ssh://git@host/o/r.git      → https://host/o/r.git
+
+    Anything else — https/http (LAN listener URLs included), empty,
+    local paths, scheme-less strings without a ``user@`` part —
+    passes through unchanged.
+    """
+    if not url:
+        return url
+    u = url.strip()
+    low = u.lower()
+    if low.startswith('ssh://') or low.startswith('git+ssh://'):
+        from urllib.parse import urlparse
+        p = urlparse(u[4:] if low.startswith('git+') else u)
+        host = p.hostname or ''
+        path = (p.path or '').lstrip('/')
+        if host and path:
+            return f'https://{host}/{path}'
+        return u
+    if '://' not in u and '@' in u and ':' in u:
+        # scp-style ``user@host:path``. Require the ``@`` so plain
+        # ``host:path`` / windows-drive strings stay untouched.
+        userhost, _, path = u.partition(':')
+        if '@' in userhost and '/' not in userhost and path:
+            host = userhost.rpartition('@')[2]
+            if host:
+                return f'https://{host}/{path.lstrip("/")}'
+    return u
+
+
+def _import_origin_heads(repo, refs):
+    """Mirror ``refs/heads/*`` from a fetch's ref advertisement into
+    ``refs/remotes/origin/*``. This is what dulwich's
+    ``porcelain.fetch`` does itself — but only when fetching by
+    remote NAME (``_import_remote_refs`` is gated on
+    ``remote_name is not None``), so the ssh-shaped-origin path in
+    ``_fetch_origin``, which must fetch by URL, does it manually.
+    Returns the number of refs imported."""
+    n = 0
+    prefix = b'refs/heads/'
+    for ref, sha in (refs or {}).items():
+        if isinstance(ref, bytes) and ref.startswith(prefix) and sha:
+            try:
+                repo.refs[b'refs/remotes/origin/' + ref[len(prefix):]] = sha
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
+def _origin_config_url(repo):
+    """Raw ``remote.origin.url`` from ``.git/config``, or ''."""
+    try:
+        return repo.get_config().get(
+            (b'remote', b'origin'), b'url').decode('utf-8').strip()
+    except KeyError:
+        return ''
+
+
+def _fetch_origin(repo, username, token):
+    """Fetch from origin, tolerating an ssh-shaped stored URL.
+
+    https-form origin: fetch by remote NAME so dulwich itself updates
+    ``refs/remotes/origin/*`` (see the ``_push_step_locked`` comment
+    for why the name matters). ssh-shaped origin: dulwich would route
+    the URL to ``SubprocessSSHVendor`` (no password support) — fetch
+    by the ``wan_url()`` https form instead and import the tracking
+    refs manually. Caller wraps with ``_socket_timeout`` and handles
+    exceptions."""
+    from dulwich import porcelain
+    raw = _origin_config_url(repo)
+    wan = wan_url(raw)
+    if wan == raw:
+        porcelain.fetch(
+            repo, 'origin',
+            username=username, password=token,
+            errstream=io.BytesIO(),
+        )
+        return
+    fr = porcelain.fetch(
+        repo, wan,
+        username=username, password=token,
+        errstream=io.BytesIO(),
+    )
+    n = _import_origin_heads(repo, getattr(fr, 'refs', None))
+    lift_merge.trace(
+        f'[sync-trace] fetch used wan-normalized {wan!r} '
+        f'(ssh-shaped origin kept in config); '
+        f'imported {n} tracking ref(s)')
+
+
+def _pull_origin(repo, username, token):
+    """``porcelain.pull`` from origin, tolerating an ssh-shaped
+    stored URL — same routing rule as ``_fetch_origin``. In the
+    ssh-shaped case the tracking mirror is NOT updated (dulwich only
+    imports refs for named remotes, and ``pull`` returns nothing to
+    import from) — that leaves ``refs/remotes/origin/*`` stale-
+    BEHIND, which is the safe direction: the peek in
+    ``_push_step_locked`` then can't skip the next fetch, and
+    ``_fetch_origin`` heals the mirror on the next sync/drain.
+    Exceptions propagate to the caller."""
+    from dulwich import porcelain
+    raw = _origin_config_url(repo)
+    wan = wan_url(raw)
+    target = 'origin'
+    if wan != raw:
+        target = wan
+        lift_merge.trace(
+            f'[sync-trace] pull using wan-normalized {wan!r} '
+            f'(ssh-shaped origin kept in config)')
+    porcelain.pull(
+        repo, target,
+        username=username, password=token,
+        errstream=io.BytesIO(),
+    )
+
+
 def set_remote_origin_url(working_dir, url):
     """Set / replace ``remote.origin.url`` in ``<working_dir>/.git/config``.
     Returns True on success, False otherwise. Idempotent (writes only
@@ -1854,6 +1986,11 @@ def _ensure_remote_repo(remote_url, username, token):
     # caller missing it would reproduce the SSL: CERTIFICATE_VERIFY_FAILED
     # bug we just fixed in projects.create_from_template.
     _ensure_ssl()
+
+    # scp-form ``git@host:owner/repo`` has no scheme, so urlparse
+    # would put everything in ``path`` and the owner/repo split
+    # below would produce garbage — normalize first (0.54.11).
+    remote_url = wan_url(remote_url)
 
     from urllib.parse import urlparse
     parsed = urlparse(remote_url)
@@ -2744,7 +2881,7 @@ def _init_repo_locked(project_dir, remote_url, username, token,
 
     try:
         porcelain.push(
-            repo, remote_url,
+            repo, wan_url(remote_url),
             username=username, password=token,
             errstream=io.BytesIO(),
         )
@@ -2819,8 +2956,28 @@ def _clone_repo_locked(remote_url, dest_dir, username, token, on_progress):
     errstream = _ProgressStream(on_progress) if on_progress else io.BytesIO()
 
     if os.path.exists(dest_dir):
+        # A real prior clone (has .git AND a .lift): reopen it rather
+        # than wipe — re-cloning a URL that was already here silently
+        # discarded any unpushed local work (field 2026-07-17). Users
+        # who truly want a fresh download delete the folder first.
+        # A .git WITHOUT a .lift is debris (failed or empty-repo
+        # clone) and must stay wipeable, or retrying after the owner
+        # publishes could never succeed.
+        if os.path.isdir(os.path.join(dest_dir, '.git')):
+            lift_path = _find_lift(dest_dir)
+            if lift_path:
+                result.add(S.CLONE_REUSED_EXISTING, dir=dest_dir)
+                result.add(S.LIFT_FOUND,
+                           file=os.path.basename(lift_path))
+                return lift_path, result
         import shutil
         shutil.rmtree(dest_dir)
+    wan = wan_url(remote_url)
+    if wan != remote_url:
+        print(f'[clone] ssh-shaped URL {remote_url!r}; '
+              f'cloning via {wan!r} (daemon auth is https-only)',
+              file=sys.stderr, flush=True)
+        remote_url = wan
     try:
         os.makedirs(dest_dir, exist_ok=True)
         porcelain.clone(
@@ -2872,12 +3029,9 @@ def _pull_repo_locked(project_dir, username, token):
         result.add(S.NO_REMOTE)
         return result
     try:
-        # Remote NAME, not URL — see _sync_repo_locked for why.
-        porcelain.pull(
-            repo, 'origin',
-            username=username, password=token,
-            errstream=io.BytesIO(),
-        )
+        # Remote NAME when possible (see _sync_repo_locked for why),
+        # wan-normalized URL when the stored origin is ssh-shaped.
+        _pull_origin(repo, username, token)
         result.add(S.PULLED)
     except Exception as exc:
         result.add(S.PULL_FAILED, error=str(exc))
@@ -2910,6 +3064,7 @@ def _commit_and_push_branch_locked(project_dir, username, token,
     except KeyError:
         result.add(S.NO_REMOTE)
         return result
+    remote_url = wan_url(remote_url)
 
     safe = (contributor_name.lower()
             .replace(' ', '_').replace('/', '_') or 'contributor')
@@ -3776,6 +3931,12 @@ def _push_repo_locked(project_dir, username, token):
     if not remote_url:
         result.add(S.NO_REMOTE)
         return result
+    wan = wan_url(remote_url)
+    if wan != remote_url:
+        lift_merge.trace(
+            f'[sync-trace] origin is ssh-shaped ({remote_url!r}); '
+            f'using {wan!r} for WAN ops (stored URL untouched)')
+        remote_url = wan
     _push_step_locked(repo, project_dir, username, token, remote_url, result)
     _push_extras_step(repo, project_dir, result)
     return result
@@ -3819,6 +3980,12 @@ def _sync_repo_locked(project_dir, username, token, contributor_name):
     if not remote_url:
         result.add(S.NO_REMOTE)
         return result
+    wan = wan_url(remote_url)
+    if wan != remote_url:
+        lift_merge.trace(
+            f'[sync-trace] origin is ssh-shaped ({remote_url!r}); '
+            f'using {wan!r} for WAN ops (stored URL untouched)')
+        remote_url = wan
 
     # Stage + commit local changes BEFORE the merge so they're a
     # proper commit on local <branch>, not just dirty working tree.
@@ -5123,7 +5290,10 @@ def _push_extras_step(repo, project_dir, result):
         extra_url = (extra_url or '').strip()
         if not extra_url:
             continue
-        git_user, token = get_sync_credentials(extra_url)
+        # Live-convert ssh-shaped extras like the primary; the stored
+        # URL (and the one shown in statuses) stays as configured.
+        push_url = wan_url(extra_url)
+        git_user, token = get_sync_credentials(push_url)
         if not token:
             result.add(S.EXTRA_REMOTE_PUSH_FAILED,
                        url=extra_url,
@@ -5132,7 +5302,7 @@ def _push_extras_step(repo, project_dir, result):
         try:
             with _socket_timeout(_PUSH_TIMEOUT_S):
                 porcelain.push(
-                    repo, extra_url, refspec,
+                    repo, push_url, refspec,
                     username=git_user, password=token,
                     errstream=io.BytesIO(),
                 )
@@ -5213,9 +5383,11 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
         except KeyError:
             return None
 
-    # Fetch (no merge yet).
+    # Fetch (no merge yet) — via ``_fetch_origin``, which passes the
+    # remote NAME except when the stored origin is ssh-shaped (then:
+    # wan-normalized URL + manual tracking-ref import).
     #
-    # Pass the remote NAME (``'origin'``), not the URL. Dulwich's
+    # Why the NAME matters (pre-helper history): dulwich's
     # ``porcelain.fetch`` only writes ``refs/remotes/<name>/<branch>``
     # when ``get_remote_repo`` can resolve the first positional arg
     # back to a configured remote section (``porcelain/__init__.py``
@@ -5255,11 +5427,10 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             lift_merge.trace('[sync-trace] fetch done (skipped)')
         else:
             with _socket_timeout(_FETCH_TIMEOUT_S):
-                porcelain.fetch(
-                    repo, 'origin',
-                    username=username, password=token,
-                    errstream=io.BytesIO(),
-                )
+                # Remote NAME when possible, wan-normalized URL +
+                # manual tracking-ref import when the stored origin
+                # is ssh-shaped — see _fetch_origin.
+                _fetch_origin(repo, username, token)
             lift_merge.trace('[sync-trace] fetch done')
     except Exception as exc:
         if _is_http_403(exc):
@@ -5472,11 +5643,7 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                                 f'nothing to pull')
                         else:
                             with _socket_timeout(_FETCH_TIMEOUT_S):
-                                porcelain.fetch(
-                                    repo, 'origin',
-                                    username=username, password=token,
-                                    errstream=io.BytesIO(),
-                                )
+                                _fetch_origin(repo, username, token)
                     except Exception as fexc:
                         if _is_http_403(fexc):
                             result.statuses.append(
@@ -6003,11 +6170,7 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             # another peer's push. Different recovery path.
             try:
                 with _socket_timeout(_FETCH_TIMEOUT_S):
-                    porcelain.fetch(
-                        repo, 'origin',
-                        username=username, password=token,
-                        errstream=io.BytesIO(),
-                    )
+                    _fetch_origin(repo, username, token)
                 new_remote = _read_ref(remote_ref)
             except Exception as ex:
                 lift_merge.trace(
@@ -6646,6 +6809,7 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
     except KeyError:
         result.add(S.COMMITTED_NO_REMOTE)
         return result
+    remote_url = wan_url(remote_url)
 
     try:
         branch = porcelain.active_branch(repo).decode('utf-8', errors='replace')
@@ -6653,13 +6817,10 @@ def _commit_audio_and_sync_locked(project_dir, contributor_name,
         branch = 'main'
 
     # Pull first (fetch + merge) so push won't be rejected. Remote
-    # NAME, not URL — see _sync_repo_locked for why.
+    # NAME when possible, wan-normalized URL when the stored origin
+    # is ssh-shaped — see _pull_origin.
     try:
-        porcelain.pull(
-            repo, 'origin',
-            username=username, password=token,
-            errstream=io.BytesIO(),
-        )
+        _pull_origin(repo, username, token)
     except Exception as exc:
         if _is_http_403(exc):
             # Local commit is safe; surface the access issue

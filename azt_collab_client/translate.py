@@ -183,6 +183,10 @@ _HANDLERS = {
         'The repository was found but is empty — the project’s first '
         'upload may not have finished. Ask the project owner to '
         'publish it, then try again.'),
+    S.CLONE_REUSED_EXISTING:  lambda p: _tr(
+        'This project is already on this device; opening the existing '
+        'copy. (Delete its folder first if you need a fresh '
+        'download.)'),
     S.ON_BRANCH:              lambda p: _fmt(_tr('On branch {branch}.'), p),
     S.STAGED_ALL:             lambda p: _tr('Staged all changes.'),
     S.OPEN_PR:                lambda p: _tr('Open your git host to create a pull request.'),

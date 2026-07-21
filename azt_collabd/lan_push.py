@@ -159,6 +159,39 @@ def _verify_fingerprint(ssl_sock, expected_fp, peer_id):
     return True
 
 
+def _pinned_pool_manager(ctx, expected_fp, connect, read):
+    """Fingerprint-pinned urllib3 PoolManager with bounded timeouts
+    and NO urllib3-level retries (push bodies are non-rewindable
+    generators — a retry resends the remainder and the peer reads
+    mid-pack garbage; our sweep/merge machinery is the retry layer).
+
+    Timeout sizing (field 2026-07-21): urllib3 keeps the CONNECT
+    timeout on the socket for the entire request-SEND phase — it
+    only switches to the read timeout just before reading the
+    response — so ``connect`` is also the per-write stall ceiling
+    while uploading a pack. 5 s tripped mid-upload under receiver
+    backpressure ("The write operation timed out") on every big
+    push, while the peer went on to ingest and apply the full pack.
+    Peeks and tiny-body calls keep connect tight for fast dead-
+    endpoint failure; pushes get a generous value.
+
+    ``cert_reqs='CERT_NONE'``: urllib3 clobbers ``ctx.verify_mode``
+    with ``resolve_cert_reqs(cert_reqs)`` inside
+    ``_ssl_wrap_socket_and_match_hostname``; the default (None)
+    resolves to CERT_REQUIRED, undoing our unverified context and
+    failing on self-signed peer certs. Identity is pinned via
+    ``assert_fingerprint`` instead."""
+    import urllib3
+    return urllib3.PoolManager(
+        ssl_context=ctx,
+        assert_hostname=False,
+        assert_fingerprint=expected_fp,
+        cert_reqs='CERT_NONE',
+        timeout=urllib3.Timeout(connect=connect, read=read),
+        retries=False,
+    )
+
+
 def _push_to_peer(project, peer_entry):
     """Single push attempt against one paired peer. Returns
     ``True`` on success, ``False`` on any failure. Logs detail
@@ -182,36 +215,34 @@ def _push_to_peer(project, peer_entry):
         return False
     host, port = endpoint
     url = f'https://{host}:{port}/{project.langcode}.git'
+    # Dial-time summary (always-emit rule): without this line the
+    # only trace of an attempt was its eventual failure warning,
+    # minutes later under a slow timeout — "did my trigger do
+    # anything?" was unanswerable from the log (field 2026-07-21).
+    print(f'[lan-push] dialing {pid[:8]!r} at {host}:{port} '
+          f'for {project.langcode!r}',
+          file=sys.stderr, flush=True)
     try:
         ctx = _build_ssl_context(expected_fp)
     except Exception as ex:
         print(f'[lan-push] context build failed for {pid[:8]!r}: '
               f'{ex!r}', file=sys.stderr, flush=True)
         return False
-    # dulwich's HttpGitClient uses urllib3 underneath; constructing
-    # a urllib3 PoolManager with our custom SSL context is the
-    # documented seam for client-side TLS knobs. Fingerprint
-    # verification happens through urllib3's assert_fingerprint
-    # (formatted as "sha256:HEXSTRING") — that catches a
-    # cert mismatch at handshake completion.
+    # dulwich's HttpGitClient uses urllib3 underneath; a PoolManager
+    # with our custom SSL context is the documented seam for client-
+    # side TLS knobs (fingerprint pinning via assert_fingerprint).
+    # Two pms because of the urllib3 connect-timeout-governs-send
+    # quirk (see _pinned_pool_manager): the peeks must fail fast on
+    # dead endpoints (connect=5), while the push's connect value is
+    # really the per-write stall ceiling during pack upload — 5 s
+    # aborted every big push mid-stream (field 2026-07-21). A
+    # straight-to-push miss on a dead endpoint pays 30 s once; the
+    # fast-fail gate covers the cooldown after that.
     try:
-        import urllib3
-        pm = urllib3.PoolManager(
-            ssl_context=ctx,
-            assert_hostname=False,
-            assert_fingerprint=expected_fp,
-            # urllib3 clobbers ``ctx.verify_mode`` with
-            # ``resolve_cert_reqs(cert_reqs)`` inside
-            # ``_ssl_wrap_socket_and_match_hostname``. With
-            # ``cert_reqs=None`` (default) that resolves to
-            # CERT_REQUIRED, undoing our ``ctx.verify_mode=CERT_NONE``
-            # and producing ``CERTIFICATE_VERIFY_FAILED: self signed
-            # certificate`` even though our context was built
-            # unverified. Passing ``'CERT_NONE'`` here makes urllib3
-            # set our context's verify_mode to CERT_NONE too — same
-            # value we already had, just survives the override.
-            cert_reqs='CERT_NONE',
-        )
+        peek_pm = _pinned_pool_manager(ctx, expected_fp,
+                                       connect=5, read=10)
+        pm = _pinned_pool_manager(ctx, expected_fp,
+                                  connect=30, read=180)
     except Exception as ex:
         print(f'[lan-push] urllib3 pool manager failed for '
               f'{pid[:8]!r}: {ex!r}',
@@ -224,7 +255,7 @@ def _push_to_peer(project, peer_entry):
     # actually advance the peer. Without this the porcelain.push
     # "success" line is ambiguous between real delivery and no-op.
     local_head = _local_head_sha(project)
-    pre_peer_head = _peek_peer_main(url, pm, pid)
+    pre_peer_head = _peek_peer_main(url, peek_pm, pid)
     # Honest per-peer observation: any time ls-remote returns a
     # peer's main SHA we record it. Drives the honest
     # ``lan_unshared`` and ``at_risk`` counts (since 0.47.0; was
@@ -341,10 +372,45 @@ def _push_to_peer(project, peer_entry):
         # the address was fine.
         _is_connect_timeout = ('ConnectTimeoutError' in msg
                                or 'connect timeout' in msg)
-        if ('Connection refused' in msg
-                or 'Errno 111' in msg
-                or 'NewConnectionError' in msg
-                or _is_connect_timeout):
+        _is_connect_class = ('Connection refused' in msg
+                             or 'Errno 111' in msg
+                             or 'NewConnectionError' in msg
+                             or _is_connect_timeout)
+        if not _is_connect_class and local_head:
+            # Delivered-despite-lost-response check (0.54.13). Field
+            # shape 2026-07-21: the connection dies at/after end of
+            # upload but the peer has ALREADY ingested and applied
+            # the pack (desktop `git log` showed our commits at its
+            # HEAD while we logged failures and re-pushed the same
+            # pack every burst, tracebacking the peer each time).
+            # If the peer's main now IS the head we just pushed,
+            # that IS delivery — record it and stop the loop. Only
+            # for non-connect-class errors: if we never connected,
+            # the peek is a wasted dial.
+            try:
+                post_head = _peek_peer_main(url, peek_pm, pid)
+            except Exception:
+                post_head = None
+            if post_head and post_head == local_head:
+                print(f'[lan-push] {pid[:8]!r}: push errored ({cls}) '
+                      f'but peer main is AT our head '
+                      f'{local_head[:12]!r} — delivered, response '
+                      f'lost; recording success',
+                      file=sys.stderr, flush=True)
+                try:
+                    _peers.set_peer_last_seen_main(
+                        pid, project.langcode, post_head)
+                except Exception:
+                    pass
+                try:
+                    _peers.set_peer_covered_local(
+                        pid, project.langcode, post_head)
+                except Exception:
+                    pass
+                _consec_failures.pop(pid, None)
+                _record_reachable(pid)
+                return True
+        if _is_connect_class:
             _lan_discovery.invalidate_endpoint(pid)
             # Demote the dialed address in the persisted fallback
             # lists so the next resolution (mDNS-miss path) tries a
@@ -455,7 +521,7 @@ def _push_to_peer(project, peer_entry):
     # already triggers above).
     if local_head:
         try:
-            post_peer_head = _peek_peer_main(url, pm, pid)
+            post_peer_head = _peek_peer_main(url, peek_pm, pid)
         except Exception as ex:
             post_peer_head = None
             print(f'[lan-push] post-flight ls-remote raised: '
@@ -642,13 +708,10 @@ def peek_peer_head(peer_id, langcode):
               file=sys.stderr, flush=True)
         return None
     try:
-        import urllib3
-        pm = urllib3.PoolManager(
-            ssl_context=ctx,
-            assert_hostname=False,
-            assert_fingerprint=expected_fp,
-            cert_reqs='CERT_NONE',
-        )
+        # Tight bounds: peeks must fail fast on dead endpoints
+        # (see _pinned_pool_manager for the timeout semantics).
+        pm = _pinned_pool_manager(ctx, expected_fp,
+                                  connect=5, read=10)
     except Exception as ex:
         print(f'[lan-peek] pool build failed for '
               f'{peer_id[:8]!r}: {ex!r}',

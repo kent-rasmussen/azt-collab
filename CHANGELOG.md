@@ -9,6 +9,134 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.13 — LAN push write-timeout root cause + delivered-despite-lost-response
+
+ROOT CAUSE of the 0.54.12 LAN push failures (F5 closed): urllib3
+keeps the CONNECT timeout on the socket for the entire request-SEND
+phase — it only switches to the read timeout just before reading the
+response — so 0.54.12's `connect=5` gave every socket write during
+the pack upload a 5 s ceiling. Under receiver backpressure (the peer
+ingests while the sender uploads) a write blocked >5 s and the phone
+aborted with `TimeoutError('The write operation timed out')` — while
+the kernel flushed the buffered tail + FIN, so the peer received the
+COMPLETE pack, applied the refs, and only then hit BrokenPipe writing
+report-status. Field-proven 2026-07-21: desktop `git log` showed the
+phone's commits at HEAD while the phone logged failures and re-pushed
+the same pack every burst.
+
+FIX (split pool managers): `_pinned_pool_manager` helper; peeks keep
+`connect=5, read=10` (fast dead-endpoint failure, F1), the push pm
+gets `connect=30, read=180` — 30 s is really the per-write stall
+ceiling during upload. A straight-to-push miss on a dead endpoint
+pays 30 s once; the fast-fail gate covers the cooldown.
+
+FIX (delivered-despite-lost-response): on a non-connect-class push
+error, re-peek the peer's main — if it now equals the head we just
+pushed, that IS delivery: record `last_seen_main` + `covered_local`,
+clear the failure counters, return success. Ends the re-push loop
+(and the peer-side traceback spam) whenever a response is lost for
+any future reason.
+
+## 0.54.12 — LAN dial hardening: bounded timeouts, no urllib3 retries on push
+
+FIX (LAN push corrupted by urllib3 retries): the push/merge-fetch
+PoolManager (`lan_push._push_to_peer`) had urllib3's default retries
+and NO timeouts. dulwich ≥1.x sends push bodies as a non-rewindable
+GENERATOR (`Transfer-Encoding: chunked`); when the first attempt
+fails for any reason, each urllib3 retry resends only the *remaining*
+generator output, so the peer's listener reads mid-pack garbage —
+field 2026-07-21 (baf, phone→desktop): attempt 1 was fully ingested
+by the desktop and died only writing report-status (`BrokenPipeError`
+— the phone had already hung up), then three retries each produced
+`GitProtocolError: Invalid pkt-line length prefix` with pack-interior
+bytes. The retries can never succeed and they bury the real error.
+`retries=False` on the push pm — the sweep/merge machinery is the
+retry layer, as designed.
+
+FIX (unbounded LAN connects): the push pm and the sweep-peek pm had
+no connect timeout — a dead/stale endpoint held the OS TCP connect
+(~2 min) × 3 retries ≈ 6 min of a worker thread per dead endpoint,
+which made every field trigger look inert (effects surfaced minutes
+after causes). Push pm: `Timeout(connect=5, read=180)` — read budget
+covers the peer's whole pack-ingestion time, since receive-pack
+streams nothing until report-status. Peek pm: `(connect=5, read=10)`,
+matching the hello/signalling pms that already had bounds.
+
+Diagnosability (always-emit rule): `_push_to_peer` now logs one
+dial-time line (`dialing <peer> at <host>:<port> for <lang>`) so a
+sweep's attempts are visible when they START, not only when they
+fail minutes later.
+
+Session findings register: agenda/lan_field_robustness_audit.md
+(F1–F8; this release closes F1's lan_push paths and the retry half
+of F5; F5's client-abort trigger + F2/F3/F4/F8 remain open there).
+
+## 0.54.11 — ssh-shaped origin URLs: live https conversion for WAN ops
+
+FIX (WAN sync dead on ssh-form remotes): a project whose
+`remote.origin.url` is ssh-shaped (`git@github.com:owner/repo.git`,
+`ssh://…`) failed EVERY WAN fetch/pull/push with
+`NotImplementedError('Setting password not supported by
+SubprocessSSHVendor.')` — dulwich routes such URLs to its SSH vendor,
+and the daemon always authenticates with `username`/`password`
+(GitHub-App tokens are https-only). Silent in the field: the drain
+loop just backed off, so the project had no github backup (repro
+2026-07-21: baf, phone; the ls-remote peek also died with `'No host
+specified'` because the scp-form string went into `HttpGitClient`).
+
+New `repo.wan_url(url)` converts ssh shapes (`git@host:path`,
+`ssh://[user@]host[:port]/path`, `git+ssh://…`) to `https://host/path`
+**at use time only** — stored URLs (`.git/config`, projects.json,
+settings display) deliberately keep the user's spelling, since users
+legitimately keep `git@` remotes for their own command-line ssh auth.
+Applied at every WAN dulwich touchpoint: `_push_repo_locked` /
+`_sync_repo_locked` (feeds peek, chunked topic-push, preseed, sweep,
+phase-C promote), publish's `init_repo` push, `clone_repo`,
+`commit_and_push_branch`, `commit_audio_and_sync`, and
+`_push_extras_step` (per-extra). Fetch/pull sites that passed the
+remote NAME `'origin'` (required so dulwich updates tracking refs)
+now route through `_fetch_origin` / `_pull_origin`: name when the
+stored URL is https-form (unchanged behavior), wan-normalized URL
+plus a manual `refs/heads/* → refs/remotes/origin/*` import
+(`_import_origin_heads`) when ssh-shaped. The ssh-shaped pull path
+leaves the mirror stale-BEHIND (safe direction — next fetch heals).
+
+FIX (LAN — spurious "two remotes" conflict over one repo): the
+share-offer handler compared `remote_url` strings literally, so a
+peer whose URL was the ssh spelling of the SAME github repo popped a
+`KIND_REMOTE_CONFLICT` decision (field 2026-07-21). Compare is now
+`wan_url`-normalized on both sides; same-repo-different-spelling is a
+logged no-op and each side keeps its own stored spelling.
+
+`MIN_SERVER_VERSION` floor raised to 0.54.11: any device can receive
+an ssh-shaped URL via LAN share-offer adoption, and a pre-0.54.11
+daemon fails silently on it, so every daemon needs the fix.
+
+Tests: `tests/test_wan_url.py` (shape conversion matrix, pass-through
+matrix, tracking-ref import filter).
+
+## 0.54.10 — GitHub clone: reuse existing copy; fix 0.54.9 regression
+
+FIX (GitHub clone — re-cloning no longer wipes an existing copy):
+`clone_repo` unconditionally `rmtree`d an existing destination before
+cloning — so cloning a URL that was already a local project silently
+discarded that copy, including any unpushed work (field, 2026-07-17;
+the "leftover from a failed clone" assumption was enforced for LAN
+clones but not URL clones). A destination with `.git` AND a `.lift`
+is now reused as-is (new typed `CLONE_REUSED_EXISTING`; the clone
+job returns its lift_path and re-registers idempotently; no network
+touched); users who want a truly fresh download delete the folder
+first. A `.git` without a `.lift` (failed/empty-clone debris) stays
+wipeable so an empty-repo retry can still succeed after the owner
+publishes.
+
+FIX (0.54.9 regression — successful clone ended in "Clone failed:
+'Result' object has no attribute 'get'"): 0.54.9's error-derivation
+fix re-decoded the clone job's `result`, but `clone_project_status`
+already decodes it — `Result.from_dict(<Result>)` raised, AFTER the
+clone had landed and registered (so the project then opened fine,
+confusingly). Both `clone_project` branches are now shape-tolerant.
+
 ## 0.54.9 — honest failure messages (LAN + GitHub clone) + live clone progress
 
 (0.54.7/0.54.8 were taken by already-compiled builds; this block
@@ -87,10 +215,8 @@ the client's `clone_project` flattened every DONE-without-lift into
 file found in cloned repository" on a repo that has one (field,
 2026-07-17). `clone_project` now derives the error from the typed
 codes (`clone_auth_required` / `clone_failed` / `repo_empty` /
-`no_lift_found`) and decodes `result` into a real `Result` per its
-own contract — which also brings the picker's CLONE_AUTH_REQUIRED
-auth-modal routing back to life (it read `.statuses` off what was
-actually a raw wire dict, so the auth branch never fired). New typed
+`no_lift_found`). (This release also re-decoded the already-decoded
+`result` — regression fixed in 0.54.10.) New typed
 `REPO_EMPTY` (daemon + mirror + translation + FR catalog)
 distinguishes "clone landed but repo is empty — first upload may not
 have finished" from a genuine content problem; the picker shows the

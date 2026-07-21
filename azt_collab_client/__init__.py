@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.9"
+__version__ = "0.54.13"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -174,7 +174,17 @@ __version__ = "0.54.9"
 # floor forces the bootstrap update prompt before the recorder
 # trusts the opt-out. See CHANGELOG 0.50.51 + NOTES_TO_DAEMON
 # (now empty) for the rationale.
-MIN_SERVER_VERSION = "0.50.51"
+# 0.54.11 floor: ssh-shaped origin URLs (``git@github.com:o/r.git``)
+# are live-converted to https at every WAN git touchpoint
+# (``repo.wan_url``). A pre-0.54.11 daemon fails EVERY WAN
+# fetch/pull/push on such a project with
+# ``NotImplementedError('Setting password not supported by
+# SubprocessSSHVendor.')`` — silently, since the drain loop just
+# backs off — so the project has no github backup and, LAN-side,
+# spurious remote-conflict decisions pop over what is the same
+# repo in two spellings. Any device can receive an ssh-shaped URL
+# via LAN share-offer adoption, so every daemon needs the fix.
+MIN_SERVER_VERSION = "0.54.11"
 # 0.41.24 floor: deliberate bump, test scaffolding to force the
 # bootstrap install/update popup to fire when one side is rebuilt
 # and the other isn't. Set to the current ``azt_collabd.__version__``
@@ -1957,7 +1967,14 @@ def clone_project(remote_url, dest_dir, on_progress=None,
                     pass
         state = resp.get('state', 'CLONING')
         if state == 'DONE':
-            result = Result.from_dict(resp.get('result') or {})
+            # clone_project_status already decodes the wire dict into
+            # a Result; tolerate both shapes rather than re-decoding
+            # (Result.from_dict(Result) raised AttributeError, field
+            # 2026-07-17 — surfaced as "Clone failed" AFTER a clone
+            # that had actually landed and registered).
+            raw = resp.get('result')
+            result = raw if isinstance(raw, Result) \
+                else Result.from_dict(raw or {})
             lift_path = resp.get('lift_path', '')
             # Honest error derivation: the daemon marks a clone job
             # DONE even when the clone itself FAILED (the failure is
@@ -1995,9 +2012,11 @@ def clone_project(remote_url, dest_dir, on_progress=None,
                     'result': result,
                     'error': err}
         if state == 'FAILED':
+            raw = resp.get('result')
             return {'ok': False,
                     'error': resp.get('error', 'clone_failed'),
-                    'result': Result.from_dict(resp.get('result') or {})}
+                    'result': (raw if isinstance(raw, Result)
+                               else Result.from_dict(raw or {}))}
 
 
 def clone_project_start(remote_url, dest_dir, langcode='',

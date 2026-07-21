@@ -58,6 +58,12 @@ LIFT_NOT_FOUND = 'LIFT_NOT_FOUND'
 # content, none of it .lift): "no .lift found" on an empty repo sent a
 # user hunting a content problem that wasn't one (field, 2026-07-17).
 REPO_EMPTY = 'REPO_EMPTY'
+# clone_repo found a real prior clone at the destination (.git + a
+# .lift) and reused it instead of wiping — re-cloning silently
+# discarded unpushed local work (field, 2026-07-17). Users who want a
+# truly fresh download delete the project folder first. Params:
+# ``dir``.
+CLONE_REUSED_EXISTING = 'CLONE_REUSED_EXISTING'
 ON_BRANCH = 'ON_BRANCH'
 STAGED_ALL = 'STAGED_ALL'
 OPEN_PR = 'OPEN_PR'

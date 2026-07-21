@@ -44,6 +44,9 @@ LIFT_NOT_FOUND = 'LIFT_NOT_FOUND'
 # Clone landed but the repo is empty (no files at all) — usually the
 # first upload never completed. See azt_collabd/status.py.
 REPO_EMPTY = 'REPO_EMPTY'
+# clone_repo reused a real prior clone at the destination instead of
+# wiping it. Params: dir. See azt_collabd/status.py.
+CLONE_REUSED_EXISTING = 'CLONE_REUSED_EXISTING'
 ON_BRANCH = 'ON_BRANCH'
 STAGED_ALL = 'STAGED_ALL'
 OPEN_PR = 'OPEN_PR'

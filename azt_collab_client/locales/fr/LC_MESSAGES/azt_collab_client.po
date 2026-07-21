@@ -1352,6 +1352,14 @@ msgstr ""
 "n'est peut-être pas terminé. Demandez au propriétaire du projet de le "
 "publier, puis réessayez."
 
+msgid ""
+"This project is already on this device; opening the existing copy. "
+"(Delete its folder first if you need a fresh download.)"
+msgstr ""
+"Ce projet est déjà sur cet appareil ; ouverture de la copie existante. "
+"(Supprimez d'abord son dossier si vous avez besoin d'un nouveau "
+"téléchargement.)"
+
 # Pair-flow informational/failure popups (0.50.10 / 0.50.11).
 msgid "Paired, but no project came with this QR"
 msgstr "Appairé, mais aucun projet n'est arrivé avec ce QR"
