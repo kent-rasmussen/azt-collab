@@ -9,6 +9,27 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.17 — keep the presplash up until the UI can respond
+
+UX (server-APK picker; field 2026-07-21: "hard to think that the
+app is broken, which it's just loading still"): Kivy drops the
+native presplash at the FIRST FRAME (`kivy/base.py` schedules
+`EventLoop.remove_android_splash` right after `EventLoop.start()`),
+long before the picker is interactive — the rest of startup played
+out on a dead-looking half-built screen. New
+`azt_collab_client/ui/presplash_hold.py`: `hold()` (called in
+`picker_app.main()` before `app.run()`) turns Kivy's first-frame
+removal into a no-op; `release()` (scheduled one frame after
+`on_start` completes) performs the real removal on the Kivy main
+thread. A 45 s watchdog releases unconditionally so a failed load
+path can never leave the splash stuck — a stuck splash would be
+worse than the gap this fixes. Peers wire the same two calls;
+documented in CLIENT_INTEGRATION.md § 18 ("Presplash hold").
+Deliberate non-scope (per the field decision): boot work itself is
+unchanged — the boot-time update probe (~2.3 s online) stays where
+it is; moving it off the pre-interactive path is the next lever if
+startup keeps growing.
+
 ## 0.54.16 — LAN identity KEY_VALUES_MISMATCH self-heal
 
 (Landed after 0.54.15 was already built and deployed; split out so

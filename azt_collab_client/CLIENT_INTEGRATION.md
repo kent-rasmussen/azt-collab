@@ -3186,6 +3186,30 @@ After gating ``lowMemory`` adaptations:
   re-arm background polls (no battery drain in
   ``adb shell dumpsys batterystats`` while paused).
 
+### Presplash hold (keep the splash until the UI responds)
+
+Kivy drops the native presplash at the FIRST FRAME, which in
+suite apps is long before the screen can respond — heavy
+startup continues after first paint and users read the
+dead-looking window as "the app is broken." A peer SHOULD
+hold the splash until its first screen is actually usable:
+
+```python
+from azt_collab_client.ui import presplash_hold
+
+presplash_hold.hold()       # before App().run()
+# ... in App.on_start (or when initial load completes):
+Clock.schedule_once(lambda dt: presplash_hold.release(), 0)
+```
+
+Both calls are idempotent no-ops off Android. A watchdog
+releases after 45 s regardless, so a failed load path can
+never leave the splash up forever. Do NOT put anything
+slower than first-screen construction between hold and
+release — the splash is a loading signal, not a cover for
+network waits (update probes and sync belong after
+interactivity regardless).
+
 ## 19. Package-replacement handling
 
 APK install ≠ process upgrade on Android. When a package is

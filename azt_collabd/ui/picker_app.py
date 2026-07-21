@@ -638,6 +638,14 @@ class PickerApp(App):
         # non-picker → picker; picker → finish (RESULT_CANCELED).
         from kivy.core.window import Window
         Window.bind(on_keyboard=self._on_back_button)
+        # Presplash hold: main() intercepted Kivy's first-frame
+        # removal; release one frame AFTER on_start's work so the
+        # splash stays up exactly until the screen can respond —
+        # the user never sees a dead-looking half-built UI
+        # (field 2026-07-21). Watchdog in presplash_hold covers a
+        # load-path failure before this line.
+        from azt_collab_client.ui import presplash_hold
+        Clock.schedule_once(lambda dt: presplash_hold.release(), 0)
         # Probe the server version once at startup so the bottom strip
         # shows both halves. Done off the UI thread so a slow daemon
         # doesn't block first paint.
@@ -1502,6 +1510,12 @@ def main(launch_mode='external', launch_source='user'):
     app = PickerApp()
     app._launch_mode = launch_mode
     app._launch_source = launch_source
+    # Keep the native presplash up until the first screen can
+    # respond (released from on_start; watchdog-capped). Kivy's
+    # default drops it at the FIRST FRAME, leaving a dead-looking
+    # half-built UI for the rest of startup.
+    from azt_collab_client.ui import presplash_hold
+    presplash_hold.hold()
     app.run()
     first_try_log('picker_app.main_returned',
                   dt=f'{_time.monotonic() - _t0:.3f}s')
