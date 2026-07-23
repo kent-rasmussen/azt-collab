@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.43"
+__version__ = "0.54.45"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1002,6 +1002,23 @@ def lan_peer_sync():
         return []
     out = resp.get('rows') or []
     return out if isinstance(out, list) else []
+
+
+def lan_cable_link():
+    """'Check cable link': ask the daemon for the machine's local-link
+    addresses and currently-reachable paired peers, and (daemon-side)
+    re-arm discovery + fire a burst so a just-plugged USB-tether cable
+    is picked up. Returns ``{'interfaces': [...], 'peers': [{peer_id,
+    device_name, endpoint}, ...]}``; empty dict on transport failure.
+    Never raises."""
+    try:
+        resp = call('POST', '/v1/lan/cable_link', {})
+    except ServerUnavailable:
+        return {}
+    if not resp.get('ok'):
+        return {}
+    return {'interfaces': resp.get('interfaces') or [],
+            'peers': resp.get('peers') or []}
 
 
 def lan_retry_peer(peer_id):
@@ -3114,7 +3131,7 @@ __all__ = [
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
     'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_retry_peer',
-    'lan_pair_qr',
+    'lan_cable_link', 'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',

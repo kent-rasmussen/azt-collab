@@ -12,6 +12,7 @@ Peer-side: nothing to edit (all cited code is client-owned). Verify the fix on a
 ## Notes
 
 - Field report 2026-07-23 (Kent): clone-offer Accept does nothing, Decline does nothing, stuck on the popup (`auto_dismiss=False`).
+- Same day, later: Kent reports it is NOT wedging anymore (client 0.54.36, popup code unchanged) — intermittent, manifests only when the RPC is slow. Likely the wedged-daemon leg cleared (lock-regression fix or just not triggered). The structural main-thread fix + progress ask stand as filed.
 - Mechanism: `lan_accept_offer` is synchronous end-to-end (the POST carries the whole LAN clone); called on the main thread, so the UI freezes with zero feedback and later taps (incl. Decline) queue behind it. Neither RPC can raise, so a Decline that visibly does nothing means the handler never ran — main thread already parked.
 - Workaround: force-stop + relaunch the peer (decision persists daemon-side, re-surfaces via `lan_pending`); if it recurs immediately, restart the server APK too (wedged-daemon signature).
 

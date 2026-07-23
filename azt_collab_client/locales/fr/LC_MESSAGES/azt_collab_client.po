@@ -217,6 +217,21 @@ msgstr "Impossible d'ouvrir les réglages de partage — ouvrez-les depuis le t�
 msgid "Could not open tethering settings: {error}"
 msgstr "Impossible d'ouvrir les réglages de partage : {error}"
 
+msgid "Check cable link"
+msgstr "Vérifier la liaison par câble"
+
+msgid "Checking cable link…"
+msgstr "Vérification de la liaison par câble…"
+
+msgid "No local-network link found — plug in the cable and turn on USB tethering on the phone."
+msgstr "Aucune liaison réseau locale trouvée — branchez le câble et activez le partage par USB sur le téléphone."
+
+msgid "Cable/LAN link up ({ifaces}) · reachable: {names}"
+msgstr "Liaison câble/réseau active ({ifaces}) · joignables : {names}"
+
+msgid "Link up ({ifaces}) but no peer reachable yet — is USB tethering on? Retrying…"
+msgstr "Liaison active ({ifaces}) mais aucun pair joignable — le partage par USB est-il activé ? Nouvel essai…"
+
 msgid "…"
 msgstr "…"
 

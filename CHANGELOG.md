@@ -9,6 +9,57 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.45 — fix: settings-screen polls were ANR-ing the app
+
+FIX (Kent 2026-07-23, "python not responding, almost completely
+blocking"): two settings-screen polls introduced/aggravated the freeze.
+
+- **Peer-sync poll 2.5 s → 12 s.** Each poll makes the daemon open
+  every project's repo and walk git **per peer × project**; on a
+  multi-project, multi-peer phone that's dozens of walks, and at 2.5 s
+  it saturated the `:provider` daemon so every other RPC backed up. A
+  status board doesn't need sub-10 s freshness.
+- **CAWL poll moved off the UI thread.** `_tick_cawl_cache_status`
+  called `cawl_cache_status` (an RPC) **on the UI thread** every second;
+  against a busy daemon that call blocked → ANR. Now fetched in a
+  worker and rendered back on the UI thread (same pattern as peer-sync),
+  split into `_render_cawl_status`.
+
+Both are the acute triggers on top of the systemic root already tracked
+in `daemon_lock_across_network_io.md` (the daemon holds `project_lock`
+across network I/O, so a busy/slow daemon blocks UI RPCs). This makes
+the settings screen survivable now; the durable cure is that lock work.
+
+UI-side (app.py) — reopen the settings window / rebuild the phone to
+apply; no daemon restart needed for these two.
+
+## 0.54.44 — LAN clone tries all addresses; "Check cable link"; quiet CAWL offline
+
+Three things (Kent 2026-07-23):
+
+- **FIX — LAN clone/accept tries every candidate address.** The accept
+  loop (accepted a share 6× before declining) was `clone_from_peer`
+  resolving a **single** endpoint (`_resolve_endpoint`) and connecting
+  only there — the phone got the sender's wifi IP (`192.168.31.60`,
+  "Network is unreachable") while a routable cable/`10.x` address
+  existed. New `_candidate_endpoints` returns every address (mDNS →
+  static → observed); the peek and the clone now try each until one
+  connects. This is the QR multi-address fix (0.54.35) finally extended
+  to the clone path.
+- **FEATURE — "Check cable link" (desktop).** The tethering button is
+  now platform-aware: phone → "Open USB tethering settings" (host end);
+  desktop → "Check cable link" (client end) — reports the machine's
+  local-link addresses + which paired peers are reachable, and re-arms
+  discovery + bursts. The affirmation half of the cable flow: phone
+  turns tethering on, computer confirms the route reached it.
+  `POST /v1/lan/cable_link` + `lan_cable_link()`.
+- **FIX — no CAWL nag while offline.** The image-cache banner no longer
+  shows "(offline — will resume when online)"; offline it just hides
+  (keeps polling cheaply, reappears with live progress once fetching
+  resumes). Don't bother the user about caching they can't act on.
+
+Daemon-side changes (clone path, new endpoint) → restart the daemon.
+
 ## 0.54.43 — "Open USB tethering settings" shortcut (phone)
 
 FEATURE (Kent 2026-07-23): the USB-tethering toggle is 4+ taps deep and

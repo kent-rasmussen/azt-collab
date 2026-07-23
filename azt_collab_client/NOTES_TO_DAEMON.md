@@ -29,6 +29,16 @@ project" decision popup's clone-offer Accept button "doesn't seem
 to do anything, nor decline, so I'm just stuck there."
 `auto_dismiss=False`, so the user has no exit.
 
+**Update, same day:** Kent reports the popup is NOT wedging
+anymore (client meanwhile 0.54.36; peer code unchanged). So this
+is intermittent — the structure below only manifests when the
+RPC is slow (big clone, stalled transfer, or a daemon wedged
+holding `project_lock`). Repro accordingly: accept an offer for
+a large project and/or throttle the link — don't expect a hang
+on the happy path. The asks stand: the main-thread blocking is
+latent until the next slow transfer, and field transfers are
+routinely slow.
+
 Smoking gun — both button paths run a **blocking daemon RPC on
 the Kivy main thread, and only dismiss the popup after the RPC
 returns** (`ui/decisions.py::_open_share_offer_popup`, `_accept`

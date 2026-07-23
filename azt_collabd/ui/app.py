@@ -624,10 +624,15 @@ KV_TEMPLATE = '''
                 # taps deep, OEM-inconsistent). Best-effort deep-link;
                 # see share.open_tethering_settings for the fallbacks.
                 Button:
+                    id: tether_btn
                     size_hint_y: None
                     height: dp(48)
+                    # Label set per-platform in _ready: phone opens the
+                    # tethering settings (host end); desktop checks the
+                    # cable link (client end). Fallback text for the
+                    # frame before _ready runs.
                     text: _('Open USB tethering settings')
-                    on_press: root.open_tethering_settings()
+                    on_press: root.tether_button_pressed()
                 # "Pair a phone" entry was vestigial after 0.45.0 —
                 # showing the daemon's QR is now the "Show QR code"
                 # affordance inside the per-project Share popup,
@@ -1173,6 +1178,7 @@ class SettingsScreen(Screen):
             self.refresh()
             self._start_cawl_cache_poll()
             self._start_peer_sync_poll()
+            self._set_tether_button_label()
             self._focus_contributor_if_unset()
         Clock.schedule_once(_ready, 0)
 
@@ -1229,8 +1235,15 @@ class SettingsScreen(Screen):
         peer does no git walk); the fetch runs off the UI thread."""
         self._stop_peer_sync_poll()
         self._tick_peer_sync()   # immediate first paint
+        # 12 s, not 2.5 s: each poll makes the daemon open every
+        # project's repo and walk git per peer × project — dozens of
+        # walks on a multi-project, multi-peer device. At 2.5 s that
+        # saturated the phone's :provider daemon and everything else
+        # (incl. the UI-thread CAWL poll) blocked → ANR (field
+        # 2026-07-23). A status board doesn't need sub-10 s freshness;
+        # the count still updates live as deliveries land.
         self._peer_sync_event = Clock.schedule_interval(
-            lambda _dt: self._tick_peer_sync(), 2.5)
+            lambda _dt: self._tick_peer_sync(), 12.0)
 
     def _stop_peer_sync_poll(self):
         if self._peer_sync_event is not None:
@@ -1362,7 +1375,21 @@ class SettingsScreen(Screen):
         if not langcode:
             self._hide_cawl_cache_banner(banner, label)
             return
-        status = cawl_cache_status(langcode)
+        # Fetch off the UI thread — cawl_cache_status is an RPC to the
+        # (possibly busy) :provider daemon; calling it on the UI thread
+        # blocked and ANR'd the app (field 2026-07-23). Render back on
+        # the UI thread.
+        def _work():
+            try:
+                status = cawl_cache_status(langcode)
+            except Exception:
+                return
+            Clock.schedule_once(
+                lambda _dt: self._render_cawl_status(
+                    status, banner, label), 0)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _render_cawl_status(self, status, banner, label):
         total = status['total']
         cached = status['cached']
         offline = status.get('offline', False)
@@ -2100,20 +2127,76 @@ class SettingsScreen(Screen):
                 label.text = _tr('Could not open paired-devices '
                                  'list: {error}').format(error=str(ex))
 
-    def open_tethering_settings(self):
-        """Take the user to the phone's USB-tethering settings (best-
-        effort deep-link with OEM fallbacks). Any message lands in the
-        LAN status label."""
-        def _sink(msg):
-            label = self.ids.get('lan_status_label')
-            if label is not None:
-                label.text = msg or ''
+    def _on_android(self):
         try:
-            from azt_collab_client.ui.share import open_tethering_settings
-            open_tethering_settings(on_error=_sink)
-        except Exception as ex:
-            _sink(_tr('Could not open tethering settings: {error}'
-                      ).format(error=str(ex)))
+            from azt_collab_client._platform import on_android
+            return bool(on_android())
+        except Exception:
+            return False
+
+    def _set_tether_button_label(self):
+        btn = self.ids.get('tether_btn')
+        if btn is None:
+            return
+        # Phone (tether host) opens the tethering settings; desktop
+        # (tether client) checks that the cable link reached it.
+        btn.text = (_tr('Open USB tethering settings')
+                    if self._on_android()
+                    else _tr('Check cable link'))
+
+    def _lan_status(self, msg):
+        label = self.ids.get('lan_status_label')
+        if label is not None:
+            label.text = msg or ''
+
+    def tether_button_pressed(self):
+        """Phone → open tethering settings (set up the host end).
+        Desktop → check the cable link (confirm the route reached the
+        client end + nudge sync)."""
+        if self._on_android():
+            try:
+                from azt_collab_client.ui.share import (
+                    open_tethering_settings)
+                open_tethering_settings(on_error=self._lan_status)
+            except Exception as ex:
+                self._lan_status(_tr('Could not open tethering '
+                                     'settings: {error}').format(
+                                         error=str(ex)))
+        else:
+            self._check_cable_link()
+
+    def _check_cable_link(self):
+        """Desktop: report local-link addresses + reachable peers and
+        nudge discovery (the affirmation half of the USB-cable flow).
+        Runs off the UI thread; result lands in the LAN status label."""
+        self._lan_status(_tr('Checking cable link…'))
+
+        def _work():
+            try:
+                from azt_collab_client import lan_cable_link
+                info = lan_cable_link()
+            except Exception:
+                info = {}
+            ifaces = info.get('interfaces') or []
+            peers = info.get('peers') or []
+            if not ifaces:
+                text = _tr('No local-network link found — plug in the '
+                           'cable and turn on USB tethering on the '
+                           'phone.')
+            elif peers:
+                names = ', '.join(
+                    (p.get('device_name') or p.get('peer_id', '')[:8])
+                    for p in peers)
+                text = _tr('Cable/LAN link up ({ifaces}) · reachable: '
+                           '{names}').format(
+                               ifaces=', '.join(ifaces), names=names)
+            else:
+                text = _tr('Link up ({ifaces}) but no peer reachable '
+                           'yet — is USB tethering on? Retrying…'
+                           ).format(ifaces=', '.join(ifaces))
+            Clock.schedule_once(lambda _dt: self._lan_status(text), 0)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def share_diagnostics(self):
         """Daemon-settings affordance for the canonical share-

@@ -470,6 +470,48 @@ def _h_lan_retry_peer(body):
     return 200, {"ok": True}
 
 
+def _h_lan_cable_link(_body):
+    """'Check cable link' (desktop complement to the phone's tethering
+    button): report this machine's local-link addresses and which
+    paired peers are reachable right now, THEN re-arm discovery + fire
+    a burst so a just-plugged cable is picked up. Reads current
+    reachability BEFORE the re-arm (restart_browse clears the cache),
+    so the answer reflects what's reachable now and the re-arm freshens
+    it for the next check. Always ``{ok: True}``."""
+    interfaces = []
+    try:
+        from . import lan_listener as _lan_listener
+        interfaces = _lan_listener._interface_ipv4s()
+    except Exception:
+        interfaces = []
+    peers_out = []
+    try:
+        from . import lan_discovery as _lan_discovery
+        names = {p.get('peer_id', ''): p.get('device_name', '')
+                 for p in _peers.list_peers()}
+        for pid, (host, port) in _lan_discovery.known_endpoints().items():
+            peers_out.append({
+                'peer_id': pid,
+                'device_name': names.get(pid, ''),
+                'endpoint': f'{host}:{int(port)}'})
+    except Exception:
+        pass
+    # Nudge: re-arm discovery (catches a new interface) + burst.
+    try:
+        from . import lan_discovery as _lan_discovery
+        _lan_discovery.restart_browse()
+    except Exception as ex:
+        print(f'[cable-link] restart_browse raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    try:
+        from . import lan_burst as _lan_burst
+        _lan_burst.start_burst()
+    except Exception as ex:
+        print(f'[cable-link] start_burst raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True, "interfaces": interfaces, "peers": peers_out}
+
+
 def _h_lan_peer_sync(_body):
     """Per-peer × per-shared-project sync status for the settings
     overlay. Response: ``{ok: True, rows: [...]}`` — see
@@ -4850,6 +4892,8 @@ def dispatch(method, path, body):
             return _h_lan_burst(body)
         if path == '/v1/lan/retry_peer':
             return _h_lan_retry_peer(body)
+        if path == '/v1/lan/cable_link':
+            return _h_lan_cable_link(body)
         if path == '/v1/lan/static_endpoints':
             return _h_lan_set_static_endpoints(body)
         if path == '/v1/lan/clone':
