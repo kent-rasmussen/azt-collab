@@ -641,9 +641,15 @@ def _collect_conflict_paths(merged_entry):
             child_path = (f'{prefix}/{_child_key(child)}'
                           if prefix else _child_key(child))
             if (child.tag == 'annotation'
-                    and child.attrib.get('name') == CONFLICT_ANNOTATION_NAME):
-                # The conflict is on the PARENT of this annotation,
-                # not on the annotation itself.
+                    and child.attrib.get('name') == CONFLICT_ANNOTATION_NAME
+                    and child.attrib.get('value') in ('ours', 'theirs')):
+                # A per-node conflict marker. The conflict is on the
+                # PARENT of this annotation, not on the annotation
+                # itself. (Only ours/theirs node markers count — the
+                # entry-level ``value="conflict"`` summary is not a
+                # conflict site, so it's skipped; this makes the
+                # helper reusable by ``_reconcile_entry_marker`` to
+                # re-derive which fields STILL conflict.)
                 paths.add(prefix or _child_key(elem))
                 continue
             _walk(child, child_path)
@@ -743,7 +749,76 @@ def _conflict_side(elem):
     return ''
 
 
-def _normalize_entry(entry, path=''):
+def _reconcile_entry_marker(entry):
+    """Reconcile the entry-level ``azt-lift-conflict`` marker with the
+    per-node conflicts that actually survive.
+
+    The entry-level marker (``value="conflict"`` + the
+    ``azt-lift-conflict-fields`` trait) is added in ``_merge_pair``
+    from the per-node conflict annotations BEFORE ``_normalize_entry``
+    runs. When those node annotations are later stripped — e.g. the
+    gloss carve-out (0.54.20) removes false gloss conflicts — the
+    entry-level summary is left pointing at fields that are no longer
+    in conflict (field 2026-07-22 CABTAL: gloss-only entries still
+    showed an entry-level marker naming ``gloss[lang=…]`` over clean
+    gloss nodes). Re-derive the surviving conflict fields
+    (``_collect_conflict_paths``, node ``ours``/``theirs`` markers
+    only) and:
+      * no survivors → drop the whole entry-level marker (trait too);
+      * some survivors → trim the fields trait to exactly those,
+        dropping stale links to fields whose node markers were
+        stripped (the mixed audio+gloss case: keep the audio, lose
+        the gloss link).
+    Returns the number of changes applied. Call AFTER
+    ``_normalize_entry``.
+    """
+    # Cheap no-op for the overwhelmingly common clean entry: only an
+    # entry that actually carries an entry-level ``value="conflict"``
+    # marker needs reconciling. Checking direct annotation children is
+    # O(few); skipping here avoids the full-subtree
+    # ``_collect_conflict_paths`` walk on every clean entry of every
+    # merge (Kent 2026-07-22: merges run many times a day — don't pay
+    # per-entry walk cost for nothing).
+    markers = [a for a in entry.findall('annotation')
+               if a.attrib.get('name') == CONFLICT_ANNOTATION_NAME
+               and a.attrib.get('value') == 'conflict']
+    if not markers:
+        return 0
+    # Which fields STILL carry a per-node ours/theirs conflict.
+    surviving = _collect_conflict_paths(entry)
+    changed = 0
+    for a in markers:
+        if not surviving:
+            # Orphaned — no node conflict remains. Drop the whole
+            # entry-level marker (trait and all).
+            entry.remove(a)
+            changed += 1
+            continue
+        # Some conflicts survive: trim the fields trait to just those,
+        # dropping stale links to fields whose node markers were
+        # stripped (e.g. a mixed audio+gloss entry keeps the audio,
+        # loses the gloss link).
+        new_val = ','.join(surviving)
+        tr = None
+        for t in a.findall('trait'):
+            if t.attrib.get('name') == CONFLICT_FIELDS_TRAIT:
+                tr = t
+                break
+        if tr is not None and tr.attrib.get('value') != new_val:
+            tr.set('value', new_val)
+            changed += 1
+    return changed
+
+
+# Audio recording forms use the "unwritten" script subtag; the suite
+# tags them ``<vern>-Zxxx-x-audio``. Audio is SINGLE-VALUE per entry
+# (replace-per-take), so two divergent same-lang audio forms are a
+# real conflict — resolved last-wins by most-recent commit when a
+# recency resolver is supplied (see three_way_merge ``audio_recency``).
+_AUDIO_LANG_SUFFIX = 'Zxxx-x-audio'
+
+
+def _normalize_entry(entry, path='', audio_recency=None):
     """Enforce the no-duplicate-same-lang-forms invariant on
     *entry* in place (see the section comment above). Idempotent;
     cheap when there are no duplicates. Returns the number of
@@ -786,6 +861,84 @@ def _normalize_entry(entry, path=''):
                     # markers left on the survivor are false
                     # positives.
                     _strip_conflict_annotations(survivors[0])
+                continue
+            # 1.5) True multitext: a <gloss> legitimately repeats per
+            #    lang — distinct senses / synonyms, shipped that way
+            #    in the bare CAWL template (e.g. two <gloss lang="es">:
+            #    abdomen, barriga). Distinct same-lang glosses are REAL
+            #    DATA, never a conflict; only byte-identical duplicates
+            #    collapse (step 1 above). Strip any azt-lift-conflict
+            #    annotation a prior (buggy) merge stamped here so the
+            #    pollution launders out over successive merges, and do
+            #    NOT fall through to the annotate path.
+            #    Field repro 2026-07-22 (CABTAL): the single-per-lang
+            #    rule was mis-applied to glosses, falsely annotating
+            #    every multi-sense entry (abdomen=ours / barriga=theirs)
+            #    — 1284 false markers in the workshop nml.
+            #    WORKFLOW-GATED, not permanent: this holds while glosses
+            #    are READ-ONLY (no edit UI), so same-lang multiplicity
+            #    is always distinct senses, never divergence. When gloss
+            #    editing ships, two different same-lang glosses become
+            #    ambiguous — a NEW synonym vs. one gloss EDITED to
+            #    different values on two sides (a real conflict) — and
+            #    the merge will need per-gloss IDENTITY (base-match /
+            #    id, like _pair_same_key) to tell them apart. Until
+            #    then, treat all same-lang gloss multiplicity as valid.
+            #    See agenda/lift_merge_robustness.md (2026-07-22).
+            if tag == 'gloss':
+                stripped = 0
+                for f in survivors:
+                    if _conflict_side(f):
+                        _strip_conflict_annotations(f)
+                        stripped += 1
+                if stripped:
+                    repaired += 1
+                    trace(f'[merge-repair] path={path!r} guid={guid} '
+                          f'gloss[lang={lang}]: {len(survivors)} '
+                          f'distinct same-lang glosses are valid '
+                          f'multi-sense data; stripped {stripped} '
+                          f'false conflict annotation(s)')
+                continue
+            # 1.6) Audio forms: single-value per entry (replace-per-
+            #    take). Divergent takes resolve LAST-WINS by recency
+            #    when a resolver is supplied. Convergence merge
+            #    (_merge_diverged) resolves by most-recent COMMIT time
+            #    (deterministic across devices). Local pre-commit
+            #    merges (submit_file, post-receive integrate, snapshot
+            #    reapply) also pass a resolver, but a working-tree file
+            #    that isn't committed yet resolves to NOW (float inf)
+            #    and wins — "the undefined is NOW" (Kent 2026-07-22):
+            #    a just-recorded take beats an older committed one
+            #    without a spurious conflict annotation. The only
+            #    still-None case (resolver absent, e.g. a caller that
+            #    passes nothing) falls through to annotate. See
+            #    three_way_merge ``audio_recency`` +
+            #    agenda/lift_merge_robustness.md.
+            if (tag == 'form' and audio_recency is not None
+                    and lang.endswith(_AUDIO_LANG_SUFFIX)):
+                best = None
+                best_t = None
+                for f in survivors:
+                    t = audio_recency(_form_text(f))
+                    if t is not None and (best_t is None or t > best_t):
+                        best_t, best = t, f
+                if best is None:
+                    # No dates resolvable — keep document-first,
+                    # deterministic, rather than dropping blindly.
+                    best = survivors[0]
+                dropped = 0
+                for f in survivors:
+                    if f is best:
+                        _strip_conflict_annotations(f)
+                    else:
+                        parent.remove(f)
+                        dropped += 1
+                if dropped:
+                    repaired += 1
+                    trace(f'[merge-repair] path={path!r} guid={guid} '
+                          f'form[lang={lang}]: audio last-wins — kept '
+                          f'{_form_text(best)!r}, dropped {dropped} '
+                          f'older take(s)')
                 continue
             # 2) Verification fields: union the code content into
             #    one form instead of keeping conflict copies.
@@ -1352,11 +1505,26 @@ def _add_fs_entry(parent, working_dir, rel_path,
               str(st.st_size - len(reference_bytes)))
 
 
-def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
+def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path='',
+                    audio_recency=None):
     """Merge LIFT XML by entry guid. Returns ``MergeResult`` with the
     merged bytes and a list of Conflicts. The base may be empty
     (``b''``); the algorithm treats that as "no shared history" and
-    falls back to add-add semantics."""
+    falls back to add-add semantics.
+
+    ``audio_recency`` (optional): ``fn(filename) -> recency|None``.
+    When supplied, divergent same-lang AUDIO forms resolve last-wins
+    by recency (this function stays pure — the caller supplies the
+    recency policy). The daemon's resolver returns a commit time for
+    committed files, ``float('inf')`` (NOW) for a working-tree file
+    not yet committed, and ``None`` for a filename that resolves
+    nowhere. ``inf`` beats any commit time, so a just-recorded take
+    wins without a spurious conflict annotation ("undefined is NOW").
+    The convergence merge (``_merge_diverged``) passes a commit-time-
+    only resolver (no NOW) so it stays deterministic across devices;
+    local pre-commit merges pass a NOW-aware one. When ``audio_recency``
+    is ``None`` entirely (tests, external callers), divergent audio is
+    ANNOTATED instead (keep both)."""
     base, base_err = _parse(base_bytes, 'base')
     ours, ours_err = _parse(ours_bytes, 'ours')
     theirs, theirs_err = _parse(theirs_bytes, 'theirs')
@@ -1536,7 +1704,8 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
         # (verification fields — content-level auto-resolution, so
         # no conflict survives to be scanned), or get annotated.
         for elem in merged:
-            repairs += _normalize_entry(elem, path=path)
+            repairs += _normalize_entry(elem, path=path,
+                                        audio_recency=audio_recency)
 
         # Did this merge produce a conflict? Look for the marker
         # annotation anywhere in the merged result. Skipped when
@@ -1592,7 +1761,13 @@ def three_way_merge(base_bytes, ours_bytes, theirs_bytes, path=''):
     # stale conflict annotations. Idempotent, so re-visiting the
     # entries normalized in the loop above is a silent no-op.
     for e in merged_root.findall('entry'):
-        repairs += _normalize_entry(e, path=path)
+        repairs += _normalize_entry(e, path=path,
+                                    audio_recency=audio_recency)
+        # After node-level stripping, drop entry-level conflict
+        # markers left orphaned (e.g. gloss-only conflicts whose
+        # node annotations the carve-out just removed). See
+        # _reconcile_entry_marker.
+        repairs += _reconcile_entry_marker(e)
     if repairs:
         trace(f'[merge-repair] path={path!r} total repairs={repairs}')
 

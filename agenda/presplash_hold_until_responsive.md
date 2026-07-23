@@ -27,9 +27,20 @@ Shipped 0.54.17:
   completes.
 - Peer seam documented in CLIENT_INTEGRATION.md § 18.
 
+Fixed 0.54.28 (drawer-launch regression): the on_start next-frame
+release raced the settings screen's blocking first `refresh()` (cred /
+online / project_status RPCs on the main thread) and dropped the splash
+onto a frozen UI on a cold-spawning daemon. Now the settings screen
+releases at the end of its `_ready` (after refresh), and on_start only
+blind-releases on the external/picker-initial path. Watchdog unchanged.
+
 Follow-ups:
-- Recorder wiring (2 lines) in azt_recorder — peer-side change,
-  rides the recorder's own release cadence.
+- ~~Recorder wiring (2 lines) in azt_recorder~~ **DONE 2026-07-21
+  (recorder 1.61.0, pending build):** `hold()` in the
+  `__main__` block before `App().run()`; `release()` scheduled
+  next-frame in `on_start`, deliberately BEFORE the bootstrap
+  schedule so the FIFO queue clears the splash before any
+  bootstrap popup.
 - The measured boot costs stay as-is by Kent's scope decision; if
   "longer" keeps growing, the next lever is moving the boot-time
   GitHub update probe off the pre-interactive path (~2.3 s online,

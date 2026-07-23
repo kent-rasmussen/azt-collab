@@ -9,6 +9,423 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.35 — pairing QR advertises ALL addresses (cable-pairing plug-and-go)
+
+FIX (Kent 2026-07-23): the pairing QR encoded a single `endpoint` from
+`_outward_ip_guess()` — the default-route interface, which on a
+USB-tethering setup is the wifi/mobile IP, not the `usb0` cable address
+the scanning phone can actually reach. (Verified still true in code
+today; the Phase-1 "advertise all addresses" gap had never landed.)
+
+- **QR now carries every address.** `_h_lan_pair_qr` adds an
+  `endpoints` list = every non-loopback local IPv4
+  (`lan_listener.bound_endpoints_all()`, private-first) paired with the
+  bound port. `endpoint` (first candidate) stays in the payload for
+  pre-0.54.35 scanners → fully backward-compatible, no floor bump.
+- **Receiver tries each.** `_h_lan_pair_accept` reads the `endpoints`
+  list (falls back to `[endpoint]` for old QRs), records them all via
+  `peers.record_pair(endpoints=…)` (peers.json + the dialer already
+  handle an endpoint list), and the reverse-hello tries each candidate
+  until one connects (`hello_to_peer` returns False on unreachable).
+- Symmetric by construction — both devices run this daemon code, so
+  each advertises all its addresses and tries all of the other's.
+- Client is unchanged: `lan_pair_qr` / `lan_pair_accept` ferry the
+  payload verbatim, so the richer list flows through untouched.
+
+With 0.54.34's link-up nudge, cable pairing is now plug-and-go: plug in,
+enable USB tethering, show/scan the QR — the `usb0` address is in it and
+the peer reaches it. Remaining Phase-1 nicety: regenerate a
+*already-displayed* QR when interfaces change (a QR shown BEFORE
+plugging in is still stale until reopened).
+
+## 0.54.34 — LAN nudge on link-up: "plug in and go" for USB tethering
+
+FEATURE (Kent 2026-07-23): make cable connection zero-gesture — plug
+the phone in, enable USB tethering, and sync starts on its own.
+
+The gap: the zeroconf browser is started at daemon boot, before the
+USB-tether interface (usb0/enx…) exists, so it never browses the new
+link and a paired peer there isn't discovered until a manual re-arm
+(LAN toggle off/on, or a restart). Now the watcher loop fingerprints
+the machine's interfaces each tick (`_net_signature`: `/sys/class/net`
+names + best-effort default-route IP) and, on a change while LAN sync
+is on, calls `lan_discovery.restart_browse()` + `lan_burst.start_burst()`
+— re-arming discovery on the new interface and firing a burst so the
+peer is found and synced with no user action. mDNS crossing the tether
+link + arrival-fires-sweep were already proven (usb_cable_transport.md
+Phase 0); this closes the "who re-scans when the cable appears" gap.
+
+Also: while LAN sync is on, the adaptive connectivity poll is capped at
+15 s (was growing toward a 5-min idle cap), so a link-up is caught
+within ~15 s. LAN-on already keeps the listener/mDNS (and Android
+FGS/WifiLock) up, so the tighter poll is negligible incremental radio;
+the pocket-battery backoff is unchanged when LAN sync is off.
+
+## 0.54.33 — Paired-devices page: actually scrolls; endpoints capped at 2 lines
+
+FIX (Kent 2026-07-23): the "Nearby & paired devices" page didn't scroll
+— a long list ran off the bottom of the popup — and a peer with many
+observed/static endpoints blew its row up tall.
+
+- **Scroll.** `paired_phones_popup._resize_to_content` set
+  `scroll.height = max(list_box.height, dp(80))` — the viewport equal to
+  the full content height, so the ScrollView had nothing to scroll and
+  the overflow was pushed off the (90%-capped) popup. Now the viewport
+  is capped at the space actually available inside the popup
+  (`min(list_box.height, avail)`), so once content exceeds that it
+  scrolls.
+- **Endpoint overflow.** `_build_full_row`'s `_add` gained a
+  `max_lines` option; the endpoint label (which shows the full
+  comma-joined endpoint list from `_peer_endpoint_str`) is now capped at
+  **2 lines** with `shorten`/ellipsis + a hard height ceiling, so a peer
+  with a long list of addresses no longer shoves the rest of the row and
+  list off the page. Applies everywhere `_build_full_row` is used
+  (paired list, share popup, offers).
+
+## 0.54.32 — cheap-no-op merge: skip the LIFT parse when only one side changed
+
+FIX (Kent 2026-07-23): `_merge_diverged` ran the full
+`three_way_merge` (parse 3× LIFT + `_normalize_entry` on all ~1700
+entries, ~20–40 s) on **every** merge where the two `.lift` blobs
+differed — even when only ONE side had changed the lexicon vs the merge
+base. The cheap "take the changed side's blob" fast paths (`o == t`,
+`o == b`, `t == b`) existed but sat AFTER the `.lift` / slots / kv
+special-case branches, so they were unreachable for those paths.
+
+Hoisted the three fast paths above the special-case branches. Now a
+path that's identical on both sides, or changed on only one side, is
+resolved by reusing the existing blob — no bytes load, no parse, no
+merge, no normalize. The heavy `.lift` merge (and the slots/kv conflict
+logic) only runs for the genuine both-sides-changed-differently case
+(`o != t and o != b and t != b`), which is the only time it's needed.
+Behaviorally identical to before (it's the same resolution the non-LIFT
+paths already used — just reached in the right order); purely a cost
+cut, and the highest-frequency one since merges run constantly during
+an active session. First of the "cheap merge" wins from
+`daemon_lock_across_network_io.md`; per-entry incremental (for the
+both-sides-changed case) remains the larger follow-on.
+
+## 0.54.31 — audio-recency resolver: one walk, not one-per-file; forget shows why
+
+FIX 1 — merge speed (Kent 2026-07-22, nml recovery). A convergence
+merge with many divergent audio takes crawled: 234 takes → ~55 minutes.
+`_audio_recency_resolver.resolve()` ran a path-filtered history walk
+(`get_walker(paths=[path])`) **per filename per tip** — O(files ×
+history), i.e. ~468 deep walks. Rewritten to date every file in **one
+walk per tip** (newest-first, recording basename → most-recent commit
+time), with early-exit once every file in the tip tree is dated;
+`resolve()` is now a dict lookup. Same last-wins result, orders of
+magnitude faster. NOW-on-disk semantics unchanged.
+
+FIX 2 — forget shows the reason. The picker's forget dialog reported a
+bare "Could not forget …" with no detail; a failure with no explanation
+led a user to wipe project data manually (field 2026-07-22). It now
+appends the Result's translated status(es) (e.g. `NOT_A_PROJECT`, a
+busy/timeout, or a server error), or "the service did not respond" when
+the daemon is unreachable.
+
+Known follow-up (not in this release): a merge that pulls a large
+audio history into a project makes the drain try to push all of it
+(nml: ~1.25 GB / 522 commits) — slow/timeout-prone on a poor link.
+That's the resumable topic-branch/pre-seed path working as designed,
+but the UX of "is it making progress / is it done" needs work.
+
+## 0.54.30 — `sha_to_merge`: fold a stray ref in via projects.json
+
+FEATURE (Kent 2026-07-22): a behind-the-scenes recovery gesture for
+merging a commit/branch that lives in a project's repo (a fork, a
+fetched peer/phone lineage as `refs/remotes/<x>/…`) into the project
+using collabd's own convergence engine — no RPC, no UI, "read the log".
+
+- Add `"sha_to_merge": "<full-sha-or-ref-name>"` to a project's entry
+  in `projects.json`. On the **next daemon launch**,
+  `repo.consume_pending_merges()` runs `_merge_diverged(HEAD, that ref)`
+  — LIFT-aware union by guid + audio last-wins, same as a normal sync —
+  **commit-only**, marks the project `pending_push`, and **clears the
+  key** (one-shot, on any outcome, so a success can't pile up empty
+  merge commits and a failure can't retry every launch). Outcome logged
+  under `[merge-ref]`.
+- Commit-only by design: the drain pushes when the daemon is online, so
+  an operator can stay disconnected, watch the merge, `git reset --hard`
+  if wrong, then reconnect to let it push. Isolation = controlling the
+  wire, no forced pre-push check.
+- Wired into **both** startup paths (`server.serve` desktop +
+  `server_apk/service.py:main` Android) per the "startup hooks live in
+  both" rule.
+- Refuses unrelated histories (`MERGE_UNRELATED_HISTORIES`) — the
+  0.54.19 guard stands; "related" includes a fork of the same repo.
+- New engine: `repo.merge_ref_into_project` / `consume_pending_merges`,
+  `_resolve_ref_or_sha`; registry helpers `projects.pending_merges` /
+  `clear_sha_to_merge`. Status code `MERGED_REF` (both status mirrors +
+  translation). Documented in `docs/merge_ref_recovery.md`.
+
+No client wrapper / RPC — declarative-only by request (collabd works
+behind the scenes; the operator reads the daemon log).
+
+## 0.54.29 — presplash releases on daemon-answered, not on fallback
+
+FIX (Kent 2026-07-22): 0.54.28 held the splash through the settings
+screen's blocking `refresh()`, but a residual settings load still
+flashed after the splash. Cause: on a cold launch the first
+`get_credentials_status` returns the daemon-unreachable fallback dict
+(no `confirmed` field) fast — the daemon `:provider` process is still
+spawning — so `refresh()` returned quickly, the splash dropped, and the
+1.5 s credentials-retry then repainted the real button states.
+
+Fix (Kent's suggestion — "do it on success"): the presplash release is
+now gated on the daemon actually answering (`'confirmed' in gh`), not on
+`refresh()` merely returning. The single 1.5 s retry became a bounded
+re-poll (`_CRED_RETRY_MAX=6` × `_CRED_RETRY_INTERVAL_S=0.8 s` ≈ 4.8 s);
+the splash holds until the daemon answers and then releases with the
+real button states already painted. If the daemon never answers within
+the budget, release anyway (best-effort UI beats a stuck splash; the
+45 s watchdog remains the last resort). The budget resets per settings
+entry so a later visit while the daemon is down re-polls fresh.
+
+`refresh()` runs on every settings entry and after connect/publish
+actions too, but `presplash_hold.release()` is idempotent (first call
+wins, no-op off Android), so gating the release inside `refresh()` is
+safe from all those call sites.
+
+## 0.54.28 — fix: presplash dropped before the settings UI responds
+
+FIX (Kent 2026-07-22): launching the server APK from the app drawer
+showed the settings UI a second or two before it would respond — the
+0.54.17 "hold splash until responsive" wasn't covering this path.
+
+Cause: the splash was released from `PickerApp.on_start` one frame after
+on_start, a fixed point unsynchronized with the actual load. On an
+internal launch (drawer tap) the SETTINGS screen is initial and its
+first `refresh()` — `get_credentials_status` / `is_online` /
+`project_status` RPCs — runs synchronously on the main thread from the
+screen's `on_enter`→`_ready`. On a cold drawer launch the `:provider`
+daemon process is still spawning, so that first RPC blocks ~1-2 s. The
+on_start release won the race and dropped the splash onto the frozen UI.
+
+Fix: the settings screen now releases the splash at the end of its
+blocking `_ready` (after `refresh()` returns), so the splash stays up
+exactly until the screen is interactive. `on_start` no longer
+blind-releases on the internal path; it still does a next-frame release
+on the external (peer PICK_PROJECT) path, where the picker is initial,
+its load is light, and the calling peer already warmed the daemon. The
+45 s watchdog still backstops any load-path failure.
+
+## 0.54.27 — fix: forget long-press never fired in the picker
+
+FIX (Kent 2026-07-22): the 0.54.25 forget long-press "just went back"
+(loaded the project) instead of opening the forget dialog. The row
+lives inside the scrolling project list, and the original
+implementation armed its timer from a raw `on_touch_down` bound handler
+gated on `collide_point(*touch.pos)` — but the touch coords there aren't
+in the button's coordinate space once a ScrollView is in the chain, so
+the collide test failed, the timer never armed, and every hold fell
+through to a normal tap.
+
+Rewritten to use the button's own `on_press` / `on_release`
+(ButtonBehavior has already done the collide + touch-grab), so there's
+no coordinate math to get wrong: `on_press` arms the timer,
+`_on_release` cancels it on a quick tap or swallows the release if the
+long-press already fired, and the timer callback re-checks
+`btn.state == 'down'` so a scroll-drag that steals the touch cancels the
+long-press on its own (no move handler needed).
+
+## 0.54.26 — audio merge: "undefined is NOW" (1A uncommitted-side)
+
+FEATURE (Kent 2026-07-22): the local pre-commit merges no longer
+annotate-and-defer divergent audio — if a working-tree take is
+plausibly NOW, it wins.
+
+- `_audio_recency_resolver` gains a `work_dir` parameter. A referenced
+  audio file that is **not** in committed history but **is** present on
+  disk resolves to `float('inf')` = NOW (it was just recorded on this
+  device, so it's the newest take and beats any committed one). Files
+  in history keep their commit time; files that resolve nowhere stay
+  `None` (ambiguous → keep document-first).
+- Three local merge sites now build and pass a NOW-aware resolver:
+  `_submit_file_locked`, `integrate_head_into_working_tree`
+  (post-receive), and `reapply_snapshot_after_merge` (LAN merge
+  reapply). Previously these passed no resolver and annotated the
+  divergence as a conflict pair.
+- The convergence merge (`_merge_diverged`) is unchanged: it passes
+  `work_dir=None`, so it stays pure most-recent-**commit**-time and
+  therefore deterministic across devices. NOW is inherently local (only
+  the device holding the uncommitted file sees it); once committed and
+  converged, `_merge_diverged` re-derives the winner deterministically —
+  so resolving NOW locally is safe and just spares the user a spurious
+  annotation that would resolve away on the next computer.
+- Resolver work stays lazy + cached (the on-disk basename scan runs
+  only on a real audio conflict), honoring the cheap-no-op rule.
+
+## 0.54.25 — forget-project UI (long-press on a picker row)
+
+FEATURE (Kent 2026-07-22): the forget-a-project engine
+(`repo.forget_project`, shipped as engine-only earlier) is now wired
+end to end and reachable from the picker.
+
+- **Status codes** `NOT_A_PROJECT` / `PROJECT_FORGOTTEN` added to both
+  `azt_collabd/status.py` and the client mirror, with translations
+  (en + fr). `PROJECT_FORGOTTEN` carries `langcode` + `deleted`.
+- **Server endpoint** `POST /v1/projects/<lang>/forget`
+  (`_h_forget_project`, modeled on `_h_set_repo_slug`) → returns the
+  engine `Result`. Body `{delete_files: false}` default.
+- **Client wrapper** `forget_project(langcode, delete_files=False)` →
+  `Result`; typed transport-failure return, never raises. Re-exported
+  in `__all__`.
+- **UI**: long-press a project row in the shared picker to open a
+  risk-gated confirm — "Remove from device" (unregister + tombstone +
+  peer-unshare, files kept) vs "Delete data too" (also rmtree, red
+  button). The destructive option shows an extra warning when
+  `project_status(langcode).at_risk` (no confirmed off-device copy).
+  Long-press is a Clock timer armed on touch-down / cancelled on
+  up+move, so the row stays a single tap target and normal taps still
+  open the project.
+
+No `MIN_SERVER_VERSION` bump: the endpoint is additive and a peer
+calling it against a pre-0.54.25 daemon degrades to a typed
+`SERVER_ERROR` (404), not a crash.
+
+## 0.54.24 — audio last-wins in the merge (1A)
+
+FEATURE (Kent 2026-07-22): divergent single-value audio takes now
+resolve **last-wins by most-recent commit** in the convergence merge,
+instead of accumulating annotated pairs. `_merge_diverged` builds a
+deterministic recency resolver (`_audio_recency_resolver`: most-recent
+commit touching each audio file's path, across both lineage tips, via
+dulwich — no git CLI, so it works on Android) and hands it to
+`lift_merge.three_way_merge(audio_recency=…)`. `_normalize_entry`'s new
+audio branch keeps the newest take, drops the older, strips the marker.
+
+Design decisions (all in agenda/lift_merge_robustness.md):
+- **Per-file commit, not branch-tip** — branch-tip is wrong for the
+  normal field pattern (a month-dark phone's tip is "today", so its
+  month-old files would beat another phone's yesterday work).
+- **Resolve on ALL platforms, no split** — resolving on desktop but
+  annotating on Android would make the same merge produce different
+  trees on different devices → divergence. Per-file-commit is
+  deterministic across devices (identical history), so resolving
+  everywhere is both correct and convergence-safe.
+- **Cheap-no-op** — the resolver is lazy; the tree scan + per-file
+  walks run only when a merge actually hits an audio conflict. A
+  conflict-free merge does zero git work.
+- **Only `_merge_diverged` passes a resolver.** Other three_way_merge
+  sites (submit_file, post-receive-merge, recovery) merge against an
+  UNCOMMITTED side where "most recent commit" is undefined; they pass
+  None → annotate → defer to the next `_merge_diverged`, which resolves
+  deterministically. FOLLOW-UP: audit `post-receive-merge` (a
+  receive-side sync point) for whether deferring is convergence-safe
+  there, or whether it needs the resolver too.
+
+Clock-skew caveat (inherent to any time-based last-wins) accepted.
+Tests in `tests/test_multisense_gloss.py` (last-wins keeps newest,
+no-resolver annotates, idempotent + deterministic incl. older-wins).
+
+## 0.54.23 — merge-sweep cheap no-op (don't walk clean entries)
+
+PERF: `_reconcile_entry_marker` (added 0.54.21/22, runs on every entry
+of every merge) was calling the full-subtree `_collect_conflict_paths`
+walk unconditionally — including on the ~99% of entries with no
+conflict marker. Now it first checks direct annotation children for an
+entry-level `value="conflict"` marker and returns immediately if
+there's none; only genuinely-marked entries pay the walk. Matters
+because merges run many times a day (Kent 2026-07-22) and the sweep
+touches all ~1700 entries each time — the clean path must be O(few),
+not O(subtree). `_normalize_entry` already short-circuits its clean
+path (groups with <2 members skip). Design note for the pending audio
+last-wins (1A): resolve — and do the git commit-date lookups — ONLY
+for entries that actually hold an audio conflict, so a merge with no
+audio conflicts does zero git calls.
+
+## 0.54.22 — reconcile entry-level marker's field list, not just all-or-nothing
+
+FIX (completes 0.54.21): `_reconcile_entry_marker` was all-or-nothing
+— it dropped the entry-level `azt-lift-conflict` marker only when NO
+per-node conflict survived, and otherwise left the marker (and its
+`azt-lift-conflict-fields` trait) untouched. So a MIXED entry — a real
+audio conflict plus a false gloss marker in the same entry — kept the
+marker with a trait still naming the now-clean `gloss[…]` field: a
+dangling link. (Not hit by the 2026-07-22 CABTAL data, which had no
+mixed entries — 117 pure-audio, 25 pure-gloss — but a real hole for
+"self-heal moving forward.") Now it re-derives the surviving conflict
+fields from the node `ours`/`theirs` markers (`_collect_conflict_paths`,
+which now counts only those, not the entry-level summary) and either
+drops the marker (no survivors) or trims its trait to exactly the
+surviving fields (some survivors). Test:
+`test_mixed_entry_marker_trimmed_not_removed`.
+
+## 0.54.21 — drop orphaned entry-level conflict markers (gloss carve-out, part 2)
+
+FIX (completes 0.54.20; field 2026-07-22 CABTAL): the merge adds an
+entry-level `azt-lift-conflict` marker (+ `azt-lift-conflict-fields`
+trait naming the field) in `_merge_pair`, derived from the per-node
+conflict annotations — BEFORE `_normalize_entry` runs. So when the
+0.54.20 gloss carve-out strips a gloss node's false conflict marker,
+the entry-level summary was left orphaned, still naming
+`gloss[lang=…]` over now-clean gloss nodes. Result: gloss-only
+entries still looked conflicted (and my "all remaining conflicts are
+audio" read was wrong — they were a mix). New
+`_reconcile_entry_marker`, run per entry right after
+`_normalize_entry` in the final sweep, removes the entry-level
+`conflict` marker when no per-node `ours`/`theirs` conflict survives;
+entries with a real surviving conflict (e.g. audio) keep it. So
+gloss-only conflicts now vanish completely (node + entry-level), and
+existing pollution self-heals as merges touch entries. Tests added
+to `tests/test_multisense_gloss.py`.
+
+## 0.54.20 — glosses are legitimately multi-per-lang (stop false conflicts)
+
+FIX (LIFT merge — the big one; field 2026-07-22 CABTAL): the merge's
+"no duplicate same-lang forms" invariant was mis-applied to
+`<gloss>`. A sense legitimately carries multiple same-`@lang` glosses
+(distinct senses/synonyms — the bare CAWL template ships e.g. two
+`<gloss lang="es">`: `abdomen`, `barriga`), but `_normalize_entry`
+grouped glosses by lang like a single-form field and stamped
+`azt-lift-conflict` on every multi-sense entry. Result: 1284 false
+conflict markers in the workshop nml — over fully-intact data (the
+bug ANNOTATES, never deletes: identical-dup collapse can't drop
+distinct text, and the union path is verification-only). Now
+`_normalize_entry` exempts `<gloss>`: byte-identical duplicates still
+collapse, but distinct same-lang glosses are kept unannotated as the
+valid multi-sense data they are, AND any false `azt-lift-conflict`
+annotation a prior merge left on a gloss is stripped — so existing
+pollution self-heals over successive merges. Tests:
+`tests/test_multisense_gloss.py`.
+
+Scope note (CLAUDE.md invariant #13, updated): this "same-lang
+glosses never conflict" rule is WORKFLOW-GATED — it holds only while
+glosses are read-only (no edit UI). When gloss editing ships it must
+be revisited: two divergent same-lang glosses then become ambiguous
+(new synonym vs. edited-to-conflict) and the merge will need
+per-gloss identity to tell them apart. Tracked in
+agenda/lift_merge_robustness.md.
+
+Not shipped in the package (recovery tools, in scratchpad): a
+one-shot `strip_false_gloss_conflicts.py` (minimal-diff, gloss-scoped
+removal of the accumulated false annotations for immediate relief
+without waiting for merges to launder them) and the
+`merge_itservices_into_nml.py` rescue driver.
+
+## 0.54.19 — refuse to merge histories with no common ancestor
+
+SAFETY (merge guard — audit F16a): `_merge_diverged` computed the
+merge base and, when there was NONE, silently proceeded with an
+EMPTY base — treating two unrelated projects that share a langcode
+label as one project where everything was "added on both sides,"
+then committing and pushing the union in both directions. Now:
+no common ancestor → `UnrelatedHistoriesError`, surfaced as new
+typed `MERGE_UNRELATED_HISTORIES` (both status mirrors + FR
+translation) at the sync/phase-B call sites, and a loud refusal
+log on the LAN merge path. Nothing is modified on either side.
+Test: `tests/test_merge_unrelated.py`.
+
+DOCUMENTED LIMIT (the 2026-07-22 nml incident is NOT covered by
+this guard): projects forked from one another share an ancestor,
+so keeping intentional forks apart requires project identity
+beyond the langcode — design tracked in
+agenda/project_identity_beyond_langcode.md; the incident's
+recovery in agenda/disentangle_nml_repositories.md. The share
+mis-bind that started it (a bare `nml` label silently pointing at
+a test directory) is the provenance-display work in the same item.
+
 ## 0.54.18 — picker fits landscape/desktop windows
 
 UX (project picker on a computer; field 2026-07-21): the header

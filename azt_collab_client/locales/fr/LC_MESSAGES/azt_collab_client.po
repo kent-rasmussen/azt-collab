@@ -1665,6 +1665,39 @@ msgstr "Le projet {langcode} est aussi envoyé vers {url}."
 msgid "A different project named {langcode} already exists. Rename or remove it first."
 msgstr "Un projet différent nommé {langcode} existe déjà. Renommez ou supprimez-le d'abord."
 
+msgid "Sync refused: the two copies have no shared history — they are different projects using the same language code. Nothing was changed."
+msgstr "Synchronisation refusée : les deux copies n'ont aucun historique commun — ce sont des projets différents qui utilisent le même code de langue. Rien n'a été modifié."
+
+msgid "Merged {sha} into {langcode} ({n_conflicts} conflicts). Will push when online."
+msgstr "{sha} fusionné dans {langcode} ({n_conflicts} conflits). Sera envoyé une fois en ligne."
+
+msgid "No project named {langcode} to forget."
+msgstr "Aucun projet nommé {langcode} à oublier."
+
+msgid "Forgot project {langcode} and deleted its files."
+msgstr "Projet {langcode} oublié et ses fichiers supprimés."
+
+msgid "Forgot project {langcode} (files kept on disk)."
+msgstr "Projet {langcode} oublié (fichiers conservés sur le disque)."
+
+msgid "Forget project"
+msgstr "Oublier le projet"
+
+msgid "Forget \"{name}\"?\n\nThis removes the project from this device and stops sharing it with paired phones."
+msgstr "Oublier « {name} » ?\n\nCela retire le projet de cet appareil et cesse de le partager avec les téléphones appairés."
+
+msgid "Warning: this project has no confirmed copy on GitHub or another device. Deleting its data cannot be undone."
+msgstr "Attention : ce projet n'a aucune copie confirmée sur GitHub ou un autre appareil. La suppression de ses données est irréversible."
+
+msgid "Remove from device"
+msgstr "Retirer de l'appareil"
+
+msgid "Delete data too"
+msgstr "Supprimer aussi les données"
+
+msgid "Could not forget \"{name}\"."
+msgstr "Impossible d'oublier « {name} »."
+
 msgid "Confirm: push project {langcode} to {url} also?"
 msgstr "Confirmer : envoyer aussi le projet {langcode} vers {url} ?"
 

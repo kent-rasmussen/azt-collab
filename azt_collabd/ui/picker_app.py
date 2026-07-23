@@ -639,13 +639,28 @@ class PickerApp(App):
         from kivy.core.window import Window
         Window.bind(on_keyboard=self._on_back_button)
         # Presplash hold: main() intercepted Kivy's first-frame
-        # removal; release one frame AFTER on_start's work so the
-        # splash stays up exactly until the screen can respond —
-        # the user never sees a dead-looking half-built UI
-        # (field 2026-07-21). Watchdog in presplash_hold covers a
-        # load-path failure before this line.
+        # removal; release once the FIRST screen can respond.
+        #
+        # Which screen that is depends on launch_mode:
+        #   - 'internal' (launcher tap / open_server_ui / Switch-
+        #     project): the SETTINGS screen is initial, and its
+        #     blocking first refresh() (credentials / online /
+        #     project_status RPCs) runs on the main thread from the
+        #     screen's own on_enter→_ready. That callback releases
+        #     the splash when the work is done. Releasing HERE — one
+        #     frame after on_start — raced that callback and dropped
+        #     the splash onto a still-frozen UI while refresh() blocked
+        #     the main thread on a cold-spawning daemon (field
+        #     2026-07-22, drawer launch). So we do NOT release here in
+        #     internal mode.
+        #   - 'external' (peer PICK_PROJECT intent): the PICKER is
+        #     initial; its load is light and the calling peer already
+        #     warmed the daemon, so a next-frame release is fine.
+        # Watchdog in presplash_hold covers a load-path failure either
+        # way (e.g. settings screen never reaches _ready).
         from azt_collab_client.ui import presplash_hold
-        Clock.schedule_once(lambda dt: presplash_hold.release(), 0)
+        if getattr(self, '_launch_mode', 'external') != 'internal':
+            Clock.schedule_once(lambda dt: presplash_hold.release(), 0)
         # Probe the server version once at startup so the bottom strip
         # shows both halves. Done off the UI thread so a slow daemon
         # doesn't block first paint.

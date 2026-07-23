@@ -148,6 +148,27 @@ def bound_endpoint():
         return _STATE['bound']
 
 
+def bound_endpoints_all():
+    """Every plausible ``ip:port`` for THIS listener: each non-loopback
+    local IPv4 (``_interface_ipv4s``, private-first) paired with the
+    bound port. Advertised in the pairing QR so a peer reaching us over
+    ANY link — wifi, a USB-tether ``usb0``, a hotspot subnet — finds a
+    reachable address (the receiver tries each). This is the fix for
+    the single-address gap: ``_outward_ip_guess`` picks only the
+    default-route IP, which on a tethering setup is the wrong one for
+    the cable. Empty list when the listener isn't bound."""
+    with _LOCK:
+        bound = _STATE['bound']
+    if not bound:
+        return []
+    port = bound[1]
+    ips = _interface_ipv4s()
+    if not ips:
+        host = bound[0]
+        return [f'{host}:{port}'] if host and host != '0.0.0.0' else []
+    return [f'{ip}:{port}' for ip in ips]
+
+
 class _DynamicBackend:
     """dulwich Backend that resolves ``open_repository`` against
     the *current* state of ``projects.json`` and ``peers.json`` —

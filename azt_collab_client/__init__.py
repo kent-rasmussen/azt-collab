@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.18"
+__version__ = "0.54.35"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -2535,6 +2535,38 @@ def set_repo_slug(langcode, slug):
     return Project.from_dict(resp.get('project', {}))
 
 
+def forget_project(langcode, delete_files=False):
+    """Forget project *langcode* on this device.
+
+    Two gestures the UI exposes (with a risk-gated confirm — see
+    ``project_status(langcode).at_risk`` for whether the data has
+    an off-device copy):
+
+    - ``delete_files=False`` — "Remove from device": drop the
+      registry entry and tombstone the working_dir so the
+      auto-repair rescan won't resurrect it, and unshare from
+      every paired peer. The folder stays on disk; a deliberate
+      re-add (open-file / re-clone) lifts the tombstone.
+    - ``delete_files=True`` — "Delete data too": also remove the
+      working tree from disk. Irreversible; only offer it once the
+      user has confirmed against ``at_risk``.
+
+    Returns a ``Result``: ``S.PROJECT_FORGOTTEN`` (params:
+    ``langcode``, ``deleted``) on success, ``S.NOT_A_PROJECT`` if
+    the langcode isn't registered, or a typed transport failure.
+    Never raises."""
+    try:
+        resp = call('POST', f'/v1/projects/{langcode}/forget',
+                    {'delete_files': bool(delete_files)})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if resp.get('ok'):
+        return Result.from_dict(resp.get('result') or {})
+    return Result(statuses=[Status(
+        'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+
+
 def atomic_commit_bytes(langcode, rel_path, data, commit_after=True):
     """Atomically write *data* to ``<working_dir>/<rel_path>`` for
     project *langcode*. Goes through the daemon's
@@ -3076,7 +3108,7 @@ __all__ = [
     'get_diagnostic_snapshot',
     'restart_server',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
-    'set_cawl_image_repo', 'set_repo_slug',
+    'set_cawl_image_repo', 'set_repo_slug', 'forget_project',
     'record_project_sync_time', 'grant_collaborator',
     'LiftHandle', 'MediaHandle', 'CAWLHandle',
     'audio_uri_for', 'image_uri_for', 'is_content_uri',

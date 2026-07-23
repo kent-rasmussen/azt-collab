@@ -685,8 +685,41 @@ def drain_pushes_now(langcode=''):
               file=sys.stderr, flush=True)
 
 
+_last_net_sig = None
+
+
+def _net_signature():
+    """Cheap fingerprint of the machine's network interfaces, to detect
+    a link coming up/down — notably a phone plugged in with USB
+    tethering enabled, which brings up a new interface (usb0 / enx… /
+    an RNDIS/NCM ethernet adapter). The zeroconf browser was started
+    before that interface existed and won't see peers on it, so a
+    change here triggers a discovery re-arm + burst.
+
+    Linux: the set of names under ``/sys/class/net`` (catches the new
+    interface appearing). Plus a best-effort default-route IP so
+    platforms without ``/sys`` still notice an address change. Empty /
+    stable elsewhere ⇒ no false triggers; any failure is swallowed."""
+    import socket
+    sig = set()
+    try:
+        sig.update(os.listdir('/sys/class/net'))
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('192.0.2.1', 9))   # TEST-NET-1; sends nothing
+            sig.add('ip:' + s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    return frozenset(sig)
+
+
 def _watcher_loop():
-    global _last_online_state, _online_since
+    global _last_online_state, _online_since, _last_net_sig
     while _watcher_stop is not None and not _watcher_stop.is_set():
         try:
             online = _has_internet()
@@ -790,6 +823,29 @@ def _watcher_loop():
         except Exception as ex:
             print(f'[scheduler] lan_listener.apply_toggle failed: '
                   f'{ex!r}', file=sys.stderr, flush=True)
+        # Link-up nudge (0.54.34) — "plug in and go" for USB tethering.
+        # If the interface set changed since last tick (a phone plugged
+        # in + USB tethering enabled brings up usb0/enx…), the zeroconf
+        # browser — started before that interface existed — won't be
+        # browsing it. Re-arm discovery and fire a burst so a paired
+        # peer on the new link is found + synced with no user gesture.
+        # Only while LAN sync is on, and only on an actual change.
+        if _settings.lan_allow_sync():
+            try:
+                sig = _net_signature()
+                if _last_net_sig is not None and sig != _last_net_sig:
+                    print('[watcher] network interfaces changed '
+                          '(link up/down) — re-arming LAN discovery '
+                          '+ burst', file=sys.stderr, flush=True)
+                    from . import lan_discovery as _lan_discovery
+                    _lan_discovery.restart_browse()
+                    from . import lan_burst as _lan_burst
+                    _lan_burst.start_burst()
+                    _reset_probe_backoff(reason='net-change')
+                _last_net_sig = sig
+            except Exception as ex:
+                print(f'[watcher] link-up nudge raised: {ex!r}',
+                      file=sys.stderr, flush=True)
         # Drain the deferred post-receive-reset queue. Entries land
         # here when ``_reset_working_tree_after_receive`` hit a
         # LockTimeout (typically because the local outgoing merge
@@ -856,6 +912,18 @@ def _watcher_loop():
         # entry points (``drain_pushes_now``) reset it too.
         base = max(5.0, float(_settings.connectivity_poll_s()))
         interval = _adaptive_probe_interval(base)
+        # While LAN sync is on, keep the poll brisk (≤15 s) so a
+        # link-up (USB tether plug) is caught by the interface-change
+        # check above within ~15 s rather than after the idle backoff
+        # grows toward its 5-min cap. LAN-on already keeps the listener
+        # + mDNS (and, on Android, the FGS + WifiLock) up, so a 15 s
+        # probe is negligible incremental radio. (The pocket-battery
+        # backoff still applies fully when LAN sync is off.)
+        try:
+            if _settings.lan_allow_sync():
+                interval = min(interval, 15.0)
+        except Exception:
+            pass
         if _watcher_stop.wait(timeout=interval):
             break
 

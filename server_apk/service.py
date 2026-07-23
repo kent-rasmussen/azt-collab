@@ -636,6 +636,19 @@ def main():
     scheduler.reconcile_on_startup()
     _boot_trace('after_reconcile')
 
+    # One-shot hand-requested merges: any project carrying a
+    # ``sha_to_merge`` key in projects.json gets that ref merged in
+    # via the convergence engine (commit-only; drain pushes when
+    # online), then the key is cleared. Wired here in addition to the
+    # desktop ``serve()`` callsite per the "startup hooks live in both"
+    # rule. See docs/merge_ref_recovery.md.
+    try:
+        from azt_collabd import repo as _repo
+        _repo.consume_pending_merges()
+    except Exception as ex:
+        print(f'[merge-ref] consume_pending_merges failed: {ex!r}',
+              file=sys.stderr, flush=True)
+
     # One-shot retroactive auto-fire for the pre-0.50.52 Publish
     # bug. Walks projects.json, finds the (.git/config has URL +
     # registry remote_url empty) mismatch, and re-fires the

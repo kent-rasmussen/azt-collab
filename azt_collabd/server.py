@@ -465,11 +465,23 @@ def _h_lan_pair_qr(body):
                      "detail": str(ex)}
     body = body or {}
     endpoint = str(body.get('endpoint', '') or '')
-    if not endpoint:
-        # Auto-populate from the running listener when present.
-        bound = _lan_listener.bound_endpoint()
-        if bound:
-            endpoint = f'{bound[0]}:{bound[1]}'
+    # All candidate ip:port the peer can try (0.54.35). Caller-supplied
+    # endpoint (desktop smoke test) stays authoritative; otherwise
+    # advertise EVERY local interface address so a peer on any link
+    # (wifi / USB-tether usb0 / hotspot) has a reachable one. ``endpoint``
+    # stays populated (first candidate) for pre-0.54.35 scanners.
+    endpoints = []
+    if endpoint:
+        endpoints = [endpoint]
+    else:
+        endpoints = _lan_listener.bound_endpoints_all()
+        if endpoints:
+            endpoint = endpoints[0]
+        else:
+            bound = _lan_listener.bound_endpoint()
+            if bound:
+                endpoint = f'{bound[0]}:{bound[1]}'
+                endpoints = [endpoint]
     # Optional combined-pair-share-clone fields. When the user taps
     # "Share {langcode} project" → "Show QR code", the daemon UI
     # passes the active langcode here; we look up the registered
@@ -500,7 +512,8 @@ def _h_lan_pair_qr(body):
         'v': 1,
         'peer_id': info['peer_id'],
         'fp': info['fp'],
-        'endpoint': endpoint,
+        'endpoint': endpoint,        # primary (back-compat with < 0.54.35)
+        'endpoints': endpoints,      # all candidates; receiver tries each
         'device_name': store.get_device_name(),
         'langcode': langcode,
         'repo_url': repo_url,
@@ -579,6 +592,13 @@ def _h_lan_pair_accept(body):
     peer_id = str(payload.get('peer_id', '') or '')
     fp = str(payload.get('fp', '') or '')
     endpoint = str(payload.get('endpoint', '') or '')
+    # All candidate ip:port from the QR (0.54.35); fall back to the
+    # single ``endpoint`` for QRs built by pre-0.54.35 daemons.
+    raw_eps = payload.get('endpoints')
+    endpoints = ([str(e) for e in raw_eps if isinstance(e, str) and e]
+                 if isinstance(raw_eps, list) else [])
+    if not endpoints and endpoint:
+        endpoints = [endpoint]
     device_name = str(payload.get('device_name', '') or '')
     if v != 1:
         return 200, {"ok": False, "error": "bad_payload",
@@ -590,30 +610,40 @@ def _h_lan_pair_accept(body):
     if len(peer_id) != 64 or len(fp) != 64:
         return 200, {"ok": False, "error": "bad_payload",
                      "detail": "peer_id / fp wrong length"}
-    entry = _peers.record_pair(peer_id, fp, device_name, endpoint)
+    entry = _peers.record_pair(peer_id, fp, device_name,
+                               endpoints=endpoints)
     # Best-effort auto-reverse-record: introduce ourselves to the
     # remote listener so the user doesn't have to scan a QR in the
     # other direction. Network / TLS / unreachable failures are
     # non-fatal — the local record is the durable state, and the
     # next sync that lands on the remote will trip the listener's
     # paired-peer check (which fires LAN_FP_MISMATCH if needed).
-    if endpoint:
-        try:
-            host, port_str = endpoint.rsplit(':', 1)
-            from . import lan_push as _lan_push
-            # Pass the QR's ``langcode`` so the remote's hello
-            # handler can add it to their shared_projects allowlist
-            # for us in the same gesture — symmetric share without a
-            # second tap on the owner side. Empty payload langcode
-            # = pair-only QR (no auto-share).
-            qr_langcode = str(payload.get('langcode', '') or '')
-            _lan_push.hello_to_peer(
-                host, int(port_str), fp,
-                store.get_device_name(),
-                langcode=qr_langcode)
-        except Exception as ex:
-            print(f'[server] hello to {peer_id[:8]!r} raised: '
-                  f'{ex!r}', file=sys.stderr, flush=True)
+    # Try each advertised endpoint until one connects: the peer's
+    # reachable address (e.g. the USB-tether usb0) may not be its
+    # default-route one, and hello_to_peer returns False (never
+    # raises) on an unreachable candidate.
+    if endpoints:
+        from . import lan_push as _lan_push
+        # Pass the QR's ``langcode`` so the remote's hello handler can
+        # add it to their shared_projects allowlist for us in the same
+        # gesture — symmetric share without a second tap on the owner
+        # side. Empty payload langcode = pair-only QR (no auto-share).
+        qr_langcode = str(payload.get('langcode', '') or '')
+        for ep in endpoints:
+            try:
+                host, port_str = ep.rsplit(':', 1)
+            except ValueError:
+                continue
+            try:
+                if _lan_push.hello_to_peer(
+                        host, int(port_str), fp,
+                        store.get_device_name(),
+                        langcode=qr_langcode):
+                    break   # reached them on this address; done
+            except Exception as ex:
+                print(f'[server] hello to {peer_id[:8]!r} via '
+                      f'{ep!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
     result = Result()
     result.add(S.LAN_PAIRED, peer_id=peer_id, device_name=device_name)
     return 200, {"ok": True, "result": result.to_dict(),
@@ -1839,6 +1869,24 @@ def _h_set_repo_slug(langcode, body):
     projects.set_repo_slug(langcode, slug.strip())
     return 200, {"ok": True, "project": _project_for_api(
         projects.get(langcode))}
+
+
+def _h_forget_project(langcode, body):
+    """``POST /v1/projects/<lang>/forget`` — forget a project.
+
+    Body: ``{delete_files: false}`` (default). ``delete_files=true``
+    also removes the working tree from disk. Delegates to
+    ``repo.forget_project`` (which unshares from peers, unregisters,
+    tombstones the working_dir against the auto-repair rescan, and
+    optionally rmtrees, all under ``project_lock``). Returns the
+    engine ``Result`` (``PROJECT_FORGOTTEN`` / ``NOT_A_PROJECT``);
+    UI-visible friction (the risk-gated confirm) is the caller's job.
+    """
+    if not isinstance(body, dict):
+        body = {}
+    delete_files = bool(body.get('delete_files', False))
+    result = repo.forget_project(langcode, delete_files=delete_files)
+    return 200, {"ok": True, "result": result.to_dict()}
 
 
 def _h_github_install_url(_body):
@@ -4834,6 +4882,8 @@ def dispatch(method, path, body):
                 return _h_set_cawl_image_repo(parts[3], body)
             if len(parts) == 5 and parts[4] == 'repo_slug':
                 return _h_set_repo_slug(parts[3], body)
+            if len(parts) == 5 and parts[4] == 'forget':
+                return _h_forget_project(parts[3], body)
             if len(parts) == 6 and parts[4] == 'kv':
                 return _h_project_kv_set(parts[3], parts[5], body)
             if len(parts) == 6 and parts[4] == 'slots' \
@@ -5577,6 +5627,19 @@ def run(host='127.0.0.1', port=0):
     # Must run BEFORE start_watcher so the watcher sees a consistent
     # job table.
     scheduler.reconcile_on_startup()
+
+    # One-shot hand-requested merges: any project carrying a
+    # ``sha_to_merge`` key in projects.json gets that ref merged into
+    # it via the convergence engine (commit-only; drain pushes when
+    # online), then the key is cleared. Behind-the-scenes recovery
+    # gesture — see docs/merge_ref_recovery.md. Mirrored in the Android
+    # startup path (server_apk/service.py) per the "startup hooks live
+    # in both" rule.
+    try:
+        repo_mod.consume_pending_merges()
+    except Exception as ex:
+        print(f'[merge-ref] consume_pending_merges raised: {ex!r}',
+              file=sys.stderr, flush=True)
 
     # One-shot retroactive cleanup for the pre-0.50.52 Publish bug.
     # Strips ``.git/config`` origin when the registry has no URL — a

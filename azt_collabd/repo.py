@@ -572,14 +572,176 @@ def _all_commits_descend_from(repo, ancestor_sha, descendant_sha):
     return True
 
 
+class UnrelatedHistoriesError(Exception):
+    """``_merge_diverged`` refusal: ours and theirs share NO common
+    ancestor. A legitimately shared project always has one (clone /
+    LAN-clone / publish all propagate history), so no-merge-base
+    means two INDEPENDENT projects that happen to share a langcode
+    label. Pre-guard, the merge silently ran with an EMPTY base and
+    pushed the union to both sides. Auto-merging unrelated projects
+    is data pollution in both directions; a union should only ever
+    be an explicit user decision (not yet built — refusal is the
+    safe floor).
+
+    KNOWN LIMIT (field 2026-07-22, the incident that motivated
+    this): projects FORKED from one another (e.g. a `-x-test` fork
+    meant to stay separate) DO share an ancestor, so this guard
+    does not fire for them — keeping forks apart requires a project
+    identity distinct from the langcode (tracked in
+    agenda/project_identity_beyond_langcode.md); until that ships,
+    the only protection for forks is not sharing them to the same
+    peers."""
+
+
+def _audio_recency_resolver(repo, local_sha, remote_sha, work_dir=None):
+    """Return ``fn(filename) -> recency|None``: how recent that audio
+    file's content is, for last-wins resolution of divergent single-
+    value audio takes. Fed to
+    ``lift_merge.three_way_merge(audio_recency=...)``.
+
+    Recency values:
+      - a committed file → the most-recent commit time touching its
+        path across the supplied lineage tips (a float, comparable);
+      - a file NOT in committed history but present on disk under
+        *work_dir* → ``float('inf')`` = **NOW**. A file that exists
+        only in the working tree was just produced on this device, so
+        it is the newest thing there is and must beat any committed
+        take. This is the "undefined is NOW" rule: not every merge has
+        two committed lineages, and the uncommitted side is NOW
+        (Kent 2026-07-22). Only enabled when *work_dir* is passed;
+        the convergence merge (``_merge_diverged``) passes ``None`` so
+        it stays pure commit-time and deterministic across devices
+        (its inputs are committed trees, so NOW never legitimately
+        applies there anyway).
+      - a filename that resolves nowhere (not committed, not on disk)
+        → ``None``: ambiguous, so ``_normalize_entry`` keeps the
+        document-first survivor rather than dropping blindly.
+
+    NOW is only ever true on the one device holding the uncommitted
+    file; once committed and converged, ``_merge_diverged`` re-derives
+    the winner deterministically by commit time — so resolving NOW
+    locally is safe and just spares the user a spurious conflict
+    annotation that would resolve away on the next computer anyway.
+
+    Lazy + cached, and — critically — **one history walk per tip**,
+    not one per file. The first ``resolve`` call walks each tip's
+    history newest-first ONCE, recording basename → most-recent commit
+    time for every path as it goes, and stops early once every file in
+    the tip tree has been dated (files are usually touched recently, so
+    this exits well before the root commit). Subsequent calls are dict
+    lookups. The pre-0.54.31 version ran a ``get_walker(paths=[path])``
+    per filename per tip — O(files × history) — which turned a merge
+    with a few hundred divergent audio takes into a ~1-hour crawl
+    (field 2026-07-22, nml recovery: 234 takes → 55 min). A
+    conflict-free merge still pays nothing (the resolver isn't called
+    unless the LIFT merge hits an audio conflict — the cheap-no-op
+    rule; merges run many times a day)."""
+    tips = [s for s in (local_sha, remote_sha) if s]
+    state = {'times': None, 'ondisk': None}
+
+    def _times():
+        # basename -> most-recent commit_time across both tips.
+        if state['times'] is not None:
+            return state['times']
+        m = {}
+        for tip in tips:
+            # Files we still need to date for this tip — everything in
+            # its tree. Lets us stop the walk once all are dated instead
+            # of walking to the root commit every time.
+            want = set()
+            try:
+                commit = repo[tip]
+                for e in repo.object_store.iter_tree_contents(commit.tree):
+                    want.add(os.path.basename(
+                        e.path.decode('utf-8', 'replace')))
+            except Exception:
+                want = set()
+            seen = set()
+            try:
+                for entry in repo.get_walker(include=[tip]):
+                    ct = entry.commit.commit_time
+                    try:
+                        raw = entry.changes()
+                    except Exception:
+                        raw = []
+                    # A merge commit's changes() is a list-of-lists
+                    # (one per parent); a normal commit's is a flat
+                    # list of TreeChange. Flatten defensively.
+                    for ch in raw:
+                        for c in (ch if isinstance(ch, list) else [ch]):
+                            for side in (getattr(c, 'new', None),
+                                         getattr(c, 'old', None)):
+                                p = getattr(side, 'path', None)
+                                if not p:
+                                    continue
+                                base = os.path.basename(
+                                    p.decode('utf-8', 'replace'))
+                                # newest-first walk → keep the max time
+                                # (also correct when merging both tips).
+                                if base not in m or ct > m[base]:
+                                    m[base] = ct
+                                seen.add(base)
+                    if want and want <= seen:
+                        break   # every file in this tip's tree is dated
+            except Exception:
+                pass
+        state['times'] = m
+        return m
+
+    def _ondisk():
+        # Set of basenames present in the working tree (minus .git).
+        # Built once, only when a filename misses committed history —
+        # i.e. only on a real audio conflict involving an uncommitted
+        # file.
+        if state['ondisk'] is None:
+            names = set()
+            if work_dir:
+                for root, dirs, files in os.walk(work_dir):
+                    if '.git' in dirs:
+                        dirs.remove('.git')
+                    for fn in files:
+                        names.add(fn)
+            state['ondisk'] = names
+        return state['ondisk']
+
+    def resolve(filename):
+        if not filename:
+            return None
+        t = _times().get(filename)
+        if t is not None:
+            return t
+        if work_dir and filename in _ondisk():
+            # Uncommitted but on disk → NOW (undefined is NOW).
+            return float('inf')
+        return None
+
+    return resolve
+
+
 def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
     """Three-way merge ours (local_sha) and theirs (remote_sha) into the
     working tree. .lift files merge via lift_merge; other paths use
     take-changed-side-or-ours semantics. Creates a merge commit with
-    both parents. Returns (commit_sha, conflicts_list)."""
+    both parents. Returns (commit_sha, conflicts_list).
+
+    Divergent single-value AUDIO forms resolve last-wins by most-recent
+    commit (``_audio_recency_resolver``) — this is the convergence
+    merge, so resolving here is deterministic across devices; other
+    merge sites annotate and defer to the next merge here.
+
+    Raises ``UnrelatedHistoriesError`` when the two tips have no
+    common ancestor — see the class docstring; never merge with an
+    empty base."""
     from dulwich import porcelain
 
     base_sha = _find_merge_base(repo, local_sha, remote_sha)
+    if not base_sha:
+        raise UnrelatedHistoriesError(
+            f'no common ancestor between local '
+            f'{_sha_str(local_sha)[:12]} and remote '
+            f'{_sha_str(remote_sha)[:12]} — refusing to merge '
+            f'unrelated histories (two different projects with '
+            f'the same language code?)')
     head_commit = repo[local_sha]
     remote_commit = repo[remote_sha]
     base_commit = repo[base_sha] if base_sha else None
@@ -608,6 +770,11 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
     merged_writes = {}
     deletes = []          # paths to remove
 
+    # Last-wins resolver for divergent single-value audio takes.
+    # Lazy: does no work unless a .lift merge below actually hits an
+    # audio conflict and calls it.
+    audio_rec = _audio_recency_resolver(repo, local_sha, remote_sha)
+
     for path in sorted(all_paths):
         b = base_blobs.get(path)
         o = head_blobs.get(path)
@@ -615,6 +782,41 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
 
         if o is None and t is None:
             deletes.append(path)
+            continue
+
+        # Cheap-no-op fast paths — MUST precede the heavy special-case
+        # branches (slots / kv / .lift) below. If a path is identical
+        # on both sides, or changed on only ONE side vs the base,
+        # resolve it here by reusing the existing blob: no bytes load,
+        # no LIFT parse, no three_way_merge, no per-entry normalize.
+        # Pre-0.54.32 these checks sat AFTER the .lift branch and were
+        # unreachable for .lift, so a merge where only one side touched
+        # the lexicon still parsed + normalized all ~1700 entries — the
+        # dominant per-merge cost (merges run many times a day). After
+        # these three `continue`s, the special-case branches below only
+        # ever see the genuine both-sides-changed-differently case
+        # (o != t and o != b and t != b), which is when their conflict
+        # logic is actually needed.
+        if o == t:
+            # Identical on both sides (both-None already handled above).
+            if o is None:
+                deletes.append(path)
+            else:
+                merged_writes[path] = ('sha', o)
+            continue
+        if o == b:
+            # Only theirs changed — take theirs (or accept their delete)
+            if t is None:
+                deletes.append(path)
+            else:
+                merged_writes[path] = ('sha', t)
+            continue
+        if t == b:
+            # Only ours changed — take ours (or accept our delete)
+            if o is None:
+                deletes.append(path)
+            else:
+                merged_writes[path] = ('sha', o)
             continue
 
         # Slot claims (.azt/slots/<slot>.txt): two devices may
@@ -661,7 +863,8 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
             o_bytes = _blob_bytes(repo, o) or b''
             t_bytes = _blob_bytes(repo, t) or b''
             mr = lift_merge.three_way_merge(
-                b_bytes or b'', o_bytes, t_bytes, path=path)
+                b_bytes or b'', o_bytes, t_bytes, path=path,
+                audio_recency=audio_rec)
             merged_writes[path] = ('bytes', mr.merged_bytes)
             conflicts.extend(mr.conflicts)
             # Persist a forensic dump for any guard trip. The dump
@@ -686,26 +889,6 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
             del b_bytes, o_bytes, t_bytes
             continue
 
-        if o == t:
-            if o is None:
-                deletes.append(path)
-            else:
-                merged_writes[path] = ('sha', o)
-            continue
-        if o == b:
-            # Only theirs changed — take theirs (or accept their delete)
-            if t is None:
-                deletes.append(path)
-            else:
-                merged_writes[path] = ('sha', t)
-            continue
-        if t == b:
-            # Only ours changed — take ours
-            if o is None:
-                deletes.append(path)
-            else:
-                merged_writes[path] = ('sha', o)
-            continue
         # Both changed differently for a non-LIFT file → take ours,
         # surface the conflict for the commit message.
         if o is not None:
@@ -1216,6 +1399,242 @@ def set_remote_origin_url(working_dir, url):
         return False
 
 
+def forget_project(langcode, delete_files=False):
+    """Forget *langcode*: remove it from the registry, tombstone its
+    working_dir so the auto-repair scan won't resurrect it, and drop
+    the langcode from every paired peer's share allowlist (so a peer
+    can't re-offer / re-sync it). With *delete_files*, also delete the
+    working tree from disk.
+
+    Two user-facing gestures map here (0.54.19+, audit F16 / the
+    2026-07-22 cross-merge cleanup):
+      - "Remove from device": ``delete_files=False`` — non-destructive,
+        the folder stays on disk; a deliberate re-add (open-file /
+        re-clone) lifts the tombstone. This is what survives the
+        diag-repair rescan (the whole reason the tombstone exists).
+      - "Delete data too": ``delete_files=True`` — for when the data is
+        known bad; the tree is removed. Friction is the caller's job
+        (risk-gated confirm in the UI); this function just executes.
+
+    Returns a ``Result`` with ``PROJECT_FORGOTTEN`` (params: langcode,
+    deleted) or ``NOT_A_PROJECT``. Holds ``project_lock`` for the whole
+    operation so a concurrent commit / sweep / merge can't race the
+    unregister + rmtree."""
+    from . import projects as _projects
+    result = Result()
+    p = _projects.get(langcode)
+    if p is None:
+        result.add(S.NOT_A_PROJECT, langcode=langcode)
+        return result
+    working_dir = (p.working_dir or '').strip()
+
+    def _do():
+        # Unshare from every paired peer first — a peer holding this
+        # langcode in shared_projects could otherwise re-offer or
+        # (LAN) keep dialing for it after we forget locally.
+        try:
+            from . import peers as _peers
+            for entry in _peers.list_peers() or []:
+                pid = entry.get('peer_id', '') or ''
+                if pid and langcode in (entry.get('shared_projects') or []):
+                    _peers.remove_shared_project(pid, langcode)
+        except Exception as ex:
+            print(f'[forget] {langcode!r}: peer-unshare raised '
+                  f'(continuing): {ex!r}', file=sys.stderr, flush=True)
+        _projects.unregister(langcode)
+        if working_dir:
+            _projects.add_forgotten(working_dir)
+        deleted = False
+        if delete_files and working_dir:
+            import shutil
+            try:
+                shutil.rmtree(working_dir)
+                deleted = True
+            except FileNotFoundError:
+                deleted = True  # already gone — treat as success
+            except Exception as ex:
+                print(f'[forget] {langcode!r}: rmtree({working_dir!r}) '
+                      f'raised: {ex!r}', file=sys.stderr, flush=True)
+                # Registry entry is already removed + tombstoned, so
+                # the project is "forgotten" even though bytes remain.
+                result.add(S.PROJECT_FORGOTTEN, langcode=langcode,
+                           deleted=False)
+                result.add(S.SERVER_ERROR,
+                           error=f'files not deleted: {ex!r}')
+                return
+        print(f'[forget] {langcode!r} forgotten '
+              f'(delete_files={delete_files}, deleted={deleted}, '
+              f'dir={working_dir!r})', file=sys.stderr, flush=True)
+        result.add(S.PROJECT_FORGOTTEN, langcode=langcode,
+                   deleted=deleted)
+
+    if working_dir:
+        try:
+            with project_lock(working_dir, timeout=10.0):
+                _do()
+        except LockTimeout:
+            return _busy_result(working_dir)
+    else:
+        # No working_dir on record — just drop the registry entry.
+        _do()
+    return result
+
+
+def _resolve_ref_or_sha(repo, ref):
+    """Resolve *ref* (a full 40-char hex SHA or a ref name) to a commit
+    SHA present in *repo*, or ``None``. Ref names are tried verbatim
+    and under refs/remotes/, refs/heads/, refs/tags/ — so
+    ``xtest/phone-lineage-premerge`` resolves to
+    ``refs/remotes/xtest/phone-lineage-premerge``."""
+    ref = (ref or '').strip()
+    if not ref:
+        return None
+    low = ref.lower()
+    if len(low) == 40 and all(c in '0123456789abcdef' for c in low):
+        try:
+            repo[low.encode('ascii')]      # object present?
+            return low.encode('ascii')
+        except KeyError:
+            return None
+    rb = ref.encode('utf-8')
+    for cand in (rb, b'refs/remotes/' + rb, b'refs/heads/' + rb,
+                 b'refs/tags/' + rb):
+        try:
+            return repo.refs[cand]
+        except KeyError:
+            continue
+    return None
+
+
+def merge_ref_into_project(langcode, ref):
+    """Merge an in-repo ref/SHA into *langcode* with the convergence
+    engine (``_merge_diverged``): LIFT-aware union by guid + audio
+    last-wins, the same merge a normal sync runs when two related
+    lineages diverge.
+
+    COMMIT-ONLY: creates the merge commit locally and marks the
+    project ``pending_push`` so the scheduler's drain pushes it when
+    the daemon is online (and ``work_offline`` is off). Never pushes
+    inline — so an operator can stay disconnected, inspect the merge,
+    and ``git reset --hard`` the pre-merge HEAD to undo, then reconnect
+    to let the push happen. Holds ``project_lock``.
+
+    *ref* is a full SHA or a resolvable ref name (see
+    ``_resolve_ref_or_sha``). Returns a ``Result``: ``MERGED_REF``
+    (params langcode / sha / n_conflicts) on success,
+    ``MERGE_UNRELATED_HISTORIES`` if the two tips share no ancestor,
+    ``NOT_A_PROJECT`` / ``NOT_A_REPO`` / ``SERVER_ERROR`` otherwise.
+
+    This is the engine behind the one-shot ``sha_to_merge`` key in
+    projects.json, consumed on daemon launch by
+    ``consume_pending_merges`` — see docs/merge_ref_recovery.md."""
+    from dulwich import porcelain
+    from . import projects as _projects
+    result = Result()
+    p = _projects.get(langcode)
+    if p is None:
+        result.add(S.NOT_A_PROJECT, langcode=langcode)
+        return result
+    working_dir = (p.working_dir or '').strip()
+    if not working_dir:
+        result.add(S.NOT_A_REPO)
+        return result
+
+    def _do():
+        repo = _get_repo(working_dir)
+        if repo is None:
+            result.add(S.NOT_A_REPO)
+            return
+        target = _resolve_ref_or_sha(repo, ref)
+        if target is None:
+            result.add(S.SERVER_ERROR, error=f'ref not found: {ref!r}')
+            return
+        try:
+            local_sha = repo.head()
+        except KeyError:
+            result.add(S.NOT_A_REPO)
+            return
+        try:
+            branch = porcelain.active_branch(repo).decode(
+                'utf-8', errors='replace')
+        except Exception:
+            branch = 'main'
+        print(f'[merge-ref] {langcode!r} merging {_sha_str(target)[:12]} '
+              f'into {branch} (HEAD {_sha_str(local_sha)[:12]}); '
+              f'undo with: git -C {working_dir} reset --hard '
+              f'{_sha_str(local_sha)}', file=sys.stderr, flush=True)
+        try:
+            merge_sha, conflicts = _merge_diverged(
+                repo, working_dir, branch, local_sha, target)
+        except UnrelatedHistoriesError as ex:
+            print(f'[merge-ref] {langcode!r} refused: {ex}',
+                  file=sys.stderr, flush=True)
+            result.add(S.MERGE_UNRELATED_HISTORIES, error=str(ex))
+            return
+        try:
+            from . import scheduler as _scheduler
+            _scheduler._set_pending_push(langcode, True)
+        except Exception as ex:
+            print(f'[merge-ref] {langcode!r} set_pending_push raised '
+                  f'(merge committed; push deferred): {ex!r}',
+                  file=sys.stderr, flush=True)
+        print(f'[merge-ref] {langcode!r} merged -> '
+              f'{_sha_str(merge_sha)[:12]} ({len(conflicts)} conflicts); '
+              f'pending_push set (pushes when online)',
+              file=sys.stderr, flush=True)
+        result.add(S.MERGED_REF, langcode=langcode,
+                   sha=_sha_str(merge_sha)[:12], n_conflicts=len(conflicts))
+
+    try:
+        with project_lock(working_dir, timeout=30.0):
+            _do()
+    except LockTimeout:
+        return _busy_result(working_dir)
+    return result
+
+
+def consume_pending_merges():
+    """Run any one-shot merges requested via a ``sha_to_merge`` key in
+    projects.json, then clear each key. Called once per daemon launch
+    from BOTH startup paths (desktop ``server.serve`` and Android
+    ``server_apk/service.py:main``). Behind-the-scenes by design: the
+    operator adds the key, relaunches, and reads the daemon log for the
+    outcome — no RPC, no UI. Never raises; a bad entry logs and is
+    skipped. See docs/merge_ref_recovery.md.
+
+    One-shot regardless of outcome: the key is cleared even on
+    failure, so a doomed merge (unrelated histories, missing SHA)
+    can't retry every launch, and a SUCCESSFUL merge can't pile up an
+    empty merge commit on each subsequent launch (``_merge_diverged``
+    always writes a commit). Re-add the key to try again."""
+    from . import projects as _projects
+    try:
+        pending = _projects.pending_merges()
+    except Exception as ex:
+        print(f'[merge-ref] pending scan failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    if not pending:
+        return
+    print(f'[merge-ref] {len(pending)} pending merge(s) from '
+          f'projects.json: {sorted(pending)}',
+          file=sys.stderr, flush=True)
+    for langcode, sha in pending.items():
+        try:
+            result = merge_ref_into_project(langcode, sha)
+            print(f'[merge-ref] {langcode!r} outcome: {result.codes()}',
+                  file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[merge-ref] {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+        finally:
+            try:
+                _projects.clear_sha_to_merge(langcode)
+            except Exception as ex:
+                print(f'[merge-ref] {langcode!r} clear key failed: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+
+
 def strip_lan_origin_if_present(working_dir,
                                 scope_to_paired_peers=True):
     """If ``<working_dir>/.git/config`` has
@@ -1722,6 +2141,16 @@ def diagnose_and_repair_registry_on_startup():
               file=sys.stderr, flush=True)
         return
 
+    # Projects the user EXPLICITLY forgot must not be resurrected by
+    # this auto-scan (Kent 2026-07-22: re-adding is a deliberate act).
+    try:
+        forgotten = _projects_mod.forgotten_dirs()
+    except Exception as ex:
+        print(f'[diag-repair] forgotten_dirs raised {ex!r}; '
+              f'proceeding with empty tombstone',
+              file=sys.stderr, flush=True)
+        forgotten = set()
+
     candidates = []
     for n in names:
         p = os.path.join(projects_dir, n)
@@ -1732,6 +2161,11 @@ def diagnose_and_repair_registry_on_startup():
         except Exception:
             continue
         if real_p in registered_dirs:
+            continue
+        if real_p in forgotten:
+            print(f'[diag-repair] skipping {n!r}: explicitly '
+                  f'forgotten (tombstone) — re-add is manual',
+                  file=sys.stderr, flush=True)
             continue
         if not os.path.isdir(os.path.join(p, '.git')):
             continue
@@ -3342,8 +3776,14 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
                       f'{base_str[:12]!r} not in repo; merging with '
                       f'empty base', file=sys.stderr, flush=True)
         if rel_path.lower().endswith('.lift'):
+            # theirs = the just-submitted working file; a new take it
+            # references may be on disk but uncommitted → NOW wins
+            # (work_dir enables the on-disk plausibility check).
+            audio_rec = _audio_recency_resolver(
+                repo, head, None, work_dir=project_dir)
             mr = lift_merge.three_way_merge(
-                base_bytes, ours_bytes, theirs_bytes, path=rel_path)
+                base_bytes, ours_bytes, theirs_bytes, path=rel_path,
+                audio_recency=audio_rec)
             merged = mr.merged_bytes
             n_conflicts = len(mr.conflicts)
             for _c in mr.conflicts:
@@ -3470,6 +3910,10 @@ def integrate_head_into_working_tree(repo, project_dir):
     n_kept_ours = 0
     n_deleted_honored = 0
     n_deleted_overridden = 0
+    # ours = working tree; a take it references may be uncommitted →
+    # NOW wins over theirs' committed take (work_dir on-disk check).
+    audio_rec = _audio_recency_resolver(
+        repo, head_sha, None, work_dir=project_dir)
     for path, head_entry in head_files.items():
         base_entry = base_files.get(path)
         if base_entry is not None \
@@ -3523,7 +3967,8 @@ def integrate_head_into_working_tree(repo, project_dir):
             try:
                 mr = lift_merge.three_way_merge(
                     base_bytes, wt_bytes, head_bytes,
-                    path=path.decode('utf-8', 'replace'))
+                    path=path.decode('utf-8', 'replace'),
+                    audio_recency=audio_rec)
                 with open(wt_path, 'wb') as fh:
                     fh.write(mr.merged_bytes)
                 n_merged_lift += 1
@@ -3647,6 +4092,14 @@ def reapply_snapshot_after_merge(repo, project_dir, snapshot,
             base_blobs = {}
     applied = 0
     total_conflicts = 0
+    # ours = the pre-merge snapshot (user's working-tree edits); a take
+    # it references may be uncommitted → NOW wins (work_dir on-disk).
+    try:
+        _head_now = repo.refs[b'HEAD']
+    except Exception:
+        _head_now = None
+    audio_rec = _audio_recency_resolver(
+        repo, _head_now, None, work_dir=project_dir)
     for path_bytes, snap_bytes in snapshot.items():
         try:
             rel = path_bytes.decode('utf-8', 'replace')
@@ -3672,7 +4125,7 @@ def reapply_snapshot_after_merge(repo, project_dir, snapshot,
             try:
                 mr = lift_merge.three_way_merge(
                     base_bytes, snap_bytes, post_merge_bytes,
-                    path=rel)
+                    path=rel, audio_recency=audio_rec)
                 with open(full, 'wb') as fh:
                     fh.write(mr.merged_bytes)
                 applied += 1
@@ -5573,6 +6026,10 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             lift_merge.trace(
                 f'[sync-trace] merge_diverged done '
                 f'conflicts={len(conflicts)}')
+        except UnrelatedHistoriesError as exc:
+            lift_merge.trace(f'[sync-trace] merge REFUSED: {exc}')
+            result.add(S.MERGE_UNRELATED_HISTORIES, error=str(exc))
+            return result
         except Exception as exc:
             lift_merge.trace(f'[sync-trace] merge_diverged FAILED: {exc}')
             result.add(S.PULL_FAILED,
@@ -5758,6 +6215,13 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
                                     f'[sync-trace] phase-b: re-merge '
                                     f'done '
                                     f'conflicts={len(re_conflicts)}')
+                            except UnrelatedHistoriesError as mexc:
+                                lift_merge.trace(
+                                    f'[sync-trace] phase-b: re-merge '
+                                    f'REFUSED: {mexc}')
+                                result.add(S.MERGE_UNRELATED_HISTORIES,
+                                           error=str(mexc))
+                                return result
                             except Exception as mexc:
                                 lift_merge.trace(
                                     f'[sync-trace] phase-b: re-merge '

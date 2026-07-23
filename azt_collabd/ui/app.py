@@ -68,6 +68,15 @@ from azt_collab_client._debug import first_try_log
 
 _tr = _client_i18n._
 
+# Cold-start credentials re-poll budget (settings screen). On launch
+# the daemon (:provider process on Android) is still spawning, so the
+# first get_credentials_status returns the unreachable fallback; we
+# re-poll until it answers, holding the presplash until then. Budget:
+# _CRED_RETRY_MAX × _CRED_RETRY_INTERVAL_S ≈ 4.8 s, well under the
+# presplash_hold 45 s watchdog.
+_CRED_RETRY_MAX = 6
+_CRED_RETRY_INTERVAL_S = 0.8
+
 
 def _show_share_repo_qr_popup(url, langcode, font_name='Roboto'):
     """Modal popup that renders ``url`` as a QR code via segno
@@ -1124,6 +1133,12 @@ class SettingsScreen(Screen):
         # "'super' object has no attribute '__getattr__'" from
         # ObservableDict when a key is missing.
         def _ready(*_):
+            # Fresh retry budget per screen entry so a visit while the
+            # daemon is down still re-polls (and, at startup, holds the
+            # splash until the daemon answers). The presplash release
+            # itself lives in refresh(), gated on the daemon actually
+            # answering — see the comment there.
+            self._credentials_retry_count = 0
             self._build_lang_selector()
             self.refresh()
             self._start_cawl_cache_poll()
@@ -1340,13 +1355,14 @@ class SettingsScreen(Screen):
             lambda dt: setattr(sm, 'transition', old_transition), 0.1)
 
     def _retry_refresh_credentials(self):
-        """One-shot follow-up refresh after a cold-start
+        """Bounded follow-up refresh after a cold-start
         ``get_credentials_status`` returned the daemon-unreachable
-        fallback. Clears the flag before calling so a subsequent
-        screen entry can trigger its own retry chain. We only
-        re-run when the screen is still current, otherwise we'd
+        fallback. Each ``refresh()`` re-checks and, while the daemon
+        is still cold and the budget (``_CRED_RETRY_MAX``) isn't
+        spent, schedules the next tick — and releases the presplash
+        the moment the daemon answers (or the budget runs out). We
+        only re-run when the screen is still current, otherwise we'd
         wake an off-screen settings page."""
-        self._credentials_retry_scheduled = False
         if self.manager is None or self.manager.current != self.name:
             return
         self.refresh()
@@ -1394,16 +1410,37 @@ class SettingsScreen(Screen):
         gl = status.get('gitlab', {})
         # ``get_credentials_status`` returns a ServerUnavailable
         # fallback dict (no ``confirmed`` field) when the daemon
-        # isn't yet reachable. Detect that and reschedule one
-        # refresh so the button reflects reality once the daemon
-        # finishes booting. Guarded by a flag so we don't loop
-        # forever if the daemon really is gone — a single retry
-        # is enough to cover the cold-start race.
-        if 'confirmed' not in gh and not getattr(
-                self, '_credentials_retry_scheduled', False):
-            self._credentials_retry_scheduled = True
+        # isn't yet reachable. On a cold launch the daemon
+        # (:provider process on Android) is still spawning, so the
+        # first call gets the fallback; re-poll until it answers so
+        # the buttons reflect reality once the daemon finishes
+        # booting. Bounded so we don't poll forever if the daemon
+        # really is gone.
+        daemon_answered = 'confirmed' in gh
+        if not daemon_answered and getattr(
+                self, '_credentials_retry_count', 0) < _CRED_RETRY_MAX:
+            self._credentials_retry_count = getattr(
+                self, '_credentials_retry_count', 0) + 1
             Clock.schedule_once(
-                lambda _dt: self._retry_refresh_credentials(), 1.5)
+                lambda _dt: self._retry_refresh_credentials(),
+                _CRED_RETRY_INTERVAL_S)
+        # Presplash release is tied to DAEMON-ANSWERED, not to
+        # refresh() merely returning. Releasing after the cold-start
+        # fallback dict dropped the splash onto correct-looking
+        # chrome that then repainted ~1 s later when the retry filled
+        # in real button states (field 2026-07-22: "still a settings
+        # load after the splash"). Hold until the daemon answers — or,
+        # if it never does within the retry budget, release anyway so
+        # a genuinely-down daemon can't outlast the budget (best-effort
+        # UI beats a stuck splash; the 45 s watchdog is the last
+        # resort). Idempotent + no-op off Android / after first call.
+        if daemon_answered or getattr(
+                self, '_credentials_retry_count', 0) >= _CRED_RETRY_MAX:
+            try:
+                from azt_collab_client.ui import presplash_hold
+                presplash_hold.release()
+            except Exception:
+                pass
         # GitHub: single state-aware button. We gate on ``confirmed``
         # rather than ``connected`` because a half-finished setup
         # (token saved but App not yet installed / Verify not yet

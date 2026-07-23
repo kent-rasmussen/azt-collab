@@ -1080,6 +1080,14 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
             merged_sha, conflicts = _repo_mod._merge_diverged(
                 repo, project.working_dir, 'main',
                 local_head, peer_head)
+        except _repo_mod.UnrelatedHistoriesError as ex:
+            print(f'[lan-merge] REFUSED: {ex} — this peer\'s '
+                  f'{project.langcode!r} is a DIFFERENT project '
+                  f'sharing the langcode; no data changed on '
+                  f'either side. Unshare the project from this '
+                  f'peer (or rename one of the two) to stop these '
+                  f'attempts.', file=sys.stderr, flush=True)
+            return False
         except Exception as ex:
             print(f'[lan-merge] three-way merge raised: {ex!r}',
                   file=sys.stderr, flush=True)

@@ -108,6 +108,225 @@ The mechanism of the repeating 301 (the "annotation ping-pong"):
      glosses per entry — needs a policy: keep-first? human review?). This is
      the actual cure; #1 is the honest reporting while they exist.
 
+## Field re-confirmation + scrub policy decided — 2026-07-22 (CABTAL workshop)
+
+Reproduced live at scale during the nml recovery: an itservices→nml
+three-way merge reported `conflicts=395` on `gloss[lang=swh]`
+("2 divergent same-lang copies; annotated 2 as conflict") with
+`repairs=329` pre-existing, and the merged `nml.lift` carried
+**1284 azt-lift-conflict markers** — most riding in with the crew's
+own file from routine multi-device merging, before Kent's accident.
+Same disease as 07-11, now database-wide across the workshop's
+shared nml and compounding per sync.
+
+**ROOT CAUSE — decisive input (Kent 2026-07-22): multiple same-@lang
+`<gloss>` nodes are VALID LIFT and ship that way in the bare CAWL
+template.** Example (untouched template entry): two `<gloss lang="es">`
+(`abdomen`, `barriga`) and the swh equivalent (`tumbo / matumbo`) —
+distinct senses/synonyms of one headword, each its own gloss node,
+mirrored by the `<definition>`'s semicolon-separated senses. This is
+GOOD DATA, not a merge artifact.
+
+Therefore the "conflicts" are our merge MISINTERPRETING legitimate
+multi-sense glosses. The invariant-#13 family assumes one-node-per-
+lang for glosses ("duplicates within one lang still illegal" — the
+line in Vision item 4 above; that assumption is WRONG for glosses/
+definitions/citation, which are true multitext with legitimately
+repeatable same-lang nodes). So the merge either collapses two valid
+synonym glosses to one (DATA LOSS) or annotates them as an
+azt-lift-conflict pair (false conflict) — producing the 395/1284
+counts on data no human diverged.
+
+**The 07-22 "scrub" idea is RETRACTED — it would have destroyed
+data** (collapsing `abdomen`+`barriga` → one gloss deletes a real
+synonym). There is nothing to scrub; the DB is correct.
+
+**The fix is in the merge, not the data.** Gloss / definition /
+citation (multitext) same-lang multiplicity is valid: match gloss
+nodes by (lang, normalized-text) IDENTITY, three-way like any other
+child — a node present in base and unchanged is kept; genuine
+add/remove handled normally; NEVER collapse two different-text
+same-lang glosses and NEVER annotate same-lang multiplicity as a
+conflict merely for being multiple. Keep the single-node-per-lang
+collapse ONLY for the fields that truly are single-form-per-lang
+(the verification/`_MT`/tone/etc. list in Vision item 4 — the wife
+case, where multiplicity IS corruption). The bug is applying the
+single-form rule to true-multitext fields.
+
+CONFIRMED in code 2026-07-22: `lift_merge.py:756-757` groups
+`<gloss>` children of `<sense>` by `(tag, lang)` — treating glosses
+as single-per-lang like `<form>`. A ≥2 group that isn't byte-
+identical falls to step 3 (`:815-833`) and gets `azt-lift-conflict`
+annotations. The section comment `:658` states the wrong premise
+outright ("one `<gloss>` per lang inside one sense"). This fires on
+every legit multi-sense entry (abdomen/barriga).
+
+NON-DESTRUCTIVE — verified: step-1 collapse (`:764-782`) removes only
+byte-IDENTICAL duplicates (`abdomen`≠`barriga` → never dropped);
+union (step 2) is verification-only; glosses reach only step 3,
+which KEEPS both nodes and just annotates. So NO gloss/synonym data
+has been lost, in the itservices merge or the crew's file — the
+1284 markers are false annotations over intact data.
+
+Fix (core-merge; design + test before shipping):
+  * Exempt true-multitext nodes from the single-per-lang
+    collapse/annotate: `<gloss>` (under `<sense>`), and `<form>`
+    under `<definition>`/`<citation>`. For these, dedup
+    byte-identical only; NEVER annotate distinct same-lang nodes.
+  * Keep the single-form rule for verification/`_MT`/tone/etc.
+    (the wife-case corruption is real there).
+  * Tests: merge-idempotence on a multi-sense-gloss fixture
+    (abdomen/barriga must survive unchanged, zero conflicts);
+    the existing verification-union tests must stay green.
+  * Follow-on cleanup (now SAFE — strips false ANNOTATIONS, not
+    data): a pass removing `azt-lift-conflict` annotations from
+    same-lang gloss multiplicities. Opposite of the retracted
+    scrub. Can run on the shared repo to clear the accumulated
+    1284 markers once the merge fix stops regenerating them.
+
+### Audio-form merge policy — SHIPPED 0.54.24 (1A); 1B done ad-hoc; NOW-refine 0.54.26
+
+STATUS: 1A (merge resolves last-wins) shipped 0.54.24 —
+`_audio_recency_resolver` in repo._merge_diverged + audio branch in
+lift_merge._normalize_entry, resolve-everywhere, cheap-no-op, tests.
+1B (historical one-shot) done via resolve_audio_conflicts.py, Kent
+verified.
+
+DONE 0.54.26 (was the "OPEN FOLLOW-UP"): the local pre-commit merge
+sites no longer annotate-and-defer. `_audio_recency_resolver` grew a
+`work_dir` param — a referenced audio file not in committed history
+but present on disk resolves to `float('inf')` = NOW ("undefined is
+NOW", Kent 2026-07-22), so a just-recorded take wins with no spurious
+annotation. Wired at `_submit_file_locked`,
+`integrate_head_into_working_tree` (post-receive, repo.py ~3652), and
+`reapply_snapshot_after_merge` (LAN reapply). `_merge_diverged` keeps
+`work_dir=None` → pure most-recent-commit-time, deterministic across
+devices; NOW is inherently local and re-derives deterministically at
+convergence. Still lazy+cached (on-disk scan only on a real audio
+conflict).
+
+OPEN: the Android `dateModified` stamping bug (below) is independent
+and still open.
+
+### Audio-form merge policy — DESIGN (Kent 2026-07-22)
+
+Discovered during the itservices→nml re-run: after the gloss fix,
+142 conflicts remained, all `form[lang=nml-Zxxx-x-audio]` — two
+divergent audio recordings per entry (Kent's side vs itservices).
+
+Domain facts (Kent):
+  * Audio is SINGLE-VALUE per entry: replace-per-take, past takes
+    unrecoverable. So divergent audio forms ARE real conflicts (not
+    multi-value like glosses — do NOT exempt them the way glosses
+    were exempted).
+  * Filename is reused intentionally (avoid FS churn); the extension
+    tracks the record-time format setting. So same-base +
+    different-extension = DIFFERENT recordings, NOT format churn.
+    (My "same base = same take" collapse idea was WRONG — dropped.)
+  * Resolution rule: **last-wins.** "Overwrite is a cost of
+    collaboration." The hard case (two teams record the same word
+    then merge) is accepted as last-wins too.
+
+Cheap implementation (no per-form git blame):
+  * Compare the two branch TIPS' `commit_time` ONCE
+    (`repo[local_sha]` vs `repo[remote_sha]` in `_merge_diverged`);
+    newer side wins for all audio conflicts in that merge. One
+    comparison, not per-form. Coarse but matches the rule.
+
+The ASR-preservation refinement (protects real work — Kent's
+concern): audio forms carry substantial computed ASR/transcription
+annotations (`neurlang/ipa-whisper-base`, `facebook/mms-1b-all
+(xxx!)` ×many, `md5`, …). Last-wins drops the losing side's ASR
+with its form. But the `md5` annotation is the audio CONTENT hash:
+  * **Same md5** on both conflicting forms → audio didn't actually
+    change (filename/format only) → keep winner's form but UNION the
+    ASR annotations (by model-name key) so no ASR work is lost.
+  * **Different md5** → genuinely different take → last-wins whole
+    form incl. its ASR; re-ASR on the winning recording is the
+    inherent, accepted cost.
+
+Non-destructive stopgap (current behavior, 0.54.20): audio
+divergence is ANNOTATED (both forms + all ASR preserved as a
+conflict pair) — nothing lost, just unresolved and messy for a
+crew with no conflict UI. The resolver above replaces the annotate
+path for audio forms.
+
+Tests to add with the build: (a) different-md5 audio → last-wins by
+tip recency, loser dropped; (b) same-md5/different-filename audio →
+one form kept, ASR annotations unioned; (c) idempotence.
+
+PERF constraint (Kent 2026-07-22 — merges run many times a day, must
+not repeat expensive work every few minutes): the merge sweep runs on
+all ~1700 entries every merge, so per-entry work MUST be a cheap
+no-op on the clean path. `_reconcile_entry_marker` got an early-out in
+0.54.23 for exactly this. When 1A (last-wins by most-recent COMMIT —
+Kent's chosen recency, 2026-07-22) is built, the git commit-date
+lookup (a subprocess/log call, genuinely expensive) must run ONLY for
+entries that actually hold an audio conflict — never per-entry. A
+merge with zero audio conflicts must do zero git-date calls. Cache
+per-file dates within a merge. 1B (resolve_audio_conflicts.py,
+one-shot) pays the git-log cost once, off the merge path — that's the
+right place for the historical cleanup, not the hot merge loop.
+Load/read time is the WRONG place to move cleanup to: reads happen
+far more often than merges; merge-time-with-cheap-no-ops is correct.
+
+RECENCY BASIS decided (Kent 2026-07-22): **per-file most-recent
+COMMIT, NOT branch-tip.** Branch-tip is wrong for the normal field
+pattern, not just an edge: a phone dark for a month, one recording
+today, then merged — its tip is "today," so branch-tip would let all
+its month-old files beat another phone's yesterday work. Per-file is
+required. Affordable because it runs ONLY for actual audio-conflict
+forms (a handful per merge, → 0 after cleanup), never per-entry — so
+it does not violate the cheap-no-op rule. Lookup via dulwich (walk
+the lineage for the file's last-touching commit; Android has no git
+CLI). Caveat: commit times are device-clock-based, so a skewed clock
+can mis-order — inherent to any time-based last-wins, accepted.
+
+NO PLATFORM SPLIT — RESOLVE EVERYWHERE (Kent 2026-07-22, after
+challenging the split idea). An earlier draft had "desktop resolves,
+Android annotates-and-defers." REJECTED: it breaks deterministic
+merge output. The merge must produce the same tree on any device
+from the same inputs (the convergence property; the idempotence
+test guards it). If Android annotates the same conflict desktop
+resolves, the two produce DIFFERENT trees → they diverge → more
+merges → possibly never converge on those entries. The split saves
+almost nothing (per-conflict dulwich walks, a handful per merge,
+sub-second on a phone) and costs convergence. So: resolve on ALL
+platforms. Per-file-commit is deterministic across devices (git
+history is identical, so "the file's last commit" is the same
+answer everywhere), so resolving everywhere keeps convergence AND is
+correct. One code path, no platform gate.
+
+### FOLLOW-UP: Android not stamping dateModified (2026-07-22)
+Surfaced while evaluating `<entry dateModified>` as a recency signal:
+the Android daemon/recorder apparently does NOT update `dateModified`
+on writes (audio, etc.). That's why dateModified was unusable for
+last-wins, and it's a latent bug on its own — anything that trusts
+LIFT timestamps (sort-by-recent, "what changed", future merge
+heuristics) is blind on Android-authored edits. Fix: stamp
+`dateModified` (and `dateCreated` on new entries) on every
+Android-side LIFT write. Separate from the audio-merge work; tracked
+here so it isn't lost.
+
+### FUTURE (revisit when gloss editing ships) — Kent 2026-07-22
+
+The 0.54.20 gloss carve-out ("distinct same-lang glosses are never
+a conflict") is TRUE ONLY for the current read-only-gloss workflow.
+Once users can edit glosses, two different same-lang glosses become
+ambiguous:
+  - NEW synonym added on one side → keep both (not a conflict), or
+  - one gloss EDITED to a different value on each side → REAL
+    conflict that must surface.
+Structurally indistinguishable without per-gloss IDENTITY. The fix
+then: pair glosses three-way by a stable identity (base-match by
+content/position, or a gloss `id`/`order` attribute) via the same
+`_pair_same_key` machinery keyed children already use — a gloss
+present-and-edited on both sides conflicts; a gloss added on one
+side is a new sense. Do NOT ship gloss-editing without this, or the
+merge will silently drop divergent gloss edits. Cross-ref:
+project_identity_beyond_langcode.md (same "identity, not
+label/position" theme).
+
 Next steps, in order: ~~implement #1 (repair-vs-conflict classification)~~
 DONE 0.54.4 (canon-equal sides skip the conflict scan; sweep annotations
 count as `repairs`; test `test_shared_pollution_is_repair_not_conflict`) →

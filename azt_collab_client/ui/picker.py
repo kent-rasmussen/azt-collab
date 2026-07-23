@@ -421,6 +421,17 @@ class ProjectPickerScreen(Screen):
         total = len(projects)
 
         def _on_release(b):
+            # A long-press opens the forget dialog instead of loading.
+            # Cancel any still-pending long-press timer (quick tap), and
+            # if the long-press already fired, swallow this release so we
+            # don't also open the project. (Armed in ``_bind_longpress``.)
+            ev = getattr(b, '_longpress_ev', None)
+            if ev is not None:
+                ev.cancel()
+                b._longpress_ev = None
+            if getattr(b, '_longpress_fired', False):
+                b._longpress_fired = False
+                return
             tapped_text = getattr(b, 'text', '?')
             tapped_lc = getattr(b, 'langcode', '')
             tapped_path = getattr(b, 'lift_path', '')
@@ -456,7 +467,144 @@ class ProjectPickerScreen(Screen):
                   f"path={btn.lift_path!r}",
                   flush=True)
             btn.bind(on_release=_on_release)
+            self._bind_longpress(btn)
             box.add_widget(btn)
+
+    def _bind_longpress(self, btn, hold_s=0.6):
+        """Wire a long-press on a project row → the forget dialog.
+
+        A normal tap loads the project (``_on_release``); holding the
+        row for ``hold_s`` seconds instead pops the "forget this
+        project?" confirm.
+
+        Uses Kivy's own ``on_press`` / ``on_release`` rather than raw
+        ``on_touch_down`` — the button (via ButtonBehavior) has already
+        done the collide + touch-grab test, so there's no coordinate
+        math to get wrong inside the scrolling project list (an earlier
+        ``collide_point(*touch.pos)`` version silently failed there: the
+        touch coords weren't in the button's space, so the timer never
+        armed and every hold just fell through to a normal tap).
+
+        ``on_press`` arms a timer; ``_on_release`` cancels it (quick
+        tap) or, if it already fired, swallows the release. The timer
+        callback re-checks ``btn.state == 'down'`` so a scroll-drag that
+        steals the touch (ButtonBehavior flips state back to 'normal')
+        cancels the long-press on its own — no move handler needed.
+
+        Forget lives here, not in the settings "Current project" row
+        (alongside Publish / Share / Grant collaborator), on purpose:
+        those act on the ONE project you're working on now, whereas
+        you usually forget a project precisely because it ISN'T the
+        one you want current (e.g. a stray test repo). The picker is
+        the only surface that lets you act on ANY project in the list.
+        """
+        def _fire(_dt):
+            btn._longpress_ev = None
+            # Released or touch stolen (scroll) before the hold elapsed.
+            if getattr(btn, 'state', 'normal') != 'down':
+                return
+            btn._longpress_fired = True
+            self._forget_dialog(getattr(btn, 'langcode', ''),
+                                getattr(btn, 'text', ''))
+
+        def _on_press(b):
+            b._longpress_fired = False
+            ev = getattr(b, '_longpress_ev', None)
+            if ev is not None:
+                ev.cancel()
+            b._longpress_ev = Clock.schedule_once(_fire, hold_s)
+
+        btn.bind(on_press=_on_press)
+
+    def _forget_dialog(self, langcode, label=''):
+        """Confirm popup for forgetting a project (long-press on a
+        row). Two gestures, risk-gated on
+        ``project_status(langcode).at_risk``:
+
+        - **Remove from device** — non-destructive; the daemon
+          unregisters + tombstones the working_dir and unshares from
+          peers, but leaves the files on disk. Always offered.
+        - **Delete data too** — also rmtrees the working tree. Only
+          offered with a red warning; when ``at_risk`` (no off-device
+          copy) the warning says so explicitly."""
+        if not langcode:
+            return
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.metrics import sp
+        from .themed_popup import ThemedPopup as Popup
+        from .themed_popup import ThemedButton as Button
+        from . import theme as T
+        from ..translate import tr as _tr
+        from .. import project_status, forget_project
+
+        name = label or langcode
+        try:
+            st = project_status(langcode)
+            at_risk = bool(getattr(st, 'at_risk', False)) if st else True
+        except Exception:
+            at_risk = True
+
+        body = BoxLayout(orientation='vertical', spacing=dp(10),
+                         padding=dp(12))
+        msg = _tr('Forget "{name}"?\n\n'
+                  'This removes the project from this device and stops '
+                  'sharing it with paired phones.').format(name=name)
+        if at_risk:
+            msg += '\n\n' + _tr(
+                'Warning: this project has no confirmed copy on GitHub '
+                'or another device. Deleting its data cannot be undone.')
+        body.add_widget(Label(
+            text=msg, font_size=sp(13), halign='center', valign='middle',
+            size_hint_y=None, text_size=(dp(300), None),
+            height=dp(140) if at_risk else dp(100)))
+
+        keep_btn = Button(text=_tr('Remove from device'),
+                          size_hint_y=None, height=dp(48))
+        del_btn = Button(text=_tr('Delete data too'),
+                         background_color=T.RED,
+                         size_hint_y=None, height=dp(48))
+        cancel_btn = Button(text=_tr('Cancel'),
+                            size_hint_y=None, height=dp(48))
+        body.add_widget(keep_btn)
+        body.add_widget(del_btn)
+        body.add_widget(cancel_btn)
+
+        popup = Popup(title=_tr('Forget project'), content=body,
+                      size_hint=(0.85, None),
+                      height=dp(380) if at_risk else dp(340),
+                      auto_dismiss=False)
+
+        def _do(delete_files):
+            popup.dismiss()
+            r = forget_project(langcode, delete_files=delete_files)
+            ok = bool(r is not None and r.has('PROJECT_FORGOTTEN'))
+            if ok:
+                self._populate_projects()
+            else:
+                # Surface WHY, not a bare "couldn't" — the reason is in
+                # the Result's typed statuses (translated). A generic
+                # message with no detail once cost a user real data
+                # (field 2026-07-22). The wrapper always returns a typed
+                # Result (SERVER_UNAVAILABLE / SERVER_ERROR / BUSY /
+                # NOT_A_PROJECT …), never None, so translate_result
+                # always has something concrete to say.
+                from ..translate import translate_result as _tr_result
+                msg = _tr('Could not forget "{name}".').format(name=name)
+                detail = ''
+                if r is not None:
+                    try:
+                        detail = _tr_result(r).strip()
+                    except Exception:
+                        detail = ', '.join(r.codes())
+                if detail:
+                    msg = msg + '\n\n' + detail
+                self._show_popup(_tr('Forget project'), msg)
+
+        keep_btn.bind(on_release=lambda *_: _do(False))
+        del_btn.bind(on_release=lambda *_: _do(True))
+        cancel_btn.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
     def share_diagnostics(self):
         """Picker affordance for the canonical share-diagnostics

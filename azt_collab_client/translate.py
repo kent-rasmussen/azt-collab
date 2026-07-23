@@ -274,6 +274,20 @@ _HANDLERS = {
     S.LAN_PROJECT_COLLISION_UNRELATED: lambda p: _fmt(
         _tr('A different project named {langcode} already exists. '
             'Rename or remove it first.'), p),
+    S.MERGE_UNRELATED_HISTORIES: lambda p: _tr(
+        'Sync refused: the two copies have no shared history — '
+        'they are different projects using the same language code. '
+        'Nothing was changed.'),
+    S.MERGED_REF: lambda p: _fmt(
+        _tr('Merged {sha} into {langcode} ({n_conflicts} conflicts). '
+            'Will push when online.'), p),
+    S.NOT_A_PROJECT: lambda p: _fmt(
+        _tr('No project named {langcode} to forget.'), p),
+    S.PROJECT_FORGOTTEN: lambda p: (
+        _fmt(_tr('Forgot project {langcode} and deleted its files.'), p)
+        if p.get('deleted')
+        else _fmt(_tr('Forgot project {langcode} (files kept on disk).'),
+                  p)),
     S.LAN_ADOPT_ORIGIN_NEEDED: lambda p: _fmt(
         _tr('Confirm: push project {langcode} to {url} also?'), p),
     S.LAN_REMOTE_CONFLICT:    lambda p: _fmt(

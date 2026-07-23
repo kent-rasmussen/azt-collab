@@ -317,6 +317,44 @@ silently on a huge project. Evidence needed: receiving phone's log
 around the failure (clone begin / timeout / error lines) + the
 exact popup msgid to locate the mapping.
 
+### F15 — Pairing can complete one-sided, silently  [OPEN]
+Field 2026-07-22: karlap's peers.json held the workshop phone
+(paired 07:50Z over flaky venue wifi, shares recorded, sync
+working karlap→phone) while the PHONE had no entry for karlap at
+all — the reciprocal write in the pair handshake failed and
+nothing surfaced it. User-visible: "I don't see my computer on the
+phone's paired list", phone-side sharing impossible, and nobody
+knows until they look. Proposed rule: pairing is not "done" until
+each side has confirmed the other's record (the accept leg already
+round-trips — verify it, and surface a typed "peer did not
+confirm" instead of a half-paired success). Recovery that works
+today: re-scan a fresh QR from the not-yet-knowing side (re-pair
+preserves shares/static endpoints by design). 2026-07-22 09:55
+follow-up: once the cable link carried karlap's announce/hello
+directly to the phone, the phone's list showed karlap as PAIRED
+without any explicit re-pair gesture — so at least one recovery
+path self-heals the half-paired state over a working link; the
+finding narrows to "half-paired over a BROKEN link is silent and
+sticks until connectivity improves." Related wrinkle: the
+pair QR advertises the single guessed address (the § Pairing
+multi-address gap) — over cable-with-wifi-on it advertises the
+wifi address; workaround is wifi-off while displaying the QR.
+
+### F16 — Merge machinery joins projects by langcode label  [GUARD SHIPPED 0.54.19 for the no-ancestor case; fork case → identity item]
+Field 2026-07-22: "share nml" bound a workshop phone to karlap's
+WeSay TEST directory (registry key 'nml' pointed there; UI showed
+no binding), and `_merge_diverged` joined the lineages all morning.
+Two sub-defects: (a) `_merge_diverged` ran with an EMPTY base when
+`_find_merge_base` returned None — auto-union of truly unrelated
+projects; FIXED 0.54.19 (`UnrelatedHistoriesError`, typed
+`MERGE_UNRELATED_HISTORIES`, refusal at all call sites, test).
+(b) FORKED projects share an ancestor, so (a)'s guard cannot
+protect them — the actual incident class; requires identity beyond
+langcode → agenda/project_identity_beyond_langcode.md (Tier 1
+provenance display would have prevented the share mis-bind
+outright). Untangle of the joined histories →
+agenda/disentangle_nml_repositories.md.
+
 ## Plans
 
 Order roughly F5 (data delivery blocked) → F1/F7 (cheap, unblock

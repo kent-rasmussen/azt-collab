@@ -185,21 +185,37 @@ def get_peer(peer_id):
     return norm
 
 
-def record_pair(peer_id, fp, device_name, endpoint=''):
+def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
     """Insert or update a peer entry on pair-accept. Preserves
     existing ``shared_projects`` and ``static_endpoints`` if the
     peer is already known (re-pair just refreshes the cert
-    fingerprint and the QR-captured endpoint). Returns the
-    canonical entry."""
+    fingerprint and the QR-captured endpoint(s)). Returns the
+    canonical entry.
+
+    ``endpoints`` (0.54.35): the full candidate ``ip:port`` list from
+    the QR — every interface the peer advertised (wifi, USB-tether
+    usb0, hotspot). The dialer tries each, so a peer reachable over any
+    link works regardless of which one the peer's default route is on.
+    Falls back to the single ``endpoint`` (older QRs), then to the
+    existing list."""
     with _LOCK:
         data = _load_raw()
         peers = dict(data.get('peers') or {})
         existing = _normalize_entry(peers.get(peer_id, {}))
+        if endpoints:
+            eps = []
+            for e in endpoints:
+                e = str(e or '')
+                if e and e not in eps:
+                    eps.append(e)
+        elif endpoint:
+            eps = [endpoint]
+        else:
+            eps = existing['endpoints'] or []
         entry = {
             'device_name': str(device_name or ''),
             'fp': str(fp or ''),
-            'endpoints': [endpoint] if endpoint else (
-                existing['endpoints'] or []),
+            'endpoints': eps,
             'static_endpoints': existing['static_endpoints'],
             'shared_projects': existing['shared_projects'],
             'paired_at': existing['paired_at'] or _now_iso(),

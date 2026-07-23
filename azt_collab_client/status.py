@@ -65,6 +65,9 @@ ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 # further edits. Params: ``n_conflicts``, ``base_sha``. See
 # ``azt_collabd/status.py`` for the full rationale.
 MERGED_WITH_LOCAL = 'MERGED_WITH_LOCAL'
+# merge_ref admin op (0.54.30) — mirror of azt_collabd/status.py.
+# Params: ``langcode``, ``sha``, ``n_conflicts``.
+MERGED_REF = 'MERGED_REF'
 
 # Surgical LIFT edits (daemon 0.50.29+). See ``azt_collabd/status.py``
 # for the full rationale. The ``NO_CHANGE`` variants let peers
@@ -80,6 +83,9 @@ LIFT_INVALID = 'LIFT_INVALID'
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
+# forget_project (0.54.25) — mirror of azt_collabd/status.py.
+NOT_A_PROJECT = 'NOT_A_PROJECT'
+PROJECT_FORGOTTEN = 'PROJECT_FORGOTTEN'
 # Two-or-more successive COMMIT_FAILED for this project. Routed
 # never-silenced peer-side — same bucket as DATA_LOSS_RISK because
 # the user's data is accumulating on the daemon's filesDir without
@@ -245,6 +251,10 @@ LAN_PROJECT_CLONED = 'LAN_PROJECT_CLONED'
 LAN_PROJECT_REOPENED = 'LAN_PROJECT_REOPENED'
 LAN_PROJECT_ADOPTED_REMOTE = 'LAN_PROJECT_ADOPTED_REMOTE'
 LAN_PROJECT_COLLISION_UNRELATED = 'LAN_PROJECT_COLLISION_UNRELATED'
+# Merge-time counterpart (0.54.19): tips share no git ancestor —
+# two different projects under one langcode; merge refused,
+# nothing changed. Params: ``error``.
+MERGE_UNRELATED_HISTORIES = 'MERGE_UNRELATED_HISTORIES'
 LAN_ADOPT_ORIGIN_NEEDED = 'LAN_ADOPT_ORIGIN_NEEDED'
 LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'

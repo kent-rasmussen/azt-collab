@@ -739,25 +739,40 @@ def _build_full_row(*, name, peer_id='', endpoint='', projects='',
     info.bind(minimum_height=info.setter('height'))
 
     def _add(text, *, bold=False, size=sp(10),
-             color=None, min_height=dp(18)):
+             color=None, min_height=dp(18), max_lines=0):
         lbl = Label(
             text=text or '—',
             halign='left', valign='top',
             size_hint_y=None, font_size=size, bold=bold,
             font_name=font_name)
+        if max_lines:
+            # Cap to N lines with an ellipsis — a peer can accumulate a
+            # LOT of observed/static endpoints, and an uncapped label
+            # grows tall enough to shove the rest of the row (and the
+            # list) off the popup. shorten adds the '…'; max_lines is
+            # the hard clip that guarantees the height ceiling below is
+            # never exceeded regardless of Kivy's shorten quirks.
+            lbl.shorten = True
+            lbl.shorten_from = 'right'
+            lbl.max_lines = max_lines
         if color is not None:
             lbl.color = color
         lbl.bind(width=lambda w, *_: setattr(
             w, 'text_size', (w.width, None)))
-        lbl.bind(texture_size=lambda w, ts: setattr(
-            w, 'height', max(min_height, ts[1])))
+
+        def _sync_h(w, ts):
+            h = max(min_height, ts[1])
+            if max_lines:
+                h = min(h, min_height * max_lines + dp(2) * (max_lines - 1))
+            w.height = h
+        lbl.bind(texture_size=_sync_h)
         info.add_widget(lbl)
         return lbl
 
     _add(name or _tr('Unnamed device'),
          bold=True, size=sp(14), min_height=dp(24))
     _add(peer_id, color=theme.TEXT_DIM)
-    _add(endpoint, color=theme.TEXT_DIM)
+    _add(endpoint, color=theme.TEXT_DIM, max_lines=2)
     _add(projects, color=theme.TEXT_DIM)
 
     row.add_widget(info)
@@ -1009,19 +1024,27 @@ def paired_phones_popup(font_name='Roboto'):
                   auto_dismiss=False)
 
     def _resize_to_content(*_args):
-        # Scroll content needs at least dp(80) to avoid degenerating
-        # into a stub. The three section headers + their
-        # placeholders mean ``list_box.height`` is never zero, but
-        # keep the floor as belt-and-braces.
-        scroll.height = max(list_box.height, dp(80))
+        # The viewport must be capped at the space actually available
+        # inside a 90%-of-window popup — NOT set to the full content
+        # height. If scroll.height == list_box.height the ScrollView is
+        # exactly as tall as its child, so there's nothing to scroll and
+        # the overflow is shoved off the (capped) popup. Capping the
+        # viewport BELOW content height is what lets it scroll.
+        # (Pre-0.54.33 this was ``max(list_box.height, dp(80))`` — full
+        # content height — so a long list never scrolled: it just ran
+        # off the page. Field 2026-07-23.)
+        max_popup = Window.height * 0.9
+        avail_scroll = (max_popup - _popup_chrome - _btn_row_h
+                        - _container_spacing - _container_padding * 2)
+        avail_scroll = max(avail_scroll, dp(80))
+        scroll.height = max(min(list_box.height, avail_scroll), dp(80))
         # Body = list + buttons + inter-child spacing + top/bottom
         # padding (no inner title widget — the popup chrome shows
         # it once).
         body = (scroll.height + _btn_row_h
                 + _container_spacing
                 + _container_padding * 2)
-        popup.height = min(body + _popup_chrome,
-                           Window.height * 0.9)
+        popup.height = min(body + _popup_chrome, max_popup)
 
     def _on_window_resize(*_a):
         _resize_to_content()

@@ -89,6 +89,12 @@ ATOMIC_COMMITTED = 'ATOMIC_COMMITTED'
 # ``head_sha``.
 MERGED_WITH_LOCAL = 'MERGED_WITH_LOCAL'
 
+# merge_ref admin op (0.54.30): merged an arbitrary in-repo ref/SHA
+# into the project via the convergence engine, commit-only (the drain
+# pushes when online). Params: ``langcode``, ``sha`` (merge commit,
+# short), ``n_conflicts``.
+MERGED_REF = 'MERGED_REF'
+
 # Surgical LIFT edits (since 0.50.29). Both endpoints
 # (``set_audio`` / ``set_illustration``) splice one sub-element
 # into one entry without round-tripping the whole DOM peer-side,
@@ -117,6 +123,11 @@ LIFT_INVALID = 'LIFT_INVALID'
 NOT_A_REPO = 'NOT_A_REPO'
 NO_REMOTE = 'NO_REMOTE'
 COMMIT_FAILED = 'COMMIT_FAILED'
+# forget_project outcomes (0.54.25). PROJECT_FORGOTTEN params:
+# ``langcode``, ``deleted`` (bool — were the working-tree files
+# removed). NOT_A_PROJECT: the langcode isn't registered.
+NOT_A_PROJECT = 'NOT_A_PROJECT'
+PROJECT_FORGOTTEN = 'PROJECT_FORGOTTEN'
 # Persistent COMMIT_FAILED: the daemon has hit COMMIT_FAILED on
 # two-or-more successive commit attempts for this project.
 # dulwich's ``porcelain.commit`` essentially only raises on
@@ -422,6 +433,14 @@ LAN_PROJECT_CLONED = 'LAN_PROJECT_CLONED'
 LAN_PROJECT_REOPENED = 'LAN_PROJECT_REOPENED'
 LAN_PROJECT_ADOPTED_REMOTE = 'LAN_PROJECT_ADOPTED_REMOTE'
 LAN_PROJECT_COLLISION_UNRELATED = 'LAN_PROJECT_COLLISION_UNRELATED'
+# MERGE_UNRELATED_HISTORIES:     Merge-time counterpart of the
+#                                clone-time collision refusal above
+#                                (0.54.19): local and remote tips
+#                                share NO git ancestor, so this is
+#                                two different projects under one
+#                                langcode — refused, nothing
+#                                changed. Params: ``error``.
+MERGE_UNRELATED_HISTORIES = 'MERGE_UNRELATED_HISTORIES'
 LAN_ADOPT_ORIGIN_NEEDED = 'LAN_ADOPT_ORIGIN_NEEDED'
 LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'

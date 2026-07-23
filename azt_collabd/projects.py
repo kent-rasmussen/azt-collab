@@ -277,6 +277,15 @@ def register(langcode, working_dir, lift_path='', remote_url='',
     entry.setdefault('created_at', time.time())
     data[langcode] = entry
     _save_raw(data)
+    # An explicit register of a forgotten dir is a deliberate re-add
+    # (open-file / re-clone / re-add button) — lift the tombstone so
+    # the project stays. Only this path clears it; the auto-repair
+    # scan honors it. See the tombstone block above.
+    try:
+        clear_forgotten(working_dir)
+    except Exception as ex:
+        print(f'[collab.projects] clear_forgotten on register '
+              f'raised (non-fatal): {ex!r}', file=sys.stderr, flush=True)
     return Project.from_entry(langcode, entry)
 
 
@@ -301,10 +310,121 @@ def set_repo_slug(langcode, slug):
     _update(mut)
 
 
+def pending_merges():
+    """Return ``{langcode: sha_to_merge}`` for every project whose
+    entry carries a non-empty ``sha_to_merge`` key. That key is added
+    by hand to projects.json to request a one-time merge of an in-repo
+    ref/SHA into the project on the next daemon launch — consumed and
+    cleared by ``repo.consume_pending_merges``. Read-only; safe on a
+    parse failure (returns {}). See docs/merge_ref_recovery.md."""
+    d = _load_raw()
+    out = {}
+    for lang, entry in d.items():
+        if not isinstance(entry, dict):
+            continue
+        sha = (entry.get('sha_to_merge') or '').strip()
+        if sha:
+            out[lang] = sha
+    return out
+
+
+def clear_sha_to_merge(langcode):
+    """Remove the one-shot ``sha_to_merge`` key after it's consumed
+    (on any outcome — see ``repo.consume_pending_merges``)."""
+    def mut(d):
+        if langcode in d and isinstance(d[langcode], dict):
+            d[langcode].pop('sha_to_merge', None)
+    _update(mut)
+
+
 def unregister(langcode):
     def mut(d):
         d.pop(langcode, None)
     _update(mut)
+
+
+# ── forget tombstone ────────────────────────────────────────────────────────
+# A project the user EXPLICITLY forgot. The startup diag-repair scan
+# (repo.py) walks ``$AZT_HOME/projects/`` and re-registers any orphan
+# folder with a .git + .lift — which would silently resurrect a
+# just-forgotten project on the next daemon start. The tombstone
+# records the working_dir realpaths that must NOT be auto-re-registered.
+# It is CLEARED only by an explicit ``register()`` of that dir (open-file
+# / re-clone / a deliberate re-add button) — never by the auto-scan.
+# Kent's rule (2026-07-22): "I like the ability to pick it up later,
+# but I think that should be explicit, if I've explicitly asked to
+# forget it."
+_FORGOTTEN_FILENAME = 'forgotten_projects.json'
+
+
+def _forgotten_path():
+    return os.path.join(azt_home(), _FORGOTTEN_FILENAME)
+
+
+def _norm_dir(working_dir):
+    try:
+        return os.path.realpath(working_dir)
+    except Exception:
+        return working_dir or ''
+
+
+def forgotten_dirs():
+    """Set of working_dir realpaths the user explicitly forgot.
+    Empty set on any read/parse failure (fail-open: a missing
+    tombstone must never block a legitimate project)."""
+    try:
+        with open(_forgotten_path(), 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return set()
+    except Exception as ex:
+        print(f'[collab.projects] forgotten-store read failed: {ex}',
+              file=sys.stderr, flush=True)
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(x) for x in data if isinstance(x, str) and x}
+
+
+def _write_forgotten(dirs):
+    path = _forgotten_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.forgotten.', suffix='.tmp',
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(sorted(dirs), f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def add_forgotten(working_dir):
+    """Tombstone *working_dir* so the auto-repair scan won't
+    re-register it. Idempotent."""
+    rp = _norm_dir(working_dir)
+    if not rp:
+        return
+    dirs = forgotten_dirs()
+    if rp in dirs:
+        return
+    dirs.add(rp)
+    _write_forgotten(dirs)
+
+
+def clear_forgotten(working_dir):
+    """Remove *working_dir* from the tombstone — called from an
+    EXPLICIT re-add (``register``), never from the auto-scan."""
+    rp = _norm_dir(working_dir)
+    dirs = forgotten_dirs()
+    if rp not in dirs:
+        return
+    dirs.discard(rp)
+    _write_forgotten(dirs)
 
 
 def rename(old_langcode, new_langcode):
