@@ -9,6 +9,69 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.49 — "up to date (as of <time>)" on the peer-sync board
+
+Kent 2026-07-23, in the field.
+
+- 'Up to date' on the sync board is a recorded memory of the last
+  handshake, not a live confirmation — so a computer could show "up to
+  date" for a peer while the phone showed "awaiting first sync," and
+  the bare phrase hid that they simply hadn't exchanged. The 'up to
+  date' phrase now carries "(as of <time>)", where the time is the
+  peer's `last_seen_at` (bumped on every authenticated handshake),
+  rendered as a short LOCAL absolute time (`Jul 23 14:32`). Absolute so
+  it needn't re-render on a timer; local so it matches the device
+  clock. Row gains `last_seen_at`; display formats it (`_fmt_as_of`).
+
+Daemon-side (row field) + UI → restart the daemon.
+
+## 0.54.48 — "Listening on …" shows ALL addresses, not the default-route guess
+
+Kent 2026-07-23, in the field.
+
+- The listener binds `0.0.0.0` (every interface), but the settings
+  line reported only `_outward_ip_guess()` — the *default-route* IP.
+  On a wifi-off, USB-tethered desktop that guess is the wrong one
+  (still 192.x from a residual interface holding the default route)
+  while the phone is reachable only on the 10.x tether link, so the
+  line read "Listening on 192.x" and looked broken even though the
+  socket answers on the tether fine. The `endpoint` field of
+  `lan_toggle` / `lan_set_toggle` now lists **every** interface
+  address (`bound_endpoints_all`, live-enumerated), so the user can
+  see which subnet matches the peer. Display-only field; no wire/
+  client change (the string just got longer).
+- Capped that line at 4 addresses with a "(+N more)" suffix — a dev
+  host with docker / libvirt / VPN bridges can enumerate a dozen+.
+  The list is private-first sorted (a tether 10.x sorts ahead of
+  172.x/192.168.x), so the address that matters stays visible; peers
+  still get the full candidate list via the QR / discovery.
+
+Daemon-side → restart the daemon.
+
+## 0.54.47 — real "N to send" count; re-advertise on link change (asymmetry fix)
+
+Kent 2026-07-23.
+
+- **Show the real count, not "200+".** The board's `to_send` cap was
+  200 → "200+", uselessly hiding whether it's 205 or 3550. Now counted
+  with a walker-only helper (`_count_commits_ahead` — no per-commit dict
+  allocation, so an exact count of thousands is cheap) and the cap is
+  100000, so field numbers show exactly. Affordable because the board is
+  cached and recomputes only on change (0.54.46).
+- **Re-advertise mDNS on interface change (the "phone awaiting first
+  sync while computer says up-to-date" asymmetry).** The mDNS
+  advertisement captured its addresses at register time; when the
+  computer's wifi dropped and only the USB-tether links stayed up, it
+  kept advertising the dead wifi IP, so the phone discovered/dialed an
+  unreachable address and never delivered → no coverage → "awaiting
+  first sync" (while the computer, which *could* reach the phone, showed
+  "up to date"). New `lan_discovery.restart_advertise()` re-registers
+  with current interface addresses; the fast interface watcher now calls
+  it alongside `restart_browse` on any link change, so peers learn our
+  live (tether) address within ~3 s.
+
+Daemon-side → restart the daemon.
+
 ## 0.54.46 — event-driven sync board; fast USB-link watcher; auto-bind listener
 
 Kent 2026-07-23. Three related LAN/UX improvements.

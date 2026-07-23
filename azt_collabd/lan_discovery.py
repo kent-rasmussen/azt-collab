@@ -825,6 +825,10 @@ def start_advertise(peer_id_hex, fp_hex, port, device_name=''):
     with _LOCK:
         if _STATE['advertise'] is not None:
             return
+        # Retain params so restart_advertise can re-register with
+        # fresh addresses when interfaces change.
+        _STATE['advertise_params'] = (peer_id_hex, fp_hex, port,
+                                      device_name)
         mode = _STATE['mode'] or _detect_mode()
         _STATE['mode'] = mode
         if mode == 'zeroconf':
@@ -895,3 +899,25 @@ def restart_browse():
     with _LOCK:
         _endpoints.clear()
     start_browse()
+
+
+def restart_advertise():
+    """Re-register the mDNS advertisement with the machine's CURRENT
+    interface addresses. The advertised addresses are captured at
+    register time (``_start_advertise_zeroconf``); when interfaces
+    change — wifi drops, a USB-tether ``usb0``/``enx…`` comes up — the
+    old advertisement goes STALE and peers keep discovering (and
+    dialing) a dead address. Field 2026-07-23: computer's wifi down,
+    only tether links live, but the phone still had the computer's old
+    wifi IP and couldn't reach it → phone stuck at "awaiting first
+    sync" while the computer showed "up to date." Called on interface
+    change so peers see our live addresses. No-op if we were never
+    advertising."""
+    with _LOCK:
+        params = _STATE.get('advertise_params')
+    if not params:
+        return
+    print('[lan-discovery] restart_advertise: re-registering mDNS with '
+          'current interface addresses', file=sys.stderr, flush=True)
+    stop_advertise()
+    start_advertise(*params)

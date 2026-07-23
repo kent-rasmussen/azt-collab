@@ -190,6 +190,9 @@ msgstr "Échec de la mise à jour : {detail}"
 msgid "up to date"
 msgstr "à jour"
 
+msgid "up to date (as of {when})"
+msgstr "à jour (au {when})"
+
 msgid "incoming"
 msgstr "en réception"
 

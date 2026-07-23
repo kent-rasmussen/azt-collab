@@ -488,6 +488,25 @@ def _commits_between(repo, base_sha, tip_sha, limit=20):
     return out
 
 
+def _count_commits_ahead(repo, exclude_sha, head_sha, cap=100000):
+    """Count commits reachable from *head_sha* but NOT *exclude_sha*,
+    via a walker — no per-commit dict allocation (unlike
+    ``_commits_between``), so an exact count of thousands is cheap. Used
+    by the peer-sync board's 'N to send'. *exclude_sha* may be diverged
+    from head (counts the outbound delta). Capped at *cap* (returns cap
+    on hitting the ceiling — realistically never for field data)."""
+    n = 0
+    try:
+        walker = repo.get_walker(include=[head_sha], exclude=[exclude_sha])
+        for _ in walker:
+            n += 1
+            if n >= cap:
+                break
+    except Exception:
+        return 0
+    return n
+
+
 def _is_ancestor(repo, ancestor_sha, descendant_sha):
     """Return True if *ancestor_sha* is reachable from *descendant_sha*."""
     if ancestor_sha == descendant_sha:
@@ -2980,10 +2999,9 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
     if coverage is None:
         to_send_known = False
     elif coverage != head:
-        commits = _commits_between(repo, coverage, head, limit=count_limit + 1)
-        to_send = len(commits)
-        if to_send > count_limit:
-            to_send, capped = count_limit, True
+        to_send = _count_commits_ahead(repo, coverage, head, cap=count_limit)
+        if to_send >= count_limit:
+            capped = True
 
     # Inbound: their main isn't reachable from our HEAD ⇒ they hold
     # commits we don't. Count unknown by design (we may not hold them).
@@ -3007,6 +3025,10 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         'to_send_known': to_send_known,
         'capped': capped,
         'incoming': incoming,
+        # When we last authenticated a handshake with this peer — the
+        # "as of" for an 'up to date' judgment, which is a recorded
+        # memory, not a live confirmation (0.54.49).
+        'last_seen_at': peer_entry.get('last_seen_at', '') or '',
     }
 
 
@@ -3024,7 +3046,7 @@ def invalidate_peer_sync():
     _peer_sync_cache['dirty'] = True
 
 
-def lan_peer_sync_rows(count_limit=200):
+def lan_peer_sync_rows(count_limit=100000):
     """Cached read of the peer-sync board (Tier A, 2a). Recomputes the
     per-peer git walk ONLY when invalidated by a change event
     (``invalidate_peer_sync``) — and then at most once per
@@ -3046,7 +3068,7 @@ def lan_peer_sync_rows(count_limit=200):
     return list(st['rows'])
 
 
-def _compute_peer_sync_rows(count_limit=200):
+def _compute_peer_sync_rows(count_limit=100000):
     """Per-peer × per-shared-project sync status for the settings
     overlay (the "where do I stand with my peers" board, Tier A).
 

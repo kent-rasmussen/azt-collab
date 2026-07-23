@@ -768,13 +768,49 @@ def _h_lan_unshare_project(body):
     return 200, {"ok": True, "peer": entry}
 
 
+def _lan_endpoint_display():
+    """Human-facing 'Listening on …' string: EVERY address the
+    listener answers on, not just the single default-route guess.
+
+    The socket binds ``0.0.0.0`` (all interfaces), so a peer reaching
+    us on ANY local address connects — but ``_outward_ip_guess`` only
+    reports the default-route IP, which on a multi-homed / USB-tether
+    host is routinely the wrong one (field 2026-07-23: a wifi-off
+    desktop still reported its 192.x default-route IP while the phone
+    was reachable only on the 10.x tether link). Showing all of them
+    lets the user see which subnet actually matches the peer."""
+    try:
+        eps = _lan_listener.bound_endpoints_all()
+    except Exception:
+        eps = []
+    if eps:
+        # Cap the human-facing line: a dev host with docker / libvirt /
+        # VPN bridges can enumerate a dozen+ addresses, which is noise
+        # here. bound_endpoints_all() is private-first sorted and a
+        # tether 10.x sorts ahead of 172.x/192.168.x, so the address
+        # that matters stays visible. The peer still receives the FULL
+        # candidate list via the pairing QR / discovery — this trim is
+        # display-only.
+        _CAP = 4
+        shown = eps[:_CAP]
+        line = ', '.join(shown)
+        if len(eps) > _CAP:
+            line += f' (+{len(eps) - _CAP} more)'
+        return line
+    bound = _lan_listener.bound_endpoint()
+    if bound and bound[0] and bound[0] != '0.0.0.0':
+        return f'{bound[0]}:{bound[1]}'
+    return ''
+
+
 def _h_lan_get_toggle(_body):
     """Return the daemon-wide LAN-sync toggle state and the listener's
     bound endpoint if running. Response:
-    ``{ok: True, on: bool, endpoint: 'ip:port' or ''}``."""
+    ``{ok: True, on: bool, endpoint: 'ip:port[, ip:port…]' or ''}`` —
+    ``endpoint`` lists every interface address (0.54.48; see
+    ``_lan_endpoint_display``)."""
     on = _settings.lan_allow_sync()
-    bound = _lan_listener.bound_endpoint()
-    endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    endpoint = _lan_endpoint_display()
     return 200, {"ok": True, "on": on, "endpoint": endpoint}
 
 
@@ -801,8 +837,7 @@ def _h_lan_set_toggle(body):
         print(f'[server] lan toggle apply failed: {ex!r}',
               file=sys.stderr, flush=True)
     on = _settings.lan_allow_sync()
-    bound = _lan_listener.bound_endpoint()
-    endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    endpoint = _lan_endpoint_display()
     # Daemon-wide change — push-notify all observers (every project's
     # rendering may shift modes / suffix). Reaches only descendants-
     # mode subscribers on the parent status URI.

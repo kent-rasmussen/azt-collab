@@ -782,8 +782,14 @@ def _iface_watcher_loop():
                     try:
                         from . import lan_discovery as _lan_discovery
                         _lan_discovery.restart_browse()
+                        # Re-advertise with the NEW interface addresses
+                        # too — otherwise peers keep discovering our
+                        # stale (e.g. now-dead wifi) address and can't
+                        # reach us over the new link (field 2026-07-23:
+                        # the phone-can't-reach-computer asymmetry).
+                        _lan_discovery.restart_advertise()
                     except Exception as ex:
-                        print(f'[iface-watch] restart_browse raised: '
+                        print(f'[iface-watch] restart discovery raised: '
                               f'{ex!r}', file=sys.stderr, flush=True)
                     try:
                         from . import lan_burst as _lan_burst

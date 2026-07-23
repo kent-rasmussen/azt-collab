@@ -1266,10 +1266,36 @@ class SettingsScreen(Screen):
                 lambda _dt: self._render_peer_sync(rows, current), 0)
         threading.Thread(target=_work, daemon=True).start()
 
+    def _fmt_as_of(self, iso):
+        """Render an ISO8601-UTC ``last_seen_at`` as a short LOCAL
+        absolute time ('Jul 23 14:32'). Absolute (not relative) so it
+        needn't be re-rendered on a timer, and local so it matches the
+        clock on the device. Empty string on missing / unparseable."""
+        if not iso:
+            return ''
+        import datetime as _dt
+        s = iso.strip().replace('Z', '+00:00')
+        try:
+            dt = _dt.datetime.fromisoformat(s)
+        except Exception:
+            return ''
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()          # → local TZ
+        return dt.strftime('%b %d %H:%M')
+
     def _peer_sync_status_text(self, row):
-        """The right-hand status phrase for one peer row: 'up to date'
-        / 'incoming' / 'N to send' (+ 'incoming' when diverged), or
-        '?' when we couldn't compute the outbound count."""
+        """The right-hand status phrase for one peer row: 'up to date
+        (as of <time>)' / 'incoming' / 'N to send' (+ 'incoming' when
+        diverged), or 'awaiting first sync' when we've no coverage yet.
+
+        'Up to date' carries an "(as of <time>)" because it's a
+        recorded memory of the last handshake, NOT a live confirmation
+        — the peer may have made changes since that we haven't heard
+        about. The timestamp lets the user judge how stale that
+        judgment is (field 2026-07-23: a computer showing 'up to date'
+        while the phone showed 'awaiting first sync' — the disagreement
+        meant they hadn't actually exchanged, which the bare phrase
+        hid)."""
         if not row.get('to_send_known', True):
             return _tr('awaiting first sync')
         parts = []
@@ -1279,7 +1305,12 @@ class SettingsScreen(Screen):
             parts.append(_tr('{n} to send').format(n=shown))
         if row.get('incoming'):
             parts.append(_tr('incoming'))
-        return ' · '.join(parts) if parts else _tr('up to date')
+        if parts:
+            return ' · '.join(parts)
+        as_of = self._fmt_as_of(row.get('last_seen_at', ''))
+        if as_of:
+            return _tr('up to date (as of {when})').format(when=as_of)
+        return _tr('up to date')
 
     def _render_peer_sync(self, rows, current_langcode):
         from kivy.uix.label import Label
