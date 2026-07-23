@@ -694,6 +694,17 @@ KV_TEMPLATE = '''
                         color: T.TEXT_DIM
                         size_hint_y: None
                         height: self.texture_size[1] + dp(4)
+                    # Per-peer sync status for THIS project (one line
+                    # per paired peer): up to date / incoming / N to
+                    # send. Populated by ``_tick_peer_sync``; sits just
+                    # above the Share button per the layout Kent asked
+                    # for (2026-07-23).
+                    BoxLayout:
+                        id: peer_sync_this
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(2)
                     RecBtn:
                         id: share_project_btn
                         # The Share popup folds in three sharing
@@ -716,6 +727,17 @@ KV_TEMPLATE = '''
                         color: T.TEXT_DIM
                         size_hint_y: None
                         height: dp(20)
+                # Per-peer sync status for OTHER projects (one line per
+                # peer × project): between the current-project row and
+                # Switch project, per Kent's layout (2026-07-23). Lives
+                # OUTSIDE the gated project_actions_row so it shows even
+                # when the current project has no remote.
+                BoxLayout:
+                    id: peer_sync_others
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(2)
                 # Switch project — always visible, outside the gated
                 # project_actions_row. A user may want to abandon an
                 # unpublished project for another without publishing
@@ -1142,14 +1164,16 @@ class SettingsScreen(Screen):
             self._build_lang_selector()
             self.refresh()
             self._start_cawl_cache_poll()
+            self._start_peer_sync_poll()
             self._focus_contributor_if_unset()
         Clock.schedule_once(_ready, 0)
 
     def on_leave(self):
-        # Stop the CAWL cache poll when the user navigates away —
-        # don't leave a Clock-scheduled callback waking the daemon
-        # every 5 s for a screen the user can't see.
+        # Stop the polls when the user navigates away — don't leave
+        # Clock-scheduled callbacks waking the daemon for a screen the
+        # user can't see.
         self._stop_cawl_cache_poll()
+        self._stop_peer_sync_poll()
 
     _cawl_cache_event = None
 
@@ -1187,6 +1211,98 @@ class SettingsScreen(Screen):
             except Exception:
                 pass
             self._cawl_cache_event = None
+
+    # ── Peer-sync overlay (Tier A: "where do I stand with my peers") ──
+    _peer_sync_event = None
+
+    def _start_peer_sync_poll(self):
+        """Poll per-peer sync status every ~2.5 s while the settings
+        screen is up. Cheap server-side on the steady path (a caught-up
+        peer does no git walk); the fetch runs off the UI thread."""
+        self._stop_peer_sync_poll()
+        self._tick_peer_sync()   # immediate first paint
+        self._peer_sync_event = Clock.schedule_interval(
+            lambda _dt: self._tick_peer_sync(), 2.5)
+
+    def _stop_peer_sync_poll(self):
+        if self._peer_sync_event is not None:
+            try:
+                self._peer_sync_event.cancel()
+            except Exception:
+                pass
+            self._peer_sync_event = None
+
+    def _tick_peer_sync(self):
+        # Fetch off the UI thread — the daemon walks git per peer — then
+        # render back on the UI thread.
+        def _work():
+            try:
+                from azt_collab_client import lan_peer_sync, last_project
+                rows = lan_peer_sync() or []
+                current = (last_project() or '').strip()
+            except Exception:
+                rows, current = [], ''
+            Clock.schedule_once(
+                lambda _dt: self._render_peer_sync(rows, current), 0)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _peer_sync_status_text(self, row):
+        """The right-hand status phrase for one peer row: 'up to date'
+        / 'incoming' / 'N to send' (+ 'incoming' when diverged), or
+        '?' when we couldn't compute the outbound count."""
+        if not row.get('to_send_known', True):
+            return _tr('status unknown')
+        parts = []
+        n = int(row.get('to_send', 0) or 0)
+        if n > 0:
+            shown = (str(n) + '+') if row.get('capped') else str(n)
+            parts.append(_tr('{n} to send').format(n=shown))
+        if row.get('incoming'):
+            parts.append(_tr('incoming'))
+        return ' · '.join(parts) if parts else _tr('up to date')
+
+    def _render_peer_sync(self, rows, current_langcode):
+        from kivy.uix.label import Label
+        from azt_collab_client.ui import theme as _theme
+        this_box = self.ids.get('peer_sync_this')
+        others_box = self.ids.get('peer_sync_others')
+        if this_box is None or others_box is None:
+            return
+        this_box.clear_widgets()
+        others_box.clear_widgets()
+        font = getattr(App.get_running_app(), 'font_name', 'Roboto')
+        for row in rows:
+            name = (row.get('device_name')
+                    or (row.get('peer_id', '')[:8] + '…'))
+            lang = row.get('langcode', '')
+            status = self._peer_sync_status_text(row)
+            if lang and lang == current_langcode:
+                text = f'{name} · {status}'
+                box = this_box
+            else:
+                text = f'{name} · {lang} · {status}'
+                box = others_box
+            lbl = Label(text=text, size_hint_y=None, height=dp(20),
+                        font_size=sp(11), color=_theme.TEXT_DIM,
+                        halign='left', valign='middle', font_name=font)
+            lbl.bind(width=lambda w, *_: setattr(
+                w, 'text_size', (w.width, None)))
+            box.add_widget(lbl)
+        # The current-project lines live INSIDE the gated actions row,
+        # whose height is set explicitly — grow it to fit them.
+        self._sync_actions_row_height()
+
+    def _sync_actions_row_height(self):
+        """Add the current-project peer lines' height to the gated
+        actions row (its base height is stamped by
+        ``_refresh_project_actions_row``). No-op until that base exists
+        or when the row is hidden (base 0)."""
+        row = self.ids.get('project_actions_row')
+        this_box = self.ids.get('peer_sync_this')
+        base = getattr(self, '_actions_row_base_h', 0)
+        if row is None or this_box is None or not base:
+            return
+        row.height = base + this_box.height
 
     def _tick_cawl_cache_status(self):
         banner = self.ids.get('cawl_cache_status_banner')
@@ -1533,6 +1649,7 @@ class SettingsScreen(Screen):
         # first button), Publish fired switch_project_btn, etc.
         row.height = 0
         row.opacity = 0
+        self._actions_row_base_h = 0   # hidden ⇒ peer-sync adds nothing
         if info is not None:
             info.text = ''
         if msg is not None:
@@ -1587,12 +1704,17 @@ class SettingsScreen(Screen):
                 ).format(langcode=project.langcode)
         # Heights (0.45.0): section label (dp 32) + info (~dp 40, +dp 20
         # for the optional backup line) + share-project button (dp 52) +
-        # msg (dp 20) + 3× spacing (dp 8 each). The separate grant_collab
-        # button is gone in 0.45.0 — folded into the share popup's
-        # three-section body. Switch-project lives OUTSIDE this row.
-        row.height = (dp(32) + dp(40) + (dp(20) if backup_line else 0)
-                      + dp(52) + dp(20) + dp(8) * 3)
+        # msg (dp 20). Spacing: dp(8) between children — now 4 gaps
+        # since the peer-sync-this box sits between info and the share
+        # button (0.54.38). The peer-sync box's own height is added on
+        # top by ``_sync_actions_row_height`` (it's dynamic — grows with
+        # the number of paired peers). Switch-project lives OUTSIDE this
+        # row; the other-projects peer box does too.
+        self._actions_row_base_h = (
+            dp(32) + dp(40) + (dp(20) if backup_line else 0)
+            + dp(52) + dp(20) + dp(8) * 4)
         row.opacity = 1
+        self._sync_actions_row_height()
         # Restore the children that ``_detach_project_actions_children``
         # may have removed during a previous refresh while the row
         # was hidden. Idempotent if they're already attached.
@@ -3668,11 +3790,19 @@ class CollabUIApp(App):
                           on_error=self._show_error)
 
     def update_app(self):
-        """Poll the configured GitHub repo for a newer server APK and,
-        if found, download + trigger Android's system installer.
-        Repo / asset filename are sourced from ``azt_collabd.config``
-        so the same code path serves any sister app that wires its own
-        ``update_repo`` via ``configure(update_repo=...)``."""
+        """Update this app. On Android: poll the configured GitHub repo
+        for a newer server APK and, if found, download + trigger the
+        system installer (repo / asset from ``azt_collabd.config``). On
+        desktop the app is a git checkout, not an APK, so "update"
+        fast-forwards that checkout from origin
+        (``self_update.git_pull_self``, FF-only)."""
+        try:
+            from kivy.utils import platform
+        except Exception:
+            platform = ''
+        if platform != 'android':
+            self._desktop_git_update()
+            return
         from azt_collabd.config import update_repo
         check_for_update(
             repo=update_repo(),
@@ -3684,6 +3814,39 @@ class CollabUIApp(App):
             on_no_update=lambda: self._set_update_msg(_tr('Up to date.')),
             on_error=self._show_error,
         )
+
+    def _desktop_git_update(self):
+        """Desktop update = fast-forward the daemon's own git checkout.
+        Runs in a worker so the network pull doesn't block the UI;
+        result is translated here (``self_update`` returns codes so it
+        owns no strings)."""
+        import threading
+        self._set_update_msg(_tr('Updating…'))
+
+        def _work():
+            try:
+                from azt_collabd import self_update
+                code, detail = self_update.git_pull_self()
+            except Exception as ex:
+                code, detail = 'FAILED', str(ex)
+            msgs = {
+                'UPDATED': _tr('Updated — restart to load the new '
+                               'version.'),
+                'UP_TO_DATE': _tr('Up to date.'),
+                'NOT_A_CHECKOUT': _tr('This copy is not a git checkout, '
+                                      'so it cannot self-update.'),
+                'NO_GIT': _tr('git is not installed on this computer.'),
+                'TIMEOUT': _tr('Update timed out.'),
+            }
+            if code in msgs:
+                text = msgs[code]
+            else:  # FAILED
+                text = _tr('Update failed: {detail}').format(
+                    detail=detail or '')
+            Clock.schedule_once(
+                lambda _dt: self._set_update_msg(text), 0)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _set_update_msg(self, text):
         try:

@@ -2952,6 +2952,137 @@ def _wan_unshared(repo, branch):
         return 0
 
 
+def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
+    """One status row for (this peer, this project). Returns a dict:
+    ``{peer_id, device_name, langcode, to_send, to_send_known,
+    capped, incoming}``. See ``lan_peer_sync_rows`` for the contract.
+    Cheap on the steady path: coverage == HEAD short-circuits to
+    to_send=0 / incoming=False with no walk."""
+    pid = peer_entry.get('peer_id', '') or ''
+    name = peer_entry.get('device_name', '') or ''
+    main_hex = (peer_entry.get('last_seen_main') or {}).get(langcode, '')
+    cov_hex = (peer_entry.get('last_covered_local') or {}).get(langcode, '')
+
+    def _held(hexsha):
+        if not hexsha:
+            return None
+        try:
+            b = hexsha.encode('ascii')
+        except Exception:
+            return None
+        return b if b in repo.object_store else None
+
+    # Outbound: commits from our HEAD the peer doesn't cover. Coverage
+    # = their main when we hold it, else the last commit we confirmed
+    # delivered. Neither held ⇒ we can't count (to_send_known False).
+    coverage = _held(main_hex) or _held(cov_hex)
+    to_send, to_send_known, capped = 0, True, False
+    if coverage is None:
+        to_send_known = False
+    elif coverage != head:
+        commits = _commits_between(repo, coverage, head, limit=count_limit + 1)
+        to_send = len(commits)
+        if to_send > count_limit:
+            to_send, capped = count_limit, True
+
+    # Inbound: their main isn't reachable from our HEAD ⇒ they hold
+    # commits we don't. Count unknown by design (we may not hold them).
+    incoming = False
+    if main_hex:
+        try:
+            main_b = main_hex.encode('ascii')
+        except Exception:
+            main_b = None
+        if main_b and main_b != head:
+            if main_b in repo.object_store:
+                incoming = not _is_ancestor(repo, main_b, head)
+            else:
+                incoming = True   # we don't even hold their tip
+
+    return {
+        'peer_id': pid,
+        'device_name': name,
+        'langcode': langcode,
+        'to_send': to_send,
+        'to_send_known': to_send_known,
+        'capped': capped,
+        'incoming': incoming,
+    }
+
+
+def lan_peer_sync_rows(count_limit=200):
+    """Per-peer × per-shared-project sync status for the settings
+    overlay (the "where do I stand with my peers" board, Tier A).
+
+    One dict per (paired peer, project that peer shares):
+        peer_id, device_name, langcode,
+        to_send        — commits our HEAD has that the peer doesn't
+                          cover (0 = nothing to send); capped at
+                          *count_limit*,
+        to_send_known  — False when we can't compute it (no usable
+                          coverage commit for the peer) → UI shows '?',
+        capped         — True if to_send hit the cap (show 'N+'),
+        incoming       — True when the peer holds commits we don't
+                          (count unknown by design).
+
+    Read-only, never raises (→ [] on failure), and fd-safe: every repo
+    is opened inside ``_track_opened_repos`` and auto-closed at scope
+    exit. Cheap on the steady path — a peer whose coverage == our HEAD
+    does no walk."""
+    from . import projects as _projects
+    from . import peers as _peers
+    from dulwich import porcelain
+    rows = []
+    try:
+        peer_list = _peers.list_peers() or []
+    except Exception:
+        peer_list = []
+    if not peer_list:
+        return rows
+    try:
+        all_projects = _projects.list_all() or []
+    except Exception:
+        return rows
+    with _track_opened_repos():
+        for p in all_projects:
+            langcode = (getattr(p, 'langcode', '') or '').strip()
+            wd = (getattr(p, 'working_dir', '') or '').strip()
+            if not langcode or not wd:
+                continue
+            sharers = [pe for pe in peer_list
+                       if langcode in (pe.get('shared_projects') or [])]
+            if not sharers:
+                continue
+            repo = _get_repo(wd)
+            if repo is None:
+                continue
+            try:
+                branch = porcelain.active_branch(repo).decode(
+                    'utf-8', errors='replace')
+            except Exception:
+                branch = 'main'
+            try:
+                head = repo.refs[b'refs/heads/' + branch.encode()]
+            except Exception:
+                try:
+                    head = repo.head()
+                except Exception:
+                    continue
+            for pe in sharers:
+                try:
+                    rows.append(_peer_sync_row(
+                        repo, head, langcode, pe, count_limit))
+                except Exception as ex:
+                    print(f'[peer-sync] row failed for '
+                          f'{pe.get("peer_id","")[:8]!r}/{langcode!r}: '
+                          f'{ex!r}', file=sys.stderr, flush=True)
+    # Sort so each peer's projects sit together (device name, then
+    # langcode); unnamed peers last.
+    rows.sort(key=lambda r: ((r['device_name'] or '~').lower(),
+                             r['langcode']))
+    return rows
+
+
 def _peer_exclude_shas(repo, langcode):
     """Build the walker exclude list from paired peers' coverage
     records: each peer's ``last_seen_main`` when we HOLD that

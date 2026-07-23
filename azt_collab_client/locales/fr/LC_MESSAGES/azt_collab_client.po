@@ -163,6 +163,36 @@ msgstr "Plus tard"
 msgid "Up to date."
 msgstr "À jour."
 
+msgid "Updating…"
+msgstr "Mise à jour…"
+
+msgid "Updated — restart to load the new version."
+msgstr "Mis à jour — redémarrez pour charger la nouvelle version."
+
+msgid "This copy is not a git checkout, so it cannot self-update."
+msgstr "Cette copie n'est pas un dépôt git ; elle ne peut pas se mettre à jour."
+
+msgid "git is not installed on this computer."
+msgstr "git n'est pas installé sur cet ordinateur."
+
+msgid "Update timed out."
+msgstr "Délai de mise à jour dépassé."
+
+msgid "Update failed: {detail}"
+msgstr "Échec de la mise à jour : {detail}"
+
+msgid "up to date"
+msgstr "à jour"
+
+msgid "incoming"
+msgstr "en réception"
+
+msgid "{n} to send"
+msgstr "{n} à envoyer"
+
+msgid "status unknown"
+msgstr "état inconnu"
+
 msgid "Checking for updates…"
 msgstr "Recherche de mises à jour…"
 

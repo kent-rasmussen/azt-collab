@@ -445,6 +445,20 @@ def _h_lan_list_peers(_body):
     return 200, {"ok": True, "peers": _peers.list_peers()}
 
 
+def _h_lan_peer_sync(_body):
+    """Per-peer × per-shared-project sync status for the settings
+    overlay. Response: ``{ok: True, rows: [...]}`` — see
+    ``repo.lan_peer_sync_rows`` for each row's shape. Read-only,
+    cheap on the steady path; polled by the UI every couple seconds."""
+    try:
+        rows = repo_mod.lan_peer_sync_rows()
+    except Exception as ex:
+        print(f'[peer-sync] rows raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        rows = []
+    return 200, {"ok": True, "rows": rows}
+
+
 def _h_lan_pair_qr(body):
     """Return the JSON payload to QR-encode for pairing this daemon
     with another device. Phase 2 of the LAN sync transport.
@@ -4721,6 +4735,8 @@ def dispatch(method, path, body):
             return _h_lan_peer_id(body)
         if path == '/v1/lan/peers':
             return _h_lan_list_peers(body)
+        if path == '/v1/lan/peer_sync':
+            return _h_lan_peer_sync(body)
         if path == '/v1/lan/toggle':
             return _h_lan_get_toggle(body)
         if path == '/v1/lan/pending':

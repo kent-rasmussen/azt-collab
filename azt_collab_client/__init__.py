@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.36"
+__version__ = "0.54.38"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -976,6 +976,32 @@ def lan_list_peers():
     if not isinstance(out, list):
         return []
     return out
+
+
+def lan_peer_sync():
+    """Per-peer × per-shared-project sync status for a status overlay.
+    Returns a list of dicts, one per (paired peer, project the peer
+    shares):
+
+        peer_id, device_name, langcode,
+        to_send        — int: commits our HEAD has that the peer
+                         doesn't cover (0 = nothing outbound),
+        to_send_known  — bool: False when it couldn't be computed
+                         (no usable coverage) → render '?',
+        capped         — bool: to_send hit the cap (render 'N+'),
+        incoming       — bool: the peer holds commits we don't
+                         (count unknown by design).
+
+    Empty list on transport failure or no peers. Never raises — safe
+    to poll from the UI."""
+    try:
+        resp = call('GET', '/v1/lan/peer_sync')
+    except ServerUnavailable:
+        return []
+    if not resp.get('ok'):
+        return []
+    out = resp.get('rows') or []
+    return out if isinstance(out, list) else []
 
 
 def lan_pair_qr(endpoint='', langcode=''):
@@ -3071,7 +3097,7 @@ __all__ = [
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
-    'lan_peer_id', 'lan_list_peers', 'lan_pair_qr',
+    'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',

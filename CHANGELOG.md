@@ -9,6 +9,56 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.38 — per-peer sync status in the settings UI (sync board, Tier A)
+
+FEATURE (Kent 2026-07-23): a live, in-app view of where you stand with
+your peers — no logs, no OS tools. One line per (paired peer, project
+that peer shares): `‹peer› · up to date | incoming | N to send`.
+
+- **Daemon:** `repo.lan_peer_sync_rows()` walks, per paired peer ×
+  shared project: `to_send` (commits our HEAD has that the peer doesn't
+  cover — counted exactly, capped at 200 → 'N+'), and `incoming` (bool:
+  the peer holds commits we don't — count unknown by design, since we
+  may not hold their commits). Reuses the existing per-peer coverage
+  records (`last_seen_main` / `last_covered_local`); cheap on the steady
+  path (coverage == HEAD → no walk); fd-safe (`_track_opened_repos`).
+  Exposed at `GET /v1/lan/peer_sync`; client wrapper `lan_peer_sync()`.
+- **UI (daemon settings screen):** the current project's peer lines sit
+  just above the "Share project" button; other projects' lines sit
+  between it and "Switch project" (the layout Kent specified). Polled
+  every ~2.5 s off the UI thread. The "are they transferring / done?"
+  signal is the count updating live: `N to send → 0 → up to date`.
+- Rows sorted so each peer's projects cluster. Status strings en + fr.
+
+This is Tier A of the tracked *sync status board* item; Tier B (explicit
+reachability + "transferring now" flash) remains. FIRST CUT — worth an
+on-device eyeball of the current-project block's height inside the
+gated actions row (it grows with peer count; `_sync_actions_row_height`
+adds it to the row's base).
+
+## 0.54.37 — desktop update button git-pulls the checkout
+
+FEATURE (Kent 2026-07-23): on desktop the "Update this app" button did
+nothing useful — it errored "APK install is only available on Android."
+Now it fast-forwards the daemon's own git checkout from origin.
+
+- New `azt_collabd/self_update.py` (`git_pull_self`): `git -C <root>
+  pull --ff-only` on the checkout this module lives in. FF-only on
+  purpose — a clean field clone updates silently; a clone with local
+  edits or diverged history is *reported*, never force-merged (we don't
+  mangle a working tree behind an "update" button). Returns a
+  `(code, detail)` tuple so the UI owns translation. Git stays in the
+  daemon package — the client's no-git hard-rule is untouched.
+- `SettingsScreen.update_app` branches on platform: Android keeps the
+  APK self-update; desktop calls `_desktop_git_update`, which runs the
+  pull in a worker thread and reports UPDATED / UP_TO_DATE /
+  NOT_A_CHECKOUT / NO_GIT / TIMEOUT / FAILED (translated, en + fr).
+
+Scope: this updates the **azt-collab** checkout (what the daemon's own
+update button logically updates). The desktop AZT application is a
+separate checkout with its own update path; wiring that is an azt-side
+change, not this repo's.
+
 ## 0.54.36 — pairing QR live-refreshes when addresses change
 
 FEATURE (Kent 2026-07-23): the last Phase-1 nicety — a pairing QR
