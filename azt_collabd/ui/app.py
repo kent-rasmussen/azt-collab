@@ -1251,7 +1251,7 @@ class SettingsScreen(Screen):
         / 'incoming' / 'N to send' (+ 'incoming' when diverged), or
         '?' when we couldn't compute the outbound count."""
         if not row.get('to_send_known', True):
-            return _tr('status unknown')
+            return _tr('awaiting first sync')
         parts = []
         n = int(row.get('to_send', 0) or 0)
         if n > 0:
