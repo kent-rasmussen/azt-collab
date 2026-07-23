@@ -9,6 +9,26 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.36 — pairing QR live-refreshes when addresses change
+
+FEATURE (Kent 2026-07-23): the last Phase-1 nicety — a pairing QR
+already on screen now updates itself when the machine's addresses
+change (plug in a phone + enable USB tethering while the QR is
+displayed, and `usb0` appears in it without closing/reopening).
+
+`share_pairing_qr_popup` renders the QR into a replaceable box and,
+while open, re-fetches `lan_pair_qr` every 4 s; it re-renders only when
+the advertised endpoint set actually changed (the daemon payload
+reflects current interfaces via `bound_endpoints_all`, so the re-fetch
+picks up the new address). The refresh timer is cancelled on dismiss
+alongside the existing share-offer heartbeat. Applies to both the
+pair-only and combined pair+share QR. The share-repo QR
+(`_show_share_repo_qr_popup`) is unaffected — it encodes a git URL, not
+endpoint addresses, so it has no address-staleness problem.
+
+Cable pairing is now fully plug-and-go whether you show the QR before
+or after plugging in.
+
 ## 0.54.35 — pairing QR advertises ALL addresses (cable-pairing plug-and-go)
 
 FIX (Kent 2026-07-23): the pairing QR encoded a single `endpoint` from

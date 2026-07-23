@@ -288,31 +288,48 @@ def share_pairing_qr_popup(font_name='Roboto', langcode=''):
             font_name=font_name))
 
     # Build the QR payload by calling lan_pair_qr — the daemon
-    # auto-populates the endpoint from the running listener when
+    # auto-populates the endpoint(s) from the running listener when
     # present. Passing *langcode* makes the payload combined
-    # (pair + share + clone) rather than pair-only.
+    # (pair + share + clone) rather than pair-only. Rendered into a
+    # replaceable box so the live-refresh below can swap it in place
+    # when the machine's addresses change (USB-tether plug).
     from .. import lan_pair_qr
-    payload = lan_pair_qr(langcode=langcode)
-    if payload:
+    qr_box = BoxLayout(orientation='vertical', spacing=dp(6))
+    content.add_widget(qr_box)
+    render_state = {'sig': None}
+
+    def _endpoints_sig(payload):
+        eps = payload.get('endpoints')
+        if isinstance(eps, list) and eps:
+            return tuple(eps)
+        return (payload.get('endpoint', ''),)
+
+    def _render_into(payload):
+        qr_box.clear_widgets()
+        if not payload:
+            qr_box.add_widget(Label(
+                text=_tr('Could not generate pairing QR.'),
+                font_size=sp(12), color=theme.TEXT_DIM,
+                font_name=font_name))
+            render_state['sig'] = None
+            return
         widget, err = _render_qr_widget(payload, scale=8, border=2)
         if widget is not None:
-            content.add_widget(widget)
+            qr_box.add_widget(widget)
         else:
-            content.add_widget(Label(
+            qr_box.add_widget(Label(
                 text=err, font_size=sp(12),
                 color=theme.TEXT_DIM, font_name=font_name))
         endpoint = payload.get('endpoint', '')
         if endpoint:
-            content.add_widget(Label(
+            qr_box.add_widget(Label(
                 text=_tr('Endpoint: ') + endpoint,
                 size_hint_y=None, height=dp(22),
                 font_size=sp(11), color=theme.TEXT_DIM,
                 font_name=font_name))
-    else:
-        content.add_widget(Label(
-            text=_tr('Could not generate pairing QR.'),
-            font_size=sp(12), color=theme.TEXT_DIM,
-            font_name=font_name))
+        render_state['sig'] = _endpoints_sig(payload)
+
+    _render_into(lan_pair_qr(langcode=langcode))
 
     close_btn = Button(
         text=_tr('Close'), size_hint_y=None, height=dp(44),
@@ -325,6 +342,26 @@ def share_pairing_qr_popup(font_name='Roboto', langcode=''):
         auto_dismiss=False)
     close_btn.bind(on_release=lambda *_: popup.dismiss())
 
+    from kivy.clock import Clock
+
+    # Live-refresh the QR when this machine's addresses change — e.g.
+    # the user plugs in a phone and enables USB tethering while the QR
+    # is on screen, bringing up usb0. The daemon payload reflects the
+    # current interfaces (bound_endpoints_all), so a re-fetch picks up
+    # the new address; we only re-render the (relatively costly) QR
+    # when the advertised endpoints actually changed. 0.54.36.
+    refresh = {'ev': None}
+
+    def _refresh_qr(_dt):
+        try:
+            payload = lan_pair_qr(langcode=langcode)
+        except Exception:
+            return
+        if payload and _endpoints_sig(payload) != render_state['sig']:
+            _render_into(payload)
+
+    refresh['ev'] = Clock.schedule_interval(_refresh_qr, 4)
+
     # "Valid while displayed" share offer (0.52.26): the initial
     # ``lan_pair_qr`` above already armed the offer for *langcode*; while
     # this popup stays open we heartbeat so it stays armed, and we revoke
@@ -333,7 +370,6 @@ def share_pairing_qr_popup(font_name='Roboto', langcode=''):
     # langcode and share nothing, so no heartbeat needed.
     hb = {'ev': None}
     if langcode:
-        from kivy.clock import Clock
         from .. import lan_pair_qr_keepalive, lan_pair_qr_close
 
         def _beat(_dt):
@@ -346,16 +382,20 @@ def share_pairing_qr_popup(font_name='Roboto', langcode=''):
         # beat is tolerated before the offer lapses.
         hb['ev'] = Clock.schedule_interval(_beat, 10)
 
-        def _on_dismiss(*_):
-            if hb['ev'] is not None:
-                hb['ev'].cancel()
-                hb['ev'] = None
+    def _on_dismiss(*_):
+        if refresh['ev'] is not None:
+            refresh['ev'].cancel()
+            refresh['ev'] = None
+        if hb['ev'] is not None:
+            hb['ev'].cancel()
+            hb['ev'] = None
+        if langcode:
             try:
                 lan_pair_qr_close(langcode)
             except Exception:
                 pass
 
-        popup.bind(on_dismiss=_on_dismiss)
+    popup.bind(on_dismiss=_on_dismiss)
 
     popup.open()
     return popup

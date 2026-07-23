@@ -72,9 +72,13 @@ QR was still single-address (the fix had never landed). Now
 them all and reverse-hellos each until one connects; `endpoint` stays
 for pre-0.54.35 scanners (back-compat, no floor bump). The plug-event
 re-bind/announce is covered by 0.54.34's link-up nudge (restart_browse
-+ burst on interface change). **Still open:** regenerate an
-already-displayed QR when interfaces change (a QR opened BEFORE
-plugging in is stale until reopened) — minor.
++ burst on interface change). Live QR refresh SHIPPED 0.54.36:
+`share_pairing_qr_popup` re-fetches `lan_pair_qr` every 4 s while open
+and re-renders when the endpoint set changes, so a QR displayed BEFORE
+plugging in picks up `usb0` on its own. **Phase 1 is now closed** for
+the mDNS-working path; the only residual is the no-mDNS OEM corner
+(some tether stacks filter multicast — untested), where the
+multi-address QR + static_endpoints fallback carry pairing.
 
 ### Phase 2 — ops
 
