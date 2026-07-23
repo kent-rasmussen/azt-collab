@@ -445,6 +445,31 @@ def _h_lan_list_peers(_body):
     return 200, {"ok": True, "peers": _peers.list_peers()}
 
 
+def _h_lan_retry_peer(body):
+    """Per-peer "retry sync" — the sync board's per-row link. Fires a
+    LAN burst + ``sweep_peer(peer_id)`` so the daemon tries to catch
+    that one peer up on every shared project, right now, github-
+    independent. Always ``{ok: True}`` — outcome shows via the next
+    peer_sync poll (the count updates / 'awaiting first sync' clears).
+    Body: ``{peer_id}``."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 400, {"ok": False, "error": "missing_peer_id"}
+    try:
+        from . import lan_burst as _lan_burst
+        _lan_burst.start_burst()
+    except Exception as ex:
+        print(f'[lan-retry-peer] start_burst raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    try:
+        from . import lan_push as _lan_push
+        _lan_push.sweep_peer(peer_id)
+    except Exception as ex:
+        print(f'[lan-retry-peer] {peer_id[:8]!r} sweep raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return 200, {"ok": True}
+
+
 def _h_lan_peer_sync(_body):
     """Per-peer × per-shared-project sync status for the settings
     overlay. Response: ``{ok: True, rows: [...]}`` — see
@@ -4823,6 +4848,8 @@ def dispatch(method, path, body):
             return _h_lan_set_toggle(body)
         if path == '/v1/lan/burst':
             return _h_lan_burst(body)
+        if path == '/v1/lan/retry_peer':
+            return _h_lan_retry_peer(body)
         if path == '/v1/lan/static_endpoints':
             return _h_lan_set_static_endpoints(body)
         if path == '/v1/lan/clone':

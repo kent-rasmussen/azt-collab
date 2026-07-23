@@ -229,7 +229,7 @@ class PickerApp(App):
         register_settings_kv(font_name=self._font_name)
         Builder.load_string(_KV_TEMPLATE.format(font_name=self._font_name))
         register_picker_kv(font_name=self._font_name, hide_settings_gear=False)
-        register_langpicker_kv(font_name=self._font_name)
+        register_langpicker_kv(font_name=self._font_name, show_gear=True)
         self.sm = _PickerRoot(transition=SlideTransition())
         # Honour the launch_mode set by ``main()``. 'internal' opens
         # directly on the settings screen — used when the daemon's

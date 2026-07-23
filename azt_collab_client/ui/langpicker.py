@@ -48,6 +48,30 @@ _KV_TEMPLATE = '''
         orientation: 'vertical'
         padding: dp(16)
         spacing: dp(10)
+        # Settings gear — an escape back to settings that works in
+        # BOTH launch modes (external picker doesn't route back here,
+        # and the langpicker has no other way to settings; field
+        # 2026-07-23: a phone stranded on the langpicker with no gear
+        # and back-exits). Hidden for hosts that pass show_gear=False.
+        BoxLayout:
+            size_hint_y: None
+            height: dp(40) if {show_gear} else 0
+            opacity: 1 if {show_gear} else 0
+            disabled: not {show_gear}
+            Widget:
+            Button:
+                size_hint: None, None
+                size: (dp(40), dp(40)) if {show_gear} else (0, 0)
+                background_color: T.TRANSPARENT
+                background_normal: ''
+                on_release: app.go_config()
+                Image:
+                    source: '{gear_icon}' if {show_gear} else ''
+                    size: (dp(26), dp(26)) if {show_gear} else (0, 0)
+                    size_hint: None, None
+                    center: self.parent.center
+                    allow_stretch: True
+                    keep_ratio: True
         Label:
             text: _('Choose your language')
             font_size: sp(22)
@@ -216,17 +240,34 @@ BoxLayout:
 _FONT_NAME = 'Roboto'
 
 
-def register_kv(font_name='Roboto', langtags_path=None):
+def register_kv(font_name='Roboto', langtags_path=None,
+                show_gear=False, gear_icon=None):
     """Load LangPickerScreen KV with the host's font and asset path.
 
     Call once after your main KV is loaded (so the ScreenManager rule
     referencing LangPickerScreen finds the class).
+
+    ``show_gear`` adds a settings gear (``app.go_config()``) to the top
+    — pass True from a host that has a settings screen so a user who
+    lands on the langpicker always has a route back to settings (the
+    langpicker is otherwise a dead-end in the external launch mode).
+    ``gear_icon`` is an absolute PNG path; ignored when show_gear is
+    False.
     """
     global _LANGTAGS_PATH, _FONT_NAME
     _FONT_NAME = font_name
     if langtags_path:
         _LANGTAGS_PATH = langtags_path
-    Builder.load_string(_KV_TEMPLATE.format(font_name=font_name))
+    if show_gear and not gear_icon:
+        try:
+            from .icons import icon_path
+            gear_icon = icon_path('gear')
+        except Exception:
+            gear_icon = ''
+    Builder.load_string(_KV_TEMPLATE.format(
+        font_name=font_name,
+        show_gear=bool(show_gear),
+        gear_icon=(gear_icon or '')))
 
 
 class LangPickerScreen(Screen):

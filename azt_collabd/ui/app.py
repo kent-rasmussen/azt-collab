@@ -1268,6 +1268,7 @@ class SettingsScreen(Screen):
         others_box = self.ids.get('peer_sync_others')
         if this_box is None or others_box is None:
             return
+        from kivy.uix.boxlayout import BoxLayout
         this_box.clear_widgets()
         others_box.clear_widgets()
         font = getattr(App.get_running_app(), 'font_name', 'Roboto')
@@ -1276,21 +1277,54 @@ class SettingsScreen(Screen):
                     or (row.get('peer_id', '')[:8] + '…'))
             lang = row.get('langcode', '')
             status = self._peer_sync_status_text(row)
+            peer_id = row.get('peer_id', '')
             if lang and lang == current_langcode:
                 text = f'{name} · {status}'
                 box = this_box
             else:
                 text = f'{name} · {lang} · {status}'
                 box = others_box
-            lbl = Label(text=text, size_hint_y=None, height=dp(20),
+            line = BoxLayout(orientation='horizontal', size_hint_y=None,
+                             height=dp(26), spacing=dp(6))
+            lbl = Label(text=text, size_hint_x=1,
                         font_size=sp(11), color=_theme.TEXT_DIM,
                         halign='left', valign='middle', font_name=font)
-            lbl.bind(width=lambda w, *_: setattr(
-                w, 'text_size', (w.width, None)))
-            box.add_widget(lbl)
+            lbl.bind(size=lambda w, *_: setattr(w, 'text_size', w.size))
+            line.add_widget(lbl)
+            # Per-peer "retry" — poke just this peer to sync now
+            # (github-independent burst + sweep). Outcome shows on the
+            # next poll (the count / 'awaiting first sync' updates).
+            retry = Button(
+                text=_tr('Retry'), size_hint=(None, 1), width=dp(64),
+                font_size=sp(11), font_name=font,
+                background_normal='', background_down='',
+                background_color=_theme.SURFACE_ALT, color=_theme.ACCENT)
+            retry.bind(on_release=lambda _b, pid=peer_id:
+                       self._retry_peer(pid, _b))
+            line.add_widget(retry)
+            box.add_widget(line)
         # The current-project lines live INSIDE the gated actions row,
         # whose height is set explicitly — grow it to fit them.
         self._sync_actions_row_height()
+
+    def _retry_peer(self, peer_id, btn=None):
+        """Handle a per-peer 'Retry' tap: fire the sync off the UI
+        thread and flash the button so the tap registers. The next
+        peer_sync poll surfaces the result."""
+        if not peer_id:
+            return
+        if btn is not None:
+            btn.text = _tr('…')
+        def _work():
+            try:
+                from azt_collab_client import lan_retry_peer
+                lan_retry_peer(peer_id)
+            except Exception:
+                pass
+            if btn is not None:
+                Clock.schedule_once(
+                    lambda _dt: setattr(btn, 'text', _tr('Retry')), 1.5)
+        threading.Thread(target=_work, daemon=True).start()
 
     def _sync_actions_row_height(self):
         """Add the current-project peer lines' height to the gated
@@ -3829,9 +3863,27 @@ class CollabUIApp(App):
                 code, detail = self_update.git_pull_self()
             except Exception as ex:
                 code, detail = 'FAILED', str(ex)
+            # On a real update, auto-restart the daemon so the new code
+            # is actually live — an "update" is a deliberate act and
+            # there's no case where the user updates but wants to keep
+            # running the old version (Kent 2026-07-23). The pulled
+            # files are inert until the daemon respawns; reconcile on
+            # startup handles any in-flight job the restart interrupts.
+            if code == 'UPDATED':
+                Clock.schedule_once(
+                    lambda _dt: self._set_update_msg(
+                        _tr('Updated — restarting the service…')), 0)
+                try:
+                    from azt_collab_client import restart_server
+                    restart_server()
+                except Exception as ex:
+                    Clock.schedule_once(
+                        lambda _dt: self._set_update_msg(
+                            _tr('Updated, but restart failed — restart '
+                                'the service manually. ({detail})'
+                                ).format(detail=str(ex))), 0)
+                return
             msgs = {
-                'UPDATED': _tr('Updated — restart to load the new '
-                               'version.'),
                 'UP_TO_DATE': _tr('Up to date.'),
                 'NOT_A_CHECKOUT': _tr('This copy is not a git checkout, '
                                       'so it cannot self-update.'),

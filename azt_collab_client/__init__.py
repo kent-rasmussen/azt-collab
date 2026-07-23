@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.40"
+__version__ = "0.54.42"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1002,6 +1002,22 @@ def lan_peer_sync():
         return []
     out = resp.get('rows') or []
     return out if isinstance(out, list) else []
+
+
+def lan_retry_peer(peer_id):
+    """Poke a single peer to sync now (the sync board's per-row
+    'retry' link): fires a LAN burst + sweep so the daemon tries to
+    catch that peer up on every shared project immediately,
+    github-independent. Returns True on ack, False on transport
+    failure. Fire-and-forget — the outcome shows via the next
+    ``lan_peer_sync`` poll."""
+    if not peer_id:
+        return False
+    try:
+        resp = call('POST', '/v1/lan/retry_peer', {'peer_id': peer_id})
+    except ServerUnavailable:
+        return False
+    return bool(resp.get('ok'))
 
 
 def lan_pair_qr(endpoint='', langcode=''):
@@ -3097,7 +3113,8 @@ __all__ = [
     'get_credentials_status', 'set_collab_host',
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
-    'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_pair_qr',
+    'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_retry_peer',
+    'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',

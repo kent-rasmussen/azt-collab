@@ -169,6 +169,12 @@ msgstr "Mise à jour…"
 msgid "Updated — restart to load the new version."
 msgstr "Mis à jour — redémarrez pour charger la nouvelle version."
 
+msgid "Updated — restarting the service…"
+msgstr "Mis à jour — redémarrage du service…"
+
+msgid "Updated, but restart failed — restart the service manually. ({detail})"
+msgstr "Mis à jour, mais le redémarrage a échoué — redémarrez le service manuellement. ({detail})"
+
 msgid "This copy is not a git checkout, so it cannot self-update."
 msgstr "Cette copie n'est pas un dépôt git ; elle ne peut pas se mettre à jour."
 
@@ -192,6 +198,12 @@ msgstr "{n} à envoyer"
 
 msgid "awaiting first sync"
 msgstr "en attente de la première synchro"
+
+msgid "Retry"
+msgstr "Réessayer"
+
+msgid "…"
+msgstr "…"
 
 msgid "Checking for updates…"
 msgstr "Recherche de mises à jour…"

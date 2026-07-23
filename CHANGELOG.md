@@ -9,6 +9,50 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.42 — per-peer "Retry" link in the sync board
+
+FEATURE (Kent 2026-07-23): each peer row in the sync board now has a
+**Retry** link that pokes just that peer to sync now — a LAN burst +
+`sweep_peer(peer_id)` (catches the peer up on every shared project),
+**github-independent**. Fire-and-forget; the outcome shows on the next
+peer-sync poll (the count updates / "awaiting first sync" clears).
+
+- New `POST /v1/lan/retry_peer` (`_h_lan_retry_peer`) + client wrapper
+  `lan_retry_peer(peer_id)`.
+- UI: each row became `label + Retry button`; tapping flashes "…" and
+  fires off the UI thread.
+
+Together with 0.54.40 (user Sync fires LAN regardless of github) this
+gives a from-settings, github-free way to nudge sync — the desktop
+USB/LAN case that used to dead-end on "github isn't set up." No more
+digging into logs to know whether to poke it.
+
+Daemon-side change → restart the daemon to pick it up.
+
+## 0.54.41 — desktop update auto-restarts; langpicker gear; clearer status label
+
+Three UX fixes (Kent 2026-07-23):
+
+- **Desktop update auto-restarts.** After a successful `git pull`
+  (`UPDATED`), the desktop update button now restarts the daemon
+  automatically ("Updated — restarting the service…") instead of asking
+  the user to do it — an update is a deliberate act and there's no case
+  where you'd update but keep running the old code. `reconcile_on_startup`
+  covers any in-flight job the restart interrupts. (The UI process
+  itself reloads its own code when you reopen the window; the daemon —
+  the substantive part — restarts on its own.)
+- **Language picker gets a settings gear.** The langpicker was a
+  dead-end: a phone that lands on it (e.g. no projects after a wipe) in
+  the external launch mode had no gear and back-exits, stranding the
+  user with no route to settings. `register_langpicker_kv(show_gear=…)`
+  adds a gear (`go_config`) that works in both launch modes; the server
+  APK passes `show_gear=True`, peers default off. (The deeper
+  mode-detection question — why a current-version phone reached the
+  picker in external mode via settings→Switch project — is still open;
+  this gives an escape hatch regardless.)
+- **Peer-sync label:** "status unknown" → **"awaiting first sync"** —
+  clearer that it means paired+sharing but no confirmed exchange yet.
+
 ## 0.54.40 — user Sync fires LAN regardless of github (USB/LAN-only teams)
 
 FIX (Kent 2026-07-23): "synchronize with your team now" complained that
