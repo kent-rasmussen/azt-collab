@@ -1899,7 +1899,7 @@ def _h_forget_project(langcode, body):
     if not isinstance(body, dict):
         body = {}
     delete_files = bool(body.get('delete_files', False))
-    result = repo.forget_project(langcode, delete_files=delete_files)
+    result = repo_mod.forget_project(langcode, delete_files=delete_files)
     return 200, {"ok": True, "result": result.to_dict()}
 
 
@@ -2812,6 +2812,29 @@ def _h_project_sync(langcode, body):
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
     _touch_project(langcode)
+    # A user-gestured Sync must ALWAYS try LAN first — it's local,
+    # free, and github-independent — before any WAN gate below can
+    # bail. Pre-0.54.40 this handler was WAN-only: a USB/LAN-only team
+    # (no github creds) hit AUTH_REQUIRED and never fanned out to the
+    # peer in the room, so "synchronize with your team now" did nothing
+    # over the cable (field 2026-07-23). Fans out whatever's committed;
+    # a fresh uncommitted edit still rides the next commit's fan-out.
+    # Best-effort — failures here never block the WAN attempt below.
+    try:
+        from . import lan_burst as _lan_burst
+        from . import lan_backoff as _lan_backoff
+        from . import lan_push as _lan_push
+        _lan_burst.start_burst()
+        _lan_backoff.nudge(langcode)
+        _lan_res = _lan_push.fan_out(p)
+        if _lan_res and any(_lan_res.values()):
+            try:
+                _lan_backoff.record_success(langcode)
+            except Exception:
+                pass
+    except Exception as ex:
+        print(f'[sync-rpc] {langcode!r} LAN fire raised: {ex!r}',
+              file=sys.stderr, flush=True)
     # 0.43.0: the Sync button is the user-gestured "bump push" —
     # if work_offline is on, refuse with a typed status the peer
     # routes to the settings screen. Auto-sync paths (which now

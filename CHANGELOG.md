@@ -9,6 +9,44 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.40 — user Sync fires LAN regardless of github (USB/LAN-only teams)
+
+FIX (Kent 2026-07-23): "synchronize with your team now" complained that
+github wasn't set up and did nothing over a USB cable. Cause:
+`_h_project_sync` (the user-gestured Sync) was WAN-only — no github
+token ⇒ `AUTH_REQUIRED` returned before any LAN fan-out. A USB/LAN-only
+team (github deliberately absent) could never trigger a sync.
+
+Now the handler fires the LAN nudge (burst + `fan_out`) at the top —
+local, free, github-independent — before any WAN gate. So a user Sync
+always tries the peers in the room; the WAN half still runs (and may
+still surface `AUTH_REQUIRED` informationally) but no longer *blocks*
+LAN. Fans out committed history; a brand-new uncommitted edit still
+rides the next commit's fan-out. Best-effort — LAN failures never block
+the WAN attempt.
+
+This also resolves the "status unknown" both-ways symptom: that status
+means "paired + sharing this project, but no confirmed exchange yet — no
+coverage anchor to measure against," which persisted precisely because
+the sync gesture never fanned out over LAN. Once a sync lands, coverage
+records and the peer line shows up to date / N to send.
+
+Daemon-side change → restart the daemon to pick it up.
+
+## 0.54.39 — fix: forget-project crashed with "name 'repo' is not defined"
+
+FIX (Kent 2026-07-23): the forget-project handler
+(`_h_forget_project`, 0.54.25) called `repo.forget_project(...)`, but
+server.py imports the repo module as `repo_mod` — so every forget
+attempt raised `NameError: name 'repo' is not defined`. The
+long-press dialog's error-detail surfacing (0.54.31) is what made this
+visible instead of a bare "couldn't." One-character-class fix:
+`repo.` → `repo_mod.`. (Same slip caught earlier in
+`consume_pending_merges`; swept server.py for other bare `repo.`
+references — none remained.)
+
+Daemon-side change → restart the daemon to pick it up.
+
 ## 0.54.38 — per-peer sync status in the settings UI (sync board, Tier A)
 
 FEATURE (Kent 2026-07-23): a live, in-app view of where you stand with
