@@ -61,6 +61,69 @@ def open_url(url, on_error=None):
         return False
 
 
+def open_tethering_settings(on_error=None):
+    """Open the phone's USB/tethering settings page for the user.
+
+    The USB-tethering toggle is typically 4+ taps deep and its path
+    differs per OEM. Android has no guaranteed public deep-link to it,
+    so we try the direct tethering activity (works on many stock ROMs),
+    then fall back to the documented Wireless-settings page (usually
+    one tap from tethering), then top-level Settings. Returns True if a
+    settings page opened. Non-Android → ``on_error`` with a hint; never
+    raises. No permission required — this is just an Intent, so it
+    won't add a store-review-triggering permission."""
+    try:
+        from kivy.utils import platform
+    except Exception:
+        platform = ''
+    if platform != 'android':
+        if on_error is not None:
+            on_error(_tr('Set USB tethering on the phone: Settings → '
+                         'Hotspot & tethering → USB tethering.'))
+        return False
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Intent = autoclass('android.content.Intent')
+        activity = PythonActivity.mActivity
+    except Exception as ex:
+        print(f'[tether-settings] jnius unavailable: {ex!r}')
+        if on_error is not None:
+            on_error(_tr('Could not open settings on this device.'))
+        return False
+    # 1) Direct tethering activity — lands ON the page. Component names
+    #    vary by ROM; try the common ones. An unknown component throws
+    #    ActivityNotFound, caught here → next candidate.
+    for pkg, cls in (
+            ('com.android.settings',
+             'com.android.settings.TetherSettings'),
+            ('com.android.settings',
+             'com.android.settings.Settings$TetherSettingsActivity')):
+        try:
+            it = Intent()
+            it.setClassName(pkg, cls)
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(it)
+            return True
+        except Exception:
+            continue
+    # 2) Documented fallbacks: Wireless settings (one tap from
+    #    tethering), then the top-level Settings app.
+    for action in ('android.settings.WIRELESS_SETTINGS',
+                   'android.settings.SETTINGS'):
+        try:
+            it = Intent(action)
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(it)
+            return True
+        except Exception:
+            continue
+    if on_error is not None:
+        on_error(_tr('Could not open tethering settings — open them '
+                     'from the phone: Settings → Hotspot & tethering.'))
+    return False
+
+
 def share_running_apk(filename=None, on_error=None):
     """Share the running APK via Android's share sheet.
 

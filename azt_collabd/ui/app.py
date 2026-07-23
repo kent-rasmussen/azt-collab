@@ -620,6 +620,14 @@ KV_TEMPLATE = '''
                         id: lan_no_btn
                         text: _('no')
                         on_press: root.set_lan_allow_sync(False)
+                # Shortcut to the phone's USB-tethering settings (4+
+                # taps deep, OEM-inconsistent). Best-effort deep-link;
+                # see share.open_tethering_settings for the fallbacks.
+                Button:
+                    size_hint_y: None
+                    height: dp(48)
+                    text: _('Open USB tethering settings')
+                    on_press: root.open_tethering_settings()
                 # "Pair a phone" entry was vestigial after 0.45.0 —
                 # showing the daemon's QR is now the "Show QR code"
                 # affordance inside the per-project Share popup,
@@ -1388,17 +1396,15 @@ class SettingsScreen(Screen):
             self._stop_cawl_cache_poll()
             return
         if offline:
-            # Worker bailed before iterating because device was
-            # offline. Banner stays polling at 1 Hz so we
-            # auto-update when the scheduler's connectivity
-            # watcher fires on_online_edge and the next prefetch
-            # actually runs. RPC cost is in-memory dict lookups;
-            # the [first-try] probe is already suppressed for
-            # this path.
-            label.text = _tr(
-                'Image cache: {cached} / {total} '
-                '(offline — will resume when online)').format(
-                    cached=cached, total=total)
+            # Don't nag about caching while offline — there's nothing
+            # the user can do, and a partial cache is fine; it resumes
+            # silently when the scheduler's connectivity watcher fires
+            # on_online_edge. Hide the banner (keep polling — cheap,
+            # in-memory — so it reappears with live progress once
+            # fetching actually resumes online). Kent 2026-07-23:
+            # "don't bother the user if the phone is offline."
+            self._hide_cawl_cache_banner(banner, label)
+            return
         elif circuit_open:
             # Mid-prefetch connectivity loss tripped the breaker.
             # Same auto-resume path via the scheduler edge.
@@ -2093,6 +2099,21 @@ class SettingsScreen(Screen):
             if label is not None:
                 label.text = _tr('Could not open paired-devices '
                                  'list: {error}').format(error=str(ex))
+
+    def open_tethering_settings(self):
+        """Take the user to the phone's USB-tethering settings (best-
+        effort deep-link with OEM fallbacks). Any message lands in the
+        LAN status label."""
+        def _sink(msg):
+            label = self.ids.get('lan_status_label')
+            if label is not None:
+                label.text = msg or ''
+        try:
+            from azt_collab_client.ui.share import open_tethering_settings
+            open_tethering_settings(on_error=_sink)
+        except Exception as ex:
+            _sink(_tr('Could not open tethering settings: {error}'
+                      ).format(error=str(ex)))
 
     def share_diagnostics(self):
         """Daemon-settings affordance for the canonical share-

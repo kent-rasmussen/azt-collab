@@ -134,20 +134,49 @@ def _is_not_shared(err):
 
 
 def _resolve_endpoint(peer_entry):
-    """Endpoint resolution order: mDNS → static → QR-hint."""
+    """Endpoint resolution order: mDNS → static → QR-hint. Returns the
+    single best-guess ``(host, port)`` — kept for callers that only
+    want one. The clone path uses ``_candidate_endpoints`` (try each)."""
+    cands = _candidate_endpoints(peer_entry)
+    return cands[0] if cands else None
+
+
+def _candidate_endpoints(peer_entry):
+    """EVERY plausible ``(host, port)`` for this peer, best-first: the
+    live mDNS-resolved endpoint, then manual static_endpoints, then
+    observed endpoints. Deduped. The clone/peek tries each until one
+    connects — a peer advertises an address on every interface (wifi,
+    USB-tether usb0, hotspot) and only some are routable from HERE.
+    Field 2026-07-23: the phone had no route to the sender's wifi IP
+    (192.168.31.60 → 'Network is unreachable') but a cable/10.x address
+    was reachable; the single-endpoint resolver picked the dead one and
+    every clone attempt failed, so the user re-accepted the offer six
+    times. Trying each candidate fixes that."""
+    out = []
+    seen = set()
+
+    def _add(host, port):
+        try:
+            key = (str(host), int(port))
+        except (ValueError, TypeError):
+            return
+        if key[0] and key not in seen:
+            seen.add(key)
+            out.append(key)
+
     pid = peer_entry.get('peer_id', '')
     if pid:
         mdns = _lan_discovery.get_endpoint(pid)
         if mdns is not None:
-            return mdns
+            _add(mdns[0], mdns[1])
     for source in ('static_endpoints', 'endpoints'):
         for raw in (peer_entry.get(source) or []):
             try:
-                host, port = raw.rsplit(':', 1)
-                return (host, int(port))
+                host, port = str(raw).rsplit(':', 1)
+                _add(host, int(port))
             except (ValueError, TypeError):
                 continue
-    return None
+    return out
 
 
 def _build_pool_manager(expected_fp):
@@ -369,17 +398,21 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         result.add(_S.SERVER_ERROR, error='peer_unknown')
         return result
     expected_fp = entry.get('fp', '')
-    endpoint = _resolve_endpoint(entry)
-    if endpoint is None:
+    candidates = _candidate_endpoints(entry)
+    if not candidates:
         result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id)
         return result
-    host, port = endpoint
-    url = f'https://{host}:{int(port)}/{langcode}.git'
 
     existing = _projects.get(langcode)
     if existing is not None:
-        # Compare via ls-remote — cheap.
-        refs = _peek_remote_refs(url, expected_fp)
+        # Compare via ls-remote — cheap. Try each candidate address
+        # until one answers (the peer may only be routable on some).
+        refs = None
+        for host, port in candidates:
+            url = f'https://{host}:{int(port)}/{langcode}.git'
+            refs = _peek_remote_refs(url, expected_fp)
+            if refs is not None:
+                break
         related = _shares_commits_with(
             refs or {}, existing.working_dir)
         if not related:
@@ -432,13 +465,24 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
     # (an in-progress clone was indistinguishable from nothing
     # happening).
     dest_dir = _project_dest_dir(langcode)
-    print(f'[lan-clone] start: {langcode!r} from {peer_id!r} '
-          f'at {host}:{port}', file=sys.stderr, flush=True)
-    lift_path, err = _do_lan_clone(
-        host, port, langcode, expected_fp, dest_dir)
+    # Try each candidate address until one connects — a peer reachable
+    # over the cable/10.x but not its wifi IP (or vice versa) still
+    # clones instead of dead-ending on the first address.
+    lift_path, err = '', 'no reachable endpoint'
+    for host, port in candidates:
+        print(f'[lan-clone] start: {langcode!r} from {peer_id!r} '
+              f'at {host}:{port}', file=sys.stderr, flush=True)
+        lift_path, err = _do_lan_clone(
+            host, port, langcode, expected_fp, dest_dir)
+        if not err:
+            break
+        print(f'[lan-clone] {langcode!r} from {peer_id!r}: '
+              f'{host}:{port} failed ({err}) — trying next candidate '
+              f'if any', file=sys.stderr, flush=True)
     if err:
-        print(f'[lan-clone] failed: {langcode!r} from {peer_id!r}: '
-              f'{err}', file=sys.stderr, flush=True)
+        print(f'[lan-clone] failed: {langcode!r} from {peer_id!r} '
+              f'(all {len(candidates)} candidate(s)): {err}',
+              file=sys.stderr, flush=True)
         # Distinguish "connection stalled mid-transfer" from "could
         # not resolve / connect at all" so the UI can route the
         # right user-facing prompt. ``_do_lan_clone`` tags the

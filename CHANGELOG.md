@@ -9,6 +9,19 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.43 — "Open USB tethering settings" shortcut (phone)
+
+FEATURE (Kent 2026-07-23): the USB-tethering toggle is 4+ taps deep and
+its path differs per OEM. New "Open USB tethering settings" button in
+the settings LAN section (between the Local-network-sync toggle and
+Paired devices) deep-links there for the user. Android has no
+guaranteed public link to that exact page, so `share.open_tethering_
+settings` tries the direct tethering activity (works on many stock
+ROMs), then falls back to Wireless settings (one tap away), then
+top-level Settings — worst case one tap instead of four, never crashes.
+No new permission (just an Intent). Off-Android shows the tap-path as
+text. Strings en + fr.
+
 ## 0.54.42 — per-peer "Retry" link in the sync board
 
 FEATURE (Kent 2026-07-23): each peer row in the sync board now has a

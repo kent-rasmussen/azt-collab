@@ -202,6 +202,21 @@ msgstr "en attente de la première synchro"
 msgid "Retry"
 msgstr "Réessayer"
 
+msgid "Open USB tethering settings"
+msgstr "Ouvrir les réglages de partage par USB"
+
+msgid "Set USB tethering on the phone: Settings → Hotspot & tethering → USB tethering."
+msgstr "Activez le partage par USB sur le téléphone : Réglages → Point d'accès et partage → Partage par USB."
+
+msgid "Could not open settings on this device."
+msgstr "Impossible d'ouvrir les réglages sur cet appareil."
+
+msgid "Could not open tethering settings — open them from the phone: Settings → Hotspot & tethering."
+msgstr "Impossible d'ouvrir les réglages de partage — ouvrez-les depuis le téléphone : Réglages → Point d'accès et partage."
+
+msgid "Could not open tethering settings: {error}"
+msgstr "Impossible d'ouvrir les réglages de partage : {error}"
+
 msgid "…"
 msgstr "…"
 
