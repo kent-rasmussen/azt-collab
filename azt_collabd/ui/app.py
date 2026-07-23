@@ -1235,15 +1235,14 @@ class SettingsScreen(Screen):
         peer does no git walk); the fetch runs off the UI thread."""
         self._stop_peer_sync_poll()
         self._tick_peer_sync()   # immediate first paint
-        # 12 s, not 2.5 s: each poll makes the daemon open every
-        # project's repo and walk git per peer × project — dozens of
-        # walks on a multi-project, multi-peer device. At 2.5 s that
-        # saturated the phone's :provider daemon and everything else
-        # (incl. the UI-thread CAWL poll) blocked → ANR (field
-        # 2026-07-23). A status board doesn't need sub-10 s freshness;
-        # the count still updates live as deliveries land.
+        # 5 s is fine now that the daemon caches the board and only
+        # re-walks git on a change event (commit / delivery / pairing;
+        # see repo.lan_peer_sync_rows). When nothing changed this poll
+        # is a dict read, not the dozens-of-git-walks that ANR'd the
+        # daemon at 2.5 s (0.54.45). The fetch is also off the UI
+        # thread. So a short interval buys responsiveness at ~zero cost.
         self._peer_sync_event = Clock.schedule_interval(
-            lambda _dt: self._tick_peer_sync(), 12.0)
+            lambda _dt: self._tick_peer_sync(), 5.0)
 
     def _stop_peer_sync_poll(self):
         if self._peer_sync_event is not None:

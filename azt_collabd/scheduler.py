@@ -411,6 +411,14 @@ def _set_pending_push(langcode, value):
             projects._save_raw(data)
     except Exception as ex:
         print(f'[scheduler] pending_push update failed: {ex}')
+    # A commit (sets pending_push) or a successful push (clears it)
+    # changes the peer-sync board's "N to send" — mark it stale so the
+    # next UI read recomputes, event-driven rather than on a timer.
+    try:
+        from . import repo as _repo
+        _repo.invalidate_peer_sync()
+    except Exception:
+        pass
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -620,8 +628,10 @@ def get_job(job_id):
 # ── Connectivity watcher ────────────────────────────────────────────────────
 
 def start_watcher():
-    """Start the offline→online watcher. Idempotent."""
+    """Start the offline→online watcher + the fast interface watcher.
+    Idempotent."""
     global _watcher_thread, _watcher_stop, _last_online_state, _online_since
+    global _iface_watch_thread, _iface_watch_stop
     if _watcher_thread is not None and _watcher_thread.is_alive():
         return
     _watcher_stop = threading.Event()
@@ -630,11 +640,20 @@ def start_watcher():
     _watcher_thread = threading.Thread(
         target=_watcher_loop, daemon=True, name='azt_collabd-watcher')
     _watcher_thread.start()
+    # Dedicated fast (~3 s) interface watcher for USB-tether link-up.
+    if _iface_watch_thread is None or not _iface_watch_thread.is_alive():
+        _iface_watch_stop = threading.Event()
+        _iface_watch_thread = threading.Thread(
+            target=_iface_watcher_loop, daemon=True,
+            name='azt_collabd-iface-watch')
+        _iface_watch_thread.start()
 
 
 def stop_watcher():
     if _watcher_stop is not None:
         _watcher_stop.set()
+    if _iface_watch_stop is not None:
+        _iface_watch_stop.set()
 
 
 def is_online_cached():
@@ -716,6 +735,69 @@ def _net_signature():
     except Exception:
         pass
     return frozenset(sig)
+
+
+_iface_watch_thread = None
+_iface_watch_stop = None
+_IFACE_POLL_S = 3.0
+
+
+def _iface_watcher_loop():
+    """Fast, cheap, LOCAL watcher for a network link coming up/down —
+    the USB-tether "plug in and go" trigger. Every ~3 s it fingerprints
+    the interfaces (``_net_signature``: /sys/class/net + default-route
+    IP — no network, no daemon RPC) and, on a change while LAN sync is
+    on, re-arms discovery (``restart_browse``) + fires a burst so a
+    peer on the new interface (usb0) is found within a few seconds — no
+    manual LAN toggle. Separate from the connectivity watcher on
+    purpose: that one does an expensive network probe and backs off to
+    minutes; the interface check must stay fast and mustn't drag the
+    probe's cadence with it (0.54.46)."""
+    global _last_net_sig
+    while _iface_watch_stop is not None and not _iface_watch_stop.is_set():
+        try:
+            if _settings.lan_allow_sync():
+                # Auto-bind: LAN is ON but the listener isn't bound
+                # (fresh enable, daemon respawn, or a bind that lost
+                # its interface) → re-apply the toggle to bind it.
+                # apply_toggle is idempotent (no-op when already bound),
+                # so this just heals the "on but not bound" state within
+                # one 3 s tick instead of waiting for the user to flip
+                # the toggle by hand (field 2026-07-23). 0.54.46.
+                try:
+                    from . import lan_listener as _lan_listener
+                    if _lan_listener.bound_endpoint() is None:
+                        print('[iface-watch] LAN on but listener not '
+                              'bound — applying toggle to bind',
+                              file=sys.stderr, flush=True)
+                        _lan_listener.apply_toggle()
+                except Exception as ex:
+                    print(f'[iface-watch] auto-bind raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+                sig = _net_signature()
+                if _last_net_sig is not None and sig != _last_net_sig:
+                    print('[iface-watch] interfaces changed (link '
+                          'up/down) — re-arming LAN discovery + burst',
+                          file=sys.stderr, flush=True)
+                    try:
+                        from . import lan_discovery as _lan_discovery
+                        _lan_discovery.restart_browse()
+                    except Exception as ex:
+                        print(f'[iface-watch] restart_browse raised: '
+                              f'{ex!r}', file=sys.stderr, flush=True)
+                    try:
+                        from . import lan_burst as _lan_burst
+                        _lan_burst.start_burst()
+                    except Exception as ex:
+                        print(f'[iface-watch] start_burst raised: '
+                              f'{ex!r}', file=sys.stderr, flush=True)
+                    _reset_probe_backoff(reason='net-change')
+                _last_net_sig = sig
+        except Exception as ex:
+            print(f'[iface-watch] loop raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+        if _iface_watch_stop.wait(timeout=_IFACE_POLL_S):
+            break
 
 
 def _watcher_loop():
@@ -823,29 +905,12 @@ def _watcher_loop():
         except Exception as ex:
             print(f'[scheduler] lan_listener.apply_toggle failed: '
                   f'{ex!r}', file=sys.stderr, flush=True)
-        # Link-up nudge (0.54.34) — "plug in and go" for USB tethering.
-        # If the interface set changed since last tick (a phone plugged
-        # in + USB tethering enabled brings up usb0/enx…), the zeroconf
-        # browser — started before that interface existed — won't be
-        # browsing it. Re-arm discovery and fire a burst so a paired
-        # peer on the new link is found + synced with no user gesture.
-        # Only while LAN sync is on, and only on an actual change.
-        if _settings.lan_allow_sync():
-            try:
-                sig = _net_signature()
-                if _last_net_sig is not None and sig != _last_net_sig:
-                    print('[watcher] network interfaces changed '
-                          '(link up/down) — re-arming LAN discovery '
-                          '+ burst', file=sys.stderr, flush=True)
-                    from . import lan_discovery as _lan_discovery
-                    _lan_discovery.restart_browse()
-                    from . import lan_burst as _lan_burst
-                    _lan_burst.start_burst()
-                    _reset_probe_backoff(reason='net-change')
-                _last_net_sig = sig
-            except Exception as ex:
-                print(f'[watcher] link-up nudge raised: {ex!r}',
-                      file=sys.stderr, flush=True)
+        # Link-up detection (USB-tether "plug in and go") moved to its
+        # own fast watcher (``_iface_watcher_loop``, ~3 s) as of
+        # 0.54.46 — piggybacking this connectivity loop meant up to
+        # ~15 s to notice a new interface, so users flipped the LAN
+        # toggle by hand to force it. The interface check is cheap +
+        # local; it doesn't belong behind the network-probe cadence.
         # Drain the deferred post-receive-reset queue. Entries land
         # here when ``_reset_working_tree_after_receive`` hit a
         # LockTimeout (typically because the local outgoing merge

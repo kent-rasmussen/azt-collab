@@ -185,6 +185,18 @@ def get_peer(peer_id):
     return norm
 
 
+def _invalidate_sync_board():
+    """Tell the peer-sync board (repo.py) its cached rows are stale
+    because a peer mutation changed them. Lazy import breaks the
+    repo→peers module cycle; best-effort (the board has a staleness
+    backstop anyway)."""
+    try:
+        from . import repo as _repo
+        _repo.invalidate_peer_sync()
+    except Exception:
+        pass
+
+
 def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
     """Insert or update a peer entry on pair-accept. Preserves
     existing ``shared_projects`` and ``static_endpoints`` if the
@@ -224,6 +236,7 @@ def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
         peers[str(peer_id)] = entry
         data['peers'] = peers
         _save_raw(data)
+    _invalidate_sync_board()  # a new/updated pairing changes the board
     out = dict(entry)
     out['peer_id'] = str(peer_id)
     return out
@@ -387,6 +400,7 @@ def set_peer_covered_local(peer_id, langcode, sha):
         peers[peer_id] = entry
         data['peers'] = peers
         _save_raw(data)
+    _invalidate_sync_board()  # a delivery changed a peer's coverage
     return True
 
 

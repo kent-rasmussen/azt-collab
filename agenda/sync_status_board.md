@@ -16,6 +16,28 @@
   thing all through the 2026-07-22 workshop)
 - **Waiting on:** Nothing
 
+## Status
+
+Tier A shipped 0.54.38; ANR fix 0.54.45; **2a shipped 0.54.46** —
+daemon caches the board and re-walks git only on a change event
+(commit / LAN delivery / pairing; `repo.invalidate_peer_sync`), with a
+30 s staleness backstop; the UI poll is a cheap cached read. This is
+the "changes arrive with the changes" model, server-side.
+
+**2b — DEFERRED (this item's remaining push work).** Replace the
+residual cheap cache-poll with real push so the UI never asks:
+- **Android:** `ContentResolver.notifyChange(uri)` from the `:provider`
+  daemon + `registerContentObserver` in the Activity — the native
+  cross-process push, a clean fit since the daemon is already a
+  ContentProvider. This is the worthwhile half.
+- **Desktop:** loopback HTTP has no push channel — would need SSE/
+  long-poll or a file-watch (itself a small poll). Low value: a
+  cache-read poll there is already ~free. Probably skip desktop 2b.
+Kent 2026-07-23: "do 1 & 2a, store 2b." Significantly more work than
+2a (per-platform push machinery + two implementations) for the last
+increment (kill the near-free poll); pick up when Android push is worth
+the plumbing.
+
 ## Plans
 
 ### Rows: project × paired-peer

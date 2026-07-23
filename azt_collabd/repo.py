@@ -3010,7 +3010,43 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
     }
 
 
+_peer_sync_cache = {'rows': [], 'computed_at': 0.0, 'dirty': True}
+_PEER_SYNC_MIN_RECOMPUTE_S = 5.0    # don't re-walk more often than this
+_PEER_SYNC_MAX_STALE_S = 30.0       # re-walk at least this often (safety)
+
+
+def invalidate_peer_sync():
+    """Mark the peer-sync board stale so the NEXT read recomputes it.
+    Called at the events that change the board — a commit, a LAN
+    delivery, a pairing — so the expensive git walk runs on CHANGE, not
+    on the UI's timer (the poll then just reads the cached value). See
+    ``lan_peer_sync_rows``. Cheap; safe to over-call."""
+    _peer_sync_cache['dirty'] = True
+
+
 def lan_peer_sync_rows(count_limit=200):
+    """Cached read of the peer-sync board (Tier A, 2a). Recomputes the
+    per-peer git walk ONLY when invalidated by a change event
+    (``invalidate_peer_sync``) — and then at most once per
+    ``_PEER_SYNC_MIN_RECOMPUTE_S`` (so a commit storm can't spin it) —
+    with a ``_PEER_SYNC_MAX_STALE_S`` backstop so a missed invalidation
+    still refreshes within ~30 s. The UI polls this freely; when nothing
+    changed it's a dict read, no git work (the fix for the 2.5 s poll
+    that ANR'd the daemon; and it matches the 'changes arrive with the
+    changes' model — the walk is event-driven, not clock-driven)."""
+    import time
+    now = time.time()
+    st = _peer_sync_cache
+    age = now - st['computed_at']
+    if (st['dirty'] and age >= _PEER_SYNC_MIN_RECOMPUTE_S) \
+            or age >= _PEER_SYNC_MAX_STALE_S:
+        st['rows'] = _compute_peer_sync_rows(count_limit)
+        st['computed_at'] = now
+        st['dirty'] = False
+    return list(st['rows'])
+
+
+def _compute_peer_sync_rows(count_limit=200):
     """Per-peer × per-shared-project sync status for the settings
     overlay (the "where do I stand with my peers" board, Tier A).
 

@@ -9,6 +9,34 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.46 — event-driven sync board; fast USB-link watcher; auto-bind listener
+
+Kent 2026-07-23. Three related LAN/UX improvements.
+
+- **Peer-sync board is now event-driven, not polled-and-walked (#1 +
+  #2a).** The daemon caches the board and re-runs the per-peer git walk
+  ONLY when a change event fires — a commit (`_set_pending_push`), a LAN
+  delivery (`peers.set_peer_covered_local`), or a pairing
+  (`record_pair`) all call `repo.invalidate_peer_sync` — with a 30 s
+  staleness backstop for any missed event. The UI poll (back to 5 s) is
+  now a cheap cached read, no git work unless something changed. This is
+  the "changes arrive with the changes" model and undoes the 2.5 s
+  walk-storm that ANR'd the daemon (0.54.45). (#2b, real push via
+  Android ContentObserver, is deferred — see sync_status_board.md.)
+- **Fast USB-link watcher.** Interface-change detection moved out of the
+  connectivity watcher (which backs off to ~15 s) into a dedicated ~3 s
+  local watcher (`_iface_watcher_loop`) — cheap (`/sys/class/net` +
+  default-route IP, no network). A plugged-in USB-tether interface
+  (`usb0`/`enx…`) now re-arms discovery within a few seconds, so no more
+  manual LAN toggling to make it register.
+- **Auto-bind the listener.** If LAN sync is on but the listener isn't
+  bound (fresh enable / daemon respawn), the fast watcher re-applies the
+  toggle to bind it within one ~3 s tick — no user action. Fixes the
+  "Local network sharing is on (listener not yet bound)" state needing a
+  manual off/on flip.
+
+Daemon-side changes → restart the daemon.
+
 ## 0.54.45 — fix: settings-screen polls were ANR-ing the app
 
 FIX (Kent 2026-07-23, "python not responding, almost completely
