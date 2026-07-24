@@ -97,6 +97,16 @@ def _fire_arrival(peer_id_hex):
             # never even try the now-fresh endpoint.
             _lan_push._record_reachable(peer_id_hex)
             _lan_push.sweep_peer(peer_id_hex)
+            # Auto-complete any share-offers the user already
+            # affirmed while this peer was absent. Guarded on its own
+            # so a clone fault doesn't skip the URL-announce below.
+            try:
+                from . import lan_clone as _lan_clone
+                _lan_clone.retry_affirmed_offers(peer_id_hex)
+            except Exception as ex:
+                print(f'[lan-discovery] arrival retry-affirmed '
+                      f'{peer_id_hex[:8]!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
             # Announce remote_url for every shared project to the
             # just-arrived peer (0.50.60). Closes the fanout-vs-
             # mDNS race: ``_spawn_publish_fanout`` fires on PUSHED
@@ -121,7 +131,23 @@ def _fire_arrival(peer_id_hex):
                     continue
                 url = (project.remote_url or '').strip()
                 if not url:
-                    continue
+                    # LAN-only project (no github URL). The old skip
+                    # meant the user-tap share POST was the ONLY offer
+                    # such a project ever extended — miss it once
+                    # (peer offline at share time) and the peer stayed
+                    # 'shared'-but-offerless forever (field
+                    # 2026-07-24). Re-extend the offer on arrival
+                    # while the peer has NEVER synced this project;
+                    # once coverage exists, go quiet. Receiver side is
+                    # idempotent: no local project → stashes the clone
+                    # offer (dedup by stable id); has it → 'no_url'
+                    # no-op.
+                    lsm = (entry.get('last_seen_main')
+                           or {}).get(langcode)
+                    cov = (entry.get('last_covered_local')
+                           or {}).get(langcode)
+                    if lsm or cov:
+                        continue
                 try:
                     vernlang = project.effective_vernlang()
                 except Exception:

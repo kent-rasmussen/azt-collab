@@ -9,19 +9,321 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
-## 0.54.49 — "up to date (as of <time>)" on the peer-sync board
+## 0.54.63 — "shared but offerless" self-heals: ghost-registry guard + LAN-only re-offer
+
+Kent 2026-07-24. Field: desktop says 'shared' + board says 'awaiting
+first sync', but the client shows neither the project nor an offer —
+and unshare/re-share doesn't produce one. Two mechanisms, both healed:
+
+- **Ghost-registry guard (receiver).** `_handle_share_offer` treated
+  "registry has a record for this langcode" as "peer has the project"
+  and dispatched every re-offer to a silent branch (no_url / noop /
+  auto-adopt). A record whose working tree is GONE (forget-with-delete
+  residue, wiped dir, interrupted clone) therefore swallowed re-offers
+  forever, invisibly. Now: if the registered working tree has no
+  `.git` on disk, the record is forgotten (logged loudly) and the
+  offer stashes as a fresh clone-offer. (Runs in the daemon process,
+  which owns the files — the disk check is legitimate there.)
+- **LAN-only re-offer on arrival (owner).** The arrival announce
+  skipped projects with no github URL, so for a LAN-only project the
+  user-tap share POST was the ONLY offer ever extended — miss it once
+  and the peer stayed 'shared'-but-offerless. Now the offer re-extends
+  on every arrival while the peer has NEVER synced that project
+  (no `last_seen_main`/`last_covered_local` for it); once coverage
+  exists it goes quiet. Receiver side is idempotent.
+
+Diagnosis aid that needs no rebuild: the share popup's flash text after
+a Share tap is the receiver's dispatch — "Already in sync." = receiver
+believes it has the project (the ghost case).
+
+Daemon both sides → desktop restart + client APK rebuild.
+
+## 0.54.62 — clone progress display never reverts to the pre-start hint
+
+Kent 2026-07-24. Field: live transfer progress showed, then the popup
+fell back to "first time can take a while" — reading as a silent
+restart.
+
+- The daemon's clone-progress slot is `active` only while one attempt
+  is mid-transfer; it legitimately goes inactive between
+  candidate-address retries and during post-transfer finalization
+  (find LIFT / register / merge). The receive popup's poll reverted to
+  the static pre-start hint whenever the slot was inactive. Now, once
+  any progress has been seen, the last progress line is kept instead —
+  the hint only ever shows BEFORE the first byte moves. (The
+  offer-confirm popup already behaved this way.)
+
+Client UI → rebuild peer apps / relaunch UI on desktop.
+
+## 0.54.61 — cable-link leads with "Listening on", not "This computer"
+
+Kent 2026-07-24 ("do those mean different things?" — yes, and the
+difference is the diagnostic).
+
+- "This computer: {ifaces}" was the LINK layer (interfaces up, no
+  port, says nothing about the server); "Listening on ip:port" is the
+  SERVICE layer (bound, dialable). The cable-link report now leads
+  with the service truth, in the same vocabulary as the LAN-toggle
+  line: "Listening on {ip:port, …}" when bound; an explicit
+  "Link up ({ifaces}) — but not listening. Is LAN sync on?" when the
+  link is up but the listener isn't — so link presence never implies
+  reachability. Daemon adds `listening` (`bound_endpoints_all`) to the
+  cable_link response; the wrapper passes it tri-state (absent = old
+  daemon can't say → falls back to the old "This computer" line
+  rather than falsely claiming "not listening").
+
+Daemon + client wrapper + settings UI → restart daemon + relaunch UI.
+
+## 0.54.60 — cable-link servers one per line, address first
+
+Kent 2026-07-24.
+
+- The comma-joined server names read poorly; now a header line
+  ("Servers on other devices:") followed by one line per server:
+  `10.143.126.7:34501 — Kent Phone`, with "(self)" where it applies.
+  Formatting only — the endpoint was already in the payload.
+
+Settings UI → relaunch the UI.
+
+## 0.54.59 — cable-link list labels our own advertisement "(self)"
+
+Kent 2026-07-24.
+
+- The discovery browser hears this machine's OWN mDNS advertisement
+  (same link — and usefully so: it proves the advertisement is
+  actually visible on the wire), so it appeared in the cable-link
+  report as if it were another device. Kept, but tagged: the daemon
+  marks the entry `is_self` (compared against `peer_id.peer_id_hex()`)
+  and the report renders "{name} (self)" (fr: «(cet appareil)»).
+
+Daemon + settings UI → restart both.
+
+## 0.54.58 — LAN status label wraps; cable-link report split by device
+
+Kent 2026-07-24.
+
+- The LAN status label (`lan_status_label`) was a fixed dp(28)
+  single line, so the multi-address "Listening on …" line (0.54.48)
+  and the cable-link report ran off the page. Now wrap-and-grow
+  (`text_size` bound to width, height tracks texture).
+- Cable-link report restructured, one fact per line:
+  "This computer: {ifaces}" on the first line (these are THIS
+  machine's link addresses), then "Servers on other devices:
+  {names}" — or "No other device reachable yet — is USB tethering
+  on?" — on the next.
+
+Settings UI → restart the UI (desktop) / rebuild server APK.
+
+## 0.54.57 — "Checking cable link…" can't strand; clean truncated-push log
+
+Kent 2026-07-24. Papercuts 6 + 7 from the 2026-07-23 list.
+
+- **(7) "Checking cable link…" never resolving, twice over.** Root:
+  `_h_lan_cable_link` ran `restart_browse()` + `start_burst()` INLINE
+  before responding — zeroconf teardown blocks for seconds and burst
+  sweeps dial stale peers at multi-second timeouts each, so the RPC
+  (default timeout 300 s) held the label hostage. The nudge now runs on
+  a daemon-side background thread and the response returns immediately
+  with current reachability. Belt-and-braces: the UI adds a 20 s
+  watchdog that posts "The collaboration service did not answer — try
+  again." so no daemon state (including an old, un-restarted daemon)
+  can ever strand the label; a late real result overwrites it.
+- **(6) Truncated inbound LAN push logged a raw 15-frame traceback**
+  (`ValueError: invalid literal for int() with base 16: b''` out of
+  dulwich's chunked-body reader when a peer disconnects mid-push). Now
+  caught in the receive middleware's `_generator` and logged as one
+  line: "receive interrupted (peer disconnected mid-transfer; sender
+  will retry)." Transient by design — the sender still holds the data.
+
+Daemon + settings UI → rebuild server APK / restart desktop daemon.
+
+## 0.54.56 — clone/offer papercuts 1, 3, 4, 5
+
+Kent 2026-07-24. The remaining papercuts from the 2026-07-23 evening
+list (agenda/sync_status_board.md § Clone/offer completion papercuts;
+#2 shipped as 0.54.55).
+
+- **(1) Adopt-origin confirm now surfaces IN-FLOW** after an
+  offer-accept clone: when the accept result carries
+  `LAN_ADOPT_ORIGIN_NEEDED`, the confirm popup chains straight into
+  `_resolve_adopt_origin_then_done` (the same helper `scan_to_pair`
+  uses) on the device where the clone happened — instead of falling
+  through to the background decisions watcher and popping on whatever
+  peer app opened next (field: the recorder).
+- **(3) Offer affordance clears itself.** `paired_phones_popup` gains a
+  cheap 3 s `lan_pending` watcher that rebuilds the rows only when the
+  pending share-offer id set CHANGES — so the red "{project} pending"
+  link disappears when an affirmed offer auto-completes in the
+  background (and appears when a fresh offer lands) without
+  closing/reopening the screen. Errors still keep the offer listed
+  (daemon keeps the decision until delivered — per "fixing 3 is
+  sufficient for 1", no separate completion notification).
+- **(4) Retry reports its outcome.** `_h_lan_retry_peer` now returns
+  the sweep's per-project outcomes; the wrapper passes them through
+  (`None` = transport failure, `{}` = nothing needed sending); the
+  board's Retry button shows '…' while running, then 'OK' (delivered
+  or already current) / '!' (push failed or no daemon answer), reverts
+  after 2.5 s, and forces an immediate board re-poll so counts and
+  "(time)" suffixes move. Was: silent fire-and-forget that read as
+  "Retry does nothing."
+- **(5) Red buttons → red text links.** The "{project} pending" button
+  (Nearby & paired) and the "Review" button (Manage paired device) are
+  now plain red text links (`_link_button`: ThemedButton with
+  transparent fill), not solid red buttons ("bit much").
+
+Daemon (`retry_peer` response) + client UI → rebuild server APK (and
+recorder, for its bundled client UI) + restart.
+
+## 0.54.55 — freshly-cloned project no longer reads "awaiting first sync"
 
 Kent 2026-07-23, in the field.
 
-- 'Up to date' on the sync board is a recorded memory of the last
-  handshake, not a live confirmation — so a computer could show "up to
-  date" for a peer while the phone showed "awaiting first sync," and
-  the bare phrase hid that they simply hadn't exchanged. The 'up to
-  date' phrase now carries "(as of <time>)", where the time is the
-  peer's `last_seen_at` (bumped on every authenticated handshake),
-  rendered as a short LOCAL absolute time (`Jul 23 14:32`). Absolute so
-  it needn't re-render on a timer; local so it matches the device
-  clock. Row gains `last_seen_at`; display formats it (`_fmt_as_of`).
+- After an offer-accept (or any) LAN clone, `clone_from_peer` now
+  records `peers.set_peer_last_seen_main(peer_id, langcode, <cloned
+  HEAD>)`. We DID observe the peer's main during the clone (it's our new
+  HEAD), so this is honest coverage — and the sync board now shows the
+  peer as "up to date" right after cloning instead of the nonsensical
+  "awaiting first sync." (`Repo` imported locally at the call site — it
+  is not module-level in lan_clone.py.)
+
+Daemon-side → rebuild the server APK.
+
+## 0.54.54 — retire the offer auto-popup (offers go passive-only)
+
+Kent 2026-07-23, in the field.
+
+- **The shared decisions watcher no longer auto-pops `share_offer`
+  decisions** (`ui/decisions.py` `_render_decision` skips
+  `KIND_SHARE_OFFER`). Offers surface passively on the peer screens
+  (0.54.53's "{project} pending" affordance) where the user affirms
+  once; pair-requests and conflicts still pop (live handshakes). This
+  is what actually stops the recurring popup — 0.54.53's passive list
+  alone would have been *additive* to the nag, not a replacement.
+- Takes effect in each app on ITS next rebuild — the decisions watcher
+  is bundled per-app, so the recorder keeps popping until the recorder
+  is rebuilt.
+
+Client UI → rebuild the app(s) whose popup you want retired.
+
+## 0.54.53 — offers surfaced on the peer screens; visible clone progress/errors; clone traceback
+
+Kent 2026-07-23, in the field. Stages 2+3 of "surface offers, don't
+nag" + clone-failure diagnostics.
+
+- **Pending offers now show on both peer screens** (was: recorder popup
+  only). *Manage paired device* gets a "Pending invitations" area above
+  "Shared projects"; *Nearby & paired devices* gets a red
+  "{project} pending" / "{n} pending" button on the device's row. Tap →
+  **Accept / Decline confirm** (consent stays an explicit gesture).
+  Renders nothing when a peer has no offers.
+- **Affirm-once, auto-complete later.** Accepting when the peer is
+  absent stamps the offer `affirmed` (0.54.52's `set_param`); the peer's
+  next genuine mDNS arrival auto-runs the clone
+  (`lan_clone.retry_affirmed_offers`, hooked into
+  `lan_discovery._fire_arrival`). No background retry against dead
+  addresses; the row reads "{project} — will sync when nearby" once
+  affirmed.
+- **Clone is no longer a silent blip.** The confirm popup polls the
+  daemon's `clone_progress()` and shows the live git sideband
+  ("Counting objects: 12% (n/m)") while copying, then renders the
+  ACTUAL result status — a success line, the peer-absent line, or the
+  specific failure (e.g. `LAN_LOCAL_TLS_ERROR`,
+  `LAN_PROJECT_NOT_SHARED`, `LAN_CLONE_TIMEOUT`) — instead of the flat
+  "couldn't copy" the agent's first pass used.
+- **Clone failures now log a full traceback + the OSError filename.**
+  Field 2026-07-23: a clone reached the peer (10.x) then died on a bare
+  `FileNotFoundError(2)` with no filename, mislabeled `LAN_LOCAL_TLS_
+  ERROR` by the greedy heuristic (the cert loads fine, so it's a
+  DIFFERENT missing file). The traceback dump in `_do_lan_clone` names
+  the exact path on the next repro so the real cause is fixable.
+
+Known-open (not in this version): the `FileNotFoundError` mislabel
+itself (pending the traceback that names the file), and the
+decline-doesn't-stick bug under one-way reachability (agenda). Daemon +
+client UI → each app picks up the change on ITS next rebuild: rebuild
+the **server APK** for the daemon behavior + the Manage/Nearby surface;
+rebuild the **recorder** to retire its offer popup + get the passive
+surface there too.
+
+## 0.54.52 — stale share-offer: sensible "not connected" message (offer surfacing, stage 1)
+
+Kent 2026-07-23, in the field. Stage 1 of the "surface offers, don't
+nag" redesign (agenda/sync_status_board.md § Pending offers).
+
+- Field: an accepted clone offer for `nml` from a phone that's no
+  longer around kept surfacing, its clone failing against a dead
+  address (`LAN_PEER_UNREACHABLE`). Correction to an earlier claim of
+  mine: there is **no automatic background clone-retry loop** — the
+  seam map confirms nothing in the scheduler/discovery re-drives a
+  failed accepted offer; it persists in `pending_decisions.json` and
+  re-surfaces / is re-acted-on. (The separate `192.168.31.60` push
+  error IS automatic fan-out to a different stale peer.)
+- New status **`LAN_OFFER_PEER_ABSENT`**: when accepting an offer fails
+  only because the offering peer isn't reachable now
+  (`LAN_PEER_UNREACHABLE` / `LAN_CLONE_TIMEOUT`), the accept result adds
+  this offer-context code, and the UI shows "*{device} is not
+  connected. The invitation is kept — ask again when you are both
+  nearby.*" instead of a bare "not reachable." The offer stays listed;
+  no background retry. Added to both `status.py` files + `translate.py`
+  + fr `.po`.
+- Stages 2 (surface pending offers on the two peer screens as a red
+  "{project} pending" affordance) and 3 (auto-complete on real arrival
+  after an explicit affirm) are next, each its own version.
+
+Daemon-side → restart the daemon.
+
+## 0.54.51 — shorten the held-unmerged label to "to merge"
+
+Kent 2026-07-23, in the field.
+
+- Renamed the held-unmerged sync-board status from "awaiting merge"
+  (0.54.50) to **"to merge"** (fr: *à fusionner*) — shorter. No
+  functional change; label + French string only. Split out as its own
+  stamp because 0.54.50 was already built + installed (arm64/v7a
+  release APK) with the longer label, so the built artifact stays
+  uniquely identified.
+
+UI string → restart the daemon (desktop) / reinstall (Android) to see it.
+
+## 0.54.50 — split "incoming" into "incoming" vs "awaiting merge"
+
+Kent 2026-07-23, in the field. **Built + installed as an APK.**
+
+- The board's single "incoming" lumped two data-safety-distinct states:
+  (a) their commits live only on their device and we must receive them
+  to be safe, vs (b) we already hold their bytes and simply haven't
+  merged them. (b) doesn't need the peer to reach us — the merge is our
+  own outstanding work. Now shown separately: **"incoming"** =
+  data still only on the peer (their unmerged commits, or a merge
+  commit they made); **"awaiting merge"** = we hold their tip, unmerged
+  (`incoming_held`) — renamed to "to merge" in 0.54.51. "…(Jul 23
+  14:32)" thus reads "we got their data then and haven't folded it in,"
+  never "we're waiting on them." Row gains `incoming_held`;
+  `_peer_sync_status_text` branches on it. Note: whoever merges first
+  makes a commit the other must fetch, so the held/unmerged state flips
+  back to "incoming" the moment the peer merges first — which the
+  held-vs-not-held test tracks automatically.
+
+Daemon-side (row field) + UI → restart the daemon.
+
+## 0.54.49 — timestamp on every peer-sync status
+
+Kent 2026-07-23, in the field.
+
+- Every non-'awaiting' status on the sync board is a recorded memory
+  from the last handshake, not a live confirmation — 'up to date',
+  'N to send' and 'incoming' alike describe how things stood as of the
+  last exchange. So a computer could show "up to date" for a peer while
+  the phone showed "awaiting first sync," and the bare phrases hid that
+  they simply hadn't exchanged. Each such status now carries a bare
+  "(<time>)" suffix — a property of the row (the peer's `last_seen_at`,
+  bumped on every authenticated handshake), appended once after the
+  status, e.g. "up to date (Jul 23 14:32)" / "3 to send (Jul 23
+  14:32)". Rendered as a short LOCAL absolute time: absolute so it
+  needn't re-render on a timer, local so it matches the device clock.
+  'Awaiting first sync' stays bare — there's no successful exchange to
+  timestamp. Row gains `last_seen_at`; display formats it
+  (`_fmt_as_of`).
 
 Daemon-side (row field) + UI → restart the daemon.
 

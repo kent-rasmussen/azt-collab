@@ -299,6 +299,11 @@ _HANDLERS = {
         _tr('Share for {langcode} was declined.'), p),
     S.LAN_OFFER_ACCEPTED:     lambda p: _fmt(
         _tr('Accepted share offer for {langcode}.'), p),
+    S.LAN_OFFER_PEER_ABSENT:  lambda p: _fmt(
+        _tr('{device_name} is not connected. The invitation is kept '
+            '— ask again when you are both nearby.'),
+        {'device_name': (p or {}).get('device_name')
+         or _tr('That device')}),
     # Sender-side feedback for the "Share" / "Offer share again"
     # gesture. ``dispatch`` is the receiver's per-state outcome.
     # Each dispatch value gets a short string the share popup

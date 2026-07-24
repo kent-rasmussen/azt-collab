@@ -190,11 +190,11 @@ msgstr "Échec de la mise à jour : {detail}"
 msgid "up to date"
 msgstr "à jour"
 
-msgid "up to date (as of {when})"
-msgstr "à jour (au {when})"
-
 msgid "incoming"
 msgstr "en réception"
+
+msgid "to merge"
+msgstr "à fusionner"
 
 msgid "{n} to send"
 msgstr "{n} à envoyer"
@@ -202,8 +202,20 @@ msgstr "{n} à envoyer"
 msgid "awaiting first sync"
 msgstr "en attente de la première synchro"
 
+msgid "{device_name} is not connected. The invitation is kept — ask again when you are both nearby."
+msgstr "{device_name} n'est pas connecté. L'invitation est conservée — redemandez quand vous serez à proximité l'un de l'autre."
+
+msgid "That device"
+msgstr "Cet appareil"
+
 msgid "Retry"
 msgstr "Réessayer"
+
+msgid "!"
+msgstr "!"
+
+msgid "The collaboration service did not answer — try again."
+msgstr "Le service de collaboration n'a pas répondu — réessayez."
 
 msgid "Open USB tethering settings"
 msgstr "Ouvrir les réglages de partage par USB"
@@ -229,11 +241,20 @@ msgstr "Vérification de la liaison par câble…"
 msgid "No local-network link found — plug in the cable and turn on USB tethering on the phone."
 msgstr "Aucune liaison réseau locale trouvée — branchez le câble et activez le partage par USB sur le téléphone."
 
-msgid "Cable/LAN link up ({ifaces}) · reachable: {names}"
-msgstr "Liaison câble/réseau active ({ifaces}) · joignables : {names}"
+msgid "This computer: {ifaces}"
+msgstr "Cet ordinateur : {ifaces}"
 
-msgid "Link up ({ifaces}) but no peer reachable yet — is USB tethering on? Retrying…"
-msgstr "Liaison active ({ifaces}) mais aucun pair joignable — le partage par USB est-il activé ? Nouvel essai…"
+msgid "Servers on other devices:"
+msgstr "Serveurs sur d'autres appareils :"
+
+msgid "(self)"
+msgstr "(cet appareil)"
+
+msgid "Link up ({ifaces}) — but not listening. Is LAN sync on?"
+msgstr "Liaison active ({ifaces}) — mais pas à l'écoute. Le partage en réseau local est-il activé ?"
+
+msgid "No other device reachable yet — is USB tethering on?"
+msgstr "Aucun autre appareil joignable pour l'instant — le partage de connexion USB est-il activé ?"
 
 msgid "…"
 msgstr "…"
@@ -2229,3 +2250,33 @@ msgid "No phones paired yet. Use \"Pair a phone\" to scan another phone's QR."
 msgstr ""
 "Aucun téléphone appairé pour l'instant. Utilisez « Appairer un "
 "téléphone » pour scanner le QR d'un autre téléphone."
+
+msgid "Share invitation"
+msgstr "Invitation de partage"
+
+msgid "{device} wants to share “{project}” with you."
+msgstr "{device} veut partager « {project} » avec vous."
+
+msgid "Pending invitations"
+msgstr "Invitations en attente"
+
+msgid "{project} pending"
+msgstr "{project} en attente"
+
+msgid "{project} — will sync when nearby"
+msgstr "{project} — se synchronisera à proximité"
+
+msgid "{n} pending"
+msgstr "{n} en attente"
+
+msgid "Review"
+msgstr "Examiner"
+
+msgid "Working…"
+msgstr "En cours…"
+
+msgid "Project copied to this phone."
+msgstr "Projet copié sur ce téléphone."
+
+msgid "Could not copy the project."
+msgstr "Impossible de copier le projet."

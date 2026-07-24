@@ -161,4 +161,44 @@ github WAN still works when any device gets a data connection, so
 the convergence safety net stays github per invariant #10; the
 cable is an opportunistic LAN link like any other.
 
+### Phone ↔ phone (or tablet ↔ tablet) by USB: NOT viable — 2026-07-23
+
+Question raised: can two Android devices sync over a USB cable the
+way a phone ↔ computer does? **No — and the blocker is a missing
+Android *network-client* role, not a physical one.**
+
+Two separate role axes; don't conflate them:
+- **USB bus role** (host/OTG vs peripheral): who powers+enumerates
+  the cable. Phones are peripherals by default; OTG makes one bus-host.
+- **Networking role** (gateway/host vs client): who hands out an IP
+  vs who receives one. THIS is the wall.
+
+Android readily **hosts** a tethered network — USB tethering makes
+the phone the gateway/DHCP server handing an address to whatever's on
+the other end. That's exactly what it does for a PC, and it's why
+phone ↔ computer works: the PC is happy to be the network **client**
+(takes the DHCP lease). Android has **no "receive USB tethering" /
+network-client mode** — it can't accept an IP/RNDIS *from* another
+device over USB. So between two phones, **both can only offer to be
+the host; neither can be the client** → two gateways, no lease, no
+link. (Even if you sorted the bus/OTG role physically, the missing
+client role is still the wall.)
+
+**Phone ↔ phone path that works: WiFi hotspot.** One phone hosts a
+hotspot, the other joins *as a WiFi client* — a role Android DOES
+have. This is the already-built `static_endpoints` hotspot-host
+fallback; the sync stack rides it unchanged (mDNS + listener, exactly
+as over the PC tether). No cable, no OTG lottery.
+
+**Only reliable *cable* between two phones: hardware, not tethering.**
+A USB-C→Ethernet adapter on each device + an ethernet cable (or a tiny
+switch) gives each phone a normal wired interface on a shared subnet;
+the daemon treats it like any other LAN. USB-C↔USB-C data-role-swap
+networking is not exposed as an Android user action (chipset/ROM
+lottery) — don't rely on it.
+
+Consequence for our code: **nothing to build.** Any IP link (hotspot,
+USB-C/ethernet) rendezvouses via the existing multi-address advertise
+(0.54.47/.48) + discovery. The constraint is Android's, not ours.
+
 ## Research

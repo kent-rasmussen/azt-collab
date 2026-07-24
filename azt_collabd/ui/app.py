@@ -650,10 +650,13 @@ KV_TEMPLATE = '''
                     id: lan_status_label
                     text: ''
                     size_hint_y: None
-                    height: dp(28)
+                    # Wrap-and-grow: multi-address "Listening on …"
+                    # lines and the two-line cable-link report ran off
+                    # the page at a fixed dp(28) (field 2026-07-24).
+                    height: max(dp(28), self.texture_size[1] + dp(6))
                     halign: 'left'
-                    valign: 'middle'
-                    text_size: self.size
+                    valign: 'top'
+                    text_size: self.width, None
                     font_size: sp(11)
                 # Cache images — daemon-side CAWL prefetch policy.
                 # Default is one image per CAWL line (the preferred
@@ -1284,18 +1287,22 @@ class SettingsScreen(Screen):
         return dt.strftime('%b %d %H:%M')
 
     def _peer_sync_status_text(self, row):
-        """The right-hand status phrase for one peer row: 'up to date
-        (as of <time>)' / 'incoming' / 'N to send' (+ 'incoming' when
-        diverged), or 'awaiting first sync' when we've no coverage yet.
+        """The right-hand status phrase for one peer row: 'up to date'
+        / 'incoming' / 'N to send' (+ 'incoming' when diverged), each
+        suffixed with a bare '(<time>)'; or bare 'awaiting first sync'
+        when we've no coverage yet.
 
-        'Up to date' carries an "(as of <time>)" because it's a
-        recorded memory of the last handshake, NOT a live confirmation
-        — the peer may have made changes since that we haven't heard
-        about. The timestamp lets the user judge how stale that
-        judgment is (field 2026-07-23: a computer showing 'up to date'
-        while the phone showed 'awaiting first sync' — the disagreement
-        meant they hadn't actually exchanged, which the bare phrase
-        hid)."""
+        EVERY non-'awaiting' status is a recorded memory from the last
+        handshake, NOT a live confirmation — 'up to date', 'N to send'
+        and 'incoming' alike describe how things stood as of the last
+        exchange, and the peer may have changed since. So the "(<time>)"
+        is a property of the whole row (its `last_seen_at`, bumped on
+        every authenticated handshake), appended once after the status
+        rather than baked into one phrase. 'Awaiting first sync' stays
+        bare — there's no successful exchange to timestamp.
+        Field 2026-07-23: a computer showing 'up to date' beside a phone
+        showing 'awaiting first sync' — the disagreement meant they
+        hadn't actually exchanged, which the bare phrase hid."""
         if not row.get('to_send_known', True):
             return _tr('awaiting first sync')
         parts = []
@@ -1304,13 +1311,19 @@ class SettingsScreen(Screen):
             shown = (str(n) + '+') if row.get('capped') else str(n)
             parts.append(_tr('{n} to send').format(n=shown))
         if row.get('incoming'):
-            parts.append(_tr('incoming'))
-        if parts:
-            return ' · '.join(parts)
+            # 'to merge' = we hold their bytes, just haven't folded
+            # them in (our own chore — the peer needn't reach us).
+            # 'incoming' = data still only on the peer, which we must
+            # receive to be safe. Two data-safety-distinct states.
+            if row.get('incoming_held'):
+                parts.append(_tr('to merge'))
+            else:
+                parts.append(_tr('incoming'))
+        base = ' · '.join(parts) if parts else _tr('up to date')
         as_of = self._fmt_as_of(row.get('last_seen_at', ''))
         if as_of:
-            return _tr('up to date (as of {when})').format(when=as_of)
-        return _tr('up to date')
+            base += f' ({as_of})'
+        return base
 
     def _render_peer_sync(self, rows, current_langcode):
         from kivy.uix.label import Label
@@ -1359,22 +1372,45 @@ class SettingsScreen(Screen):
         self._sync_actions_row_height()
 
     def _retry_peer(self, peer_id, btn=None):
-        """Handle a per-peer 'Retry' tap: fire the sync off the UI
-        thread and flash the button so the tap registers. The next
-        peer_sync poll surfaces the result."""
+        """Handle a per-peer 'Retry' tap: run the burst+sweep off the
+        UI thread and REPORT the outcome on the button — 'OK' (pushes
+        delivered, or nothing needed sending) / '!' (a push failed or
+        the daemon didn't answer) — then force a board re-poll so the
+        counts / timestamps move. The old silent fire-and-forget read
+        as 'Retry does nothing' (field 2026-07-23)."""
         if not peer_id:
             return
         if btn is not None:
             btn.text = _tr('…')
+            btn.disabled = True
+
         def _work():
+            out = None
             try:
                 from azt_collab_client import lan_retry_peer
-                lan_retry_peer(peer_id)
+                out = lan_retry_peer(peer_id)
             except Exception:
-                pass
-            if btn is not None:
-                Clock.schedule_once(
-                    lambda _dt: setattr(btn, 'text', _tr('Retry')), 1.5)
+                out = None
+
+            def _report(_dt):
+                if btn is not None:
+                    ok = (out is not None
+                          and (not out or all(out.values())))
+                    btn.text = _tr('OK') if ok else _tr('!')
+
+                    def _revert(_dt2):
+                        btn.text = _tr('Retry')
+                        btn.disabled = False
+                    Clock.schedule_once(_revert, 2.5)
+                # Pull fresh rows now — a delivered sweep bumped
+                # coverage, so the cached board re-reads with new
+                # counts / "(time)" suffixes.
+                try:
+                    self._tick_peer_sync(0)
+                except Exception:
+                    pass
+            Clock.schedule_once(_report, 0)
+
         threading.Thread(target=_work, daemon=True).start()
 
     def _sync_actions_row_height(self):
@@ -2198,8 +2234,20 @@ class SettingsScreen(Screen):
     def _check_cable_link(self):
         """Desktop: report local-link addresses + reachable peers and
         nudge discovery (the affirmation half of the USB-cable flow).
-        Runs off the UI thread; result lands in the LAN status label."""
+        Runs off the UI thread; result lands in the LAN status label.
+        A 20 s watchdog posts a terminal 'did not answer' so a blocked
+        daemon can never strand the label on 'Checking…' (field
+        2026-07-24); if the RPC does answer later, its real result
+        overwrites the watchdog text."""
         self._lan_status(_tr('Checking cable link…'))
+        state = {'done': False}
+
+        def _watchdog(_dt):
+            if not state['done']:
+                self._lan_status(_tr(
+                    'The collaboration service did not answer — '
+                    'try again.'))
+        Clock.schedule_once(_watchdog, 20)
 
         def _work():
             try:
@@ -2207,23 +2255,48 @@ class SettingsScreen(Screen):
                 info = lan_cable_link()
             except Exception:
                 info = {}
+            state['done'] = True
             ifaces = info.get('interfaces') or []
+            listening = info.get('listening') or []
             peers = info.get('peers') or []
             if not ifaces:
                 text = _tr('No local-network link found — plug in the '
                            'cable and turn on USB tethering on the '
                            'phone.')
-            elif peers:
-                names = ', '.join(
-                    (p.get('device_name') or p.get('peer_id', '')[:8])
-                    for p in peers)
-                text = _tr('Cable/LAN link up ({ifaces}) · reachable: '
-                           '{names}').format(
-                               ifaces=', '.join(ifaces), names=names)
             else:
-                text = _tr('Link up ({ifaces}) but no peer reachable '
-                           'yet — is USB tethering on? Retrying…'
-                           ).format(ifaces=', '.join(ifaces))
+                # Line 1: OUR service state — "Listening on ip:port"
+                # (same vocabulary as the LAN-toggle line) when the
+                # listener is bound; an explicit link-up-but-NOT-
+                # listening call-out when it isn't (link up alone must
+                # never imply reachable). Old daemons omit
+                # ``listening`` — fall back to the raw link addresses.
+                # Then the servers on other devices, one per line.
+                if listening:
+                    text = _tr('Listening on {endpoint}').format(
+                        endpoint=', '.join(listening))
+                elif info.get('listening') is not None:
+                    text = _tr('Link up ({ifaces}) — but not '
+                               'listening. Is LAN sync on?').format(
+                                   ifaces=', '.join(ifaces))
+                else:
+                    text = _tr('This computer: {ifaces}').format(
+                        ifaces=', '.join(ifaces))
+                if peers:
+                    # One server per line, address first — a
+                    # comma-joined run of names read poorly (field
+                    # 2026-07-24).
+                    lines = [
+                        p.get('endpoint', '') + ' — '
+                        + (p.get('device_name')
+                           or p.get('peer_id', '')[:8])
+                        + (' ' + _tr('(self)')
+                           if p.get('is_self') else '')
+                        for p in peers]
+                    text += ('\n' + _tr('Servers on other devices:')
+                             + '\n' + '\n'.join(lines))
+                else:
+                    text += '\n' + _tr('No other device reachable yet '
+                                       '— is USB tethering on?')
             Clock.schedule_once(lambda _dt: self._lan_status(text), 0)
 
         threading.Thread(target=_work, daemon=True).start()

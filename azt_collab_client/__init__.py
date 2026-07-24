@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.49"
+__version__ = "0.54.63"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -990,7 +990,15 @@ def lan_peer_sync():
                          (no usable coverage) → render '?',
         capped         — bool: to_send hit the cap (render 'N+'),
         incoming       — bool: the peer holds commits we don't
-                         (count unknown by design).
+                         (count unknown by design),
+        incoming_held  — bool: when incoming, True = we already hold
+                         their tip and just haven't merged it ('to
+                         merge' — our own chore, data safe); False =
+                         their tip isn't in our store yet ('incoming' —
+                         data still only on the peer),
+        last_seen_at   — str: ISO8601-UTC of the last authenticated
+                         handshake; the 'as-of' time for every non-
+                         'awaiting first sync' status.
 
     Empty list on transport failure or no peers. Never raises — safe
     to poll from the UI."""
@@ -1008,33 +1016,49 @@ def lan_cable_link():
     """'Check cable link': ask the daemon for the machine's local-link
     addresses and currently-reachable paired peers, and (daemon-side)
     re-arm discovery + fire a burst so a just-plugged USB-tether cable
-    is picked up. Returns ``{'interfaces': [...], 'peers': [{peer_id,
-    device_name, endpoint}, ...]}``; empty dict on transport failure.
-    Never raises."""
+    is picked up. Returns ``{'interfaces': [...], 'listening':
+    ['ip:port', ...], 'peers': [{peer_id, device_name, endpoint,
+    is_self}, ...]}`` — ``listening`` is the dialable endpoints when
+    the listener is bound, empty otherwise (link up ≠ listening; old
+    daemons omit it). Empty dict on transport failure. Never
+    raises."""
     try:
         resp = call('POST', '/v1/lan/cable_link', {})
     except ServerUnavailable:
         return {}
     if not resp.get('ok'):
         return {}
-    return {'interfaces': resp.get('interfaces') or [],
-            'peers': resp.get('peers') or []}
+    out = {'interfaces': resp.get('interfaces') or [],
+           'peers': resp.get('peers') or []}
+    # Tri-state on purpose: key absent = old daemon that can't say
+    # (caller must NOT render "not listening"); [] = daemon said the
+    # listener is genuinely unbound.
+    if isinstance(resp.get('listening'), list):
+        out['listening'] = resp['listening']
+    return out
 
 
 def lan_retry_peer(peer_id):
     """Poke a single peer to sync now (the sync board's per-row
     'retry' link): fires a LAN burst + sweep so the daemon tries to
     catch that peer up on every shared project immediately,
-    github-independent. Returns True on ack, False on transport
-    failure. Fire-and-forget — the outcome shows via the next
-    ``lan_peer_sync`` poll."""
+    github-independent. Returns the sweep's per-project outcome dict
+    ``{langcode: bool}`` — ``{}`` means nothing needed sending (peer
+    already current / sweep debounced) — or ``None`` on transport
+    failure / daemon refusal, so the UI can acknowledge the tap with
+    a real result. (Pre-0.54.56 daemons omit ``outcomes``; that
+    decodes as ``{}``, indistinguishable from nothing-to-send —
+    acceptable.)"""
     if not peer_id:
-        return False
+        return None
     try:
         resp = call('POST', '/v1/lan/retry_peer', {'peer_id': peer_id})
     except ServerUnavailable:
-        return False
-    return bool(resp.get('ok'))
+        return None
+    if not resp.get('ok'):
+        return None
+    out = resp.get('outcomes')
+    return out if isinstance(out, dict) else {}
 
 
 def lan_pair_qr(endpoint='', langcode=''):

@@ -446,6 +446,17 @@ LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+# LAN_OFFER_PEER_ABSENT: user affirmed a pending share/clone offer but
+#                        the offering peer isn't reachable right now
+#                        (clone hit LAN_PEER_UNREACHABLE / timeout). The
+#                        offer STAYS pending (listed on the peer screen);
+#                        this is the user-facing "not a background
+#                        retry, just come back when they're around"
+#                        message, distinct from the generic
+#                        LAN_PEER_UNREACHABLE so the offer context reads
+#                        "ask again when nearby". Params: ``peer_id``,
+#                        ``device_name``, ``langcode``. Since 0.54.52.
+LAN_OFFER_PEER_ABSENT = 'LAN_OFFER_PEER_ABSENT'
 # Sender-side outcomes for the user-tap "Share" / "Offer share
 # again" gesture, added in 0.50.43 so the UI can show meaningful
 # feedback instead of always flashing a generic "Sent."

@@ -449,9 +449,12 @@ def _h_lan_retry_peer(body):
     """Per-peer "retry sync" — the sync board's per-row link. Fires a
     LAN burst + ``sweep_peer(peer_id)`` so the daemon tries to catch
     that one peer up on every shared project, right now, github-
-    independent. Always ``{ok: True}`` — outcome shows via the next
-    peer_sync poll (the count updates / 'awaiting first sync' clears).
-    Body: ``{peer_id}``."""
+    independent. Returns ``{ok: True, outcomes: {langcode: bool}}`` —
+    the sweep's per-project delivery outcomes (empty when the peer is
+    already current everywhere, the sweep was debounced, or the peer
+    is unknown), so the UI can acknowledge the tap with a real result
+    instead of fire-and-forget silence (field 2026-07-23: "not sure
+    I've ever seen Try do anything"). Body: ``{peer_id}``."""
     peer_id = str((body or {}).get('peer_id', '') or '')
     if not peer_id:
         return 400, {"ok": False, "error": "missing_peer_id"}
@@ -461,13 +464,14 @@ def _h_lan_retry_peer(body):
     except Exception as ex:
         print(f'[lan-retry-peer] start_burst raised: {ex!r}',
               file=sys.stderr, flush=True)
+    outcomes = {}
     try:
         from . import lan_push as _lan_push
-        _lan_push.sweep_peer(peer_id)
+        outcomes = _lan_push.sweep_peer(peer_id) or {}
     except Exception as ex:
         print(f'[lan-retry-peer] {peer_id[:8]!r} sweep raised: {ex!r}',
               file=sys.stderr, flush=True)
-    return 200, {"ok": True}
+    return 200, {"ok": True, "outcomes": outcomes}
 
 
 def _h_lan_cable_link(_body):
@@ -479,37 +483,62 @@ def _h_lan_cable_link(_body):
     so the answer reflects what's reachable now and the re-arm freshens
     it for the next check. Always ``{ok: True}``."""
     interfaces = []
+    listening = []
     try:
         from . import lan_listener as _lan_listener
         interfaces = _lan_listener._interface_ipv4s()
+        # The dialable ip:port endpoints when the listener is bound
+        # (empty when it isn't). Distinct from ``interfaces`` — link
+        # up ≠ listening — and the UI leads with this so "reachable"
+        # is never implied by mere link presence (0.54.61).
+        listening = _lan_listener.bound_endpoints_all()
     except Exception:
-        interfaces = []
+        pass
     peers_out = []
     try:
         from . import lan_discovery as _lan_discovery
+        from . import peer_id as _peer_id_mod
+        # The browser hears our OWN advertisement too (same link, by
+        # design — it proves the advertisement is actually visible).
+        # Tag it so the UI can label it "(self)" instead of passing it
+        # off as another device (field 2026-07-24: "the third one is
+        # the self, not another?").
+        my_pid = _peer_id_mod.peer_id_hex()
         names = {p.get('peer_id', ''): p.get('device_name', '')
                  for p in _peers.list_peers()}
         for pid, (host, port) in _lan_discovery.known_endpoints().items():
             peers_out.append({
                 'peer_id': pid,
                 'device_name': names.get(pid, ''),
-                'endpoint': f'{host}:{int(port)}'})
+                'endpoint': f'{host}:{int(port)}',
+                'is_self': bool(my_pid) and pid == my_pid})
     except Exception:
         pass
-    # Nudge: re-arm discovery (catches a new interface) + burst.
-    try:
-        from . import lan_discovery as _lan_discovery
-        _lan_discovery.restart_browse()
-    except Exception as ex:
-        print(f'[cable-link] restart_browse raised: {ex!r}',
-              file=sys.stderr, flush=True)
-    try:
-        from . import lan_burst as _lan_burst
-        _lan_burst.start_burst()
-    except Exception as ex:
-        print(f'[cable-link] start_burst raised: {ex!r}',
-              file=sys.stderr, flush=True)
-    return 200, {"ok": True, "interfaces": interfaces, "peers": peers_out}
+    # Nudge in the BACKGROUND: restart_browse can block for seconds
+    # (zeroconf teardown / NsdManager stalls) and start_burst's sweeps
+    # dial peers with multi-second connect timeouts — running them
+    # inline held this RPC (and the UI's "Checking cable link…" label)
+    # hostage until they finished, seemingly forever on a wedged
+    # discovery stack (field 2026-07-24). The response reflects what's
+    # reachable NOW; the nudge freshens it for the next check.
+    def _nudge():
+        try:
+            from . import lan_discovery as _lan_discovery
+            _lan_discovery.restart_browse()
+        except Exception as ex:
+            print(f'[cable-link] restart_browse raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+        try:
+            from . import lan_burst as _lan_burst
+            _lan_burst.start_burst()
+        except Exception as ex:
+            print(f'[cable-link] start_burst raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+    import threading as _threading
+    _threading.Thread(target=_nudge, daemon=True,
+                      name='cable-link-nudge').start()
+    return 200, {"ok": True, "interfaces": interfaces,
+                 "listening": listening, "peers": peers_out}
 
 
 def _h_lan_peer_sync(_body):
@@ -1163,6 +1192,23 @@ def _h_lan_accept_offer(body):
         print(f'[server] accept_offer {decision_id!r}: clone did '
               f'not deliver (codes={result.codes()!r}); pending '
               f'kept for retry', file=sys.stderr, flush=True)
+        # If the reason is simply that the offering peer isn't around
+        # right now, add the offer-context "ask again when nearby"
+        # status so the UI shows a sensible sentence instead of a bare
+        # LAN_PEER_UNREACHABLE. The offer stays listed on the peer
+        # screen; there is no background retry (0.54.52).
+        if result.has_any(S.LAN_PEER_UNREACHABLE, S.LAN_CLONE_TIMEOUT):
+            result.add(S.LAN_OFFER_PEER_ABSENT,
+                       peer_id=str(params.get('peer_id', '') or ''),
+                       device_name=str(params.get('device_name', '')
+                                       or ''),
+                       langcode=str(params.get('langcode', '') or ''))
+            # The user tapped Accept — consent is given. Stamp the
+            # decision affirmed so it auto-completes the next time
+            # this peer is genuinely discovered on the LAN
+            # (lan_discovery arrival → lan_clone.retry_affirmed_offers)
+            # instead of waiting for another manual tap.
+            _pending.set_param(decision_id, 'affirmed', True)
     return 200, {"ok": True, "result": result.to_dict()}
 
 

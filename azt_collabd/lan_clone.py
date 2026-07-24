@@ -358,13 +358,75 @@ def _do_lan_clone(host, port, langcode, expected_fp, dest_dir):
     except Exception as ex:
         if _looks_like_timeout(ex):
             return '', f'clone_timed_out: {ex!r}'
-        return '', f'clone_failed: {ex!r}'
+        # Dump the full traceback + any filename the OSError carries.
+        # A bare FileNotFoundError(2) here (field 2026-07-23) gives no
+        # clue which file is missing; the greedy _is_local_tls_error
+        # then mislabels it. The traceback names the exact path so the
+        # real cause is fixable instead of guessed.
+        import traceback as _tb
+        _fn = getattr(ex, 'filename', None)
+        print(f'[lan-clone] clone raised for {langcode!r} '
+              f'(file={_fn!r}):\n{_tb.format_exc()}',
+              file=sys.stderr, flush=True)
+        return '', (f'clone_failed: {ex!r}'
+                    + (f' file={_fn!r}' if _fn else ''))
     finally:
         _PROGRESS['active'] = False
     lift_path = _find_lift_in(dest_dir)
     if not lift_path:
         return '', 'no_lift_in_clone'
     return lift_path, ''
+
+
+def retry_affirmed_offers(peer_id):
+    """Auto-complete any share-offers this peer already affirmed.
+
+    Called on peer arrival (mDNS transition absent → present). Walks
+    the pending decisions, filters to affirmed share-offers from
+    *peer_id*, and re-runs the LAN clone for each. A delivered clone
+    (CLONED / REOPENED) removes the decision; a failure leaves it
+    pending for the next arrival. Never raises — a peer arrival must
+    not be derailed by a bookkeeping fault."""
+    try:
+        from . import pending_decisions as _pd
+        offers = []
+        for d in _pd.list_all():
+            params = d.get('params') or {}
+            if (d.get('kind') == _pd.KIND_SHARE_OFFER
+                    and params.get('peer_id') == peer_id
+                    and params.get('affirmed')):
+                offers.append(d)
+        if not offers:
+            return
+        for d in offers:
+            decision_id = d.get('id', '')
+            params = d.get('params') or {}
+            langcode = str(params.get('langcode', '') or '')
+            try:
+                result = clone_from_peer(
+                    peer_id, langcode,
+                    incoming_url=str(params.get('repo_url', '') or ''),
+                    incoming_vernlang=str(params.get('vernlang', '')
+                                          or ''))
+            except Exception as ex:
+                print(f'[lan-clone] retry affirmed offer {langcode!r} '
+                      f'from {peer_id[:8]!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+                continue
+            if result.has_any(_S.LAN_PROJECT_CLONED,
+                              _S.LAN_PROJECT_REOPENED):
+                _pd.remove(decision_id)
+                print(f'[lan-clone] affirmed offer {langcode!r} from '
+                      f'{peer_id[:8]!r} auto-completed on arrival',
+                      file=sys.stderr, flush=True)
+            else:
+                print(f'[lan-clone] affirmed offer {langcode!r} from '
+                      f'{peer_id[:8]!r} still pending '
+                      f'(codes={result.codes()!r})',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-clone] retry_affirmed_offers {peer_id[:8]!r} '
+              f'raised: {ex!r}', file=sys.stderr, flush=True)
 
 
 def clone_from_peer(peer_id, langcode, incoming_url='',
@@ -546,6 +608,21 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         _peers.add_shared_project(peer_id, langcode)
     except Exception:
         pass
+    # Record the peer's main as observed = the tip we just cloned, so
+    # the sync board shows "up to date" for this peer instead of
+    # "awaiting first sync" the instant after a clone (field 2026-07-23:
+    # a freshly-cloned project read "awaiting first sync", which is
+    # nonsense — we literally just got their data). We DID observe their
+    # main (== our new HEAD) during the clone, so this is honest
+    # coverage, not a fabricated one.
+    try:
+        from dulwich.repo import Repo
+        _head = Repo(dest_dir).head().decode('ascii', 'replace')
+        if _head:
+            _peers.set_peer_last_seen_main(peer_id, langcode, _head)
+    except Exception as ex:
+        print(f'[lan-clone] post-clone coverage record failed: '
+              f'{ex!r}', file=sys.stderr, flush=True)
     print(f'[lan-clone] done: {langcode!r} from {peer_id!r} → '
           f'{lift_path!r}', file=sys.stderr, flush=True)
     result.add(_S.LAN_PROJECT_CLONED,

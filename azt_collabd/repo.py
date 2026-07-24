@@ -3005,7 +3005,18 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
 
     # Inbound: their main isn't reachable from our HEAD ⇒ they hold
     # commits we don't. Count unknown by design (we may not hold them).
+    # Two data-safety-distinct cases (0.54.50):
+    #   incoming_held=True  — their tip IS in our object store, just not
+    #     merged into HEAD ('to merge'). Their bytes are already safe on
+    #     our disk; the only outstanding thing is OUR merge work. Not a
+    #     "need the peer to talk to us" state.
+    #   incoming_held=False — their tip is NOT in our store: data that
+    #     lives only on their device (their unmerged commits, or a merge
+    #     commit THEY made) and that we must still receive to be safe.
+    # Whoever merges first produces a commit the other must fetch, so a
+    # held/unmerged pair flips to not-held the instant the peer merges.
     incoming = False
+    incoming_held = False
     if main_hex:
         try:
             main_b = main_hex.encode('ascii')
@@ -3014,6 +3025,7 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         if main_b and main_b != head:
             if main_b in repo.object_store:
                 incoming = not _is_ancestor(repo, main_b, head)
+                incoming_held = incoming   # held, just not merged
             else:
                 incoming = True   # we don't even hold their tip
 
@@ -3025,6 +3037,9 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         'to_send_known': to_send_known,
         'capped': capped,
         'incoming': incoming,
+        # True ⇒ 'awaiting merge' (we hold their bytes, unmerged);
+        # False + incoming ⇒ 'incoming' (data still only on the peer).
+        'incoming_held': incoming_held,
         # When we last authenticated a handshake with this peer — the
         # "as of" for an 'up to date' judgment, which is a recorded
         # memory, not a live confirmation (0.54.49).

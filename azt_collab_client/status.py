@@ -260,6 +260,12 @@ LAN_REMOTE_CONFLICT = 'LAN_REMOTE_CONFLICT'
 LAN_SHARE_OFFER = 'LAN_SHARE_OFFER'
 LAN_SHARE_DECLINED = 'LAN_SHARE_DECLINED'
 LAN_OFFER_ACCEPTED = 'LAN_OFFER_ACCEPTED'
+# Affirmed a pending offer but the offering peer isn't reachable now;
+# the offer stays pending. "Ask again when nearby" — distinct from the
+# generic LAN_PEER_UNREACHABLE for offer-context messaging. Params:
+# peer_id, device_name, langcode. See azt_collabd/status.py. Since
+# 0.54.52.
+LAN_OFFER_PEER_ABSENT = 'LAN_OFFER_PEER_ABSENT'
 # Sender-side outcomes for the user-tap share gesture — see
 # azt_collabd/status.py for the per-code body.
 LAN_OFFER_DELIVERED = 'LAN_OFFER_DELIVERED'

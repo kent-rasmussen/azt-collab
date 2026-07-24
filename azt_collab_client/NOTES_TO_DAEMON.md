@@ -98,6 +98,31 @@ APK too — that's the wedged-daemon signature.
 Owner: peer team (recorder). Evidence inline above; ping for a
 repro session if needed — two paired phones on the field router.
 
+### ASK: fold the 0.54.40 LAN fan-out outcome into the sync Result as typed codes
+
+`_h_project_sync` (0.54.40) fires the LAN fan-out before the WAN
+gates but does not add any LAN status to the returned `Result` —
+the fan-out outcome is only visible in daemon logs. So a peer
+routing on the result can't tell "WAN unconfigured but the room
+synced" from "nothing happened": `AUTH_REQUIRED` / `NO_REMOTE`
+look identical in both worlds.
+
+The recorder (1.62.0) works around it with a second RPC — on
+those codes it reads `ProjectStatus.lan_allow_sync` and treats
+the refusal as informational (toast + stay) when LAN is armed.
+That's toggle-armed, not outcome — it can't distinguish "fanned
+out to 2 peers" from "LAN on, nobody reachable."
+
+Ask: add typed codes to the sync Result, e.g.
+`S.LAN_FANNED_OUT` (params: `peers_reached`, `peers_total`) /
+`S.LAN_NO_PEERS_REACHED`, so peers route on codes per the
+suite rule (status codes drive logic) and can drop the extra
+`project_status` round-trip + show something concrete
+("synced with 2 devices; internet backup not set up").
+
+Owner: peer team (recorder). Low urgency — the workaround holds;
+this is contract hygiene + better wording.
+
 ### INVESTIGATE: merge churn from bulk ASR-draft annotations
 
 The desktop AZT app is gaining a **bulk ASR** stage that writes machine-

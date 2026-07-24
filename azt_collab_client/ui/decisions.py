@@ -3,7 +3,9 @@ Shared decisions watcher — single Kivy popup surface for every
 peer.
 
 Polls ``lan_pending()`` on a configurable cadence; for each
-unresolved decision, renders a modal popup matching the kind.
+unresolved decision, renders a modal popup matching the kind —
+EXCEPT share/clone offers (since 0.54.54), which surface passively
+on the peer screens instead of interrupting with a popup.
 Accept / Decline / (per-kind extras like the 3-way Internet-URL
 conflict resolution) dispatch to the existing per-kind RPCs and
 fire ``on_resolved(kind, action, decision)`` for the host peer
@@ -133,8 +135,18 @@ def _render_decision(decision):
     (unknown kind logged, nothing rendered)."""
     kind = decision.get('kind', '')
     if kind == KIND_SHARE_OFFER:
-        _open_share_offer_popup(decision)
-        return True
+        # Share/clone offers are NO LONGER auto-popped (0.54.54). They
+        # surface passively on the peer screens ("{project} pending" on
+        # Nearby & paired devices / Manage paired device), where the
+        # user affirms once via a confirm popup and an affirmed offer
+        # auto-completes on the peer's next arrival. Auto-popping an
+        # offer every poll was the nag this redesign removes — a
+        # vanished/asymmetric peer's offer re-arrived and re-popped
+        # endlessly. Skip (return False) so the poller moves on to any
+        # interactive decision behind it. `_open_share_offer_popup`
+        # stays defined for the manual "Receive a project" path
+        # (`pending_offers_popup`).
+        return False
     if kind == KIND_PAIR_REQUEST:
         _open_pair_request_popup(decision)
         return True

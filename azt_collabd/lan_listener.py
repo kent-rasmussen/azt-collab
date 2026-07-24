@@ -596,6 +596,34 @@ def _handle_share_offer(environ, start_response, peer_id,
         local_proj = _projects.get(langcode)
     except Exception:
         local_proj = None
+    # Ghost guard (0.54.63): a registry record whose working tree is
+    # GONE (forget-with-delete residue, wiped dir, interrupted clone)
+    # must not swallow re-offers forever. Without this, every
+    # re-share from the owner dispatched to a silent branch
+    # (no_url/noop/adopted) because "the project is registered" —
+    # while the picker showed nothing and the user saw no offer
+    # (field 2026-07-24: desktop 'shared' + board 'awaiting first
+    # sync', client shows neither project nor offer). This handler
+    # runs in the daemon process, which owns the files, so the disk
+    # check is legitimate here (unlike in peer code). Heal = forget
+    # the ghost record, then fall through to the normal
+    # stash-clone-offer path.
+    if local_proj is not None:
+        _wd = str(getattr(local_proj, 'working_dir', '') or '')
+        if not _wd or not os.path.isdir(os.path.join(_wd, '.git')):
+            print(f'[lan-listener] share-offer for {langcode!r}: '
+                  f'registry record is a GHOST (working tree '
+                  f'missing at {_wd!r}) — forgetting record, '
+                  f'treating offer as fresh', file=sys.stderr,
+                  flush=True)
+            try:
+                from . import repo as _repo_mod
+                _repo_mod.forget_project(langcode, delete_files=False)
+            except Exception as ex:
+                print(f'[lan-listener] ghost forget for '
+                      f'{langcode!r} failed: {ex!r}',
+                      file=sys.stderr, flush=True)
+            local_proj = None
     local_url = ''
     if local_proj is not None:
         local_url = str(getattr(local_proj, 'remote_url', '') or '')
@@ -1598,6 +1626,19 @@ def _post_receive_pack_middleware(inner_app):
             try:
                 for chunk in result:
                     yield chunk
+            except (ValueError, ConnectionError, OSError) as ex:
+                # A peer that disconnects mid-push (screen off, walked
+                # out of range, killed) leaves a truncated chunked
+                # body; dulwich's reader surfaces it as
+                # ``ValueError: invalid literal for int() with base
+                # 16: b''`` and wsgiref printed the raw 15-frame
+                # traceback (field 2026-07-23). Transient by design —
+                # the sender still holds the data and re-pushes; one
+                # line is the whole story.
+                print(f'[lan-listener] {langcode!r} receive '
+                      f'interrupted (peer disconnected mid-transfer; '
+                      f'sender will retry): {ex!r}',
+                      file=sys.stderr, flush=True)
             finally:
                 try:
                     s = status_holder[0] or ''

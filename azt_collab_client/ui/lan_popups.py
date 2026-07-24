@@ -186,6 +186,20 @@ def _resolve_adopt_origin_then_done(result, on_done, font_name):
                        font_name=font_name)
 
 
+def _link_button(text, color=None, **kwargs):
+    """A ThemedButton styled as a plain text link — no fill, colored
+    text (default ``theme.RED``). Used for the passive pending-offer
+    affordances; a solid red button read as alarming ("bit much",
+    field 2026-07-23)."""
+    kwargs.setdefault('bold', False)
+    btn = Button(text=text, color=color or theme.RED, **kwargs)
+    try:
+        btn._fill_color.rgba = (0, 0, 0, 0)
+    except Exception:
+        pass
+    return btn
+
+
 def _render_qr_widget(payload, scale=8, border=2):
     """Render ``payload`` (a dict — typically the daemon's pairing
     QR payload) as a Kivy ``Image`` widget. ``segno`` produces PNG
@@ -514,15 +528,23 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
         # daemon's HTTP server is threaded, so this gets through
         # while the clone RPC is still occupying its own thread.
         sub_default = sub_label.text
+        seen = {'progress': False}
         def _poll_progress(_dt):
             try:
                 snap = lan_clone_progress()
             except Exception:
                 return
             if snap.get('active') and snap.get('text'):
+                seen['progress'] = True
                 sub_label.text = snap['text']
-            else:
+            elif not seen['progress']:
                 sub_label.text = sub_default
+            # else: keep the LAST progress line. The slot goes
+            # inactive between candidate-address attempts and during
+            # post-transfer finalize (find LIFT / register / merge);
+            # reverting to the "first time can take a while" hint
+            # AFTER data visibly moved read as a silent restart
+            # (field 2026-07-24).
         progress_poll_ev = Clock.schedule_interval(_poll_progress, 1.0)
 
         def _worker():
@@ -860,6 +882,186 @@ def _peer_endpoint_str(peer):
     return ', '.join(eps)
 
 
+def _pending_offers_for(peer_id):
+    """Return the pending share-offer decisions whose
+    ``params.peer_id`` matches *peer_id*. Never raises — returns []
+    on any error so callers can fold it into row-building without a
+    guard."""
+    try:
+        from .. import lan_pending
+        out = []
+        for d in (lan_pending() or []):
+            if not isinstance(d, dict):
+                continue
+            if d.get('kind') != 'share_offer':
+                continue
+            params = d.get('params') or {}
+            if str(params.get('peer_id', '') or '') == str(peer_id or ''):
+                out.append(d)
+        return out
+    except Exception:
+        return []
+
+
+def _offer_confirm_popup(decision, on_done, font_name='Roboto'):
+    """Accept / Decline confirm for a single pending share-offer.
+
+    Accept runs ``lan_accept_offer`` off the UI thread and renders
+    the outcome (copied / kept-for-later when the peer is absent /
+    generic failure). Either action calls ``on_done()`` — the parent
+    screen's refresh — before dismissing."""
+    from .. import (lan_accept_offer, lan_decline_offer,
+                    lan_clone_progress, S)
+    from ..status import Result, Status
+    from ..translate import translate_status
+
+    params = decision.get('params') or {}
+    decision_id = decision.get('id', '')
+    peer_id = str(params.get('peer_id', '') or '')
+    device = (params.get('device_name')
+              or (peer_id[:8] if peer_id else _tr('Unnamed device')))
+    project = str(params.get('langcode', '') or '')
+
+    body = BoxLayout(orientation='vertical', spacing=dp(12),
+                     padding=dp(16))
+    msg = Label(
+        text=_tr('{device} wants to share “{project}” with you.'
+                 ).format(device=device, project=project),
+        font_size=sp(13), font_name=font_name,
+        halign='center', valign='top', size_hint_y=None,
+        text_size=(dp(280), None))
+    msg.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1]))
+    body.add_widget(msg)
+
+    status_lbl = Label(
+        text='', font_size=sp(12), font_name=font_name,
+        halign='center', valign='middle', color=theme.TEXT_DIM,
+        size_hint_y=None, height=dp(0), text_size=(dp(280), None))
+    body.add_widget(status_lbl)
+
+    btn_row = BoxLayout(orientation='horizontal', size_hint_y=None,
+                        height=dp(44), spacing=dp(8))
+    decline_btn = Button(text=_tr('Decline'), font_size=sp(13),
+                         font_name=font_name)
+    accept_btn = Button(text=_tr('Accept'), font_size=sp(13),
+                        font_name=font_name,
+                        background_color=theme.ACCENT)
+    btn_row.add_widget(decline_btn)
+    btn_row.add_widget(accept_btn)
+    body.add_widget(btn_row)
+
+    popup = Popup(title=_tr('Share invitation'), content=body,
+                  size_hint=(0.9, 0.5), auto_dismiss=False)
+
+    # Holder for the clone-progress poll event so _accept can start
+    # it and _on_accept_result / _finish can cancel it.
+    _prog = {'ev': None}
+
+    def _stop_progress():
+        ev = _prog.get('ev')
+        if ev is not None:
+            try:
+                ev.cancel()
+            except Exception:
+                pass
+            _prog['ev'] = None
+
+    def _finish():
+        _stop_progress()
+        try:
+            if on_done is not None:
+                on_done()
+        except Exception:
+            pass
+        popup.dismiss()
+
+    def _on_accept_result(result):
+        _stop_progress()
+        delay = 3.0
+        if result.has_any(S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED):
+            status_lbl.text = _tr('Project copied to this phone.')
+            delay = 1.4
+            if result.has(S.LAN_ADOPT_ORIGIN_NEEDED):
+                # Surface the "adopt github remote?" confirm IN-FLOW,
+                # right after this popup closes — same gesture, same
+                # device. Without this it fell through to the
+                # background decisions watcher and popped on whatever
+                # peer app opened next (field 2026-07-23: the
+                # recorder). Mirrors scan_to_pair.
+                Clock.schedule_once(
+                    lambda _dt: _resolve_adopt_origin_then_done(
+                        result, None, font_name),
+                    delay + 0.2)
+        elif result.has(S.LAN_OFFER_PEER_ABSENT):
+            # Render just the peer-absent status ("kept — ask again
+            # when nearby"), not the whole joined result.
+            absent = next((s for s in result.statuses
+                           if s.code == S.LAN_OFFER_PEER_ABSENT), None)
+            status_lbl.text = (translate_status(absent) if absent
+                               else _tr('Could not copy the project.'))
+        else:
+            # Surface the SPECIFIC failure (LAN_LOCAL_TLS_ERROR,
+            # LAN_PROJECT_NOT_SHARED, LAN_CLONE_TIMEOUT, …) — the clone
+            # adds one terminal status; translating it tells the user
+            # (and us) what actually blocked the copy, instead of a
+            # flat "couldn't copy" that hides a fixable cause.
+            worst = result.statuses[-1] if result.statuses else None
+            status_lbl.text = (translate_status(worst) if worst
+                               else _tr('Could not copy the project.'))
+        # Let the user read the outcome line, then refresh + dismiss.
+        Clock.schedule_once(lambda _dt: _finish(), delay)
+
+    def _accept(*_):
+        accept_btn.disabled = True
+        decline_btn.disabled = True
+        status_lbl.height = dp(24)
+        status_lbl.text = _tr('Working…')
+
+        # Surface the daemon's live clone progress ("Counting objects:
+        # 12% (n/m)") while the accept RPC runs on its own thread — a
+        # first copy can run for a while, and an unmoving screen reads
+        # as hung. Same poll pattern as the pairing/receive flow.
+        def _poll_progress(_dt):
+            try:
+                snap = lan_clone_progress()
+            except Exception:
+                return
+            if snap.get('active') and snap.get('text'):
+                status_lbl.text = snap['text']
+        _prog['ev'] = Clock.schedule_interval(_poll_progress, 1.0)
+
+        def _worker():
+            try:
+                result = lan_accept_offer(decision_id)
+            except Exception as ex:
+                result = Result(statuses=[Status(
+                    'SERVER_ERROR', {'error': f'{ex!r}'})])
+            Clock.schedule_once(
+                lambda _dt: _on_accept_result(result), 0)
+
+        threading.Thread(target=_worker, daemon=True,
+                         name='lan-offer-accept').start()
+
+    def _decline(*_):
+        accept_btn.disabled = True
+        decline_btn.disabled = True
+
+        def _worker():
+            try:
+                lan_decline_offer(decision_id)
+            except Exception:
+                pass
+            Clock.schedule_once(lambda _dt: _finish(), 0)
+
+        threading.Thread(target=_worker, daemon=True,
+                         name='lan-offer-decline').start()
+
+    accept_btn.bind(on_release=_accept)
+    decline_btn.bind(on_release=_decline)
+    popup.open()
+    return popup
+
+
 def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
     """Per-peer detail popup: list shared projects (with toggles),
     static endpoints (with add/remove), and an unpair button."""
@@ -880,6 +1082,49 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
         text=_tr('Peer ID: ') + pid,
         size_hint_y=None, height=dp(22), font_size=sp(10),
         color=theme.TEXT_DIM, font_name=font_name))
+
+    # Pending invitations from this peer. Passive surface: the user
+    # affirms once here; an affirmed offer auto-completes when the
+    # peer is next nearby. Rendered nothing-when-empty (no header).
+    pending_box = BoxLayout(orientation='vertical', size_hint_y=None,
+                            spacing=dp(4))
+    pending_box.bind(minimum_height=pending_box.setter('height'))
+    content.add_widget(pending_box)
+
+    def _refresh_pending():
+        pending_box.clear_widgets()
+        offers = _pending_offers_for(pid)
+        if not offers:
+            return
+        pending_box.add_widget(Label(
+            text=_tr('Pending invitations'),
+            size_hint_y=None, height=dp(24), font_size=sp(12),
+            bold=True, font_name=font_name))
+        for d in offers:
+            o_params = d.get('params') or {}
+            lang = str(o_params.get('langcode', '') or '')
+            affirmed = bool(o_params.get('affirmed'))
+            label_text = (
+                _tr('{project} — will sync when nearby') if affirmed
+                else _tr('{project} pending')).format(project=lang)
+            row = BoxLayout(orientation='horizontal', size_hint_y=None,
+                            height=dp(34), spacing=dp(8))
+            row.add_widget(Label(
+                text=label_text, halign='left', valign='middle',
+                font_size=sp(12), color=theme.RED, font_name=font_name,
+                text_size=(dp(180), dp(30))))
+            review_btn = _link_button(
+                _tr('Review'),
+                size_hint=(None, None), width=dp(110), height=dp(32),
+                font_size=sp(12), font_name=font_name)
+            review_btn.bind(on_release=lambda _b, dd=d:
+                            _offer_confirm_popup(
+                                dd, on_done=_refresh_pending,
+                                font_name=font_name))
+            row.add_widget(review_btn)
+            pending_box.add_widget(row)
+
+    _refresh_pending()
 
     # Shared projects toggle list.
     content.add_widget(Label(
@@ -1309,21 +1554,79 @@ def paired_phones_popup(font_name='Roboto'):
                 unpair_btn.bind(
                     on_release=lambda *_args, p=peer:
                         _confirm_unpair(p))
+                row_buttons = [manage_btn, unpair_btn]
+                # Passive pending-offer affordance: a red button that
+                # opens the affirm/decline confirm for the first
+                # pending offer from this peer (or a count if >1).
+                offers = _pending_offers_for(peer.get('peer_id', ''))
+                if offers:
+                    first_lang = str(
+                        (offers[0].get('params') or {}).get(
+                            'langcode', '') or '')
+                    offer_label = (
+                        _tr('{n} pending').format(n=len(offers))
+                        if len(offers) > 1
+                        else _tr('{project} pending').format(
+                            project=first_lang))
+                    # Plain red text link, not a filled button —
+                    # "bit much" (field 2026-07-23).
+                    offer_btn = _link_button(
+                        offer_label,
+                        size_hint=(None, None),
+                        width=dp(96), height=dp(40),
+                        font_size=sp(11), font_name=font_name)
+                    offer_btn.bind(
+                        on_release=lambda *_args, d=offers[0]:
+                            _offer_confirm_popup(
+                                d, on_done=_refresh,
+                                font_name=font_name))
+                    row_buttons.append(offer_btn)
                 paired_box.add_widget(_build_full_row(
                     name=peer.get('device_name')
                         or _tr('Unnamed device'),
                     peer_id=peer.get('peer_id', '') or '',
                     endpoint=_peer_endpoint_str(peer),
                     projects=shared,
-                    buttons=[manage_btn, unpair_btn],
+                    buttons=row_buttons,
                     font_name=font_name))
         else:
             paired_box.add_widget(_placeholder(
                 _tr('No phones paired yet. Use "Pair a phone" to '
                     'scan another phone\'s QR.')))
 
+    # Offers watcher: cheap ``lan_pending`` poll (3 s); rebuilds the
+    # rows ONLY when the pending share-offer id set changes — e.g. an
+    # affirmed offer auto-completed on the peer's arrival, or a fresh
+    # offer landed — so the red "{project} pending" link clears or
+    # appears without closing/reopening the screen. Kept OUTSIDE
+    # ``_active_polls`` because ``_refresh`` cancels those wholesale.
+    from .. import lan_pending as _lan_pending_rpc
+    _offers_watch = {'ev': None, 'ids': None}
+
+    def _poll_offers(_dt):
+        try:
+            ids = sorted(
+                d.get('id', '') for d in (_lan_pending_rpc() or [])
+                if d.get('kind') == 'share_offer')
+        except Exception:
+            return
+        if _offers_watch['ids'] is None:
+            _offers_watch['ids'] = ids
+            return
+        if ids != _offers_watch['ids']:
+            _offers_watch['ids'] = ids
+            _refresh()
+
+    _offers_watch['ev'] = Clock.schedule_interval(_poll_offers, 3.0)
+
     def _on_close(*_):
         _cancel_all_polls()
+        ev = _offers_watch.get('ev')
+        if ev is not None:
+            try:
+                ev.cancel()
+            except Exception:
+                pass
         try:
             Window.unbind(height=_on_window_resize)
         except Exception:

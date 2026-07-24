@@ -76,4 +76,105 @@ this: "is the sync done / was there a bad merge?"; "which directory
 is 'nml' bound to?" (the cross-merge incident); "what head is this
 project at?" (couldn't verify the disentangle on the phone).
 
+## Pending offers: surface, don't nag (design 2026-07-23)
+
+Same "surface facts on the peer screen, don't nag" philosophy as this
+board; belongs here. Trigger: a stale accepted clone offer for `nml`
+from a vanished phone (`db033cd4…` @ 192.168.31.76, unreachable subnet)
+retried forever — `[lan-clone] … pending kept for retry` on every
+discovery tick + log spam. Kent: "any principled reason to have these
+nagging messages at all? we have a peer screen."
+
+**Model (agreed):**
+- An incoming share/clone offer is a **durable, passive intent**, not a
+  background retry loop. No blind re-dial of a cached/stale address; no
+  log-spam.
+- **Consent is two-sided and explicit:** the offerer offered (their
+  approval); the receiver **taps once to affirm** ("clone/share when we
+  next meet"). Nothing pulls data before that tap.
+- **After the tap, completion is automatic "under the hood"** the next
+  time the two are genuinely together (real mDNS arrival with a
+  reachable endpoint — we already fire `sweep_peer` on arrival). NOT
+  per-meeting tapping. This preserves hands-free convergence.
+- **Stale / peer-absent:** instead of retry, a plain typed status —
+  *"{peer} not connected; ask for clone/share again when they're
+  around."* New status code (peer-side, e.g. `LAN_OFFER_PEER_ABSENT`),
+  displayed, not looped.
+
+**UI surfacing (two places):**
+1. **Nearby & Paired devices** (the list): at the END of a device's
+   project list, a red **"{project} pending"** entry, clickable to
+   affirm — so the invitation + which device it's under is visible
+   WITHOUT drilling into Manage.
+2. **Manage Paired Device** (per-device detail): pending offers listed
+   ABOVE "shared projects", same affirm affordance.
+
+**Supersedes** the retry-budget/expiry idea floated 2026-07-23 — surface
+-not-retry is the cleaner answer; drop the expiry approach.
+
+**Build order:** daemon lifecycle first (stop blind retry; persist
+offer as affirm-pending; complete on real arrival post-affirm; typed
+absent-status), then a list/affirm RPC + client wrapper, then the two
+UI surfaces. Own version(s); freeze discipline.
+
+**BUG found 2026-07-23 — Decline doesn't stick under asymmetric
+reachability.** `_h_lan_decline_offer` (server.py) removes the pending
+decision, then best-effort nacks the sender. But the inbound handler
+`_handle_share_offer` (lan_listener.py:607) **re-stashes the offer
+unconditionally** on every sender POST. So: a connected sender gets the
+nack, rolls back its `shared_projects`, stops offering → stays cleared;
+but a sender we can't reach back (one-way reachability — it reaches us,
+we can't reach it: the same failure that blocks the clone) never gets
+the nack, keeps re-offering on its bursts, and the decline is undone on
+the next inbound POST → the offer recurs. (Accept recurs too, by
+design — clone fails, kept.) Field: the `nml`/`db033cd4` offer recurred
+on both accept AND decline; a different, connected phone's offer
+declined cleanly.
+**Fix:** persist a local "declined" suppression keyed (peer_id,
+langcode); in `_handle_share_offer`, if a re-arriving offer matches a
+suppression, DON'T re-stash — silently drop and re-attempt the nack
+(clear the suppression once the sender acks / stops, or on a TTL). Makes
+Decline stick even when the nack can't be delivered. Land AFTER the
+Stage 2/3 agent's server.py edits (avoid clobber); own version.
+
+## Clone/offer completion papercuts (2026-07-23 pm, field)
+
+Cluster found after 0.54.53/.54 shipped the offer surfacing. Land as
+one version so the recorder is rebuilt once.
+
+1. **DONE 0.54.56 — adopt-origin surfaces in-flow.**
+   `_offer_confirm_popup` chains into
+   `_resolve_adopt_origin_then_done` on `LAN_ADOPT_ORIGIN_NEEDED`,
+   same device, same gesture.
+2. **DONE 0.54.55 — "awaiting first sync" right after cloning.**
+   `lan_clone.clone_from_peer` records
+   `peers.set_peer_last_seen_main(peer_id, langcode, <cloned HEAD>)`
+   after register → board shows "up to date" post-clone.
+3. **DONE 0.54.56 — offer affordance self-clears.** 3 s change-only
+   `lan_pending` watcher in `paired_phones_popup` rebuilds rows when
+   the offer set changes; daemon already keeps the decision until
+   delivered; errors show in the confirm popup ("3 covers 1").
+4. **DONE 0.54.56 — Retry reports outcome.** `retry_peer` returns
+   sweep outcomes; button '…' → 'OK'/'!' + forced board re-poll.
+5. **DONE 0.54.56 — red buttons → red text links** (`_link_button`),
+   both Nearby "{project} pending" and Manage "Review".
+6. **DONE 0.54.57 — truncated inbound push logs one clean line**
+   (caught in `_generator`; "peer disconnected mid-transfer; sender
+   will retry").
+7. **DONE 0.54.57 — "Checking cable link…" can't strand.** Real cause
+   was daemon-side: the handler ran restart_browse + burst INLINE
+   before responding (seconds-to-minutes). Nudge now backgrounded;
+   response immediate; UI adds a 20 s watchdog as belt-and-braces.
+8. **`SERVICE_RESTARTED` repeating in the server UI log + earlier
+   `AZTServiceConnector.ensureBound … ClassNotFoundException`.** The
+   settings-UI client keeps finding the daemon connection dropped and
+   respawning it — i.e. the daemon isn't staying alive between calls.
+   Likely root: the sticky-bind service never binds (ClassNotFound), so
+   the `:provider` daemon is killed when idle and every UI call
+   lazy-respawns it. This is probably the source of much of the
+   session's flakiness (dropped transfers, "did nothing" taps). HIGHER
+   priority than the cosmetics — chase the ClassNotFoundException
+   (dex/manifest injection of `AZTServiceConnector` in the current
+   build) first. NOT yet diagnosed.
+
 ## Research

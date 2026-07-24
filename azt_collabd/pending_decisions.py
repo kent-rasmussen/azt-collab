@@ -132,6 +132,31 @@ def add(kind, params):
     return entry
 
 
+def set_param(decision_id, key, value):
+    """Set ``entry['params'][key] = value`` for one decision and
+    persist. Returns True on success, False if the id is absent.
+    Used to stamp ``affirmed=True`` once the user has consented to a
+    share-offer so it can auto-complete on the peer's next arrival."""
+    with _LOCK:
+        data = _load_raw()
+        decisions = data.get('decisions', [])
+        changed = False
+        for d in decisions:
+            if isinstance(d, dict) and d.get('id') == decision_id:
+                params = d.get('params')
+                if not isinstance(params, dict):
+                    params = {}
+                    d['params'] = params
+                params[key] = value
+                changed = True
+                break
+        if not changed:
+            return False
+        data['decisions'] = decisions
+        _save_raw(data)
+    return True
+
+
 def remove(decision_id):
     """Delete a decision by id. Returns True if it existed."""
     with _LOCK:
