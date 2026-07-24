@@ -608,6 +608,20 @@ class PickerApp(App):
             azt_collabd.paths.azt_home(), 'config.json')
         self._config_mtime = self._get_config_mtime()
         Clock.schedule_interval(self._check_language_change, 1.0)
+        # Surface pending decisions (pair requests, remote conflicts,
+        # adopt-origin fallback) in THIS app too. Until 0.54.65 only
+        # peer apps ran the watcher, so an inbound pair request
+        # surfaced NOWHERE while the user sat in the daemon's own
+        # picker/settings screens — the sender's button just said
+        # "Waiting…" until the recorder happened to be opened (field
+        # 2026-07-24). Share offers stay exempt inside the watcher
+        # (passive surface since 0.54.54).
+        try:
+            from azt_collab_client.ui import install_decision_watcher
+            install_decision_watcher()
+        except Exception as ex:
+            print(f'[picker_app] decision watcher install failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
         # Android 15+ enforces edge-to-edge by default — the status
         # bar and gesture navigation bar overlay the app window
         # unless we opt back into the pre-API-35 "decor fits system

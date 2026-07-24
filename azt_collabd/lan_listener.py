@@ -1605,13 +1605,50 @@ def _post_receive_pack_middleware(inner_app):
         _POST_RECEIVE_PATH_RE = re.compile(
             r'^/([^/]+)\.git/git-receive-pack$')
 
+    def _is_peer_disconnect(ex):
+        """True for the exception shapes a peer vanishing
+        mid-transfer produces: raw socket resets, or dulwich's
+        ``GitProtocolError`` wrapping one (raised ``from`` the socket
+        error, so ``__cause__`` carries the original — field
+        2026-07-24: upload-pack negotiation reset when the phone
+        hopped networks printed a 40-line double traceback)."""
+        if isinstance(ex, (ConnectionResetError, BrokenPipeError)):
+            return True
+        cause = getattr(ex, '__cause__', None)
+        return isinstance(cause,
+                          (ConnectionResetError, BrokenPipeError))
+
     def _wrapped(environ, start_response):
         method = environ.get('REQUEST_METHOD', '')
         path = environ.get('PATH_INFO', '')
         m = (_POST_RECEIVE_PATH_RE.match(path)
              if method == 'POST' else None)
         if m is None:
-            return inner_app(environ, start_response)
+            # Non-receive routes (upload-pack serving a peer's fetch,
+            # info/refs, …) get the same disconnect-absorbing wrap as
+            # the receive path below: a peer that vanishes mid-
+            # transfer is ONE log line, not a traceback. Anything
+            # that isn't a disconnect re-raises untouched.
+            result = inner_app(environ, start_response)
+
+            def _absorb():
+                try:
+                    for chunk in result:
+                        yield chunk
+                except Exception as ex:
+                    if not _is_peer_disconnect(ex):
+                        raise
+                    print(f'[lan-listener] {path!r} interrupted '
+                          f'(peer disconnected mid-transfer; they '
+                          f'will retry): {ex!r}',
+                          file=sys.stderr, flush=True)
+                finally:
+                    if hasattr(result, 'close'):
+                        try:
+                            result.close()
+                        except Exception:
+                            pass
+            return _absorb()
 
         langcode = m.group(1)
         status_holder = [None]

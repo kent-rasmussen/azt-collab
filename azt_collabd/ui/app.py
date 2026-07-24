@@ -1617,6 +1617,19 @@ class SettingsScreen(Screen):
         self.refresh()
 
     def refresh(self):
+        # Re-probe the bottom version strip too — it's captured at UI
+        # startup and goes stale across daemon restarts (field
+        # 2026-07-24: footer said 'server 0.54.63' from a transient
+        # spawn caught during respawn churn, while the surviving
+        # daemon was 0.54.61). Refresh Status = "pull it ALL again,"
+        # version included.
+        try:
+            app = App.get_running_app()
+            if hasattr(app, '_probe_server_version'):
+                threading.Thread(target=app._probe_server_version,
+                                 daemon=True).start()
+        except Exception:
+            pass
         # Debug-section indicator stays in sync regardless of
         # whether status fetching succeeded.
         try:
@@ -2120,6 +2133,7 @@ class SettingsScreen(Screen):
             return
         self._lan_enabled = bool(applied.get('on'))
         self._lan_endpoint = applied.get('endpoint', '')
+        self._lan_pid = int(applied.get('pid') or 0)
         self._refresh_lan_buttons()
         self._refresh_lan_status()
         # The work-offline status text describes the joint state
@@ -2141,6 +2155,7 @@ class SettingsScreen(Screen):
             state = {'on': False, 'endpoint': ''}
         self._lan_enabled = bool(state.get('on'))
         self._lan_endpoint = state.get('endpoint', '')
+        self._lan_pid = int(state.get('pid') or 0)
         self._refresh_lan_buttons()
         self._refresh_lan_status()
 
@@ -2163,8 +2178,19 @@ class SettingsScreen(Screen):
             label.text = ''
             return
         if endpoint:
-            label.text = _tr('Listening on {endpoint}').format(
+            text = _tr('Listening on {endpoint}').format(
                 endpoint=endpoint)
+            # Double-daemon diagnostic (Kent 2026-07-24): the pid of
+            # the daemon that ANSWERED the toggle RPC. Lets the user
+            # compare against the process list / server.json at a
+            # glance — especially on Windows, where the flock
+            # single-instance guard is a no-op. A pid that changes
+            # between refreshes exposes a silent respawn. Locale-
+            # neutral suffix, deliberately untranslated.
+            pid = int(getattr(self, '_lan_pid', 0) or 0)
+            if pid:
+                text += f' · pid {pid}'
+            label.text = text
         else:
             label.text = _tr('Local-network sharing is on (listener '
                              'not yet bound).')
@@ -3972,6 +3998,16 @@ class CollabUIApp(App):
         import threading
         threading.Thread(target=self._probe_server_version,
                          daemon=True).start()
+        # Surface pending decisions (pair requests, remote conflicts,
+        # adopt-origin fallback) in the desktop settings UI too — see
+        # the matching install in picker_app.on_start for the field
+        # rationale (0.54.65).
+        try:
+            from azt_collab_client.ui import install_decision_watcher
+            install_decision_watcher()
+        except Exception as ex:
+            print(f'[collab-ui] decision watcher install failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
 
     def _probe_server_version(self):
         """Ask the daemon what version it is via /v1/health (the

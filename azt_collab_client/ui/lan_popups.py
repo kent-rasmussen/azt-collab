@@ -1454,21 +1454,41 @@ def paired_phones_popup(font_name='Roboto'):
             if not pid:
                 return
             _set_waiting()
-            result = lan_pair_request_send(pid, '')
-            if result.has(S.LAN_PAIR_REQUEST_PENDING):
-                # Poll every 2 s; daemon's outbound state clears on
-                # read after a terminal state, so we'll see
-                # accepted/declined/timeout exactly once.
-                ev = Clock.schedule_interval(_poll, 2.0)
-                _active_polls[pid] = ev
-                return
-            # Anything else is a failure to even send the request
-            # — show the translated reason and revert. Common cases:
-            # LAN_TOGGLE_OFF, LAN_PEER_UNREACHABLE, SERVER_*.
-            text = translate_result(result) or _tr(
-                'Could not send pair request.')
-            action_btn.text = text[:40]
-            Clock.schedule_once(lambda _t: _set_pair(), 3.0)
+
+            def _work():
+                # Off the UI thread: the send dials the peer's
+                # listener and can block for seconds — running it on
+                # the Kivy main thread froze the whole screen ("the
+                # button won't push", field 2026-07-24). Same disease
+                # as the dead-buttons item.
+                try:
+                    result = lan_pair_request_send(pid, '')
+                except Exception:
+                    result = None
+
+                def _land(_dt):
+                    if (result is not None
+                            and result.has(S.LAN_PAIR_REQUEST_PENDING)):
+                        # Poll every 2 s; daemon's outbound state
+                        # clears on read after a terminal state, so
+                        # we'll see accepted/declined/timeout exactly
+                        # once.
+                        ev = Clock.schedule_interval(_poll, 2.0)
+                        _active_polls[pid] = ev
+                        return
+                    # Anything else is a failure to even send the
+                    # request — show the translated reason and
+                    # revert. Common cases: LAN_TOGGLE_OFF,
+                    # LAN_PEER_UNREACHABLE, SERVER_*.
+                    text = ((translate_result(result)
+                             if result is not None else '')
+                            or _tr('Could not send pair request.'))
+                    action_btn.text = text[:40]
+                    Clock.schedule_once(lambda _t: _set_pair(), 3.0)
+                Clock.schedule_once(_land, 0)
+
+            threading.Thread(target=_work, daemon=True,
+                             name='lan-pair-send').start()
 
         action_btn.bind(on_release=_on_pair)
         return _build_full_row(

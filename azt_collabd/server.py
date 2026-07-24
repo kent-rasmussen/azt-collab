@@ -840,7 +840,13 @@ def _h_lan_get_toggle(_body):
     ``_lan_endpoint_display``)."""
     on = _settings.lan_allow_sync()
     endpoint = _lan_endpoint_display()
-    return 200, {"ok": True, "on": on, "endpoint": endpoint}
+    # ``pid`` = THIS daemon process — the one that answered. Shown in
+    # the UI after "Listening on …" as a double-daemon diagnostic
+    # (Windows has no flock, so the single-instance guard is
+    # advisory there; a visible pid lets the user compare against
+    # the process list / server.json at a glance). 0.54.66.
+    return 200, {"ok": True, "on": on, "endpoint": endpoint,
+                 "pid": os.getpid()}
 
 
 def _h_lan_set_toggle(body):
@@ -867,6 +873,7 @@ def _h_lan_set_toggle(body):
               file=sys.stderr, flush=True)
     on = _settings.lan_allow_sync()
     endpoint = _lan_endpoint_display()
+    pid = os.getpid()
     # Daemon-wide change — push-notify all observers (every project's
     # rendering may shift modes / suffix). Reaches only descendants-
     # mode subscribers on the parent status URI.
@@ -875,7 +882,8 @@ def _h_lan_set_toggle(body):
         _notify.notify_global_changed()
     except Exception:
         pass
-    return 200, {"ok": True, "on": on, "endpoint": endpoint}
+    return 200, {"ok": True, "on": on, "endpoint": endpoint,
+                 "pid": pid}
 
 
 def _h_lan_clone(body):
@@ -926,9 +934,44 @@ def _h_lan_clone(body):
 def _h_lan_pending(_body):
     """List pending UI decisions (share offers, pair requests,
     adopt-origin prompts, remote conflicts). Powers the shared
-    decisions watcher (``azt_collab_client.ui.decisions``)."""
+    decisions watcher (``azt_collab_client.ui.decisions``).
+
+    Read-time hygiene (0.54.67): purge REMOTE_CONFLICT decisions
+    whose two URLs are the SAME repo wan-normalized (ssh vs https
+    spelling). Invariant #14 says those must never surface — the
+    stash-time guard exists since 0.54.11, but decisions stashed by
+    OLDER daemons persist in pending_decisions.json and became
+    visible the moment 0.54.65 gave the daemon's own UIs a decisions
+    watcher (field 2026-07-24: a July-21-era baf ssh-vs-https
+    "conflict" popped three days later). Purging at read time heals
+    any vintage of stale stash."""
     from . import pending_decisions as _pending
-    return 200, {"ok": True, "decisions": _pending.list_all()}
+    decisions = _pending.list_all()
+    keep = []
+    for d in decisions:
+        if d.get('kind') == _pending.KIND_REMOTE_CONFLICT:
+            p = d.get('params') or {}
+            a = str(p.get('existing_url', '') or '')
+            b = str(p.get('incoming_url', '') or '')
+            same = False
+            if a and b:
+                try:
+                    from .repo import wan_url as _wan_url
+                    same = _wan_url(a) == _wan_url(b)
+                except Exception:
+                    same = False
+            if same:
+                try:
+                    _pending.remove(d.get('id', ''))
+                except Exception:
+                    pass
+                print(f'[server] purged stale remote-conflict '
+                      f'{d.get("id", "")!r}: same repo in two '
+                      f'spellings ({a!r} vs {b!r})',
+                      file=sys.stderr, flush=True)
+                continue
+        keep.append(d)
+    return 200, {"ok": True, "decisions": keep}
 
 
 def _h_lan_clone_progress(_body):

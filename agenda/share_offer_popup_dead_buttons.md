@@ -28,5 +28,13 @@ Peer-side: nothing to edit (all cited code is client-owned). Verify the fix on a
   same wedge shape if used; thread it like the confirm popup. (b) the
   other decision popups (pair-request / adopt-origin / conflict) also
   run RPCs on the main thread. (c) field re-verify per done-criteria.
+- 2026-07-24 (0.54.65): same disease found + fixed in the Nearby
+  "Pair" button — `_on_pair` ran the pair-request send synchronously
+  on the main thread (screen froze; "button won't push"). Threaded.
+  ALSO: decision watcher now installed in the daemon's own UI apps
+  (picker_app + CollabUIApp) — inbound pair requests previously
+  surfaced nowhere unless the recorder was open. Residuals (a)
+  `pending_offers_popup._accept` and (b) decisions.py per-kind popup
+  RPCs remain synchronous on the main thread.
 
 ## Research

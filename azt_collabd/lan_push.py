@@ -115,6 +115,11 @@ def _build_ssl_context(expected_fp):
     """Build a client-side SSL context that authenticates the peer's
     cert by *fingerprint* rather than CA chain.
 
+    Raises when *expected_fp* is empty: the pool layer pins via
+    urllib3 ``assert_fingerprint``, which silently SKIPS pinning on a
+    falsy value — and with CA validation deliberately off, that would
+    be a genuinely unverified connection (0.54.64).
+
     We can't use ``ctx.set_verify`` with a callback that consults the
     peer's cert because Python's ``ssl`` doesn't expose a verify
     callback at the application layer. Instead we leave the context
@@ -126,6 +131,10 @@ def _build_ssl_context(expected_fp):
     if not cert_path or not key_path:
         raise RuntimeError('this daemon has no LAN identity '
                            '(cryptography unavailable?)')
+    if not expected_fp:
+        raise RuntimeError(
+            'peer has no recorded TLS fingerprint — refusing '
+            'unpinned connection')
     # ``ssl._create_unverified_context()`` is the documented
     # idiom for "skip CA validation entirely." A manually-built
     # ``SSLContext(PROTOCOL_TLS_CLIENT)`` followed by

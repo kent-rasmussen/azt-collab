@@ -157,3 +157,39 @@ Check against the merge path:
 
 Owner: desktop ASR-split work. Resolve before bulk ASR ships to multi-machine
 collab projects.
+
+### ASK: commit metadata since a sha — feed the desktop "team changes" notice
+
+Kent (2026-07-24, desktop azt): the reload-offer popup ("Your team
+made changes to this database…") should say **who** and **how
+much** — "3 edits from Ondoua, plus 2 merge commits" — so a user
+can distinguish real teammate work from merge churn before
+deciding to reload now vs later.
+
+The desktop session already holds both ends of the range: its
+`base_sha` (loaded/last-submitted against) and the newly detected
+head from the poll / `submit_file` result. What's missing is
+commit metadata for the range — azt deliberately never runs git
+against the daemon-locked repo, and the client exposes no
+commit-range read.
+
+Ask:
+1. Daemon: read-only `GET /v1/projects/<langcode>/commits?since=<sha>`
+   → `{ok, commits: [{sha, author, message, merge: bool, ts}]}`
+   for `since..HEAD` on the project branch, oldest first.
+   `merge` = parent count > 1 (that's the churn discriminator).
+   Bound it (e.g. newest 100 + a `truncated: true` flag) so a
+   long-offline machine can't pull an unbounded payload; unknown
+   `since` (pruned/foreign sha) → full bounded tail rather than
+   an error.
+2. Client wrapper: `commits_since(langcode, sha)` → list (empty
+   on transport failure or pre-this daemons, so peers degrade to
+   today's generic wording without version sniffing).
+
+Desktop azt will then enrich `collab_offer_reload` (main.py) —
+count non-merge commits by author, mention merge count
+separately — and can later feed the same data to the title-bar
+ambient status. Recorder could reuse it for its reload toast.
+
+Owner: desktop team asks; daemon implements at their cadence.
+Desktop wires up on sight of `commits_since` in the client.

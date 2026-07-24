@@ -187,6 +187,15 @@ def _build_pool_manager(expected_fp):
     key_path = _peer_id.key_path()
     if not cert_path or not key_path:
         raise RuntimeError('this daemon has no LAN identity')
+    # Refuse to build an UNPINNED pool. urllib3's ``assert_fingerprint``
+    # is skipped when falsy — an empty fp (corrupted / partial
+    # peers.json entry) would otherwise connect with NO identity check
+    # at all, since CA validation is deliberately off in this design
+    # (identity = fingerprint pin, not chain). 0.54.64.
+    if not expected_fp:
+        raise RuntimeError(
+            'peer has no recorded TLS fingerprint — refusing '
+            'unpinned connection')
     # See ``lan_push._build_ssl_context`` for why we use the
     # underscored helper instead of ``SSLContext(PROTOCOL_TLS_CLIENT)``
     # + ``verify_mode=CERT_NONE``: the latter doesn't actually skip
@@ -198,6 +207,18 @@ def _build_pool_manager(expected_fp):
     ctx.verify_mode = ssl.CERT_NONE
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     import urllib3
+    # Silence urllib3's InsecureRequestWarning for these pools: it
+    # fires because we skip CA-chain validation, but peer identity IS
+    # verified — by SHA-256 fingerprint pin (``assert_fingerprint``
+    # below) against peers.json, per the LAN trust design. The warning
+    # alarmed a log reader in the field (2026-07-24) over a connection
+    # that is in fact TLS-encrypted and pinned. Verified-HTTPS paths
+    # (github, CAWL) never emit this warning, so nothing real is
+    # masked.
+    try:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
     return urllib3.PoolManager(
         ssl_context=ctx,
         assert_hostname=False,

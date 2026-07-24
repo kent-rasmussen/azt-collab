@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.63"
+__version__ = "0.54.67"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1120,18 +1120,22 @@ def lan_pair_qr_close(langcode):
 
 def lan_toggle():
     """Read the daemon-wide LAN-sync toggle and the listener's
-    bound endpoint. Returns ``{'on': bool, 'endpoint': 'ip:port'}``;
-    on transport failure returns ``{'on': False, 'endpoint': ''}``
-    so peers offline can still render their settings UI."""
+    bound endpoint. Returns ``{'on': bool, 'endpoint': 'ip:port',
+    'pid': int}`` — ``pid`` is the answering daemon's process id
+    (0 when unknown / pre-0.54.66 daemon), a double-daemon
+    diagnostic. On transport failure returns
+    ``{'on': False, 'endpoint': '', 'pid': 0}`` so peers offline can
+    still render their settings UI."""
     try:
         resp = call('GET', '/v1/lan/toggle')
     except ServerUnavailable:
-        return {'on': False, 'endpoint': ''}
+        return {'on': False, 'endpoint': '', 'pid': 0}
     if not resp.get('ok'):
-        return {'on': False, 'endpoint': ''}
+        return {'on': False, 'endpoint': '', 'pid': 0}
     return {
         'on': bool(resp.get('on')),
         'endpoint': str(resp.get('endpoint', '') or ''),
+        'pid': int(resp.get('pid') or 0),
     }
 
 
@@ -1144,12 +1148,13 @@ def lan_set_toggle(on):
     try:
         resp = call('POST', '/v1/lan/toggle', {'on': bool(on)})
     except ServerUnavailable:
-        return {'on': False, 'endpoint': ''}
+        return {'on': False, 'endpoint': '', 'pid': 0}
     if not resp.get('ok'):
-        return {'on': False, 'endpoint': ''}
+        return {'on': False, 'endpoint': '', 'pid': 0}
     return {
         'on': bool(resp.get('on')),
         'endpoint': str(resp.get('endpoint', '') or ''),
+        'pid': int(resp.get('pid') or 0),
     }
 
 

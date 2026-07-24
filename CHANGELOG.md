@@ -9,6 +9,95 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.67 — purge stale same-repo "remote conflict" decisions at read time
+
+Kent 2026-07-24. Field: a "Two Internet locations" popup for baf over
+`git@github.com:…` vs `https://github.com/…` — the SAME repo in two
+spellings, which invariant #14 forbids ever surfacing as a conflict.
+
+- The stash-time wan-normalized guard exists since 0.54.11, so this
+  wasn't a fresh stash — it was a **stale decision from the July-21
+  baf incident era** sitting in `pending_decisions.json`, invisible
+  until 0.54.65 gave the daemon's own UIs a decisions watcher (new
+  eyes drained the old queue). `_h_lan_pending` now purges
+  REMOTE_CONFLICT decisions whose two URLs wan-normalize equal —
+  read-time hygiene that heals any vintage of stale stash, logged
+  when it fires.
+- If one pops before the daemon restart: tap **Keep mine** (keeps the
+  ssh spelling; the daemon https-converts at network call sites).
+  Never "Use both" for same-repo spellings — that's origin + extra of
+  one repo, double-push.
+
+Daemon-side → restart the daemon.
+
+## 0.54.66 — "Listening on … · pid N" (double-daemon diagnostic)
+
+Kent 2026-07-24 ("since we don't actually know it ever bit us, perhaps
+a diagnostic is best").
+
+- The LAN status line now appends the ANSWERING daemon's process id:
+  "Listening on 10.42.0.1:34501 · pid 2538656". Toggle RPCs
+  (`lan_toggle` / `lan_set_toggle`) carry `pid` (wrappers pass it
+  through; 0 from pre-0.54.66 daemons → suffix omitted). Diagnostic
+  value: compare against the process list / server.json at a glance
+  — most relevant on Windows, where `fcntl` is absent and the flock
+  single-instance guard is a documented no-op (`locks.py`), so
+  double-daemon prevention rests on server.json + health-probe
+  discipline alone. A pid that CHANGES between refreshes also
+  exposes a silent respawn. Suffix is locale-neutral, untranslated.
+
+Daemon + client wrapper + settings UI → restart daemon + relaunch UI.
+
+## 0.54.65 — inbound pair requests surface in the daemon's own UIs; Pair send off the UI thread; footer re-probes
+
+Kent 2026-07-24. Field: "I click 'pair' in unpaired, and can't see that
+anything happens… then the other side's button won't push."
+
+- **Decision watcher installed in the daemon's own UI apps**
+  (`picker_app.on_start` + `CollabUIApp.on_start`). Until now only
+  peer apps (recorder) ran it — so an inbound pair request surfaced
+  NOWHERE while the user sat in the daemon's picker/settings screens;
+  the sender's button just said "Waiting…" until the recorder
+  happened to open. (Also explains why every popup historically
+  appeared "on the recorder.") Pair flow reminder: tap Pair on ONE
+  side; the other side gets an accept prompt — never Pair on both.
+  Share offers stay exempt (passive surface, 0.54.54).
+- **Pair send threaded.** `_on_pair` ran `lan_pair_request_send`
+  synchronously on the Kivy main thread — the dial can block for
+  seconds, freezing the screen ("the button won't push"). Now on a
+  worker thread, result marshaled back via Clock.
+- **Version footer re-probes on Refresh Status.** It was captured
+  once at UI startup — field repro: footer said 'server 0.54.63'
+  (a transient spawn caught during respawn churn) while the surviving
+  daemon was 0.54.61, defeating the footer's whole purpose as the
+  "which daemon am I talking to" check. `/v1/health` remains the
+  authoritative answer.
+
+Client UI + daemon UI → relaunch UIs / rebuild APKs (recorder too, to
+pick up the threaded Pair send in its bundled client).
+
+## 0.54.64 — silence pinned-TLS warning noise; refuse unpinned LAN connections
+
+Kent 2026-07-24.
+
+- **`InsecureRequestWarning` silenced for the pinned LAN pools.** It
+  fired because CA-chain validation is deliberately off in the LAN
+  trust design — but peer identity IS verified, by SHA-256 fingerprint
+  pin (`assert_fingerprint`) against peers.json, bound to the QR
+  pairing gesture (invariant #10). The warning alarmed a field log
+  reader over a connection that is in fact TLS-encrypted and pinned.
+  Verified-HTTPS paths (github, CAWL) never emit it, so nothing real
+  is masked.
+- **Empty-fingerprint hardening (real gap, found while answering the
+  above).** urllib3 skips `assert_fingerprint` when it's falsy — so a
+  corrupted / partial peers.json entry with an empty `fp` would have
+  connected with NO identity check at all. Both TLS builders
+  (`lan_clone._build_pool_manager`, `lan_push._build_ssl_context`) now
+  refuse outright: "peer has no recorded TLS fingerprint — refusing
+  unpinned connection."
+
+Daemon-side → restart the daemon / rebuild server APK.
+
 ## 0.54.63 — "shared but offerless" self-heals: ghost-registry guard + LAN-only re-offer
 
 Kent 2026-07-24. Field: desktop says 'shared' + board says 'awaiting
