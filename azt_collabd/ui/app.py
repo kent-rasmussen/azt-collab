@@ -1265,8 +1265,39 @@ class SettingsScreen(Screen):
                 current = (last_project() or '').strip()
             except Exception:
                 rows, current = [], ''
-            Clock.schedule_once(
-                lambda _dt: self._render_peer_sync(rows, current), 0)
+            # Piggyback: re-fetch the LAN toggle state so the status
+            # line tracks daemon-side changes. The label otherwise
+            # held whatever the screen opened with — the AUTO-bind
+            # (iface-watch → apply_toggle) lands seconds after daemon
+            # boot with no notification, so "starting the listener…"
+            # sat stale while the listener served for minutes and the
+            # user "fixed" it by cycling a healthy listener (field
+            # 2026-07-24). Render only on CHANGE so transient label
+            # text (cable-link results, errors) isn't clobbered by
+            # steady-state polls.
+            try:
+                from azt_collab_client import lan_toggle
+                lan_state = lan_toggle() or {}
+            except Exception:
+                lan_state = None
+
+            def _land(_dt):
+                self._render_peer_sync(rows, current)
+                if lan_state is None:
+                    return
+                on = bool(lan_state.get('on'))
+                ep = lan_state.get('endpoint', '') or ''
+                pid = int(lan_state.get('pid') or 0)
+                if (on != bool(getattr(self, '_lan_enabled', False))
+                        or ep != getattr(self, '_lan_endpoint', '')
+                        or pid != int(getattr(self, '_lan_pid', 0)
+                                      or 0)):
+                    self._lan_enabled = on
+                    self._lan_endpoint = ep
+                    self._lan_pid = pid
+                    self._refresh_lan_buttons()
+                    self._refresh_lan_status()
+            Clock.schedule_once(_land, 0)
         threading.Thread(target=_work, daemon=True).start()
 
     def _fmt_as_of(self, iso):
@@ -1320,7 +1351,9 @@ class SettingsScreen(Screen):
             else:
                 parts.append(_tr('incoming'))
         base = ' · '.join(parts) if parts else _tr('up to date')
-        as_of = self._fmt_as_of(row.get('last_seen_at', ''))
+        # Strictly the per-project ref observation time — never the
+        # peer-level "we talked" stamp (0.54.70).
+        as_of = self._fmt_as_of(row.get('observed_at', ''))
         if as_of:
             base += f' ({as_of})'
         return base
@@ -2192,8 +2225,13 @@ class SettingsScreen(Screen):
                 text += f' · pid {pid}'
             label.text = text
         else:
-            label.text = _tr('Local-network sharing is on (listener '
-                             'not yet bound).')
+            # Transient right after a daemon start: the setting is on
+            # and the watcher auto-binds the listener within seconds
+            # (0.54.46) — no user action needed. The old "(listener
+            # not yet bound)" read as a to-do (field 2026-07-24: "is
+            # that waiting for me to toggle sharing?").
+            label.text = _tr('Local-network sharing is on — starting '
+                             'the listener… (no action needed)')
 
     def open_pair_phone(self):
         try:

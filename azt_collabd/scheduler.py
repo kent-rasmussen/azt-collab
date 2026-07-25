@@ -771,6 +771,20 @@ def _iface_watcher_loop():
                               'bound — applying toggle to bind',
                               file=sys.stderr, flush=True)
                         _lan_listener.apply_toggle()
+                        # Tell observers the LAN state changed. The
+                        # user-toggle RPC notifies; this auto-bind
+                        # path didn't, so Android UIs kept rendering
+                        # the pre-bind "starting the listener…"
+                        # snapshot while the listener served for
+                        # minutes (field 2026-07-24 — user cycled a
+                        # healthy listener to "fix" a stale label).
+                        if _lan_listener.bound_endpoint() is not None:
+                            try:
+                                from .android_cp import notify \
+                                    as _notify
+                                _notify.notify_global_changed()
+                            except Exception:
+                                pass
                 except Exception as ex:
                     print(f'[iface-watch] auto-bind raised: {ex!r}',
                           file=sys.stderr, flush=True)

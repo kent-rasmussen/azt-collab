@@ -1676,6 +1676,17 @@ def _post_receive_pack_middleware(inner_app):
                       f'interrupted (peer disconnected mid-transfer; '
                       f'sender will retry): {ex!r}',
                       file=sys.stderr, flush=True)
+            except Exception as ex:
+                # dulwich wraps socket errors in GitProtocolError
+                # (raised ``from`` the original, so __cause__ carries
+                # it) — absorb only the disconnect class; anything
+                # else re-raises untouched (0.54.68).
+                if not _is_peer_disconnect(ex):
+                    raise
+                print(f'[lan-listener] {langcode!r} receive '
+                      f'interrupted (peer disconnected mid-transfer; '
+                      f'sender will retry): {ex!r}',
+                      file=sys.stderr, flush=True)
             finally:
                 try:
                     s = status_holder[0] or ''

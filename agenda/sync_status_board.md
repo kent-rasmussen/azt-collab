@@ -165,16 +165,38 @@ one version so the recorder is rebuilt once.
    was daemon-side: the handler ran restart_browse + burst INLINE
    before responding (seconds-to-minutes). Nudge now backgrounded;
    response immediate; UI adds a 20 s watchdog as belt-and-braces.
-8. **`SERVICE_RESTARTED` repeating in the server UI log + earlier
-   `AZTServiceConnector.ensureBound … ClassNotFoundException`.** The
-   settings-UI client keeps finding the daemon connection dropped and
-   respawning it — i.e. the daemon isn't staying alive between calls.
-   Likely root: the sticky-bind service never binds (ClassNotFound), so
-   the `:provider` daemon is killed when idle and every UI call
-   lazy-respawns it. This is probably the source of much of the
-   session's flakiness (dropped transfers, "did nothing" taps). HIGHER
-   priority than the cosmetics — chase the ClassNotFoundException
-   (dex/manifest injection of `AZTServiceConnector` in the current
-   build) first. NOT yet diagnosed.
+8. **RESOLVED (probable) 2026-07-24 — yesterday's APK was a bad build
+   (missing dex classes).** Second CNF found in the 07-23 21:08 log:
+   `androidx.core.app.NotificationCompat$Builder` → `[lan-fgs] no
+   notification; cannot promote` → listener bound but the `:provider`
+   process ran WITHOUT foreground protection → Android reaped it
+   freely → lazy-respawn on every peer call = the SERVICE_RESTARTED
+   storm + "did nothing" flakiness. Same disease as that evening's
+   `AZTServiceConnector` CNF: Java/AndroidX classes absent from that
+   build's dex (see memories: AAR implementation-deps don't propagate;
+   shared-cache contamination). Today's build promotes fine
+   (`[lan-fgs] promoted to foreground`, 07-24 20:22) — classes
+   present. Watch: if CNFs recur after a CLEAN build, reopen as a
+   p4a dep-propagation problem; until then, remedy is `buildozer
+   android clean` after Java/manifest-affecting changes.
+
+## Log finds 2026-07-24 evening (not yet fixed)
+
+9. **Phone's `en` project is a drain-loop ghost.** `drain push 'en'
+   codes=['NOT_A_REPO']`, 134 consecutive failures, wan_backoff parked
+   at 24 h — and `[scheduler] drain pushes: ['en']` still logs every
+   ~15 s (noise even while skipped). The 0.54.63 ghost heal only fires
+   on an INBOUND share-offer; the drain path never heals. Options:
+   (a) drain-side ghost check (working tree missing → forget record,
+   logged — same guard as .63, different seam); (b) at minimum stop
+   logging the candidate list every tick when everything is
+   backoff-skipped. Care: auto-forget on drain failure is riskier
+   than on offer-arrival; verify NOT_A_REPO really means missing
+   .git before wiring.
+10. **Dangling safety tag warns on every nml serve.**
+   `WARNING ref refs/tags/main-before-itservices-merge points at
+   non-present sha 1db02cfa…` — disentangle-era tag, object since
+   pruned. Harmless but per-serve noise. Fix: delete the dangling tag
+   (its target is gone; it protects nothing).
 
 ## Research

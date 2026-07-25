@@ -3040,10 +3040,16 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         # True ⇒ 'awaiting merge' (we hold their bytes, unmerged);
         # False + incoming ⇒ 'incoming' (data still only on the peer).
         'incoming_held': incoming_held,
-        # When we last authenticated a handshake with this peer — the
-        # "as of" for an 'up to date' judgment, which is a recorded
-        # memory, not a live confirmation (0.54.49).
-        'last_seen_at': peer_entry.get('last_seen_at', '') or '',
+        # When we last OBSERVED this project's refs on this peer
+        # (their main via peek / verified containment) — strictly
+        # ref-level, per Kent 2026-07-24: "distinguish 'I saw it'
+        # from 'it got its HEAD ref sum'." Mere contact (the
+        # peer-level last_seen_at) must NOT stamp a project
+        # judgment; the 'N to send' baseline was measured at THIS
+        # time, not at last contact. Empty until the first
+        # post-0.54.70 observation.
+        'observed_at': (peer_entry.get('project_seen_at')
+                        or {}).get(langcode, '') or '',
     }
 
 
@@ -3898,7 +3904,10 @@ def submit_file(project_dir, rel_path, staged_path, base_sha,
 
     Returns ``(Result, head_sha)``. Codes: ``COMMITTED_LOCAL``
     (with ``head_sha`` param) / ``MERGED_WITH_LOCAL`` (divergent
-    path taken; params ``n_conflicts``, ``base_sha``) /
+    path taken; params ``n_conflicts``, ``base_sha``,
+    ``merged_identical`` — True when the merged bytes equal the
+    submitted bytes, so the caller's in-memory state is current
+    and no reload is needed) /
     ``NOTHING_TO_COMMIT`` / ``CONTRIBUTOR_UNSET`` (file bytes still
     land — durability never waits on identity) / ``COMMIT_FAILED``
     / ``BUSY``. Contributor-unset and commit-failure still leave
@@ -4024,12 +4033,25 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
             os.unlink(staged_path)
         except OSError:
             pass
+        # Trivial-merge signal (0.54.73): when the merged bytes are
+        # byte-identical to what the caller just submitted, the file
+        # on disk contains NOTHING the caller doesn't already hold in
+        # memory — a reload would show nothing new. Field driver: an
+        # offline machine whose earlier save fell back to a direct
+        # write gets its own bytes committed later, then every
+        # subsequent save takes this divergent path and nags "updates
+        # from your team" over the user's own content. The caller can
+        # adopt ``head_sha`` as its new base and skip the reload
+        # prompt when this is True.
+        merged_identical = (merged == theirs_bytes)
         result.add(S.MERGED_WITH_LOCAL,
-                   n_conflicts=n_conflicts, base_sha=base_str)
+                   n_conflicts=n_conflicts, base_sha=base_str,
+                   merged_identical=merged_identical)
         print(f'[submit_file] {project_dir!r}: base '
               f'{base_str[:12] or "<none>"!r} != HEAD '
               f'{head_str[:12]!r} — merged ({n_conflicts} '
-              f'conflict(s))', file=sys.stderr, flush=True)
+              f'conflict(s), identical_to_submitted='
+              f'{merged_identical})', file=sys.stderr, flush=True)
 
     if not contributor_name:
         # Bytes are durable on disk; only history waits. Same code

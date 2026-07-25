@@ -116,6 +116,12 @@ def _normalize_entry(entry):
         for k, v in raw_lcl.items():
             if isinstance(k, str) and isinstance(v, str) and v:
                 last_covered_local[k] = v
+    raw_psa = entry.get('project_seen_at') or {}
+    project_seen_at = {}
+    if isinstance(raw_psa, dict):
+        for k, v in raw_psa.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                project_seen_at[k] = v
     return {
         'device_name': str(entry.get('device_name', '') or ''),
         'fp': str(entry.get('fp', '') or ''),
@@ -153,6 +159,13 @@ def _normalize_entry(entry):
         # shared" over pending local commits (field catch
         # 2026-07-11). Keyed by langcode. Since 0.54.5.
         'last_covered_local': last_covered_local,
+        # Per-project ISO time of the last observation recorded for
+        # that project (either setter above) — the honest "(date)"
+        # for the sync board's per-row statuses: 'N to send' is
+        # computed against coverage observed THEN, which can be
+        # older than the peer-level ``last_seen_at`` (bumped by any
+        # project's contact). Since 0.54.70.
+        'project_seen_at': project_seen_at,
     }
 
 
@@ -370,9 +383,21 @@ def set_peer_last_seen_main(peer_id, langcode, sha):
         last_seen_main = dict(entry.get('last_seen_main') or {})
         last_seen_main[str(langcode)] = str(sha)
         entry['last_seen_main'] = last_seen_main
+        # Ref-level observation of THIS project → bump its
+        # per-project stamp. This is the board's "(date)": it moves
+        # ONLY when we re-obtained the information the row's judgment
+        # is made from (their main's SHA), never on mere contact —
+        # "don't move the stamp because we saw the phone" (Kent
+        # 2026-07-24). The peer-level last_seen_at (contact) rides
+        # along, since an observation implies contact.
+        obs = dict(entry.get('project_seen_at') or {})
+        obs[str(langcode)] = _now_iso()
+        entry['project_seen_at'] = obs
+        entry['last_seen_at'] = _now_iso()
         peers[peer_id] = entry
         data['peers'] = peers
         _save_raw(data)
+    _invalidate_sync_board()  # timestamp (and possibly state) moved
     return True
 
 
@@ -397,6 +422,12 @@ def set_peer_covered_local(peer_id, langcode, sha):
         covered = dict(entry.get('last_covered_local') or {})
         covered[str(langcode)] = str(sha)
         entry['last_covered_local'] = covered
+        # Verified containment = ref-level observation of THIS
+        # project; same stamp discipline as set_peer_last_seen_main.
+        obs = dict(entry.get('project_seen_at') or {})
+        obs[str(langcode)] = _now_iso()
+        entry['project_seen_at'] = obs
+        entry['last_seen_at'] = _now_iso()
         peers[peer_id] = entry
         data['peers'] = peers
         _save_raw(data)

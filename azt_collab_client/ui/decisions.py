@@ -58,6 +58,9 @@ _STATE = {
     # ID of decision currently showing a popup. Prevents stacking
     # a second popup over the first while the user is mid-tap.
     'showing_id': '',
+    # True while a lan_pending fetch is out on a worker thread —
+    # keeps 1 Hz ticks from stacking workers when the daemon is slow.
+    'poll_in_flight': False,
 }
 
 
@@ -104,29 +107,50 @@ def install_decision_watcher(poll_interval_s=1.0, on_resolved=None):
 
 
 def _poll_once(_dt):
-    """Single poll tick. Fetches pending decisions; if any are
-    unresolved and no popup is currently showing, renders the
-    first one. Subsequent decisions surface on subsequent ticks
-    once the popup closes (``showing_id`` clears on dismiss)."""
-    if _STATE['showing_id']:
-        return  # popup already up; wait for it to resolve
-    from .. import lan_pending
-    try:
-        decisions = lan_pending()
-    except Exception as ex:
-        print(f'[decisions] lan_pending raised: {ex!r}',
-              file=sys.stderr, flush=True)
-        return
-    if not decisions:
-        return
-    # Render the oldest first — preserves arrival order so a
-    # share-offer doesn't get queue-jumped by a later
-    # adopt-origin from a different peer.
-    decisions = sorted(
-        decisions, key=lambda d: d.get('created_at', '') or '')
-    for d in decisions:
-        if _render_decision(d):
-            break  # one popup at a time
+    """Single poll tick. Fetches pending decisions ON A WORKER
+    THREAD; if any are unresolved and no popup is currently showing,
+    renders the first one (back on the main thread). Subsequent
+    decisions surface on subsequent ticks once the popup closes
+    (``showing_id`` clears on dismiss).
+
+    The fetch MUST NOT run on the Kivy main thread: this fires at
+    1 Hz, and while the daemon is respawning / briefly wedged the RPC
+    (plus the loopback transport's spawn-retry sleeps) blocks for
+    seconds — at 1 Hz that freezes the whole app into OS
+    "not responding" dialogs (field 2026-07-24, desktop settings UI;
+    the recorder has been running this same main-thread poll all
+    along). ``poll_in_flight`` keeps ticks from stacking workers."""
+    if _STATE['showing_id'] or _STATE.get('poll_in_flight'):
+        return  # popup up, or a fetch is already out
+    _STATE['poll_in_flight'] = True
+    import threading
+    from kivy.clock import Clock
+
+    def _work():
+        decisions = []
+        try:
+            from .. import lan_pending
+            decisions = lan_pending()
+        except Exception as ex:
+            print(f'[decisions] lan_pending raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+
+        def _land(_dt2):
+            _STATE['poll_in_flight'] = False
+            if _STATE['showing_id'] or not decisions:
+                return
+            # Render the oldest first — preserves arrival order so a
+            # share-offer doesn't get queue-jumped by a later
+            # adopt-origin from a different peer.
+            for d in sorted(decisions,
+                            key=lambda d: d.get('created_at', '')
+                            or ''):
+                if _render_decision(d):
+                    break  # one popup at a time
+        Clock.schedule_once(_land, 0)
+
+    threading.Thread(target=_work, daemon=True,
+                     name='decisions-poll').start()
 
 
 def _render_decision(decision):

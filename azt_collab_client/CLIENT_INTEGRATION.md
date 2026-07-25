@@ -486,11 +486,20 @@ base = project_status(langcode).head_sha    # '' pre-first-commit
 # os.replace), then hand it off:
 result = submit_file(langcode, 'xyz.lift', staged_path, base)
 if result.has(S.MERGED_WITH_LOCAL):
-    # Peer changes landed since ``base`` and were three-way-merged
-    # with your bytes. NOTHING WAS LOST — but your in-memory model
-    # is stale. Reload before accepting further edits (§ 14 smooth
-    # reload).
-    ...
+    if result.param(S.MERGED_WITH_LOCAL, 'merged_identical', False):
+        # Trivial merge (daemon 0.54.73+): the merged file is
+        # byte-identical to the bytes you just submitted — disk
+        # holds nothing your in-memory model lacks. Adopt and
+        # carry on; do NOT prompt the user to reload. (Always
+        # read with a False default: pre-0.54.73 daemons omit
+        # the param.)
+        base = result.head_sha
+    else:
+        # Peer changes landed since ``base`` and were three-way-
+        # merged with your bytes. NOTHING WAS LOST — but your
+        # in-memory model is stale. Reload before accepting
+        # further edits (§ 14 smooth reload).
+        ...
 if result.has(S.COMMITTED_LOCAL):
     base = result.head_sha                  # your next base
 elif result.has(S.CONTRIBUTOR_UNSET):
@@ -515,7 +524,12 @@ Obligations:
    write the working-tree LIFT while also holding a stale base — the
    base-aware handoff is the no-clobber guarantee.
 2. **Reload on `MERGED_WITH_LOCAL`** before accepting further edits;
-   until the reload completes, defer/queue saves.
+   until the reload completes, defer/queue saves. Exception (0.54.73+):
+   when the result carries ``merged_identical=True``, skip the reload
+   and the user prompt entirely — adopt ``result.head_sha`` as the new
+   base instead. Prompting on a trivial merge trains users to ignore
+   the reload offer (field repro 2026-07-25: an offline solo machine
+   nagging "updates from your team" over the user's own content).
 3. **§ 17b still applies.** Poll ``project_status`` (5–15 s) and
    reload on ``head_sha`` change — ``submit_file`` protects your
    *writes*; the poll bounds how long you *display* stale peer data.
@@ -526,6 +540,19 @@ Obligations:
    call it per keystroke.
 5. **Desktop only.** On Android there is no staged-file handoff
    through the ContentProvider; use § 9a surgical writes there.
+6. **Re-anchor after every direct fallback write.** If the editor
+   distinguishes its own writes from foreign changes by a file-identity
+   snapshot (stat / mtime / hash), it MUST refresh that snapshot after
+   the direct fallback write in the `SERVER_UNAVAILABLE`/`BUSY` branch
+   — the fallback is the one save path where the daemon can't do it
+   for you. Skipping this makes the editor's own bytes (committed
+   later by the daemon's reconcile or whole-tree staging) read as team
+   changes: every subsequent save takes the divergent path and the
+   change-poll latches a false "team changes" prompt that a stat-only
+   check can never self-clear. Prefer a content-identity fallback
+   (compare against ``project_status.lift_blob_sha``) over stat alone
+   when the snapshot disagrees, so mtime-only bumps (e.g. a receive
+   rewriting identical bytes) don't latch either.
 
 Registration of a desktop project (adopt-in-place) also appends azt's
 artifact ignore patterns to the project ``.gitignore`` (daemon-side,

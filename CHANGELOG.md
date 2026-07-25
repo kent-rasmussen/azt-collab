@@ -9,6 +9,144 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.73 — trivial-merge signal: `merged_identical` on MERGED_WITH_LOCAL
+
+Kent 2026-07-25. Field: an OFFLINE computer (no wifi, no LAN, solo
+work) repeatedly prompts "Merged your changes with updates from your
+team" / reload offers over the user's own content. Mechanism: a save
+that hit BUSY/unavailable fell back to azt's legacy direct write (the
+one outcome branch that can't re-record the LIFT stat); the daemon
+later committed those bytes (reconcile / debounced commit / next
+save's whole-tree staging); every subsequent save then declares a
+stale `base_sha` and takes the divergent `submit_file` path — a merge
+of the user's content with the user's content. Tracked at
+`agenda/spurious_team_update_prompts.md` (reopens the F4(c) tail of
+the 2026-07-09 arc, per its "reopen if the window returns" clause).
+
+- **`_submit_file_locked` now reports whether the divergent path
+  actually changed anything**: `MERGED_WITH_LOCAL` carries
+  `merged_identical=True` when the merged bytes are byte-identical to
+  the submitted bytes — the on-disk file holds nothing the caller
+  doesn't already have in memory, so the caller can adopt `head_sha`
+  as its new base and skip the reload prompt entirely. The
+  `[submit_file]` log line carries the same flag
+  (`identical_to_submitted=...`).
+- Additive param only — no new status code, no wire break, no
+  translation change. Callers on older clients ignore it; callers
+  must read it with a False default against pre-0.54.73 daemons.
+- The azt-side halves (consume `merged_identical`; re-record the
+  lift stat after a legacy fallback replace; content-hash fallback
+  in `_lift_changed_on_disk`) are specified in the agenda item and
+  land in the azt repo.
+
+Daemon-side → restart the daemon for the new param to be emitted.
+
+## 0.54.72 — LAN status label tracks the daemon (the toggle wasn't needed)
+
+Kent 2026-07-24. Field: UI said "not bound," user gave up and cycled
+the LAN toggle, "it immediately responded" — but the log shows the
+auto-bind had fired 7 minutes earlier and the listener was serving the
+whole time. The toggle cycled a HEALTHY listener; only the label was
+stale.
+
+- **Settings screen now re-fetches `lan_toggle` on its existing 5 s
+  board tick** and re-renders the LAN line ONLY when the state
+  actually changed (so transient label text — cable-link reports,
+  errors — isn't clobbered by steady-state polls). The stale
+  "starting the listener…" now flips to "Listening on … · pid N"
+  within one tick of the auto-bind, no gesture.
+- **The auto-bind path fires `notify_global_changed`** on a
+  successful bind (the user-toggle RPC always did; the iface-watch
+  auto-bind didn't), so Android observers learn about it too.
+
+Also noted from the same log (agenda, not fixed here): the phone's
+`en` project drains `NOT_A_REPO` every tick (134 consecutive failures,
+wan_backoff at 24 h) — a registry ghost the 0.54.63 share-offer heal
+doesn't reach; and nml serves warn about the dangling
+`main-before-itservices-merge` tag pointing at a pruned SHA.
+
+Daemon UI + scheduler → restart daemon + relaunch UI / rebuild APK.
+
+## 0.54.71 — "(listener not yet bound)" reworded; it read as a to-do
+
+Kent 2026-07-24 ("is that waiting for me to toggle sharing?").
+
+- The transient right-after-daemon-start state now reads
+  "Local-network sharing is on — starting the listener… (no action
+  needed)". The watcher auto-binds within seconds (0.54.46); nothing
+  is waiting on the user. If the text PERSISTS >30 s across
+  refreshes, that's a real bind failure — `[lan-listener]` lines in
+  the daemon log name the failing step.
+
+Settings UI string → relaunch the UI.
+
+## 0.54.70 — board dates mean "last confirmed", per project, ref-level only
+
+Kent 2026-07-24. Field: stale dates on rows for peers that were
+demonstrably connected — "are they not talking?" They were talking;
+the clock never recorded it.
+
+- **The old "(date)" (`last_seen_at`) was bumped by exactly one thing:
+  the pairing handshake.** Peeks, no-op parity confirmations, and
+  verified deliveries never moved it — so "up to date (date)" showed
+  when the state was first achieved-ish, not when last confirmed.
+- **New per-project stamp `project_seen_at[langcode]`**, written ONLY
+  by the two ref-level observation setters (`set_peer_last_seen_main`
+  — their main's SHA from a peek/push; `set_peer_covered_local` —
+  verified containment of ours). The board row now carries it as
+  `observed_at` and the "(date)" renders strictly from it — for 'up
+  to date', 'N to send', and 'incoming' alike, per "give the most
+  recent timestamp we have FOR THAT INFO."
+- **Two guarded distinctions** (Kent): (a) "I saw it" ≠ "I got its
+  HEAD ref sum" — mere contact (pairing handshake, announcements)
+  never moves a project row's date; (b) if we didn't obtain enough
+  information to re-make the row's judgment, the stamp does not move
+  just because the phone appeared. Peer-level `last_seen_at` still
+  exists (and now also bumps on observations, since observation
+  implies contact) but is never used to stamp a project judgment.
+- Rows show no date until their first post-upgrade observation
+  (typically one arrival later) rather than borrowing contact time.
+
+Daemon-side (peers.py + repo.py + board UI) → restart the daemon /
+rebuild server APK.
+
+## 0.54.69 — decisions watcher fetch off the main thread
+
+Kent 2026-07-24. Field: desktop settings UI throwing OS "wait/force
+quit" dialogs and a latched "service not responding" while the daemon
+answered curl fine.
+
+- The decisions watcher's 1 Hz poll ran `lan_pending()` synchronously
+  on the Kivy main thread. Any daemon blip (respawn window, spawn-
+  retry sleeps, brief wedge) turned each tick into a multi-second
+  main-thread stall → the app froze into OS not-responding dialogs.
+  Made newly visible on desktop by 0.54.65's watcher install, but the
+  recorder has run this same main-thread poll all along — likely a
+  contributor to phone-side ANRs. Fetch now runs on a worker thread
+  (`poll_in_flight` guard keeps ticks from stacking); rendering
+  marshals back to the main thread.
+
+Client UI → relaunch desktop UI / rebuild peer APKs.
+
+## 0.54.68 — peer-disconnect tracebacks silenced on ALL listener routes
+
+Kent 2026-07-24. Field: a 40-line double traceback
+(`ConnectionResetError` → `GitProtocolError`) out of upload-pack
+negotiation when the phone hopped networks mid-fetch (the mDNS `add`
+with a fresh address 8 s earlier is the tell).
+
+- 0.54.57's one-line treatment only covered the receive route and
+  only raw socket errors. Two gaps closed: (a) every listener route
+  (upload-pack fetch service, info/refs, …) now iterates through a
+  disconnect-absorbing wrapper; (b) dulwich's `GitProtocolError`
+  wrapper is recognized via `__cause__` (it's raised `from` the
+  socket error) — no substring matching. A vanished peer is now ONE
+  log line on any route: "interrupted (peer disconnected
+  mid-transfer; they will retry)." Non-disconnect exceptions
+  re-raise untouched.
+
+Daemon-side → restart the daemon.
+
 ## 0.54.67 — purge stale same-repo "remote conflict" decisions at read time
 
 Kent 2026-07-24. Field: a "Two Internet locations" popup for baf over

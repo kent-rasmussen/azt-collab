@@ -208,6 +208,13 @@ editor contract" (the draft above, finalized), same discipline as §17b.
 - **Commit cadence default** for sort sessions (hundreds of per-decision saves/hour = one
   commit each if >500 ms apart). Mitigation lives azt-side (coalesce; see sibling item);
   if field data shows git bloat, add a daemon max-debounce knob later.
+  **DECIDED 2026-07-25 (Kent): no coalescing — small per-save commits are wanted.**
+  Small commits are the unit of incremental push progress toward GitHub over bad links
+  (the chunked drain ticks wan_unshared down as it goes, 0.53.3); coarsening the cadence
+  would make each push unit bigger and more stall-prone. Supersedes the "azt-side
+  coalescing" clause in contract §4 above and the coalescing half of the CABTAL2026
+  goal-2 cadence watcher. If git-history bloat ever shows in the field, address it some
+  way other than coarsening save cadence.
 
 ## Open questions — all answered 2026-07-06 (kept for the record)
 1. **Concurrency model?** → Effectively single-writer from clients on desktop, but bring

@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.67"
+__version__ = "0.54.73"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -996,9 +996,14 @@ def lan_peer_sync():
                          merge' — our own chore, data safe); False =
                          their tip isn't in our store yet ('incoming' —
                          data still only on the peer),
-        last_seen_at   — str: ISO8601-UTC of the last authenticated
-                         handshake; the 'as-of' time for every non-
-                         'awaiting first sync' status.
+        observed_at    — str: ISO8601-UTC of the last REF-LEVEL
+                         observation of this project on this peer
+                         (their main via peek, or verified
+                         containment) — the 'as-of' for every non-
+                         'awaiting first sync' status. Strictly the
+                         time the judgment's information was
+                         obtained; mere contact never moves it.
+                         Empty until first observation (0.54.70).
 
     Empty list on transport failure or no peers. Never raises — safe
     to poll from the UI."""
@@ -2730,9 +2735,14 @@ def submit_file(langcode, rel_path, staged_path, base_sha, message=''):
     Returns ``Result``; drive logic with codes, in this order:
 
     - ``result.has(S.MERGED_WITH_LOCAL)`` → save succeeded AND a
-      peer merge was folded in: the caller's in-memory model is
-      stale and MUST reload before further edits (params
-      ``n_conflicts``, ``base_sha``).
+      merge was folded in (params ``n_conflicts``, ``base_sha``,
+      ``merged_identical``). When
+      ``result.param(S.MERGED_WITH_LOCAL, 'merged_identical', False)``
+      is True (daemon 0.54.73+), the merged file is byte-identical
+      to the submitted bytes — the caller's in-memory model is
+      current: adopt ``head_sha`` as the new base, no reload, no
+      user prompt. Otherwise the in-memory model is stale and MUST
+      reload before further edits.
     - ``result.has(S.COMMITTED_LOCAL)`` → committed; the new base
       is ``result.head_sha`` (also on
       ``result.param(S.COMMITTED_LOCAL, 'head_sha')``).

@@ -1272,8 +1272,8 @@ msgstr "Impossible de mettre à jour le paramètre réseau local : {error}"
 msgid "Listening on {endpoint}"
 msgstr "À l'écoute sur {endpoint}"
 
-msgid "Local-network sharing is on (listener not yet bound)."
-msgstr "Partage sur le réseau local activé (en attente d'attachement)."
+msgid "Local-network sharing is on — starting the listener… (no action needed)"
+msgstr "Partage sur le réseau local activé — démarrage de l'écoute… (aucune action requise)"
 
 msgid "Could not open pairing QR: {error}"
 msgstr "Impossible d'ouvrir le QR d'appairage : {error}"
