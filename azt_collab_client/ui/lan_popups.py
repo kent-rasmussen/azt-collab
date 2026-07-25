@@ -1174,8 +1174,22 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
         text=_tr('Manual IP / port (comma-separated)'),
         size_hint_y=None, height=dp(24), font_size=sp(12),
         bold=True, font_name=font_name))
+    # The label alone assumed you already knew what belongs here and
+    # where to find it — field 2026-07-25: "no idea how to use this;
+    # haven't so far". Say whose address it is, and name the screen
+    # to copy it from. Optional, not required: discovery tries mDNS
+    # first and a manual entry is only a fallback, so this is for the
+    # case where a device never announces (or announces too late) on
+    # a tether link.
+    content.add_widget(Label(
+        text=_tr('Optional. Its own “Listening on…” address.'),
+        size_hint_y=None, height=dp(22), font_size=sp(10),
+        color=theme.TEXT_DIM, font_name=font_name,
+        halign='left', valign='middle',
+        text_size=(dp(320), dp(20))))
     endpoints_field = TextInput(
         text=', '.join(peer.get('static_endpoints') or []),
+        hint_text='192.168.42.129:34501',
         multiline=False, size_hint_y=None, height=dp(40),
         font_size=sp(12), font_name=font_name)
     save_endpoints_btn = Button(

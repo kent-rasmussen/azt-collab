@@ -253,6 +253,9 @@ msgstr "Service en marche (v{version})"
 msgid "Service not answering"
 msgstr "Le service ne répond pas"
 
+msgid "Service not answering ({detail})"
+msgstr "Le service ne répond pas ({detail})"
+
 msgid "The link check did not finish — the service is running but busy. Try again in a moment."
 msgstr "La vérification de la liaison n’a pas abouti — le service fonctionne mais il est occupé. Réessayez dans un instant."
 
@@ -1301,6 +1304,48 @@ msgstr "Impossible de mettre à jour le paramètre réseau local : {error}"
 
 msgid "Listening on {endpoint}"
 msgstr "À l'écoute sur {endpoint}"
+
+msgid "OK"
+msgstr "OK"
+
+msgid "sharing off"
+msgstr "partage désactivé"
+
+msgid "starting the listener…"
+msgstr "démarrage du service d’écoute…"
+
+msgid "listener did not start"
+msgstr "le service d’écoute n’a pas démarré"
+
+msgid "listener did not start ({error})"
+msgstr "le service d’écoute n’a pas démarré ({error})"
+
+msgid "listener did not start — see the daemon log"
+msgstr "le service d’écoute n’a pas démarré — voir le journal du service"
+
+msgid "cable connected, but no address yet — turn on USB tethering on the phone or tablet"
+msgstr "câble connecté, mais aucune adresse — activez le partage de connexion USB sur le téléphone ou la tablette"
+
+msgid "no network address — turn on USB tethering or wifi"
+msgstr "aucune adresse réseau — activez le partage USB ou le wifi"
+
+msgid "link up — waiting for an address"
+msgstr "liaison établie — en attente d’une adresse"
+
+msgid "service busy — try the check again"
+msgstr "service occupé — refaites la vérification"
+
+msgid "just restarted — use Restart server"
+msgstr "vient d’être redémarré — utilisez Redémarrer le serveur"
+
+msgid "restarting…"
+msgstr "redémarrage…"
+
+msgid "Optional. Its own “Listening on…” address."
+msgstr "Facultatif. Son adresse « À l’écoute sur… »."
+
+msgid "This device's own address, as ip:port — copy it from its “Listening on…” line. Optional; only used if it isn't found automatically."
+msgstr "L’adresse de cet appareil, sous la forme ip:port — copiez-la depuis sa ligne « À l’écoute sur… ». Facultatif ; utilisée seulement si l’appareil n’est pas trouvé automatiquement."
 
 msgid "Get diagnostics from this device"
 msgstr "Récupérer les diagnostics de cet appareil"

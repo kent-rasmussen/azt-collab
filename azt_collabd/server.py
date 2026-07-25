@@ -517,6 +517,9 @@ def _h_lan_pull_diagnostics(body):
         status, archive_name, data = (
             _lan_push.fetch_diagnostics_from_peer(
                 peer_id, read_timeout_s=timeout_s))
+        if status == 0:
+            status, archive_name, data = _pull_after_burst(
+                peer_id, timeout_s)
     except Exception as ex:
         print(f'[lan-pull] {peer_id[:8]!r} raised: {ex!r}',
               file=sys.stderr, flush=True)
@@ -554,10 +557,9 @@ def _h_lan_pull_diagnostics(body):
             slug='', stamp=_time.strftime('%Y%m%d_%H%M%S'))
     # Tag the file with WHOSE it is — a technician who pulls from
     # several machines in a day otherwise gets a pile of
-    # same-shaped names. Sanitised to the provider's filename
-    # charset (device names carry spaces / accents in the field).
-    who = _re.sub(r'[^A-Za-z0-9._-]', '_',
-                  device_name or peer_id[:8])[:32].strip('_')
+    # same-shaped names. Same slug function the carried-bundle
+    # exclude uses, so the two can't drift.
+    who = device_slug(device_name or peer_id[:8])
     safe_name = os.path.basename(archive_name)
     if who and not safe_name.startswith(who):
         safe_name = f'{who}_{safe_name}'
@@ -589,6 +591,58 @@ def _h_lan_pull_diagnostics(body):
         "items": [{"display_name": safe_name,
                    "uri_path": f'_shares/{token}/{safe_name}'}],
     }
+
+
+def _pull_after_burst(peer_id, timeout_s, window_s=8.0):
+    """Second (and final) pull attempt, after arming a discovery
+    burst (0.54.79).
+
+    The first attempt can fail purely because we have no CURRENT
+    address for the peer: resolution goes mDNS-cached → manual IPs →
+    last-persisted endpoint, and a device just plugged into a fresh
+    tether subnet may have announced nothing yet while the persisted
+    address is from a previous session. That reads to the user as
+    "did not answer" on a cable that is plainly connected, and the
+    remedy — knowing to prime discovery, or to hand-enter a manual
+    IP — is folklore they shouldn't need (Kent 2026-07-25: "no idea
+    how to use this; haven't so far").
+
+    So: arm a burst, wait (bounded, polling so a quick announce isn't
+    penalised) for an mDNS endpoint to appear, then retry once. One
+    retry only — a pull is a user gesture with a human waiting on it,
+    not a background task that can keep grinding.
+
+    Returns the same ``(status, archive_name, data)`` triple; on
+    failure, the original caller's typed codes still apply."""
+    from . import lan_push as _lan_push
+    try:
+        from . import lan_burst as _lan_burst
+        _lan_burst.start_burst()
+    except Exception as ex:
+        print(f'[lan-pull] burst arm raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    from . import lan_discovery as _lan_discovery
+    deadline = _time.monotonic() + max(1.0, float(window_s))
+    found = None
+    while _time.monotonic() < deadline:
+        try:
+            found = _lan_discovery.get_endpoint(peer_id)
+        except Exception:
+            found = None
+        if found is not None:
+            break
+        _time.sleep(0.5)
+    print(f'[lan-pull] {peer_id[:8]!r} unreachable on first try; '
+          f'retrying after burst (mDNS '
+          f'{"found " + str(found) if found else "still silent"})',
+          file=sys.stderr, flush=True)
+    try:
+        return _lan_push.fetch_diagnostics_from_peer(
+            peer_id, read_timeout_s=timeout_s)
+    except Exception as ex:
+        print(f'[lan-pull] retry raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 0, '', b''
 
 
 def _h_lan_restart_peer(body):
@@ -1004,7 +1058,24 @@ def _h_lan_get_toggle(_body):
     # advisory there; a visible pid lets the user compare against
     # the process list / server.json at a glance). 0.54.66.
     return 200, {"ok": True, "on": on, "endpoint": endpoint,
-                 "pid": os.getpid(), "version": _VERSION}
+                 "pid": os.getpid(), "version": _VERSION,
+                 **_lan_link_fields()}
+
+
+def _lan_link_fields():
+    """``link_state`` + ``bind_error`` for the toggle responses
+    (0.54.75). An empty ``endpoint`` used to mean four different
+    things — healthy-but-off-network, cable-in-but-tethering-off,
+    nothing-plugged-in, and a genuinely failed bind — so the UI
+    could only say something vague and sometimes wrong. See
+    ``lan_listener.link_state``."""
+    try:
+        return {"link_state": _lan_listener.link_state(),
+                "bind_error": _lan_listener.bind_error()}
+    except Exception as ex:
+        print(f'[server] link_state raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return {"link_state": "", "bind_error": ""}
 
 
 def _h_lan_set_toggle(body):
@@ -1041,7 +1112,8 @@ def _h_lan_set_toggle(body):
     except Exception:
         pass
     return 200, {"ok": True, "on": on, "endpoint": endpoint,
-                 "pid": pid}
+                 "pid": pid, "version": _VERSION,
+                 **_lan_link_fields()}
 
 
 def _h_lan_clone(body):
@@ -4328,13 +4400,99 @@ def _h_prepare_share_bundle(_body):
                  "items": staged['items']}
 
 
-def stage_diagnostics_bundle():
+def device_slug(name):
+    """Filename-safe short form of a device name, for tagging a
+    pulled bundle with whose it is. Matches the Android provider's
+    filename charset (device names carry spaces and accents)."""
+    import re as _re
+    return _re.sub(r'[^A-Za-z0-9._-]', '_',
+                   str(name or ''))[:32].strip('_')
+
+
+# Carried-bundle inclusion cap (0.54.78). Newest first; anything
+# beyond this is left on disk and NAMED in the log rather than
+# silently dropped. A size cap, deliberately not an age cap: a
+# bundle collected in the field must not expire before its courier
+# reaches a network.
+_CARRIED_BYTE_CAP = 32 * 1024 * 1024
+
+
+def _carried_bundle_items(exclude_slug=''):
+    """Diagnostics bundles this device is CARRYING — ones pulled from
+    paired peers and marked ``.keep`` — as ``(name_in_archive,
+    path)`` pairs for inclusion in an outgoing bundle (0.54.78).
+
+    Why: a bundle pulled onto a phone used to have exactly one exit,
+    the share sheet that opened in the moment after the pull. Dismiss
+    it and the file was stranded — Android app-private storage, and
+    release-signed builds have no ``adb run-as``. Including carried
+    bundles here gives them a permanent exit through the ordinary
+    Share-diagnostics button, and makes a phone usable as a courier
+    between two machines that can't reach each other (Kent
+    2026-07-25).
+
+    *exclude_slug* skips bundles whose name starts with that device
+    slug, so a peer pulling from us doesn't receive its own bundle
+    echoed back.
+
+    Never raises — a carried bundle is a bonus, not the payload."""
+    items, skipped, total = [], 0, 0
+    root = os.path.join(azt_home(), '.shares')
+    candidates = []
+    try:
+        for name in os.listdir(root):
+            sub = os.path.join(root, name)
+            if not os.path.isdir(sub):
+                continue
+            if not os.path.exists(os.path.join(sub, '.keep')):
+                continue          # not a carried bundle
+            for fn in os.listdir(sub):
+                if fn == '.keep' or fn.endswith('.part'):
+                    continue
+                p = os.path.join(sub, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                candidates.append((st.st_mtime, st.st_size, fn, p))
+    except OSError as ex:
+        print(f'[share-bundle] carried scan raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return []
+    seen = set()
+    for _mt, size, fn, p in sorted(candidates, reverse=True):
+        if exclude_slug and fn.startswith(exclude_slug):
+            continue              # don't echo a peer's own bundle back
+        if fn in seen:
+            continue              # same bundle pulled twice
+        if total + size > _CARRIED_BYTE_CAP:
+            skipped += 1
+            continue
+        seen.add(fn)
+        total += size
+        items.append((f'carried/{fn}', p))
+    # Never a silent cap: say what went in and what didn't.
+    if items or skipped:
+        print(f'[share-bundle] carrying {len(items)} peer bundle(s), '
+              f'{total} bytes'
+              + (f'; {skipped} skipped (over '
+                 f'{_CARRIED_BYTE_CAP} cap)' if skipped else ''),
+              file=sys.stderr, flush=True)
+    return items
+
+
+def stage_diagnostics_bundle(exclude_slug=''):
     """Collect + stage one diagnostics archive; the shared body of
     ``_h_prepare_share_bundle`` (local Share-diagnostics button) and
     the LAN listener's ``/v1/lan/diagnostics_pull`` route (a paired
     peer pulling over the cable/LAN link, 0.54.74). One collection
     path so a pulled bundle is byte-for-byte the same artifact the
     owner's own Share button would have produced.
+
+    Includes any bundles this device is CARRYING from paired peers
+    under ``carried/`` (0.54.78) — see ``_carried_bundle_items``.
+    *exclude_slug* keeps a pulling peer from receiving its own
+    bundle back.
 
     **Takes no ``project_lock``** — logs + config + snapshot reads
     only. Load-bearing: the prime use case is pulling FROM a wedged
@@ -4427,6 +4585,13 @@ def stage_diagnostics_bundle():
         for date_str, src_path in _iter_daemon_log_files()
         if not (keep_dates and date_str not in keep_dates)
     ]
+    # Bundles pulled from paired peers ride along under ``carried/``
+    # (0.54.78), so they can leave this device through the ordinary
+    # Share button — or through a peer pulling from us, which makes a
+    # phone a courier between two machines over the cable that's
+    # already up (no USB mode switch, no internet).
+    carried = _carried_bundle_items(exclude_slug=exclude_slug)
+    log_files.extend(carried)
     content_items = (
         [(f'azt_snapshot_{stamp}.txt', snapshot)] if snapshot else [])
     try:
@@ -4437,7 +4602,8 @@ def stage_diagnostics_bundle():
         print(f'[share-bundle] archive write raised: {ex!r}',
               file=sys.stderr, flush=True)
         raise
-    log_entries = max(0, written - (1 if snapshot else 0))
+    log_entries = max(0, written - (1 if snapshot else 0)
+                      - len(carried))
 
     items = [{
         'display_name': archive_name,

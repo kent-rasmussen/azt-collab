@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.74"
+__version__ = "0.54.81"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1026,9 +1026,15 @@ def lan_cable_link():
     is_self}, ...]}`` — ``listening`` is the dialable endpoints when
     the listener is bound, empty otherwise (link up ≠ listening; old
     daemons omit it). Empty dict on transport failure. Never
-    raises."""
+    raises.
+
+    Bounded at 15 s (0.54.77): this is a local survey — interface
+    enumeration plus a reachability read, with the daemon's own
+    discovery nudge backgrounded since 0.54.57 — so it has no
+    business inheriting ``rpc.call``'s 300 s default. A UI asking
+    "is my link up?" needs an answer or a failure, not a spinner."""
     try:
-        resp = call('POST', '/v1/lan/cable_link', {})
+        resp = call('POST', '/v1/lan/cable_link', {}, timeout=15)
     except ServerUnavailable:
         return {}
     if not resp.get('ok'):
@@ -1207,6 +1213,84 @@ def lan_pair_qr_close(langcode):
     return bool(resp.get('ok'))
 
 
+def service_health(timeout_s=2.5):
+    """Bounded, side-effect-free liveness probe. Returns
+    ``{'alive': bool, 'version': str, 'pid': int, 'detail': str}``
+    within roughly *timeout_s* — always, including when the daemon
+    is dead or wedged.
+
+    Distinct from ``check_server_compat()`` on three counts, all of
+    which matter when a UI is asking "is the service up?" (0.54.77):
+
+    - **No auto-spawn.** ``check_server_compat`` goes through
+      ``rpc.call``, which launches a daemon on a missing/stale
+      ``server.json``. A liveness *question* must not start a
+      service as a side effect of being asked.
+    - **No retry ladder.** ``rpc.call`` retries up to
+      ``_MAX_ATTEMPTS`` with spawn attempts in between, so a dead
+      daemon can take many seconds to report dead — long enough that
+      the UI's "Checking…" becomes the same non-answer as the stale
+      label it replaced (Kent 2026-07-25: "30s of checking… is the
+      same kind of nonanswer").
+    - **A timeout is a verdict, not an error.** Nothing raises;
+      exceeding the budget returns ``alive=False`` with the reason in
+      ``detail``. A service that can't answer in 2.5 s is not usable
+      by the caller either way.
+
+    Android goes through the ContentProvider transport's own probe
+    (a ``ping`` against the canonical authority); loopback reads
+    ``$AZT_HOME/server.json`` and GETs ``/v1/health`` directly.
+    ``/v1/health`` is unauthenticated and lock-free, so a daemon
+    wedged on ``project_lock`` still answers — which is what makes a
+    negative result meaningful."""
+    from ._platform import on_android
+    detail = ''
+    if on_android():
+        try:
+            from .transports import android_cp as _cp
+            t = _cp.discover()
+            if t is None:
+                return {'alive': False, 'version': '', 'pid': 0,
+                        'detail': 'provider did not answer ping'}
+            try:
+                info = t.health() or {}
+            finally:
+                try:
+                    t.close()
+                except Exception:
+                    pass
+            return {'alive': True,
+                    'version': str(info.get('version', '') or ''),
+                    'pid': int(info.get('pid') or 0), 'detail': ''}
+        except Exception as ex:
+            return {'alive': False, 'version': '', 'pid': 0,
+                    'detail': f'{ex!r}'[:200]}
+    try:
+        import json as _json
+        import os as _os
+        import urllib.request as _ur
+        from .paths import azt_home as _home
+        path = _os.path.join(_home(), 'server.json')
+        with open(path, 'r', encoding='utf-8') as fh:
+            info = _json.load(fh)
+        port = int(info.get('port') or 0)
+        if not port:
+            return {'alive': False, 'version': '', 'pid': 0,
+                    'detail': 'server.json has no port'}
+        url = f'http://127.0.0.1:{port}/v1/health'
+        with _ur.urlopen(url, timeout=float(timeout_s)) as resp:
+            data = _json.loads(resp.read() or b'{}')
+        return {'alive': True,
+                'version': str(data.get('version', '') or ''),
+                'pid': int(data.get('pid')
+                           or info.get('pid') or 0), 'detail': ''}
+    except FileNotFoundError:
+        detail = 'no server.json (service not started)'
+    except Exception as ex:
+        detail = f'{ex!r}'[:200]
+    return {'alive': False, 'version': '', 'pid': 0, 'detail': detail}
+
+
 def lan_toggle():
     """Read the daemon-wide LAN-sync toggle and the listener's
     bound endpoint. Returns ``{'on': bool, 'endpoint': 'ip:port',
@@ -1226,6 +1310,27 @@ def lan_toggle():
     ``on``. It is a client-side field (transport outcome), never sent
     on the wire.
 
+    ``link_state`` (0.54.75) says WHY ``endpoint`` is empty, which it
+    can be for four unrelated reasons — don't render an empty
+    endpoint as a failure:
+
+    - ``'ok'`` — bound with at least one reachable address.
+    - ``'tether_off'`` — bound, no address, but a USB network gadget
+      is present: the cable is connected and USB tethering is off on
+      the phone/tablet. **Actionable** — tell the user to switch it
+      on (the app cannot: that needs a privileged permission the
+      suite deliberately doesn't ship; ``ui.share.
+      open_tethering_settings`` deep-links to the screen instead).
+    - ``'no_link'`` — bound, no address, no gadget: off-network by
+      circumstance. Correct by design, NOT an error.
+    - ``'not_bound'`` — the listener really isn't running; pair with
+      ``bind_error`` (``'<step>: <detail>'``, e.g.
+      ``'listener bind: OSError(98)'``) so the UI can name the
+      failing step instead of sending the user to a log.
+
+    ``''`` from a pre-0.54.75 daemon — treat as "can't tell" and fall
+    back to the endpoint-only rendering.
+
     On transport failure returns
     ``{'on': False, 'endpoint': '', 'pid': 0, 'version': '',
     'alive': False}`` so an offline peer can still render its
@@ -1233,17 +1338,28 @@ def lan_toggle():
     try:
         resp = call('GET', '/v1/lan/toggle')
     except ServerUnavailable:
-        return {'on': False, 'endpoint': '', 'pid': 0,
-                'version': '', 'alive': False}
+        return _lan_toggle_dead()
     if not resp.get('ok'):
-        return {'on': False, 'endpoint': '', 'pid': 0,
-                'version': '', 'alive': False}
+        return _lan_toggle_dead()
+    return _lan_toggle_decode(resp)
+
+
+def _lan_toggle_dead():
+    return {'on': False, 'endpoint': '', 'pid': 0, 'version': '',
+            'alive': False, 'link_state': '', 'bind_error': ''}
+
+
+def _lan_toggle_decode(resp):
+    """Shared decode for both toggle wrappers — a field added to one
+    and forgotten in the other is a known failure shape here."""
     return {
         'on': bool(resp.get('on')),
         'endpoint': str(resp.get('endpoint', '') or ''),
         'pid': int(resp.get('pid') or 0),
         'version': str(resp.get('version', '') or ''),
         'alive': True,
+        'link_state': str(resp.get('link_state', '') or ''),
+        'bind_error': str(resp.get('bind_error', '') or ''),
     }
 
 
@@ -1256,14 +1372,10 @@ def lan_set_toggle(on):
     try:
         resp = call('POST', '/v1/lan/toggle', {'on': bool(on)})
     except ServerUnavailable:
-        return {'on': False, 'endpoint': '', 'pid': 0}
+        return _lan_toggle_dead()
     if not resp.get('ok'):
-        return {'on': False, 'endpoint': '', 'pid': 0}
-    return {
-        'on': bool(resp.get('on')),
-        'endpoint': str(resp.get('endpoint', '') or ''),
-        'pid': int(resp.get('pid') or 0),
-    }
+        return _lan_toggle_dead()
+    return _lan_toggle_decode(resp)
 
 
 def lan_set_static_endpoints(peer_id, endpoints):
@@ -3274,7 +3386,7 @@ __all__ = [
     'get_device_name', 'set_device_name',
     'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_retry_peer',
     'lan_cable_link', 'lan_pull_diagnostics', 'lan_restart_peer',
-    'lan_pair_qr',
+    'service_health', 'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',

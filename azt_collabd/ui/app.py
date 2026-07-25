@@ -1294,22 +1294,43 @@ class SettingsScreen(Screen):
                 # Android too — so a daemon that stops answering must
                 # flip the line to "not answering" instead of leaving
                 # a confident "Listening on …· pid N" standing over a
-                # dead service. Pre-0.54.74 clients omit the key;
-                # absent ⇒ treat as alive (old behaviour).
+                # dead service. No separate ``/v1/health`` probe is
+                # needed here: this RPC answering IS the liveness
+                # evidence, and it carries the version too, so a
+                # second call would buy nothing (0.54.75).
+                # Pre-0.54.74 clients omit the key; absent ⇒ treat as
+                # alive (old behaviour).
                 alive = lan_state.get('alive', True)
                 version = str(lan_state.get('version', '') or '')
+                # Consecutive ticks with sharing ON but no bound
+                # endpoint. The auto-bind lands within seconds
+                # (0.54.46), so ~6 ticks (30 s) of this is a real bind
+                # failure, not a transient — and the old text kept
+                # promising "no action needed" straight through it.
+                # The tick we already run is the timer; no new clock.
+                if alive and on and not ep:
+                    ticks = int(getattr(self, '_lan_unbound_ticks', 0))
+                    self._lan_unbound_ticks = ticks + 1
+                else:
+                    self._lan_unbound_ticks = 0
+                stuck = self._lan_unbound_ticks >= 6
                 if (on != bool(getattr(self, '_lan_enabled', False))
                         or ep != getattr(self, '_lan_endpoint', '')
                         or pid != int(getattr(self, '_lan_pid', 0)
                                       or 0)
                         or alive != getattr(self, '_lan_alive', True)
                         or version != getattr(self, '_lan_version',
-                                              '')):
+                                              '')
+                        # Crossing the 30 s boundary is itself a
+                        # change worth re-rendering for.
+                        or stuck != bool(getattr(self, '_lan_stuck',
+                                                 False))):
                     self._lan_enabled = on
                     self._lan_endpoint = ep
                     self._lan_pid = pid
                     self._lan_alive = bool(alive)
                     self._lan_version = version
+                    self._lan_stuck = stuck
                     self._refresh_lan_buttons()
                     self._refresh_lan_status()
             Clock.schedule_once(_land, 0)
@@ -2182,6 +2203,24 @@ class SettingsScreen(Screen):
         self._lan_enabled = bool(applied.get('on'))
         self._lan_endpoint = applied.get('endpoint', '')
         self._lan_pid = int(applied.get('pid') or 0)
+        self._lan_alive = bool(applied.get('alive', True))
+        self._lan_version = str(applied.get('version', '') or '')
+        self._lan_link_state = str(applied.get('link_state', '') or '')
+        self._lan_bind_error = str(applied.get('bind_error', '') or '')
+        # ``apply_toggle`` is SYNCHRONOUS (hot-applied invariant), so
+        # if the reply to an explicit toggle-ON carries no endpoint,
+        # the bind already had its chance and failed — an explicit
+        # gesture is owed a straight answer, not the 30 s grace the
+        # background auto-bind gets. Seed the counter one tick short
+        # of the threshold so the next poll (~5 s) states the failure
+        # instead of "starting…". Field 2026-07-25: "I just toggled,
+        # and it came back No action needed again."
+        if self._lan_enabled and not self._lan_endpoint:
+            self._lan_unbound_ticks = 5
+            self._lan_stuck = False
+        else:
+            self._lan_unbound_ticks = 0
+            self._lan_stuck = False
         self._refresh_lan_buttons()
         self._refresh_lan_status()
         # The work-offline status text describes the joint state
@@ -2200,10 +2239,21 @@ class SettingsScreen(Screen):
         try:
             state = _lt()
         except Exception:
-            state = {'on': False, 'endpoint': ''}
+            # A raise here is itself a liveness answer — don't let it
+            # decode as the same shape a healthy "sharing off" gives
+            # (0.54.75).
+            state = {'on': False, 'endpoint': '', 'alive': False}
         self._lan_enabled = bool(state.get('on'))
         self._lan_endpoint = state.get('endpoint', '')
         self._lan_pid = int(state.get('pid') or 0)
+        # Screen-open path: 0.54.74 set only on/endpoint/pid here, so
+        # ``_lan_alive`` fell back to its True default and a dead
+        # daemon rendered as ordinary sharing-off until the first 5 s
+        # tick corrected it.
+        self._lan_alive = bool(state.get('alive', True))
+        self._lan_version = str(state.get('version', '') or '')
+        self._lan_link_state = str(state.get('link_state', '') or '')
+        self._lan_bind_error = str(state.get('bind_error', '') or '')
         self._refresh_lan_buttons()
         self._refresh_lan_status()
 
@@ -2222,23 +2272,78 @@ class SettingsScreen(Screen):
             return
         enabled = bool(getattr(self, '_lan_enabled', False))
         endpoint = getattr(self, '_lan_endpoint', '') or ''
-        # Service health first (0.54.74). The 5 s board tick feeds
-        # ``_lan_alive`` from whether its ``lan_toggle`` RPC answered
-        # — the only continuous health signal in this UI, and the one
-        # that matters on Android where "Listening on …" is likewise
-        # a polled value. A silent daemon must SAY so here: the
-        # settings line is where a user looks to decide whether the
-        # service is alive, and a stale endpoint reads as "fine".
+        # Service verdict leads EVERY state (0.54.75). The 5 s board
+        # tick feeds ``_lan_alive`` from whether its ``lan_toggle``
+        # RPC answered — the only continuous health signal in this UI,
+        # and the one that matters on Android, where "Listening on …"
+        # is likewise a polled value and the desktop cable-check
+        # (which says it in words) doesn't exist.
+        #
+        # 0.54.74 put the verdict only on the bound branch, so it was
+        # invisible in exactly the states where the user asks whether
+        # the service is alive — unbound, and sharing-off (a blank
+        # line). Leading with it makes "a version is showing" mean
+        # "the daemon answered", by construction, in every state.
+        # Kept terse per Kent 2026-07-25 ("careful adding length
+        # unnecessarily"): 'v0.54.75 OK', not a sentence.
         if not getattr(self, '_lan_alive', True):
             label.text = _tr(
                 'Collaboration service not answering — use Restart '
                 'server.')
             return
+        version = getattr(self, '_lan_version', '') or ''
+        # Locale-neutral, like the pid suffix. Pre-0.54.74 daemons
+        # send no version; say OK without one rather than implying
+        # the service is unhealthy.
+        head = f'v{version} ' + _tr('OK') if version else _tr('OK')
         if not enabled:
-            label.text = ''
+            label.text = head + ' · ' + _tr('sharing off')
+            return
+        # Why is there no endpoint? An empty string had four unrelated
+        # causes and 0.54.74 rendered them identically (0.54.75 splits
+        # them daemon-side; see ``lan_listener.link_state``). Field
+        # 2026-07-25: tablet cabled to the desktop with USB tethering
+        # switched OFF — a healthy listener with nothing to listen on,
+        # reported as "starting the listener… (no action needed)" when
+        # the fix was one toggle away on the tablet.
+        link = getattr(self, '_lan_link_state', '') or ''
+        if not endpoint and link == 'tether_off':
+            # The one state with a user action attached. We can't flip
+            # the phone's toggle for it — that needs a privileged
+            # Android permission the suite doesn't ship — so name the
+            # action instead.
+            label.text = head + ' · ' + _tr(
+                'link up — waiting for an address')
+            return
+        if not endpoint and link == 'no_link':
+            # Correct by design: a device with no address. Not a
+            # failure, so don't dress it as one — and do NOT claim a
+            # cable isn't connected, because we can't see one
+            # (0.54.80). With USB tethering off, Android exposes no
+            # network function at all, so the host has no usb0 to
+            # detect: a cabled-but-untethered tablet lands HERE, not
+            # in 'tether_off'. Naming both possibilities is the
+            # honest maximum (field 2026-07-25: cable was in, and the
+            # old wording told the user to connect one).
+            label.text = head + ' · ' + _tr(
+                'no network address — turn on USB tethering or wifi')
+            return
+        if not endpoint and link == 'not_bound':
+            # ``not_bound`` alone does NOT mean failure: for a second
+            # or two after a daemon start / toggle-on the bind simply
+            # hasn't completed yet. ``bind_error`` is the
+            # discriminator — a recorded failing step means it tried
+            # and failed; empty means not-yet-or-in-progress, which is
+            # the transient the watcher resolves by itself (0.54.76;
+            # 0.54.75 flashed a false "did not start" through normal
+            # startup).
+            err = getattr(self, '_lan_bind_error', '') or ''
+            label.text = head + ' · ' + (
+                _tr('listener did not start ({error})').format(error=err)
+                if err else _tr('starting the listener…'))
             return
         if endpoint:
-            text = _tr('Listening on {endpoint}').format(
+            text = head + ' · ' + _tr('Listening on {endpoint}').format(
                 endpoint=endpoint)
             # Double-daemon diagnostic (Kent 2026-07-24): the pid of
             # the daemon that ANSWERED the toggle RPC. Lets the user
@@ -2250,22 +2355,24 @@ class SettingsScreen(Screen):
             pid = int(getattr(self, '_lan_pid', 0) or 0)
             if pid:
                 text += f' · pid {pid}'
-            # Which code is actually serving RPCs right now — the
-            # startup version strip goes stale across a respawn, and
-            # the two live in different processes (a known field
-            # confusion). Locale-neutral, like the pid.
-            version = getattr(self, '_lan_version', '') or ''
-            if version:
-                text += f' · v{version}'
             label.text = text
+        elif getattr(self, '_lan_stuck', False):
+            # PRE-0.54.75 DAEMON FALLBACK ONLY (``link_state`` empty):
+            # without the daemon's classification we can't tell a
+            # failed bind from a healthy off-network listener, so fall
+            # back to timing — ≥30 s of unbound ticks, or a user
+            # toggle whose synchronous ``apply_toggle`` returned no
+            # endpoint. Deliberately vaguer than the classified
+            # branches above: it may be either cause. The UI and the
+            # daemon are separate processes and can differ in version.
+            label.text = head + ' · ' + _tr(
+                'listener did not start — see the daemon log')
         else:
-            # Transient right after a daemon start: the setting is on
-            # and the watcher auto-binds the listener within seconds
-            # (0.54.46) — no user action needed. The old "(listener
-            # not yet bound)" read as a to-do (field 2026-07-24: "is
-            # that waiting for me to toggle sharing?").
-            label.text = _tr('Local-network sharing is on — starting '
-                             'the listener… (no action needed)')
+            # Genuinely transient: the watcher auto-binds within
+            # seconds of a daemon start (0.54.46). No reassurance
+            # needed — the line flips to "Listening on …" by itself,
+            # and to a named state above once the daemon says which.
+            label.text = head + ' · ' + _tr('starting the listener…')
 
     def open_pair_phone(self):
         try:
@@ -2355,33 +2462,50 @@ class SettingsScreen(Screen):
         check. Field 2026-07-25: the fix for a stranded check was the
         user finding Restart server themselves."""
         self._lan_status(_tr('Checking the collaboration service…'))
-        state = {'done': False, 'health': None, 'version': ''}
+        state = {'done': False, 'health': None, 'version': '',
+                 'detail': ''}
 
         def _health_line():
             """One short service verdict, prefixed to every state of
-            this flow (waiting, result, and did-not-answer alike)."""
+            this flow (waiting, result, and did-not-answer alike).
+            Terse on purpose — same 'v0.54.75 OK' form the LAN status
+            line uses (Kent 2026-07-25: "careful adding length
+            unnecessarily")."""
             if state['health'] is True:
                 v = state['version']
-                return (_tr('Service OK (v{version})').format(version=v)
-                        if v else _tr('Service OK'))
+                return (f'v{v} ' + _tr('OK')) if v else _tr('OK')
             if state['health'] is False:
-                return _tr('Service not answering')
+                # Say WHY it's not answering when the probe knows —
+                # "no server.json (service not started)" is a
+                # different problem from a refused connection, and the
+                # user is entitled to the distinction without a log.
+                d = state['detail']
+                return (_tr('Service not answering ({detail})').format(
+                    detail=d) if d else _tr('Service not answering'))
             return _tr('Checking the service…')
 
         def _probe_health():
-            alive, version = False, ''
+            # Bounded + no-spawn (0.54.77). This used to go through
+            # ``check_server_compat`` → ``rpc.call``, which retries
+            # three times AND auto-spawns a daemon between attempts:
+            # a dead service took many seconds to report dead, so
+            # "Checking the service…" became the same non-answer as
+            # the stale label it was meant to replace (Kent
+            # 2026-07-25), and merely asking could start a daemon.
+            # ``service_health`` answers within its budget, always,
+            # and changes nothing.
+            probe = {}
             try:
-                from azt_collab_client import check_server_compat
-                probe = check_server_compat() or {}
-                alive = (probe.get('error') != 'server_unreachable')
-                version = str(probe.get('server_version', '') or '')
-            except Exception:
-                alive = False
-            state['health'] = alive
-            state['version'] = version
+                from azt_collab_client import service_health
+                probe = service_health(timeout_s=2.5) or {}
+            except Exception as ex:
+                probe = {'alive': False, 'detail': f'{ex!r}'}
+            state['health'] = bool(probe.get('alive'))
+            state['version'] = str(probe.get('version', '') or '')
+            state['detail'] = str(probe.get('detail', '') or '')
             Clock.schedule_once(
                 lambda _dt: self._lan_status(
-                    _health_line() + '\n'
+                    _health_line() + ' · '
                     + _tr('Checking cable link…')), 0)
 
         def _watchdog(_dt):
@@ -2389,9 +2513,8 @@ class SettingsScreen(Screen):
                 return
             if state['health'] is True:
                 self._lan_status(
-                    _health_line() + '\n' + _tr(
-                        'The link check did not finish — the service '
-                        'is running but busy. Try again in a moment.'))
+                    _health_line() + ' · ' + _tr(
+                        'service busy — try the check again'))
                 return
             # Health silent too: the service really is down. Restart it
             # (once per 10 min) rather than making the user find the
@@ -2401,14 +2524,12 @@ class SettingsScreen(Screen):
             last = getattr(self, '_last_auto_restart_at', 0.0)
             if now - last < 600:
                 self._lan_status(
-                    _health_line() + '\n' + _tr(
-                        'Already restarted recently — use Restart '
-                        'server, then check again.'))
+                    _health_line() + ' · ' + _tr(
+                        'just restarted — use Restart server'))
                 return
             self._last_auto_restart_at = now
             self._lan_status(
-                _health_line() + '\n' + _tr(
-                    'Restarting the collaboration service…'))
+                _health_line() + ' · ' + _tr('restarting…'))
 
             def _do_restart():
                 try:
@@ -2429,7 +2550,11 @@ class SettingsScreen(Screen):
 
             threading.Thread(target=_do_restart, daemon=True).start()
 
-        Clock.schedule_once(_watchdog, 20)
+        # 20 s → 8 s (0.54.77). The health verdict now lands in ≤2.5 s
+        # and the survey RPC is capped at 15 s client-side, so a
+        # 20 s wait bought nothing but silence. A stuck check is a
+        # non-answer; answer sooner.
+        Clock.schedule_once(_watchdog, 8)
 
         def _work():
             _probe_health()
@@ -2483,7 +2608,13 @@ class SettingsScreen(Screen):
             # Health verdict leads the report too, not just the
             # failure states: "is the service up?" is the first
             # question, and this flow is the only place that asks it.
-            text = _health_line() + '\n' + text
+            # Same ' · ' join the steady-state LAN line uses, NOT a
+            # newline: 'v0.54.77 OK · Listening on 10.42.0.1:34501'
+            # fits one line, and the peer list below needs the
+            # vertical space more (Kent 2026-07-25). ``text`` keeps
+            # its own newlines, so 'Servers on other devices:' still
+            # starts a fresh line.
+            text = _health_line() + ' · ' + text
             Clock.schedule_once(lambda _dt: self._lan_status(text), 0)
 
         threading.Thread(target=_work, daemon=True).start()

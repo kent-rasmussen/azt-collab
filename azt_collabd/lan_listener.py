@@ -63,6 +63,11 @@ _STATE = {
     'server': None,
     'thread': None,
     'bound': None,  # (host, port) once running
+    # Last failing step + detail from ``apply_toggle`` ('' when the
+    # last attempt succeeded). Surfaced typed on the toggle RPC so the
+    # settings line can NAME the failing seam instead of telling the
+    # user to go read a log (0.54.75).
+    'bind_error': '',
 }
 
 
@@ -146,6 +151,98 @@ def bound_endpoint():
     ``0.0.0.0`` and let the caller substitute the discovered IP."""
     with _LOCK:
         return _STATE['bound']
+
+
+def bind_error():
+    """Last failing step of ``apply_toggle`` ('' when the listener
+    came up, or hasn't been asked to). 0.54.75."""
+    with _LOCK:
+        return _STATE.get('bind_error', '') or ''
+
+
+def _usb_net_ifaces():
+    """Names of local network interfaces that are USB-attached —
+    i.e. a phone/tablet presenting a tether gadget (``usb0``,
+    ``enp0s20u2``, ``rndis0``, ``ncm0``…). Read from
+    ``/sys/class/net/<if>/device`` whose resolved path sits under a
+    USB bus; falls back to name matching where sysfs isn't readable.
+
+    Why sysfs and not ``_interface_ipv4s``: that helper uses
+    SIOCGIFCONF, which lists only interfaces that ALREADY have an
+    address. The state we most need to name is exactly the one it
+    can't see — the cable is plugged in and the gadget exists, but
+    the phone hasn't switched USB tethering on, so no address has
+    been handed out (field 2026-07-25: tablet cabled to the desktop,
+    tether toggle off, and the UI said "no action needed").
+
+    Empty list on any platform / permission problem — callers treat
+    that as "can't tell", never as "no cable"."""
+    out = []
+    base = '/sys/class/net'
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return out
+    for name in names:
+        if name == 'lo':
+            continue
+        is_usb = False
+        try:
+            dev = os.path.realpath(os.path.join(base, name, 'device'))
+            is_usb = ('/usb' in dev) or ('usb' in os.path.basename(dev))
+        except OSError:
+            is_usb = False
+        if not is_usb:
+            # Naming fallback for hosts where the sysfs symlink isn't
+            # present (some Android kernels): the conventional gadget
+            # names are stable enough to recognise.
+            low = name.lower()
+            is_usb = (low.startswith('usb')
+                      or low.startswith('rndis')
+                      or low.startswith('ncm'))
+        if is_usb:
+            out.append(name)
+    return out
+
+
+def link_state():
+    """Classify why (or whether) this daemon is reachable by a peer,
+    for the settings line + cable check. Returns one of:
+
+    - ``'ok'``          — bound AND at least one non-loopback IPv4 to
+                          be reached at.
+    - ``'tether_off'``  — bound, no usable address, but a USB network
+                          gadget IS present. In practice this means
+                          tethering is ON and no address has arrived
+                          yet (DHCP pending or failed) — NOT
+                          "cable in, tethering off", because with
+                          tethering off Android exposes no network
+                          function and the host sees no interface to
+                          detect.
+    - ``'no_link'``     — bound, no usable address, no USB gadget
+                          seen. Covers BOTH "nothing plugged in" and
+                          "cabled but not tethered": indistinguishable
+                          from here, so callers must not claim a cable
+                          is absent (see the 0.54.80 wording). Correct
+                          by design when a device is off network; not
+                          a failure.
+    - ``'not_bound'``   — the listener isn't running. A real failure;
+                          pair with ``bind_error()`` for the step.
+    - ``'off'``         — sharing is switched off (caller decides;
+                          never returned from here).
+
+    The distinction matters because 0.54.74 collapsed all of these
+    into an empty endpoint string, so a healthy listener on an
+    off-network machine was reported the same way as a failed bind —
+    and the UI told the user no action was needed in a state where
+    the fix was one toggle away on their tablet. 0.54.75."""
+    if not is_running():
+        return 'not_bound'
+    if bound_endpoints_all():
+        return 'ok'
+    if _usb_net_ifaces():
+        return 'tether_off'
+    return 'no_link'
 
 
 def bound_endpoints_all():
@@ -546,7 +643,14 @@ def _handle_diagnostics_pull(environ, start_response):
                               {'ok': False, 'error': 'not_paired'})
     try:
         from . import server as _server
-        staged = _server.stage_diagnostics_bundle()
+        # Include what we're carrying from OTHER peers, but not the
+        # requester's own bundle echoed back (0.54.78) — this is the
+        # courier path: a phone that pulled from one machine serves
+        # those logs onward to the next, over whatever link is
+        # already up.
+        staged = _server.stage_diagnostics_bundle(
+            exclude_slug=_server.device_slug(
+                entry.get('device_name', '')))
     except Exception as ex:
         print(f'[lan-listener] diagnostics_pull staging raised: '
               f'{ex!r}', file=sys.stderr, flush=True)
@@ -2131,27 +2235,34 @@ def apply_toggle():
     burst_armed = (_lan_fgs.snapshot().get('ref_discovery', 0) > 0)
     desired = autodiscovery or burst_armed
     if desired and not is_running():
+        def _fail(step, ex):
+            # Same per-step attribution as before, plus a typed copy
+            # the toggle RPC can hand the UI so the user sees WHICH
+            # step failed instead of "see the daemon log" (0.54.75).
+            print(f'[lan-listener] {step} failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+            with _LOCK:
+                _STATE['bind_error'] = f'{step}: {ex!r}'[:200]
         try:
             _lan_fgs.acquire_wifi_locks()
         except Exception as ex:
-            print(f'[lan-listener] acquire_wifi_locks failed: {ex!r}',
-                  file=sys.stderr, flush=True)
+            _fail('acquire_wifi_locks', ex)
             return
         try:
             _lan_fgs.start_fgs()
         except Exception as ex:
-            print(f'[lan-listener] start_fgs failed: {ex!r}',
-                  file=sys.stderr, flush=True)
+            _fail('start_fgs', ex)
             _lan_fgs.release_wifi_locks()
             return
         try:
             bound = start()
         except Exception as ex:
-            print(f'[lan-listener] listener bind failed: {ex!r}',
-                  file=sys.stderr, flush=True)
+            _fail('listener bind', ex)
             _lan_fgs.stop_fgs()
             _lan_fgs.release_wifi_locks()
             return
+        with _LOCK:
+            _STATE['bind_error'] = ''
         # Advertise + browse only after the listener is bound, so
         # the port we publish is real.
         try:

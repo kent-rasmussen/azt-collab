@@ -9,6 +9,230 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.81 — status strings trimmed to phrases
+
+Kent 2026-07-25: *"enough with the dictionary attacks; people have to
+read these."* 0.54.80 replaced a wrong sentence with a longer correct
+one, which is its own failure — an unread string conveys nothing. His
+rule: name the action, let the user work out the adjacent step.
+
+- `no network address — turn on USB tethering or wifi` (was a
+  two-clause conditional naming the cable, the phone, the tablet and
+  wifi).
+- `link up — waiting for an address` (was "cable connected, but no
+  address yet — turn on USB tethering on the phone or tablet" — also
+  wrong per 0.54.80, since this state means tethering is already on).
+- `service busy — try the check again`, `just restarted — use Restart
+  server`, `restarting…` (were full sentences), and these now join the
+  verdict with ` · ` instead of a newline.
+- `listener did not start — see the daemon log` (dropped the
+  `[lan-listener]` grep hint — that belongs in the CHANGELOG, which
+  has it).
+- Manual-IP hint: `Optional. Its own “Listening on…” address.` (was
+  three lines). The placeholder in the box carries the format.
+
+UI strings → relaunch the UI.
+
+## 0.54.80 — don't tell the user to connect the cable they already connected
+
+Kent 2026-07-25, before testing: *"are we saying 'connect a cable (then
+USB…' because we believe a cable isn't connected? Are we
+distinguishing?"* We are not, and the 0.54.75 wording claimed
+otherwise.
+
+- **The `tether_off` state can't catch "cable in, tethering off."**
+  With USB tethering switched off, Android exposes no network function
+  at all, so the host has no `usb0`-style interface to detect — the
+  cabled-but-untethered tablet lands in `no_link`, whose text told the
+  user to connect a cable. Exactly the failure class this arc has been
+  clearing out, reintroduced by a message that assumed its own
+  diagnosis. `tether_off` in practice means tethering is ON with no
+  address yet (DHCP pending or failed); its docstring now says so.
+- **`no_link` stops asserting.** New text: "no network address — if a
+  cable is connected, turn on USB tethering on the phone or tablet;
+  otherwise connect one, or join wifi." Both possibilities named, no
+  claim we can't support.
+- **Deliberately NOT adding cable detection.** Everything on
+  `/sys/bus/usb` is USB, so "a device is attached" is true of the
+  mouse and says nothing about a phone; matching vendor IDs to guess
+  "that's a tablet" is the kind of heuristic that misfires in the
+  field. Naming both possibilities beats guessing between them.
+
+UI string + docstring → relaunch the UI.
+
+## 0.54.79 — a pull primes discovery itself; the manual-IP field explains itself
+
+Kent 2026-07-25, on the manual-IP fallback: *"no idea how to use this;
+haven't so far."* Two halves of the same problem — the pull could fail
+for want of a current address, and the documented workaround was
+folklore.
+
+- **Burst-and-retry-once on an unreachable pull.** Resolution goes
+  mDNS-cached → manual IPs → last-persisted endpoint, so a device
+  just plugged into a fresh tether subnet can have announced nothing
+  yet while the persisted address is from a previous session. That
+  read as "did not answer" on a cable that was plainly connected.
+  The daemon now arms a discovery burst, waits for an mDNS endpoint
+  (bounded ~8 s, polled so a quick announce isn't penalised), and
+  retries once. **Once** — a human is waiting on this gesture, so it
+  isn't allowed to grind. Both attempts and whether mDNS ever spoke
+  go in the log.
+- **The manual-IP field says what it wants:** whose address it is
+  (the *other* device's), the shape (`ip:port`, with a
+  `192.168.42.129:34501` placeholder in the box), where to copy it
+  from (that device's "Listening on…" line — the string the 0.54.75
+  status line now prints verbatim), and that it's optional, since
+  discovery tries mDNS first and a manual entry is only a fallback.
+  Which also means a stale entry can't break discovery — safe to set
+  and forget for a cable pair, whose tether subnet is stable.
+
+Daemon + client UI → restart the daemon, relaunch the UI, rebuild
+peer APKs.
+
+## 0.54.78 — a device forwards the diagnostics it is carrying
+
+Kent 2026-07-25: *"our internet sucks here, and I'd rather not do a lot
+of USB mode switching."* A bundle pulled onto a phone had exactly one
+exit — the share sheet that opened in the moment after the pull.
+Dismiss it and the file was stranded: Android app-private storage, and
+release-signed builds have no `adb run-as`. The remaining routes were
+email (bad link) or switching USB out of tethering for MTP (breaks the
+very link being used).
+
+- **`stage_diagnostics_bundle` now includes carried bundles** under
+  `carried/` — the ones pulled from paired peers, marked `.keep`.
+  Because that function is the single collection point for BOTH the
+  local Share-diagnostics button and the peer pull route, one change
+  gives two things: a permanent exit for a stranded bundle, and the
+  **courier** case — a phone that pulled from machine A serves those
+  logs onward when machine B pulls from it, over whatever link is
+  already up. No mode switch, no internet.
+- **Newest-first, size-capped at 32 MB, and never silently.** The
+  count and byte total go in the log, and anything over the cap is
+  reported as skipped rather than dropped quietly. A **size** cap and
+  deliberately not an age cap: a bundle collected in the field must
+  not expire before its courier reaches a network.
+- **No echo.** A pull passes the requester's device slug as
+  `exclude_slug`, so a peer never receives its own bundle back.
+  Shared `device_slug()` helper, so the naming prefix and the exclude
+  can't drift apart.
+- Nesting is expected: the outer `.tar.gz` contains each carried
+  `.tar.gz`, whose name keeps its source device prefix — unpack twice
+  and you know whose logs you have.
+
+Daemon-side → restart the daemon / rebuild the server APK.
+
+## 0.54.77 — a "Checking…" that can hang is the same non-answer
+
+Kent 2026-07-25: *"easily half of my questions about a stuck server are
+there: is this server on a desktop working or not? 30s of checking… is
+the same kind of nonanswer we've been addressing for android."*
+Correct, and worse than it looked.
+
+- **New `service_health(timeout_s=2.5)` client API — bounded and
+  side-effect-free.** 0.54.74's probe called `check_server_compat()`,
+  which goes through `rpc.call`: three attempts with an **auto-spawn
+  between them**. So a dead daemon took many seconds to report dead,
+  and merely *asking* whether the service was up could start one.
+  The new probe reads `server.json` and GETs `/v1/health` directly
+  (Android: the ContentProvider `ping`), never spawns, never retries,
+  never raises — and treats exceeding its budget as the verdict,
+  because a service that can't answer in 2.5 s isn't usable by the
+  caller either way.
+- **It says why.** "Service not answering (no server.json — service
+  not started)" is a different problem from a refused connection, and
+  the user gets that distinction without opening a log.
+- **`lan_cable_link` capped at 15 s** instead of inheriting
+  `rpc.call`'s 300 s default — it's a local interface survey whose
+  discovery nudge has been backgrounded since 0.54.57.
+- **Cable-check watchdog 20 s → 8 s.** With the verdict landing in
+  ≤2.5 s and the survey capped, the extra 12 s was pure silence.
+- **One line, not two** (Kent): the verdict now joins the first line
+  with ` · ` — `v0.54.77 OK · Listening on 10.42.0.1:34501` — so the
+  vertical space goes to the "Servers on other devices" list instead
+  of a line break that fit fine.
+
+Client + UI → relaunch the UI; rebuild peer APKs to get
+`service_health`.
+
+## 0.54.76 — `not_bound` is not the same as "failed to bind"
+
+Kent 2026-07-25, reviewing 0.54.75's states before building: *"will we
+still have 'starting the listener…'?"* — which surfaced a false
+failure. For a second or two after a daemon start or a toggle-on the
+bind hasn't completed, so `is_running()` is false and 0.54.75 rendered
+that as "listener did not start" — a failure claim across normal
+startup, the same class of wrongness 0.54.75 set out to fix.
+
+- **`bind_error` is now the discriminator for `not_bound`:** a
+  recorded failing step means it tried and failed (name the step);
+  empty means not-yet-or-in-progress, which renders as "starting the
+  listener…" and resolves itself on the watcher's next reconcile.
+- For the record, since it came up: the version prefix appears in
+  **all four** `link_state` values, `not_bound` included — the state
+  only exists because the daemon answered the RPC. Absence of a
+  version means the daemon didn't answer at all. "A version is
+  showing" ⟺ "health came back OK", with no exceptions.
+
+UI-side only → relaunch the UI.
+
+## 0.54.75 — an empty LAN endpoint meant four things; now it says which
+
+Kent 2026-07-25, live: the LAN line sat on "starting the listener…
+(no action needed)" for over a minute, through a toggle cycle. Cause:
+his tablet was cabled to the desktop with **USB tethering switched
+off**, so the desktop had no non-loopback address — a perfectly
+healthy, bound listener with nothing to be reached at. `endpoint` was
+empty, and empty was the *only* signal the wire carried, so the UI
+reported a working service as if it were starting up, and promised no
+action was needed when the fix was one toggle away on the tablet.
+
+- **`lan_listener.link_state()` classifies the four causes** an empty
+  endpoint can have: `ok` (bound, has addresses) / `tether_off`
+  (bound, no address, but a USB network gadget is present — cable in,
+  tethering off) / `no_link` (bound, no address, no gadget —
+  off-network by circumstance, correct by design) / `not_bound` (a
+  real failure). USB detection reads `/sys/class/net/<if>/device` for
+  a USB bus path, with gadget-name fallback: `_interface_ipv4s` uses
+  SIOCGIFCONF, which by construction can't see the interface we most
+  need to name — the one with no address yet.
+- **`bind_error` is now typed on the wire.** `apply_toggle`'s
+  per-step attribution (`acquire_wifi_locks` / `start_fgs` /
+  `listener bind`) is recorded in `_STATE` and returned by both
+  toggle RPCs, so a genuine failure names the failing step in the UI
+  instead of sending the user to a log.
+- **The settings line states the action** in the `tether_off` case:
+  "turn on USB tethering on the phone or tablet". We can't flip it
+  for the user — that needs a privileged Android permission the
+  suite deliberately doesn't ship — so naming it is the honest
+  maximum. `no_link` is phrased as a circumstance, not an error.
+- **Verdict leads every state, terse** (`v0.54.75 OK · …`), including
+  sharing-off, which 0.54.74 rendered as a blank line. So "a version
+  is showing" now means "the daemon answered", by construction, on
+  both platforms — answering Kent's question ("does any version mean
+  health came back OK?") with yes.
+- **No separate health probe on the poll.** The 5 s tick's own
+  `lan_toggle` reply IS the liveness evidence and carries the
+  version; a second `/v1/health` call would buy nothing.
+- **Nothing added to the off→on path.** Still one POST; the new
+  fields are a lock-read plus — only when there's no address to
+  report — one `os.listdir` on sysfs. The healthy case short-circuits
+  before that.
+- Fixes two 0.54.74 gaps found while answering the same question:
+  `_refresh_lan_state` (screen-open) and `set_lan_allow_sync`
+  (toggle) set only `on`/`endpoint`/`pid`, so `_lan_alive` fell back
+  to its True default and a dead daemon rendered as ordinary
+  sharing-off until the first tick; and both toggle wrappers now
+  decode through one shared helper, since a field added to one and
+  forgotten in the other is a known failure shape here.
+- The time-based "stuck after 30 s" guess added earlier in this
+  session survives **only** as the pre-0.54.75-daemon fallback (UI
+  and daemon are separate processes and can differ in version); when
+  the daemon classifies, timing isn't consulted.
+
+Daemon + client + UI → restart the daemon, relaunch the UI, rebuild
+peer APKs.
+
 ## 0.54.74 — pull diagnostics over the cable/LAN link; service health where you'd look for it
 
 Kent 2026-07-25: *"they normally don't have the server UI up at all.
