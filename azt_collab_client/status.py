@@ -274,6 +274,14 @@ PROJECT_NOT_INITIALISED = 'PROJECT_NOT_INITIALISED'
 PROJECT_UNBORN = 'PROJECT_UNBORN'
 PEER_UNKNOWN = 'PEER_UNKNOWN'
 
+# Diagnostics pull over the LAN/cable link (0.54.74) — see
+# azt_collabd/status.py for the per-code body.
+LAN_PULL_DONE = 'LAN_PULL_DONE'
+LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
+LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'
+LAN_PULL_FAILED = 'LAN_PULL_FAILED'
+LAN_RESTART_SENT = 'LAN_RESTART_SENT'
+
 # Nearby-pair flow — see azt_collabd/status.py for the per-code
 # rationale. Sender's outbound request lives 5 min then times out;
 # receiver Accept/Decline routes through the shared decisions

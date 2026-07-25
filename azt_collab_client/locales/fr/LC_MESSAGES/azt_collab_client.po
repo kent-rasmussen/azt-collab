@@ -238,6 +238,36 @@ msgstr "Vérifier la liaison par câble"
 msgid "Checking cable link…"
 msgstr "Vérification de la liaison par câble…"
 
+msgid "Checking the collaboration service…"
+msgstr "Vérification du service de collaboration…"
+
+msgid "Checking the service…"
+msgstr "Vérification du service…"
+
+msgid "Service OK"
+msgstr "Service en marche"
+
+msgid "Service OK (v{version})"
+msgstr "Service en marche (v{version})"
+
+msgid "Service not answering"
+msgstr "Le service ne répond pas"
+
+msgid "The link check did not finish — the service is running but busy. Try again in a moment."
+msgstr "La vérification de la liaison n’a pas abouti — le service fonctionne mais il est occupé. Réessayez dans un instant."
+
+msgid "Already restarted recently — use Restart server, then check again."
+msgstr "Déjà redémarré récemment — utilisez Redémarrer le serveur, puis vérifiez de nouveau."
+
+msgid "Restarting the collaboration service…"
+msgstr "Redémarrage du service de collaboration…"
+
+msgid "Could not restart the collaboration service: {error}"
+msgstr "Impossible de redémarrer le service de collaboration : {error}"
+
+msgid "Collaboration service not answering — use Restart server."
+msgstr "Le service de collaboration ne répond pas — utilisez Redémarrer le serveur."
+
 msgid "No local-network link found — plug in the cable and turn on USB tethering on the phone."
 msgstr "Aucune liaison réseau locale trouvée — branchez le câble et activez le partage par USB sur le téléphone."
 
@@ -1271,6 +1301,42 @@ msgstr "Impossible de mettre à jour le paramètre réseau local : {error}"
 
 msgid "Listening on {endpoint}"
 msgstr "À l'écoute sur {endpoint}"
+
+msgid "Get diagnostics from this device"
+msgstr "Récupérer les diagnostics de cet appareil"
+
+msgid "Collecting from {device}…"
+msgstr "Récupération depuis {device}…"
+
+msgid "that device"
+msgstr "cet appareil"
+
+msgid "Diagnostics collected."
+msgstr "Diagnostics récupérés."
+
+msgid "Could not collect diagnostics."
+msgstr "Impossible de récupérer les diagnostics."
+
+msgid "Restart their service and retry"
+msgstr "Redémarrer leur service et réessayer"
+
+msgid "Asking that device to restart its service…"
+msgstr "Demande à cet appareil de redémarrer son service…"
+
+msgid "Got the diagnostics from {device_name}."
+msgstr "Diagnostics récupérés depuis {device_name}."
+
+msgid "That device did not answer over the cable or local network. Check the cable link, then try again."
+msgstr "Cet appareil n’a pas répondu par câble ni par le réseau local. Vérifiez la liaison par câble, puis réessayez."
+
+msgid "That device would not share diagnostics: it no longer recognises this one as a paired device. Pair again by QR code, then retry."
+msgstr "Cet appareil a refusé de partager ses diagnostics : il ne reconnaît plus celui-ci comme appareil jumelé. Jumelez de nouveau par code QR, puis réessayez."
+
+msgid "Could not collect the diagnostics from that device. Try restarting its collaboration service, then retry."
+msgstr "Impossible de récupérer les diagnostics de cet appareil. Essayez de redémarrer son service de collaboration, puis réessayez."
+
+msgid "Asked that device to restart its collaboration service. Give it a few seconds, then retry."
+msgstr "Demande envoyée à cet appareil de redémarrer son service de collaboration. Attendez quelques secondes, puis réessayez."
 
 msgid "Local-network sharing is on — starting the listener… (no action needed)"
 msgstr "Partage sur le réseau local activé — démarrage de l'écoute… (aucune action requise)"

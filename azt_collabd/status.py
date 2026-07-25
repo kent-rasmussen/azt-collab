@@ -502,6 +502,28 @@ PROJECT_NOT_INITIALISED = 'PROJECT_NOT_INITIALISED'
 PROJECT_UNBORN = 'PROJECT_UNBORN'
 PEER_UNKNOWN = 'PEER_UNKNOWN'
 
+# Diagnostics pull over the LAN/cable link (0.54.74). A technician
+# pulls a paired peer's bundle WITHOUT opening that device's UI.
+# LAN_PULL_DONE:             Bundle landed locally. Params:
+#                            ``device_name``, ``bytes``.
+# LAN_PULL_PEER_UNREACHABLE: No answer over the link. Includes the
+#                            fully-dead-daemon case (no listener at
+#                            all) — remote restart can't help there;
+#                            desktop clients auto-respawn and
+#                            Android's provider contract lazy-spawns.
+# LAN_PULL_REFUSED:          Peer answered 403 — we aren't paired
+#                            with it (or the fp doesn't match its
+#                            record). Re-pair by QR.
+# LAN_PULL_FAILED:           Peer reached but staging / streaming /
+#                            local write failed.
+# LAN_RESTART_SENT:          Remote restart accepted; the peer's
+#                            daemon is going down and back up.
+LAN_PULL_DONE = 'LAN_PULL_DONE'
+LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
+LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'
+LAN_PULL_FAILED = 'LAN_PULL_FAILED'
+LAN_RESTART_SENT = 'LAN_RESTART_SENT'
+
 # Nearby-pair flow (request from an unpaired device discovered via
 # mDNS). The sender posts to the receiver's listener; the receiver
 # stashes a pending decision (kind=pair_request) and the user

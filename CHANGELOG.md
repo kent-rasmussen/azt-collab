@@ -9,6 +9,84 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.74 — pull diagnostics over the cable/LAN link; service health where you'd look for it
+
+Kent 2026-07-25: *"they normally don't have the server UI up at all.
+So it's booting that first, then whatever. Much better if we can
+trigger it from a peer: that allows me to leave them working, plug in
+the phone, take the log, and move on."* Collecting a log from someone
+else's working machine required opening THEIR collaboration UI —
+which in the field usually isn't even running. Now the operator plugs
+in, taps once on their own device, and walks away.
+Item: `agenda/pull_diagnostics_over_peer_link.md`.
+
+**Pull (not push).** Pairing — a prior QR gesture on the owner's
+device — is the consent boundary; the pull needs zero interaction on
+their side.
+
+- **New listener routes** (paired-peer authenticated via the new
+  `_paired_claimant` gate — stricter than the signalling routes,
+  which accept unpaired callers because pairing is what they
+  establish): `POST /v1/lan/diagnostics_pull` streams back this
+  device's standard bundle (snapshot + per-day daemon logs, one
+  `.tar.gz`, `X-AZT-Archive-Name`); `POST /v1/lan/restart_daemon`
+  restarts it.
+- **`server.stage_diagnostics_bundle()` extracted** from
+  `_h_prepare_share_bundle` so a pulled bundle is byte-for-byte the
+  artifact the owner's own Share button produces. **Takes no
+  `project_lock`** — load-bearing, since the point is getting logs
+  out of a *wedged* daemon.
+- **Operator side:** `POST /v1/lan/pull_diagnostics` +
+  `POST /v1/lan/restart_peer`, wrappers `lan_pull_diagnostics()` /
+  `lan_restart_peer()`, and a "Get diagnostics from this device"
+  affordance on Manage-paired-device (worker thread — the peer gzips
+  before the first byte; the 0.54.69 main-thread lesson). Pulled
+  bundles land at `.shares/<token>/` (the one path shape the Android
+  provider serves) tagged with the source device name, with a
+  `.keep` marker exempting them from the 1 h TTL sweep — field
+  evidence gets forwarded hours later, not immediately.
+- **Wedge recovery, remote.** A failed pull offers "Restart their
+  service and retry" (one retry, no restart loop — it's someone
+  else's machine). Reaches the **wedged-alive** class (listener
+  answers, workers stuck), which is the common field wedge; a fully
+  dead peer daemon has no listener and self-heals on the owner's
+  side instead (desktop auto-respawn / Android provider lazy-spawn).
+  Restart cost is low by design: jobs → typed `JOB_INTERRUPTED`,
+  transfers retried by the sender, uncommitted bytes
+  power-cut-contained, listener re-binds its previous port, backoff
+  curves survive.
+
+**Service health, surfaced where the question gets asked.** Field
+2026-07-25: "check data link" didn't respond, and Restart server
+fixed it — with no health readout anywhere in the UI.
+
+- **Cable check probes `/v1/health` FIRST** and leads every state
+  (waiting / result / didn't-answer) with a one-line verdict
+  ("Service OK (v…)" / "Service not answering"), instead of making
+  the user wait out a 20 s timeout for a bare failure.
+- **Auto-restart on the watchdog, evidence-gated.** Health answered
+  ⇒ "running but busy", don't kill (killing a 40 s merge restarts
+  its work from zero and can livelock a slow machine). Health silent
+  ⇒ restart once, rate-limited to one per 10 min, then re-check.
+  `/v1/health` is unauthenticated, lock-free, never raises (0.54.1),
+  and desktop serves it on its own thread — so a daemon wedged on
+  `project_lock` still answers, which is what makes it the right
+  discriminator.
+- **`lan_toggle` now returns `version` + `alive`.** `alive` is the
+  transport outcome: pre-0.54.74 a dead daemon and "LAN sync off"
+  decoded to the same `on: False` shape, so the settings LAN line
+  could show a confident stale "Listening on … · pid N" over a
+  service that had stopped answering. That line is polled every 5 s
+  on BOTH platforms (the only continuous health signal either has,
+  and on Android the endpoint is likewise a polled value), so it now
+  flips to "not answering" and carries `· v<version>` — which code
+  is serving RPCs *now*, as opposed to the startup-captured strip
+  from a different process.
+
+Daemon + client + UI → restart the daemon, relaunch the UI, rebuild
+peer APKs. Peers gain the affordance from the shared picker UI with
+no peer code change.
+
 ## 0.54.73 — trivial-merge signal: `merged_identical` on MERGED_WITH_LOCAL
 
 Kent 2026-07-25. Field: an OFFLINE computer (no wifi, no LAN, solo

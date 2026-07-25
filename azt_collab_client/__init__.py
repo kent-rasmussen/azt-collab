@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.73"
+__version__ = "0.54.74"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1066,6 +1066,90 @@ def lan_retry_peer(peer_id):
     return out if isinstance(out, dict) else {}
 
 
+def lan_pull_diagnostics(peer_id, timeout_s=180):
+    """Pull a PAIRED peer's diagnostics bundle over the cable / local
+    network and land it on THIS device (daemon 0.54.74+).
+
+    The field workflow this exists for: collecting a log from someone
+    else's working machine used to mean opening THEIR collaboration
+    UI (booting it first, interrupting their work). Here the operator
+    plugs in, taps once on their own device, and walks away with the
+    bundle — pairing was the owner's consent gesture, so their device
+    needs no interaction. Works while the peer's daemon is wedged
+    (the pull route takes no project lock).
+
+    Returns ``(Result, items)`` where *items* has the same shape
+    ``prepare_share_bundle`` returns — ``[{'display_name',
+    'uri_path'}]`` — so it can go straight to
+    ``ui.share.share_files`` for forwarding. Empty on failure.
+
+    Drive logic with codes: ``S.LAN_PULL_DONE`` (params
+    ``device_name``, ``bytes``), ``S.LAN_PULL_PEER_UNREACHABLE``
+    (no answer — includes a fully-dead peer daemon, which
+    ``lan_restart_peer`` cannot help),
+    ``S.LAN_PULL_REFUSED`` (peer no longer has us paired),
+    ``S.LAN_PULL_FAILED``. *timeout_s* is generous by default: a slow
+    field machine builds + gzips the bundle before the first response
+    byte. Never raises."""
+    if not peer_id:
+        return Result(statuses=[Status(
+            'PEER_UNKNOWN', {'peer_id': ''})]), []
+    try:
+        resp = call('POST', '/v1/lan/pull_diagnostics',
+                    {'peer_id': peer_id, 'timeout_s': timeout_s},
+                    timeout=max(60, int(timeout_s) + 60))
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})]), []
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR',
+            {'error': resp.get('error', 'unknown')})]), []
+    params = {'device_name': str(resp.get('device_name', '') or ''),
+              'bytes': int(resp.get('bytes', 0) or 0)}
+    statuses = [Status(str(c), dict(params))
+                for c in (resp.get('codes') or [])]
+    items = []
+    for entry in resp.get('items') or []:
+        items.append({
+            'display_name': str(entry.get('display_name') or ''),
+            'uri_path': str(entry.get('uri_path') or ''),
+        })
+    return Result(statuses=statuses), items
+
+
+def lan_restart_peer(peer_id):
+    """Ask a PAIRED peer's daemon to restart itself over the cable /
+    local network (daemon 0.54.74+) — wedge recovery without opening
+    that device's UI.
+
+    Reaches a peer whose listener still answers while its scheduler
+    threads are stuck (the common field wedge). A peer whose daemon
+    is fully DEAD has no listener to ask: expect
+    ``S.LAN_PULL_PEER_UNREACHABLE`` there — that case self-heals on
+    the owner's side instead (desktop clients auto-respawn the daemon
+    on their next call; Android's ContentProvider contract
+    lazy-spawns it).
+
+    Returns ``Result``; codes ``S.LAN_RESTART_SENT`` /
+    ``S.LAN_PULL_PEER_UNREACHABLE`` / ``S.LAN_PULL_REFUSED`` /
+    ``S.LAN_PULL_FAILED``. Never raises."""
+    if not peer_id:
+        return Result(statuses=[Status('PEER_UNKNOWN',
+                                       {'peer_id': ''})])
+    try:
+        resp = call('POST', '/v1/lan/restart_peer',
+                    {'peer_id': peer_id})
+    except ServerUnavailable as ex:
+        return Result(statuses=[Status(
+            'SERVER_UNAVAILABLE', {'error': str(ex)})])
+    if not resp.get('ok'):
+        return Result(statuses=[Status(
+            'SERVER_ERROR', {'error': resp.get('error', 'unknown')})])
+    return Result(statuses=[Status(str(c), {})
+                            for c in (resp.get('codes') or [])])
+
+
 def lan_pair_qr(endpoint='', langcode=''):
     """Return the JSON payload to render as a pairing QR. Empty
     dict on transport failure or if the daemon can't create the
@@ -1126,21 +1210,40 @@ def lan_pair_qr_close(langcode):
 def lan_toggle():
     """Read the daemon-wide LAN-sync toggle and the listener's
     bound endpoint. Returns ``{'on': bool, 'endpoint': 'ip:port',
-    'pid': int}`` — ``pid`` is the answering daemon's process id
-    (0 when unknown / pre-0.54.66 daemon), a double-daemon
-    diagnostic. On transport failure returns
-    ``{'on': False, 'endpoint': '', 'pid': 0}`` so peers offline can
-    still render their settings UI."""
+    'pid': int, 'version': str, 'alive': bool}``.
+
+    ``pid`` is the answering daemon's process id (0 when unknown /
+    pre-0.54.66 daemon), a double-daemon diagnostic. ``version`` is
+    the answering daemon's version ('' pre-0.54.74) — which code is
+    serving RPCs *right now*, as opposed to the version a UI captured
+    at startup.
+
+    ``alive`` (0.54.74) distinguishes **"the daemon says LAN sync is
+    off"** from **"the daemon never answered"** — both used to decode
+    to the same ``on: False`` shape, so a UI polling this could render
+    a confident "off"/stale-endpoint line over a dead service. Callers
+    rendering service state MUST branch on ``alive`` before believing
+    ``on``. It is a client-side field (transport outcome), never sent
+    on the wire.
+
+    On transport failure returns
+    ``{'on': False, 'endpoint': '', 'pid': 0, 'version': '',
+    'alive': False}`` so an offline peer can still render its
+    settings UI."""
     try:
         resp = call('GET', '/v1/lan/toggle')
     except ServerUnavailable:
-        return {'on': False, 'endpoint': '', 'pid': 0}
+        return {'on': False, 'endpoint': '', 'pid': 0,
+                'version': '', 'alive': False}
     if not resp.get('ok'):
-        return {'on': False, 'endpoint': '', 'pid': 0}
+        return {'on': False, 'endpoint': '', 'pid': 0,
+                'version': '', 'alive': False}
     return {
         'on': bool(resp.get('on')),
         'endpoint': str(resp.get('endpoint', '') or ''),
         'pid': int(resp.get('pid') or 0),
+        'version': str(resp.get('version', '') or ''),
+        'alive': True,
     }
 
 
@@ -3170,7 +3273,8 @@ __all__ = [
     'get_contributor', 'set_contributor',
     'get_device_name', 'set_device_name',
     'lan_peer_id', 'lan_list_peers', 'lan_peer_sync', 'lan_retry_peer',
-    'lan_cable_link', 'lan_pair_qr',
+    'lan_cable_link', 'lan_pull_diagnostics', 'lan_restart_peer',
+    'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',

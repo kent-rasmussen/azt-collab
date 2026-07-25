@@ -3402,6 +3402,8 @@ from azt_collab_client import (
     lan_adopt_origin, lan_resolve_conflict,
     # Daemon-wide toggle (hot-applied)
     lan_toggle, lan_set_toggle,
+    # Field support over the link (since 0.54.74)
+    lan_pull_diagnostics, lan_restart_peer,
 )
 ```
 
@@ -3436,6 +3438,47 @@ Field shapes worth knowing:
   Both are no-ops for an empty langcode (pair-only QR) and return
   ``bool``. This replaced the pre-0.52.26 single-use + 10-minute
   timer.
+- ``lan_toggle()`` → ``{on, endpoint, pid, version, alive}``.
+  **``alive`` (0.54.74) is the transport outcome, not a daemon
+  field:** ``False`` means the RPC never answered. Before 0.54.74 a
+  dead daemon and a daemon reporting "LAN sync off" decoded to the
+  same ``on: False`` shape, so any UI polling this could render a
+  confident off-state (or a stale ``endpoint``) over a service that
+  had stopped answering. **A peer that renders service state from
+  this MUST branch on ``alive`` first.** ``version`` is the
+  answering daemon's version — which code is serving RPCs *now*,
+  as opposed to a version captured at peer startup (different
+  process; goes stale across a respawn).
+- ``lan_pull_diagnostics(peer_id, timeout_s=180)`` →
+  ``(Result, items)``. Pulls a **paired** peer's diagnostics bundle
+  (snapshot + per-day daemon logs, one ``.tar.gz``) over the
+  cable/LAN link and lands it on THIS device; ``items`` matches
+  ``prepare_share_bundle``'s shape
+  (``[{display_name, uri_path}]``) so it can go straight to
+  ``ui.share.share_files`` for forwarding. Codes:
+  ``LAN_PULL_DONE`` (params ``device_name``, ``bytes``),
+  ``LAN_PULL_PEER_UNREACHABLE``, ``LAN_PULL_REFUSED`` (peer no
+  longer has us paired — re-pair by QR), ``LAN_PULL_FAILED``.
+  **Why it exists:** collecting a log from someone else's working
+  machine otherwise means opening THEIR collaboration UI — which
+  in the field is usually not even running — and interrupting
+  their work. Pairing was the owner's consent gesture, so the pull
+  needs no interaction on their device. The route takes no
+  ``project_lock``, so it still works while their daemon is wedged.
+  Call it off the main thread (the peer builds + gzips the bundle
+  before the first response byte).
+- ``lan_restart_peer(peer_id)`` → ``Result``
+  (``LAN_RESTART_SENT`` / ``LAN_PULL_PEER_UNREACHABLE`` /
+  ``LAN_PULL_REFUSED`` / ``LAN_PULL_FAILED``). Asks a paired
+  peer's daemon to restart itself — wedge recovery without opening
+  the owner's UI. Reaches a **wedged-alive** peer (its listener
+  answers while its worker threads are stuck), which is the common
+  field wedge; a fully dead peer daemon has no listener and returns
+  ``LAN_PULL_PEER_UNREACHABLE`` — that case self-heals on the
+  owner's side instead (desktop clients auto-respawn the daemon on
+  their next call; Android's ContentProvider contract lazy-spawns
+  it). Offer it as a user-visible retry step, never as an automatic
+  reaction to one failed pull: it's someone else's machine.
 - ``lan_pair_accept({payload})`` → ``Result`` carrying
   ``LAN_PAIRED`` + the recorded peer entry.
 - ``lan_clone(peer_id, langcode, remote_url='', vernlang='')``

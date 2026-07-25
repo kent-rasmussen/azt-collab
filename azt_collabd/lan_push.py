@@ -1335,12 +1335,15 @@ def _https_post_signalling(host, port, path, payload):
     return resp.status, resp.data
 
 
-def _https_post_to_peer(peer_id, path, payload):
+def _https_post_to_peer(peer_id, path, payload, force=False):
     """Generic best-effort HTTPS POST to a paired peer's LAN
     listener. Resolves the peer's endpoint via the standard
     mDNS→static→QR ladder, builds a TLS-pinned PoolManager, and
     submits the payload. Returns ``(status_code, body_bytes)`` on
-    success, ``(0, b'')`` on any failure (logged)."""
+    success, ``(0, b'')`` on any failure (logged). ``force=True``
+    bypasses the recently-unreachable fast-fail gate — for
+    user-gesture paths where the operator just changed the world
+    (plugged a cable in) and a stale gate reading must not win."""
     import json
     entry = _peers.get_peer(peer_id)
     if entry is None:
@@ -1352,7 +1355,7 @@ def _https_post_to_peer(peer_id, path, payload):
     # signalling POST (share_offer / hello / share_unshared) to a
     # peer that's currently unreachable would otherwise pay the
     # 5s connect timeout. Skip when we've seen them down recently.
-    if _recently_unreachable(peer_id):
+    if not force and _recently_unreachable(peer_id):
         return 0, b''
     endpoint = _resolve_endpoint(entry)
     if endpoint is None:
@@ -1396,6 +1399,118 @@ def _https_post_to_peer(peer_id, path, payload):
     if 200 <= resp.status < 300:
         _record_reachable(peer_id)
     return resp.status, resp.data
+
+
+def _identity_claim_payload():
+    """The standard body-auth identity block for outbound listener
+    POSTs (``peer_id`` + ``fp`` + ``device_name``) — the same claim
+    shape ``send_share_offer`` ships; receivers cross-check it
+    against their ``peers.json`` record. Returns ``None`` when the
+    local identity can't be established."""
+    try:
+        from . import peer_id as _peer_id_mod
+        ident = _peer_id_mod.ensure()
+    except Exception:
+        return None
+    from . import store as _store
+    return {
+        'peer_id': ident['peer_id'],
+        'fp': ident['fp'],
+        'device_name': _store.get_device_name(),
+    }
+
+
+def fetch_diagnostics_from_peer(peer_id, read_timeout_s=180):
+    """Pull a paired peer's diagnostics bundle over the LAN/cable
+    link (0.54.74). POSTs our identity claim to the peer's
+    ``/v1/lan/diagnostics_pull``; the peer stages its standard
+    share bundle (snapshot + per-day daemon logs, one tar.gz —
+    the same collection as its local Share-diagnostics button)
+    and streams the archive back.
+
+    User-gesture path: skips the recently-unreachable fast-fail
+    gate (the operator just plugged the cable in), and uses a
+    generous read timeout — a slow field machine builds + gzips
+    the bundle inline before the first response byte.
+
+    Returns ``(status_code, archive_name, data_bytes)``;
+    ``(0, '', b'')`` on transport failure (logged)."""
+    import json
+    entry = _peers.get_peer(peer_id)
+    if entry is None:
+        return 0, '', b''
+    expected_fp = entry.get('fp', '')
+    if not expected_fp:
+        return 0, '', b''
+    endpoint = _resolve_endpoint(entry)
+    if endpoint is None:
+        print(f'[lan-pull] no endpoint for {peer_id[:8]!r}',
+              file=sys.stderr, flush=True)
+        return 0, '', b''
+    host, port = endpoint
+    payload = _identity_claim_payload()
+    if payload is None:
+        return 0, '', b''
+    try:
+        ctx = _build_ssl_context(expected_fp)
+    except Exception as ex:
+        print(f'[lan-pull] context build failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 0, '', b''
+    try:
+        import urllib3
+        pm = urllib3.PoolManager(
+            ssl_context=ctx,
+            assert_hostname=False,
+            assert_fingerprint=expected_fp,
+            cert_reqs='CERT_NONE',
+        )
+    except Exception as ex:
+        print(f'[lan-pull] urllib3 pool manager failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 0, '', b''
+    url = f'https://{host}:{int(port)}/v1/lan/diagnostics_pull'
+    try:
+        resp = pm.request(
+            'POST', url,
+            body=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            timeout=urllib3.Timeout(connect=5,
+                                    read=float(read_timeout_s)),
+            retries=False,
+        )
+    except Exception as ex:
+        print(f'[lan-pull] POST {url} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        _record_unreachable(peer_id)
+        return 0, '', b''
+    if 200 <= resp.status < 300:
+        _record_reachable(peer_id)
+    try:
+        name = resp.headers.get('X-AZT-Archive-Name', '') or ''
+    except Exception:
+        name = ''
+    return resp.status, name, resp.data
+
+
+def send_restart_request(peer_id):
+    """Ask a paired peer's daemon to restart itself (0.54.74) — the
+    remote leg of wedge recovery
+    (agenda/pull_diagnostics_over_peer_link.md). Cooperative only:
+    reaches the wedged-ALIVE class, where the peer's listener
+    thread still serves while its scheduler threads are stuck on
+    ``project_lock``/network — the common field wedge. A fully
+    dead daemon has no listener; the per-platform self-heal covers
+    that case (desktop: the owner's client polls auto-respawn;
+    Android: the ContentProvider contract). User-gesture path —
+    bypasses the fast-fail gate. Returns the HTTPS status code
+    (0 on transport failure)."""
+    payload = _identity_claim_payload()
+    if payload is None:
+        return 0
+    status, _body = _https_post_to_peer(
+        peer_id, '/v1/lan/restart_daemon', payload, force=True)
+    return status
 
 
 def send_share_offer(peer_id, langcode, repo_url='', vernlang=''):

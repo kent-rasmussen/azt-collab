@@ -1191,6 +1191,133 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
     content.add_widget(endpoints_field)
     content.add_widget(save_endpoints_btn)
 
+    # Diagnostics pull (0.54.74). Field workflow: the operator is on
+    # SOMEONE ELSE'S machine, which normally has no collaboration UI
+    # open — booting it to press their Share-diagnostics button
+    # interrupts their work. Pulling collects the same bundle from
+    # here instead; pairing was their consent. Also carries the
+    # remote-restart escape hatch for a wedged peer daemon.
+    diag_status = Label(
+        text='', size_hint_y=None, height=dp(0), font_size=sp(11),
+        color=theme.TEXT_DIM, font_name=font_name, opacity=0)
+    diag_btn = Button(
+        text=_tr('Get diagnostics from this device'),
+        size_hint_y=None, height=dp(44),
+        font_size=sp(13), font_name=font_name)
+    content.add_widget(diag_btn)
+    content.add_widget(diag_status)
+    # Holder so a runtime-added affordance (the restart escape hatch)
+    # lands HERE, next to its status line — ``content.add_widget``
+    # at that point would append below Close.
+    diag_extra = BoxLayout(orientation='vertical', size_hint_y=None,
+                           height=dp(0), spacing=dp(4))
+    content.add_widget(diag_extra)
+
+    def _say(msg, height=dp(34)):
+        diag_status.text = msg
+        diag_status.height = height
+        diag_status.opacity = 1 if msg else 0
+
+    def _offer_share(items):
+        """Hand the landed bundle to the platform share sheet so it
+        can leave this device (email / messaging / file manager).
+        Single item → ``share_files`` routes it as ACTION_SEND, which
+        is the only shape some receivers accept for non-media."""
+        from .share import share_files
+        from ..diagnostics import DIAGNOSTICS_MIME
+        from ..transports.android_cp import CANONICAL_AUTHORITY
+        uri_items = [
+            {'uri': f'content://{CANONICAL_AUTHORITY}/'
+                    f'{it.get("uri_path", "")}',
+             'display_name': it.get('display_name', '')}
+            for it in items
+            if it.get('uri_path') and it.get('display_name')]
+        if not uri_items:
+            return
+        share_files(items=uri_items, mime_type=DIAGNOSTICS_MIME,
+                    on_error=lambda m: _say(m, dp(46)))
+
+    def _pull(_btn=None, allow_restart=True):
+        from .. import lan_pull_diagnostics, S
+        from ..translate import translate_result
+        diag_extra.clear_widgets()
+        diag_extra.height = dp(0)
+        diag_btn.disabled = True
+        _say(_tr('Collecting from {device}…').format(
+            device=peer.get('device_name') or _tr('that device')))
+
+        def _worker():
+            # Off the main thread: the peer builds + gzips its bundle
+            # inline before the first response byte, which on a slow
+            # field machine is many seconds. A main-thread RPC here
+            # would land as an OS "not responding" dialog (the
+            # 0.54.69 lesson).
+            result, items = lan_pull_diagnostics(pid)
+
+            def _land(_dt):
+                diag_btn.disabled = False
+                msg = translate_result(result)
+                if result.has(S.LAN_PULL_DONE):
+                    _say(msg or _tr('Diagnostics collected.'), dp(34))
+                    _offer_share(items)
+                    return
+                _say(msg or _tr('Could not collect diagnostics.'),
+                     dp(58))
+                # Wedge escape hatch: a peer whose listener answers
+                # but whose worker threads are stuck can be restarted
+                # from here — that is what the operator would
+                # otherwise have opened the owner's UI to do. Offered
+                # once per attempt, never automatic: a restart is
+                # cheap but it is still someone else's machine.
+                if (allow_restart
+                        and result.has_any(
+                            S.LAN_PULL_FAILED,
+                            S.LAN_PULL_PEER_UNREACHABLE)):
+                    _offer_restart()
+
+            Clock.schedule_once(_land, 0)
+
+        threading.Thread(target=_worker, daemon=True,
+                         name='lan-pull-diagnostics').start()
+
+    def _offer_restart():
+        diag_extra.clear_widgets()
+        diag_extra.height = dp(34)
+        restart_btn = _link_button(
+            _tr('Restart their service and retry'),
+            size_hint_y=None, height=dp(34), font_size=sp(12),
+            font_name=font_name)
+
+        def _do_restart(*_):
+            from .. import lan_restart_peer, S
+            from ..translate import translate_result
+            restart_btn.disabled = True
+            _say(_tr('Asking that device to restart its service…'))
+
+            def _worker():
+                res = lan_restart_peer(pid)
+
+                def _land(_dt):
+                    msg = translate_result(res)
+                    _say(msg or '', dp(58))
+                    if res.has(S.LAN_RESTART_SENT):
+                        # Give the peer time to come back up, then
+                        # retry once. No second restart offer — an
+                        # endless restart/retry loop on someone
+                        # else's machine is not acceptable.
+                        Clock.schedule_once(
+                            lambda _t: _pull(allow_restart=False), 8)
+
+                Clock.schedule_once(_land, 0)
+
+            threading.Thread(target=_worker, daemon=True,
+                             name='lan-restart-peer').start()
+
+        restart_btn.bind(on_release=_do_restart)
+        diag_extra.add_widget(restart_btn)
+
+    diag_btn.bind(on_release=lambda _b: _pull())
+
     # Unpair button.
     unpair_btn = Button(
         text=_tr('Forget this device'), size_hint_y=None, height=dp(44),

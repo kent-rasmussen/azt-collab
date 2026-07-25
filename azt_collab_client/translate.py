@@ -323,6 +323,22 @@ _HANDLERS = {
         'then try sharing again.'),
     S.PEER_UNKNOWN:           lambda p: _tr(
         'That phone is not paired with this one anymore.'),
+    # Diagnostics pull over the cable / local network (0.54.74).
+    S.LAN_PULL_DONE:          lambda p: _fmt(
+        _tr('Got the diagnostics from {device_name}.'), p),
+    S.LAN_PULL_PEER_UNREACHABLE: lambda p: _tr(
+        'That device did not answer over the cable or local '
+        'network. Check the cable link, then try again.'),
+    S.LAN_PULL_REFUSED:       lambda p: _tr(
+        'That device would not share diagnostics: it no longer '
+        'recognises this one as a paired device. Pair again by QR '
+        'code, then retry.'),
+    S.LAN_PULL_FAILED:        lambda p: _tr(
+        'Could not collect the diagnostics from that device. Try '
+        'restarting its collaboration service, then retry.'),
+    S.LAN_RESTART_SENT:       lambda p: _tr(
+        'Asked that device to restart its collaboration service. '
+        'Give it a few seconds, then retry.'),
     S.LAN_PAIR_REQUEST_PENDING: lambda p: _fmt(
         _tr('Waiting for {device_name} to accept the pair request…'),
         p),

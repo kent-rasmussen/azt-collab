@@ -474,6 +474,156 @@ def _h_lan_retry_peer(body):
     return 200, {"ok": True, "outcomes": outcomes}
 
 
+def _h_lan_pull_diagnostics(body):
+    """``POST /v1/lan/pull_diagnostics`` — pull a PAIRED peer's
+    diagnostics bundle over the LAN/cable link and land it locally
+    (0.54.74). The technician-side half of
+    ``lan_listener._handle_diagnostics_pull``.
+
+    Field driver (Kent 2026-07-25): collecting a log from someone
+    else's machine meant opening THEIR server UI and interrupting
+    their work. Now: plug in, tap once here, walk away. The bundle
+    lands under ``$AZT_HOME/.shares/pulled/<peer8>/`` so the caller
+    can forward it with the existing share affordances.
+
+    Body: ``{peer_id, timeout_s?}``. Returns
+    ``{ok: True, items: [{display_name, uri_path}], peer_id,
+    device_name, bytes}`` — ``items`` in the same shape
+    ``prepare_share_bundle`` returns, so the peer UI can hand it
+    straight to ``share_files``.
+
+    Typed failures: ``LAN_PULL_PEER_UNREACHABLE`` (no answer over
+    the link — includes the fully-dead-daemon case),
+    ``LAN_PULL_REFUSED`` (peer says we're not paired),
+    ``LAN_PULL_FAILED`` (peer reached but staging/streaming
+    failed)."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 400, {"ok": False, "error": "missing_peer_id"}
+    try:
+        timeout_s = float((body or {}).get('timeout_s') or 180)
+    except (TypeError, ValueError):
+        timeout_s = 180.0
+    entry = None
+    try:
+        entry = _peers.get_peer(peer_id)
+    except Exception:
+        entry = None
+    if entry is None:
+        return 404, {"ok": False, "error": "unknown_peer"}
+    device_name = str(entry.get('device_name', '') or '')
+    try:
+        from . import lan_push as _lan_push
+        status, archive_name, data = (
+            _lan_push.fetch_diagnostics_from_peer(
+                peer_id, read_timeout_s=timeout_s))
+    except Exception as ex:
+        print(f'[lan-pull] {peer_id[:8]!r} raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 200, {"ok": True, "codes": ["LAN_PULL_FAILED"],
+                     "items": [], "peer_id": peer_id,
+                     "device_name": device_name, "bytes": 0}
+    if status == 0:
+        return 200, {"ok": True,
+                     "codes": ["LAN_PULL_PEER_UNREACHABLE"],
+                     "items": [], "peer_id": peer_id,
+                     "device_name": device_name, "bytes": 0}
+    if status == 403:
+        return 200, {"ok": True, "codes": ["LAN_PULL_REFUSED"],
+                     "items": [], "peer_id": peer_id,
+                     "device_name": device_name, "bytes": 0}
+    if not (200 <= status < 300) or not data:
+        return 200, {"ok": True, "codes": ["LAN_PULL_FAILED"],
+                     "items": [], "peer_id": peer_id,
+                     "device_name": device_name, "bytes": 0}
+    # Land it under our own ``.shares/<token>/`` tree: that is the
+    # ONE path shape the Android provider serves
+    # (``android_cp.service._resolve_share_path`` — 3 segments, token
+    # regex, filename charset), so a pulled bundle can go straight
+    # into a share intent with no second staging concept. A ``.keep``
+    # marker exempts it from the 1 h TTL sweep — unlike a locally
+    # prepared bundle (staged for an immediate share sheet), a pulled
+    # one is field-collected evidence the operator may forward hours
+    # later, from a different room, off a different link.
+    import secrets
+    import re as _re
+    if not archive_name:
+        from azt_collab_client.diagnostics import (
+            diagnostics_archive_name)
+        archive_name = diagnostics_archive_name(
+            slug='', stamp=_time.strftime('%Y%m%d_%H%M%S'))
+    # Tag the file with WHOSE it is — a technician who pulls from
+    # several machines in a day otherwise gets a pile of
+    # same-shaped names. Sanitised to the provider's filename
+    # charset (device names carry spaces / accents in the field).
+    who = _re.sub(r'[^A-Za-z0-9._-]', '_',
+                  device_name or peer_id[:8])[:32].strip('_')
+    safe_name = os.path.basename(archive_name)
+    if who and not safe_name.startswith(who):
+        safe_name = f'{who}_{safe_name}'
+    safe_name = _re.sub(r'[^A-Za-z0-9._-]', '_', safe_name)[:128]
+    token = secrets.token_hex(16)
+    dest_dir = os.path.join(azt_home(), '.shares', token)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, safe_name)
+        tmp = f'{dest}.part'
+        with open(tmp, 'wb') as fh:
+            fh.write(data)
+        os.replace(tmp, dest)
+        with open(os.path.join(dest_dir, '.keep'), 'w') as fh:
+            fh.write(f'pulled from {peer_id}\n')
+    except OSError as ex:
+        print(f'[lan-pull] write raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 200, {"ok": True, "codes": ["LAN_PULL_FAILED"],
+                     "items": [], "peer_id": peer_id,
+                     "device_name": device_name, "bytes": 0}
+    print(f'[lan-pull] pulled {safe_name!r} ({len(data)} bytes) '
+          f'from {peer_id[:8]!r} ({device_name!r}) → {dest!r}',
+          file=sys.stderr, flush=True)
+    return 200, {
+        "ok": True, "codes": ["LAN_PULL_DONE"],
+        "peer_id": peer_id, "device_name": device_name,
+        "bytes": len(data), "token": token,
+        "items": [{"display_name": safe_name,
+                   "uri_path": f'_shares/{token}/{safe_name}'}],
+    }
+
+
+def _h_lan_restart_peer(body):
+    """``POST /v1/lan/restart_peer`` — ask a paired peer's daemon to
+    restart itself over the LAN/cable link (0.54.74). Wedge recovery
+    without opening the owner's UI.
+
+    Only reaches a wedged-ALIVE peer (its listener thread still
+    answers while scheduler threads are stuck) — the common field
+    wedge. Body: ``{peer_id}``. Returns
+    ``{ok: True, codes: [...]}`` with ``LAN_RESTART_SENT`` /
+    ``LAN_PULL_PEER_UNREACHABLE`` / ``LAN_PULL_REFUSED``."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 400, {"ok": False, "error": "missing_peer_id"}
+    try:
+        from . import lan_push as _lan_push
+        status = _lan_push.send_restart_request(peer_id)
+    except Exception as ex:
+        print(f'[lan-restart-peer] {peer_id[:8]!r} raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        status = 0
+    if status == 0:
+        codes = ["LAN_PULL_PEER_UNREACHABLE"]
+    elif status == 403:
+        codes = ["LAN_PULL_REFUSED"]
+    elif 200 <= status < 300:
+        codes = ["LAN_RESTART_SENT"]
+    else:
+        codes = ["LAN_PULL_FAILED"]
+    print(f'[lan-restart-peer] {peer_id[:8]!r} → status={status} '
+          f'codes={codes}', file=sys.stderr, flush=True)
+    return 200, {"ok": True, "codes": codes}
+
+
 def _h_lan_cable_link(_body):
     """'Check cable link' (desktop complement to the phone's tethering
     button): report this machine's local-link addresses and which
@@ -837,7 +987,15 @@ def _h_lan_get_toggle(_body):
     bound endpoint if running. Response:
     ``{ok: True, on: bool, endpoint: 'ip:port[, ip:port…]' or ''}`` —
     ``endpoint`` lists every interface address (0.54.48; see
-    ``_lan_endpoint_display``)."""
+    ``_lan_endpoint_display``).
+
+    ``version`` (0.54.74) carries the answering daemon's version so
+    the settings LAN line — polled every 5 s on both platforms — can
+    double as a live service-health readout. There is no other
+    health trigger in that UI, and this is exactly where a user
+    wonders whether the service is alive. The RPC answering AT ALL is
+    the health evidence; the version says WHICH code answered (the
+    startup version strip can be stale after a respawn)."""
     on = _settings.lan_allow_sync()
     endpoint = _lan_endpoint_display()
     # ``pid`` = THIS daemon process — the one that answered. Shown in
@@ -846,7 +1004,7 @@ def _h_lan_get_toggle(_body):
     # advisory there; a visible pid lets the user compare against
     # the process list / server.json at a glance). 0.54.66.
     return 200, {"ok": True, "on": on, "endpoint": endpoint,
-                 "pid": os.getpid()}
+                 "pid": os.getpid(), "version": _VERSION}
 
 
 def _h_lan_set_toggle(body):
@@ -4162,6 +4320,29 @@ def _h_prepare_share_bundle(_body):
     later. 1h is enough for plausible compose-and-send flows.
 
     Since 0.52.13."""
+    try:
+        staged = stage_diagnostics_bundle()
+    except OSError:
+        return 500, {"ok": False, "error": "share_write_failed"}
+    return 200, {"ok": True, "token": staged['token'],
+                 "items": staged['items']}
+
+
+def stage_diagnostics_bundle():
+    """Collect + stage one diagnostics archive; the shared body of
+    ``_h_prepare_share_bundle`` (local Share-diagnostics button) and
+    the LAN listener's ``/v1/lan/diagnostics_pull`` route (a paired
+    peer pulling over the cable/LAN link, 0.54.74). One collection
+    path so a pulled bundle is byte-for-byte the same artifact the
+    owner's own Share button would have produced.
+
+    **Takes no ``project_lock``** — logs + config + snapshot reads
+    only. Load-bearing: the prime use case is pulling FROM a wedged
+    daemon whose scheduler threads hold the project locks; the
+    listener thread can still serve this route.
+
+    Returns ``{'token', 'archive_path', 'archive_name', 'items'}``.
+    Raises ``OSError`` if the archive can't be written."""
     import secrets
     import shutil
     home = azt_home()
@@ -4181,6 +4362,13 @@ def _h_prepare_share_bundle(_body):
             except OSError:
                 continue
             if age > _SHARE_BUNDLE_TTL_S:
+                # ``.keep`` marks a bundle PULLED from a paired peer
+                # (0.54.74) — field-collected evidence the operator
+                # may forward hours later, unlike a locally staged
+                # bundle whose share sheet is already open. Never
+                # swept.
+                if os.path.exists(os.path.join(sub, '.keep')):
+                    continue
                 try:
                     shutil.rmtree(sub, ignore_errors=True)
                     print(f'[share-bundle] swept stale '
@@ -4248,7 +4436,7 @@ def _h_prepare_share_bundle(_body):
     except OSError as ex:
         print(f'[share-bundle] archive write raised: {ex!r}',
               file=sys.stderr, flush=True)
-        return 500, {"ok": False, "error": "share_write_failed"}
+        raise
     log_entries = max(0, written - (1 if snapshot else 0))
 
     items = [{
@@ -4267,7 +4455,8 @@ def _h_prepare_share_bundle(_body):
           f'logs:{log_entries} '
           f'size={archive_bytes}',
           file=sys.stderr, flush=True)
-    return 200, {"ok": True, "token": token, "items": items}
+    return {'token': token, 'archive_path': archive_path,
+            'archive_name': archive_name, 'items': items}
 
 
 def _h_append_log(body):
@@ -5016,6 +5205,10 @@ def dispatch(method, path, body):
             return _h_lan_burst(body)
         if path == '/v1/lan/retry_peer':
             return _h_lan_retry_peer(body)
+        if path == '/v1/lan/pull_diagnostics':
+            return _h_lan_pull_diagnostics(body)
+        if path == '/v1/lan/restart_peer':
+            return _h_lan_restart_peer(body)
         if path == '/v1/lan/cable_link':
             return _h_lan_cable_link(body)
         if path == '/v1/lan/static_endpoints':

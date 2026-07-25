@@ -1288,13 +1288,28 @@ class SettingsScreen(Screen):
                 on = bool(lan_state.get('on'))
                 ep = lan_state.get('endpoint', '') or ''
                 pid = int(lan_state.get('pid') or 0)
+                # ``alive`` = did the poll's RPC answer at all
+                # (0.54.74). This 5 s tick is the ONLY continuous
+                # health signal either platform has, and it runs on
+                # Android too — so a daemon that stops answering must
+                # flip the line to "not answering" instead of leaving
+                # a confident "Listening on …· pid N" standing over a
+                # dead service. Pre-0.54.74 clients omit the key;
+                # absent ⇒ treat as alive (old behaviour).
+                alive = lan_state.get('alive', True)
+                version = str(lan_state.get('version', '') or '')
                 if (on != bool(getattr(self, '_lan_enabled', False))
                         or ep != getattr(self, '_lan_endpoint', '')
                         or pid != int(getattr(self, '_lan_pid', 0)
-                                      or 0)):
+                                      or 0)
+                        or alive != getattr(self, '_lan_alive', True)
+                        or version != getattr(self, '_lan_version',
+                                              '')):
                     self._lan_enabled = on
                     self._lan_endpoint = ep
                     self._lan_pid = pid
+                    self._lan_alive = bool(alive)
+                    self._lan_version = version
                     self._refresh_lan_buttons()
                     self._refresh_lan_status()
             Clock.schedule_once(_land, 0)
@@ -2207,6 +2222,18 @@ class SettingsScreen(Screen):
             return
         enabled = bool(getattr(self, '_lan_enabled', False))
         endpoint = getattr(self, '_lan_endpoint', '') or ''
+        # Service health first (0.54.74). The 5 s board tick feeds
+        # ``_lan_alive`` from whether its ``lan_toggle`` RPC answered
+        # — the only continuous health signal in this UI, and the one
+        # that matters on Android where "Listening on …" is likewise
+        # a polled value. A silent daemon must SAY so here: the
+        # settings line is where a user looks to decide whether the
+        # service is alive, and a stale endpoint reads as "fine".
+        if not getattr(self, '_lan_alive', True):
+            label.text = _tr(
+                'Collaboration service not answering — use Restart '
+                'server.')
+            return
         if not enabled:
             label.text = ''
             return
@@ -2223,6 +2250,13 @@ class SettingsScreen(Screen):
             pid = int(getattr(self, '_lan_pid', 0) or 0)
             if pid:
                 text += f' · pid {pid}'
+            # Which code is actually serving RPCs right now — the
+            # startup version strip goes stale across a respawn, and
+            # the two live in different processes (a known field
+            # confusion). Locale-neutral, like the pid.
+            version = getattr(self, '_lan_version', '') or ''
+            if version:
+                text += f' · v{version}'
             label.text = text
         else:
             # Transient right after a daemon start: the setting is on
@@ -2302,18 +2336,103 @@ class SettingsScreen(Screen):
         A 20 s watchdog posts a terminal 'did not answer' so a blocked
         daemon can never strand the label on 'Checking…' (field
         2026-07-24); if the RPC does answer later, its real result
-        overwrites the watchdog text."""
-        self._lan_status(_tr('Checking cable link…'))
-        state = {'done': False}
+        overwrites the watchdog text.
+
+        **Health leads (0.54.74).** The check probes ``/v1/health``
+        FIRST and reports the verdict immediately, before the slower
+        link survey runs — this is the only health trigger in the
+        settings UI and the place a user wonders "is the service even
+        up?", so the answer shouldn't wait on a 20 s timeout. Health is
+        lock-free, never raises (0.54.1), unauthenticated, and served
+        on its own thread by ``ThreadingHTTPServer``, so a live daemon
+        answers it even while wedged on ``project_lock`` — which makes
+        it the right evidence for the restart decision below.
+
+        The watchdog then has a verdict in hand: health answered ⇒ the
+        service is up and merely busy, say so and DON'T kill it (a
+        restart would only restart its work from zero); health silent
+        ⇒ restart once (rate-limited to one per 10 min) and re-run the
+        check. Field 2026-07-25: the fix for a stranded check was the
+        user finding Restart server themselves."""
+        self._lan_status(_tr('Checking the collaboration service…'))
+        state = {'done': False, 'health': None, 'version': ''}
+
+        def _health_line():
+            """One short service verdict, prefixed to every state of
+            this flow (waiting, result, and did-not-answer alike)."""
+            if state['health'] is True:
+                v = state['version']
+                return (_tr('Service OK (v{version})').format(version=v)
+                        if v else _tr('Service OK'))
+            if state['health'] is False:
+                return _tr('Service not answering')
+            return _tr('Checking the service…')
+
+        def _probe_health():
+            alive, version = False, ''
+            try:
+                from azt_collab_client import check_server_compat
+                probe = check_server_compat() or {}
+                alive = (probe.get('error') != 'server_unreachable')
+                version = str(probe.get('server_version', '') or '')
+            except Exception:
+                alive = False
+            state['health'] = alive
+            state['version'] = version
+            Clock.schedule_once(
+                lambda _dt: self._lan_status(
+                    _health_line() + '\n'
+                    + _tr('Checking cable link…')), 0)
 
         def _watchdog(_dt):
-            if not state['done']:
-                self._lan_status(_tr(
-                    'The collaboration service did not answer — '
-                    'try again.'))
+            if state['done']:
+                return
+            if state['health'] is True:
+                self._lan_status(
+                    _health_line() + '\n' + _tr(
+                        'The link check did not finish — the service '
+                        'is running but busy. Try again in a moment.'))
+                return
+            # Health silent too: the service really is down. Restart it
+            # (once per 10 min) rather than making the user find the
+            # Restart button — that was the field workaround.
+            import time as _t
+            now = _t.monotonic()
+            last = getattr(self, '_last_auto_restart_at', 0.0)
+            if now - last < 600:
+                self._lan_status(
+                    _health_line() + '\n' + _tr(
+                        'Already restarted recently — use Restart '
+                        'server, then check again.'))
+                return
+            self._last_auto_restart_at = now
+            self._lan_status(
+                _health_line() + '\n' + _tr(
+                    'Restarting the collaboration service…'))
+
+            def _do_restart():
+                try:
+                    from azt_collab_client import (
+                        restart_server as _rs)
+                    _rs()
+                except Exception as ex:
+                    Clock.schedule_once(
+                        lambda _dt, e=ex: self._lan_status(_tr(
+                            'Could not restart the collaboration '
+                            'service: {error}').format(error=str(e))),
+                        0)
+                    return
+                # Let the fresh daemon bind, then re-run the check
+                # (which re-probes health and reports the new state).
+                Clock.schedule_once(
+                    lambda _dt: self._check_cable_link(), 6)
+
+            threading.Thread(target=_do_restart, daemon=True).start()
+
         Clock.schedule_once(_watchdog, 20)
 
         def _work():
+            _probe_health()
             try:
                 from azt_collab_client import lan_cable_link
                 info = lan_cable_link()
@@ -2361,6 +2480,10 @@ class SettingsScreen(Screen):
                 else:
                     text += '\n' + _tr('No other device reachable yet '
                                        '— is USB tethering on?')
+            # Health verdict leads the report too, not just the
+            # failure states: "is the service up?" is the first
+            # question, and this flow is the only place that asks it.
+            text = _health_line() + '\n' + text
             Clock.schedule_once(lambda _dt: self._lan_status(text), 0)
 
         threading.Thread(target=_work, daemon=True).start()

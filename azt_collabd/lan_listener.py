@@ -485,6 +485,151 @@ def _json_response(start_response, status_line, body_dict):
     return [body_bytes]
 
 
+def _paired_claimant(payload):
+    """Resolve the body-auth identity claim in *payload* to a PAIRED
+    peer record. Returns ``(peer_id, entry)`` or ``(None, None)``.
+
+    Stricter than the share/hello signalling handlers, which accept
+    unpaired callers because pairing is what they're establishing:
+    diagnostics-pull and remote-restart are privileged operations, so
+    the claimant must ALREADY be paired (a prior QR gesture on this
+    device — the consent boundary) and the claimed ``fp`` must match
+    the fingerprint we recorded for them. Same body-auth threat model
+    as the rest of the listener (identity asserted in the body under
+    encrypted-but-unauthenticated TLS; see ``_build_server``)."""
+    peer_id = str((payload or {}).get('peer_id', '') or '')
+    claimed_fp = str((payload or {}).get('fp', '') or '')
+    if len(peer_id) != 64 or len(claimed_fp) != 64:
+        return None, None
+    try:
+        entry = _peers.get_peer(peer_id)
+    except Exception as ex:
+        print(f'[lan-listener] peer lookup raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return None, None
+    if entry is None:
+        return None, None
+    if str(entry.get('fp', '') or '') != claimed_fp:
+        return None, None
+    return peer_id, entry
+
+
+def _handle_diagnostics_pull(environ, start_response):
+    """``POST /v1/lan/diagnostics_pull`` — serve this device's
+    diagnostics bundle to a PAIRED peer over the LAN/cable link
+    (0.54.74).
+
+    Why this route exists (field, Kent 2026-07-25): the standard
+    Share-diagnostics button needs the owner's server UI to be OPEN,
+    which in the field means booting their UI and interrupting their
+    work — on someone else's computer, with their tools. Pulling
+    inverts it: the technician plugs in, taps once on THEIR OWN
+    device, and walks away with the bundle. Pairing was the owner's
+    consent gesture; nothing here needs a second one.
+
+    Auth: paired-peer body claim (``_paired_claimant``). Response is
+    the raw ``.tar.gz`` with ``X-AZT-Archive-Name`` naming it — the
+    same artifact the owner's own Share button produces.
+
+    Deliberately lock-free (see ``server.stage_diagnostics_bundle``):
+    the point is to get logs OUT of a wedged daemon."""
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id, entry = _paired_claimant(payload)
+    if peer_id is None:
+        print('[lan-listener] diagnostics_pull refused: claimant '
+              'not paired (or fp mismatch)',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'not_paired'})
+    try:
+        from . import server as _server
+        staged = _server.stage_diagnostics_bundle()
+    except Exception as ex:
+        print(f'[lan-listener] diagnostics_pull staging raised: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+        return _json_response(start_response,
+                              '500 Internal Server Error',
+                              {'ok': False,
+                               'error': 'stage_failed'})
+    try:
+        with open(staged['archive_path'], 'rb') as fh:
+            data = fh.read()
+    except OSError as ex:
+        print(f'[lan-listener] diagnostics_pull read raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response,
+                              '500 Internal Server Error',
+                              {'ok': False, 'error': 'read_failed'})
+    from azt_collab_client.diagnostics import DIAGNOSTICS_MIME
+    start_response('200 OK', [
+        ('Content-Type', DIAGNOSTICS_MIME),
+        ('Content-Length', str(len(data))),
+        ('X-AZT-Archive-Name', staged['archive_name']),
+    ])
+    print(f'[lan-listener] diagnostics_pull served '
+          f'{staged["archive_name"]!r} ({len(data)} bytes) to '
+          f'{peer_id[:8]!r} ({entry.get("device_name", "")!r})',
+          file=sys.stderr, flush=True)
+    return [data]
+
+
+def _handle_restart_daemon(environ, start_response):
+    """``POST /v1/lan/restart_daemon`` — a paired peer asks this
+    daemon to restart itself (0.54.74). The remote leg of wedge
+    recovery: in the field the fix for a wedged daemon was opening
+    the owner's settings UI and tapping Restart server, which is
+    exactly the interruption the pull workflow exists to avoid.
+
+    Reaches the **wedged-alive** class only — this listener thread
+    responds while scheduler threads are stuck on ``project_lock`` /
+    network I/O, which is the common field wedge. A fully dead
+    daemon has no listener; desktop clients auto-respawn on their
+    next poll and Android's ContentProvider contract lazy-spawns,
+    so that case self-heals without us.
+
+    Restart cost is low by design (jobs → typed ``JOB_INTERRUPTED``
+    for peer retry, transfers retried by the sender, uncommitted
+    bytes power-cut-contained, listener re-binds its previous port,
+    backoff curves deliberately survive). Auth: paired-peer body
+    claim; the same suite-signature/pairing boundary that already
+    authorizes fetch + merge here."""
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer_id, entry = _paired_claimant(payload)
+    if peer_id is None:
+        print('[lan-listener] restart_daemon refused: claimant not '
+              'paired (or fp mismatch)',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'not_paired'})
+    print(f'[lan-listener] restart_daemon requested by '
+          f'{peer_id[:8]!r} ({entry.get("device_name", "")!r})',
+          file=sys.stderr, flush=True)
+
+    def _restart_after_response():
+        # Same shape as ``server._h_admin_restart``: let the response
+        # flush before the process goes away, then reuse that
+        # handler's platform-correct teardown (execv on desktop,
+        # os._exit under Android's :provider).
+        _time.sleep(0.5)
+        try:
+            from . import server as _server
+            _server._h_admin_restart({})
+        except Exception as ex:
+            print(f'[lan-listener] remote restart raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+
+    threading.Thread(target=_restart_after_response,
+                     name='lan-remote-restart', daemon=True).start()
+    return _json_response(start_response, '200 OK',
+                          {'ok': True, 'restarting': True})
+
+
 def _handle_share_offer_bodyauth(environ, start_response):
     """Body-auth variant of share_offer (TLS client auth disabled,
     see ``_build_server``). Reads the sender's ``peer_id`` from
@@ -1023,6 +1168,15 @@ def _peer_acl_middleware(app):
                 and path_info == '/v1/lan/cawl_fetch'):
             return _handle_cawl_fetch_bodyauth(
                 environ, start_response)
+        # Privileged paired-peer routes (0.54.74): unlike the
+        # signalling endpoints above, these require an ALREADY-paired
+        # claimant (``_paired_claimant``).
+        if (method == 'POST'
+                and path_info == '/v1/lan/diagnostics_pull'):
+            return _handle_diagnostics_pull(environ, start_response)
+        if (method == 'POST'
+                and path_info == '/v1/lan/restart_daemon'):
+            return _handle_restart_daemon(environ, start_response)
         # Non-signalling fallthrough: dulwich.web's git smart-
         # protocol app. URL-level ACL is handled at backend-build
         # time — ``_build_dict_backend`` only mounts projects that
