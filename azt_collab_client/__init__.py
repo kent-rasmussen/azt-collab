@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.81"
+__version__ = "0.54.85"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1331,6 +1331,15 @@ def lan_toggle():
     ``''`` from a pre-0.54.75 daemon — treat as "can't tell" and fall
     back to the endpoint-only rendering.
 
+    ``nearby`` (0.54.82) lists the devices discovery can currently
+    see — ``[{peer_id, device_name, endpoint, is_self}]`` — so a
+    polled settings line can answer "who can I see?" without the user
+    pressing anything. ``is_self`` marks our own advertisement heard
+    back on the same link (useful: it proves the advertisement is
+    visible), so label it rather than dropping it. Empty list from a
+    pre-0.54.82 daemon, which is indistinguishable from "nothing
+    seen" — acceptable, since both render the same.
+
     On transport failure returns
     ``{'on': False, 'endpoint': '', 'pid': 0, 'version': '',
     'alive': False}`` so an offline peer can still render its
@@ -1346,7 +1355,8 @@ def lan_toggle():
 
 def _lan_toggle_dead():
     return {'on': False, 'endpoint': '', 'pid': 0, 'version': '',
-            'alive': False, 'link_state': '', 'bind_error': ''}
+            'alive': False, 'link_state': '', 'bind_error': '',
+            'nearby': None}
 
 
 def _lan_toggle_decode(resp):
@@ -1360,6 +1370,13 @@ def _lan_toggle_decode(resp):
         'alive': True,
         'link_state': str(resp.get('link_state', '') or ''),
         'bind_error': str(resp.get('bind_error', '') or ''),
+        # None ≠ [] (0.54.83). A pre-0.54.82 daemon omits the key
+        # entirely; decoding that as an empty list made the UI claim
+        # "no other devices seen yet" when the truth was "this daemon
+        # can't tell us" — a false negative from version drift alone
+        # (field 2026-07-25, UI .82 against daemon .81).
+        'nearby': (list(resp['nearby'])
+                   if isinstance(resp.get('nearby'), list) else None),
     }
 
 

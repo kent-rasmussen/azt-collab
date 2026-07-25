@@ -1302,6 +1302,14 @@ class SettingsScreen(Screen):
                 # alive (old behaviour).
                 alive = lan_state.get('alive', True)
                 version = str(lan_state.get('version', '') or '')
+                nearby = list(lan_state.get('nearby') or [])
+                # Compare by content so a peer arriving or leaving
+                # re-renders, but a steady list doesn't repaint every
+                # 5 s (and can't clobber transient label text).
+                nearby_key = tuple(sorted(
+                    (str(p.get('endpoint', '')),
+                     str(p.get('device_name', '')),
+                     bool(p.get('is_self'))) for p in nearby))
                 # Consecutive ticks with sharing ON but no bound
                 # endpoint. The auto-bind lands within seconds
                 # (0.54.46), so ~6 ticks (30 s) of this is a real bind
@@ -1324,13 +1332,17 @@ class SettingsScreen(Screen):
                         # Crossing the 30 s boundary is itself a
                         # change worth re-rendering for.
                         or stuck != bool(getattr(self, '_lan_stuck',
-                                                 False))):
+                                                 False))
+                        or nearby_key != getattr(
+                            self, '_lan_nearby_key', None)):
                     self._lan_enabled = on
                     self._lan_endpoint = ep
                     self._lan_pid = pid
                     self._lan_alive = bool(alive)
                     self._lan_version = version
                     self._lan_stuck = stuck
+                    self._lan_nearby = nearby
+                    self._lan_nearby_key = nearby_key
                     self._refresh_lan_buttons()
                     self._refresh_lan_status()
             Clock.schedule_once(_land, 0)
@@ -2207,6 +2219,7 @@ class SettingsScreen(Screen):
         self._lan_version = str(applied.get('version', '') or '')
         self._lan_link_state = str(applied.get('link_state', '') or '')
         self._lan_bind_error = str(applied.get('bind_error', '') or '')
+        self._lan_nearby = list(applied.get('nearby') or [])
         # ``apply_toggle`` is SYNCHRONOUS (hot-applied invariant), so
         # if the reply to an explicit toggle-ON carries no endpoint,
         # the bind already had its chance and failed — an explicit
@@ -2254,6 +2267,7 @@ class SettingsScreen(Screen):
         self._lan_version = str(state.get('version', '') or '')
         self._lan_link_state = str(state.get('link_state', '') or '')
         self._lan_bind_error = str(state.get('bind_error', '') or '')
+        self._lan_nearby = list(state.get('nearby') or [])
         self._refresh_lan_buttons()
         self._refresh_lan_status()
 
@@ -2265,6 +2279,44 @@ class SettingsScreen(Screen):
             yes_btn.normal_color = theme.GREEN if enabled else theme.SURFACE
         if no_btn is not None:
             no_btn.normal_color = theme.SURFACE if enabled else theme.GREEN
+
+    def _nearby_block(self):
+        """The "Other servers:" block — the list, or ``none`` on the
+        same line. Shared by the polled LAN line and the Check-cable-
+        link report so the two can't drift (0.54.82) — the list used
+        to exist only in the button's output, which made "who can I
+        see?" a gesture rather than something the screen just tells
+        you. Returns '' or a newline-prefixed block.
+
+        **Self is excluded** (0.54.85). Discovery hears our own
+        advertisement back on the same link, and the tagged "(self)"
+        entry was the only content on a phone's list — uninteresting
+        next to the "Listening on …" line two rows above, which says
+        the same thing (Kent 2026-07-25). Cost of the exclusion: we
+        lose the tell that our own multicast is visible on the link;
+        judged not worth a line.
+
+        **No "yet"** (0.54.85): it promises a pending arrival the code
+        knows nothing about, and it turned up on a device that had
+        been syncing happily all day."""
+        peers = getattr(self, '_lan_nearby', None)
+        if peers is None:
+            # The daemon didn't say (pre-0.54.82, or an unreachable
+            # one). Say NOTHING rather than claiming an empty result —
+            # that turned version drift into a false negative (field
+            # 2026-07-25: UI .82 against daemon .81 reported no
+            # devices while four addresses were listening).
+            return ''
+        others = [p for p in peers if not p.get('is_self')]
+        if not others:
+            return '\n' + _tr('Other servers: none')
+        # One per line, address first — a comma-joined run of names
+        # read poorly (field 2026-07-24).
+        lines = [
+            p.get('endpoint', '') + ' — '
+            + (p.get('device_name') or p.get('peer_id', '')[:8])
+            for p in others]
+        return '\n' + _tr('Other servers:') + '\n' + '\n'.join(lines)
 
     def _refresh_lan_status(self):
         label = self.ids.get('lan_status_label')
@@ -2355,6 +2407,13 @@ class SettingsScreen(Screen):
             pid = int(getattr(self, '_lan_pid', 0) or 0)
             if pid:
                 text += f' · pid {pid}'
+            # Nearby block LAST (0.54.83). 0.54.82 appended it before
+            # the pid suffix, so the pid dangled off the end of the
+            # block's final line — "no other devices seen yet · pid
+            # 3330921" (field screenshot 2026-07-25). Everything that
+            # belongs to the first line has to be complete before the
+            # multi-line block starts.
+            text += self._nearby_block()
             label.text = text
         elif getattr(self, '_lan_stuck', False):
             # PRE-0.54.75 DAEMON FALLBACK ONLY (``link_state`` empty):
@@ -2411,9 +2470,14 @@ class SettingsScreen(Screen):
             return
         # Phone (tether host) opens the tethering settings; desktop
         # (tether client) checks that the cable link reached it.
+        # Desktop label names the ACTION only this button performs —
+        # re-arm discovery (0.54.82). The link state and the nearby
+        # list are on the polled LAN line now, so "Check cable link"
+        # over-promised: it read as the only way to learn whether the
+        # link was up.
         btn.text = (_tr('Open USB tethering settings')
                     if self._on_android()
-                    else _tr('Check cable link'))
+                    else _tr('Look for devices now'))
 
     def _lan_status(self, msg):
         label = self.ids.get('lan_status_label')
@@ -2589,22 +2653,11 @@ class SettingsScreen(Screen):
                 else:
                     text = _tr('This computer: {ifaces}').format(
                         ifaces=', '.join(ifaces))
-                if peers:
-                    # One server per line, address first — a
-                    # comma-joined run of names read poorly (field
-                    # 2026-07-24).
-                    lines = [
-                        p.get('endpoint', '') + ' — '
-                        + (p.get('device_name')
-                           or p.get('peer_id', '')[:8])
-                        + (' ' + _tr('(self)')
-                           if p.get('is_self') else '')
-                        for p in peers]
-                    text += ('\n' + _tr('Servers on other devices:')
-                             + '\n' + '\n'.join(lines))
-                else:
-                    text += '\n' + _tr('No other device reachable yet '
-                                       '— is USB tethering on?')
+                # Same renderer the polled line uses, fed by this
+                # survey's fresher list, so the button and the steady
+                # state can't disagree about who's visible (0.54.82).
+                self._lan_nearby = peers
+                text += self._nearby_block()
             # Health verdict leads the report too, not just the
             # failure states: "is the service up?" is the first
             # question, and this flow is the only place that asks it.

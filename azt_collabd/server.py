@@ -698,26 +698,7 @@ def _h_lan_cable_link(_body):
         listening = _lan_listener.bound_endpoints_all()
     except Exception:
         pass
-    peers_out = []
-    try:
-        from . import lan_discovery as _lan_discovery
-        from . import peer_id as _peer_id_mod
-        # The browser hears our OWN advertisement too (same link, by
-        # design — it proves the advertisement is actually visible).
-        # Tag it so the UI can label it "(self)" instead of passing it
-        # off as another device (field 2026-07-24: "the third one is
-        # the self, not another?").
-        my_pid = _peer_id_mod.peer_id_hex()
-        names = {p.get('peer_id', ''): p.get('device_name', '')
-                 for p in _peers.list_peers()}
-        for pid, (host, port) in _lan_discovery.known_endpoints().items():
-            peers_out.append({
-                'peer_id': pid,
-                'device_name': names.get(pid, ''),
-                'endpoint': f'{host}:{int(port)}',
-                'is_self': bool(my_pid) and pid == my_pid})
-    except Exception:
-        pass
+    peers_out = _nearby_devices()
     # Nudge in the BACKGROUND: restart_browse can block for seconds
     # (zeroconf teardown / NsdManager stalls) and start_burst's sweeps
     # dial peers with multi-second connect timeouts — running them
@@ -1011,25 +992,20 @@ def _lan_endpoint_display():
     host is routinely the wrong one (field 2026-07-23: a wifi-off
     desktop still reported its 192.x default-route IP while the phone
     was reachable only on the 10.x tether link). Showing all of them
-    lets the user see which subnet actually matches the peer."""
+    lets the user see which subnet actually matches the peer.
+
+    **No cap, and don't reintroduce one** (Kent 2026-07-25, explicit,
+    after I added and then removed one). A hidden "(+N more)" can be
+    hiding the very address the user needs to check — which is the
+    whole reason this list exists. Loopback is already excluded, so
+    every entry here is a real candidate. The line being long is not a
+    problem; a suppressed candidate is."""
     try:
         eps = _lan_listener.bound_endpoints_all()
     except Exception:
         eps = []
     if eps:
-        # Cap the human-facing line: a dev host with docker / libvirt /
-        # VPN bridges can enumerate a dozen+ addresses, which is noise
-        # here. bound_endpoints_all() is private-first sorted and a
-        # tether 10.x sorts ahead of 172.x/192.168.x, so the address
-        # that matters stays visible. The peer still receives the FULL
-        # candidate list via the pairing QR / discovery — this trim is
-        # display-only.
-        _CAP = 4
-        shown = eps[:_CAP]
-        line = ', '.join(shown)
-        if len(eps) > _CAP:
-            line += f' (+{len(eps) - _CAP} more)'
-        return line
+        return ', '.join(eps)
     bound = _lan_listener.bound_endpoint()
     if bound and bound[0] and bound[0] != '0.0.0.0':
         return f'{bound[0]}:{bound[1]}'
@@ -1062,6 +1038,42 @@ def _h_lan_get_toggle(_body):
                  **_lan_link_fields()}
 
 
+def _nearby_devices():
+    """Devices this daemon can currently see via discovery, as
+    ``[{peer_id, device_name, endpoint, is_self}]``. In-memory
+    endpoint dict + one ``peers.json`` read for the names — cheap
+    enough for the settings poll (0.54.82), which is why the same
+    list now rides the toggle response instead of being reachable
+    only through the Check-cable-link button.
+
+    The browser hears our OWN advertisement too (same link, by
+    design — it proves the advertisement is actually visible), so
+    ``is_self`` is tagged rather than filtered: the UI labels it
+    "(self)" instead of passing it off as another device (field
+    2026-07-24: "the third one is the self, not another?").
+
+    Never raises — an empty list means "nothing seen", which is a
+    legitimate answer."""
+    out = []
+    try:
+        from . import lan_discovery as _lan_discovery
+        from . import peer_id as _peer_id_mod
+        my_pid = _peer_id_mod.peer_id_hex()
+        names = {p.get('peer_id', ''): p.get('device_name', '')
+                 for p in _peers.list_peers()}
+        for pid, (host, port) in (
+                _lan_discovery.known_endpoints().items()):
+            out.append({
+                'peer_id': pid,
+                'device_name': names.get(pid, ''),
+                'endpoint': f'{host}:{int(port)}',
+                'is_self': bool(my_pid) and pid == my_pid})
+    except Exception as ex:
+        print(f'[server] nearby scan raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    return out
+
+
 def _lan_link_fields():
     """``link_state`` + ``bind_error`` for the toggle responses
     (0.54.75). An empty ``endpoint`` used to mean four different
@@ -1071,11 +1083,17 @@ def _lan_link_fields():
     ``lan_listener.link_state``."""
     try:
         return {"link_state": _lan_listener.link_state(),
-                "bind_error": _lan_listener.bind_error()}
+                "bind_error": _lan_listener.bind_error(),
+                # 0.54.82: the nearby list was reachable only through
+                # the Check-cable-link button, so "who can I see?"
+                # required a gesture. It rides the poll now — the
+                # button keeps only the action nothing else performs
+                # (re-arm discovery).
+                "nearby": _nearby_devices()}
     except Exception as ex:
         print(f'[server] link_state raised: {ex!r}',
               file=sys.stderr, flush=True)
-        return {"link_state": "", "bind_error": ""}
+        return {"link_state": "", "bind_error": "", "nearby": []}
 
 
 def _h_lan_set_toggle(body):

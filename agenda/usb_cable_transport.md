@@ -1,4 +1,72 @@
-# USB-cable transport: phone ↔ computer over a cable, same sync stack
+# USB-cable transport
+
+## The radio-power budget doesn't apply over a cable (2026-07-25)
+
+Kent, while setting up a wifi-off cable session: *"doesn't apply to
+USB connections."* Correct, and nothing in the code knows it. USB
+tethering runs over the gadget interface (`rndis0`/`ncm0`/`usb0`),
+not the wifi radio, so the entire justification for the LAN
+power-saving machinery — `WIFI_MODE_FULL_HIGH_PERF`, the
+MulticastLock, keeping the radio hot with the screen off — buys
+nothing on a cable. A tethered phone is usually charging from that
+same cable, so the battery argument is moot twice.
+
+Two places it surfaces, with different verdicts (both examined
+2026-07-25, neither changed):
+
+1. **`lan_backoff`'s power-of-two commit curve.** Gates only the
+   *discovery burst*, NOT delivery — `scheduler._run_commit` calls
+   `fan_out` on every commit regardless ("a lone worker still
+   attempts fan_out … but the radio-wakening burst is rare"). So
+   with sharing ON (continuous browse, endpoints known) the curve
+   costs nothing; it only matters in the sharing-OFF state where
+   bursts are the only discovery. **I initially claimed it delayed
+   delivery on commits 5/6/7 — wrong, corrected same session.** A
+   USB-aware bypass (`lan_listener._usb_net_ifaces()` gives the
+   signal) is therefore a narrow win: lifecycle gestures, the Sync
+   button, and 0.54.79's pull-retry already bypass the curve.
+2. **WifiLock + MulticastLock + FGS promotion in `apply_toggle`.**
+   Acquired whenever sharing goes up, USB-only or not — the
+   genuinely pointless work on a cable. NOT changed on purpose:
+   that lifecycle is where the field pain has been (0.45.25 re-arm,
+   the missing-NotificationCompat build that let Android reap
+   `:provider`), and conditional acquisition means getting
+   re-acquisition right when wifi later appears. Revisit only with
+   time to test the FGS path properly.
+
+Also note: `_recently_unreachable` (60 s) DOES gate delivery, on both
+platforms — but it exists to avoid paying a 5 s connect timeout per
+attempt against an absent peer, which is a thread/CPU concern rather
+than a radio one, so it's defensible on desktop too. User-gesture
+paths bypass it (including the 0.54.74 diagnostics pull).
+
+## Remove the LAN toggle (agreed direction, 2026-07-25)
+
+Kent: *"we'll try to remove the toggle later."* Groundwork from the
+same session, so the removal doesn't have to re-derive it:
+
+- **`lan.allow_sync` IS `lan.autodiscovery`** — one bit, the former
+  aliasing the latter since 0.50. It bundles two distinct things:
+  (a) run the TLS listener continuously (be reachable), and (b) run
+  mDNS advertise + browse continuously (find and be found).
+- **Off ⇒ unreachable, not just quiet.** `apply_toggle` computes
+  `desired = autodiscovery or burst_armed`, so with the toggle off
+  the listener is down except inside a 30 s burst window. Everything
+  inbound fails there: sync, clone, and (since 0.54.74) the
+  diagnostics pull, whose route lives on that listener. **The device
+  you pull FROM must have sharing on.**
+- **The toggle is not the "look for peers" control** — that's a
+  burst, fired by the Sync button, lifecycle events, a power-of-two
+  commit, and 0.54.79's pull retry. Bursts work with the toggle off;
+  what the toggle changes is whether you're listening between them.
+- **So the cost of leaving it ON is near zero** when wifi is off:
+  the wifi locks are meaningless with no radio, leaving an idle
+  listener thread and (Android) the FGS promotion. Which is the
+  argument for removing the toggle rather than teaching users when
+  to flip it.
+- Open question for the removal: what replaces it as the "I don't
+  want this device advertising" control — likely nothing, if pairing
+  is the real consent boundary (as it already is for the pull).: phone ↔ computer over a cable, same sync stack
 
 - **Scope & relationships:** azt-collab (daemon LAN stack, pairing,
   discovery). Sibling of, NOT the same as,

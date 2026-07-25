@@ -1329,6 +1329,15 @@ msgstr "câble connecté, mais aucune adresse — activez le partage de connexio
 msgid "no network address — turn on USB tethering or wifi"
 msgstr "aucune adresse réseau — activez le partage USB ou le wifi"
 
+msgid "Look for devices now"
+msgstr "Rechercher des appareils maintenant"
+
+msgid "Other servers:"
+msgstr "Autres serveurs :"
+
+msgid "Other servers: none"
+msgstr "Autres serveurs : aucun"
+
 msgid "link up — waiting for an address"
 msgstr "liaison établie — en attente d’une adresse"
 

@@ -9,6 +9,108 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.85 — "Other servers:" — self excluded, no "yet"
+
+Kent 2026-07-25, testing across four devices ("they're all up to date,
+or getting there"), two devices per condition:
+
+- **Self is no longer listed.** Discovery hears our own advertisement
+  back on the same link, so a phone's list contained exactly one
+  entry — itself — which says nothing the "Listening on …" line two
+  rows above doesn't. Self was tagged rather than filtered back when
+  the list only appeared in the cable-check report (0.54.24-era: "the
+  third one is the self, not another?"); as a permanent line item it's
+  noise. Cost: we lose the tell that our own multicast is visible on
+  the link. Judged not worth a line.
+- **"no other devices seen yet" → "Other servers: none"**, on one
+  line, per Kent's wording. "Yet" promises a pending arrival the code
+  knows nothing about, and it appeared on a device that had been
+  syncing happily all day. Populated case keeps the multi-line list
+  under an "Other servers:" header.
+
+UI strings → relaunch the UI.
+
+## 0.54.84 — no cap on the listening-address list (reverts 0.54.83's)
+
+Kent 2026-07-25: *"I wasn't asking for this. In fact, I don't want it.
+Not excited about the (+1 more); what if that's the one I need to
+check?"* I misread an observation as a request. He wasn't complaining
+about the list — he was pointing out that **four addresses proved the
+machine was certainly connected to something, while the line reported
+no connections at all**. The real bug there was the false "no other
+devices seen yet" (fixed in 0.54.83); the address list was the
+evidence, not the noise.
+
+- **`_lan_endpoint_display` no longer caps or elides.** Every bound
+  address, comma-joined. The 4→2 trim from 0.54.83 and the older
+  4-plus-"(+N more)" are both gone, and the docstring now says not to
+  reintroduce one: a suppressed candidate can be exactly the address
+  the user needs to check, which is the whole reason the list exists.
+  Loopback is already excluded, so every entry is a real candidate — a
+  long line is not a problem; a hidden one is.
+
+Daemon-side display → restart the daemon.
+
+## 0.54.83 — three fixes from one screenshot
+
+Kent ran 0.54.82's UI against an 0.54.81 daemon and photographed the
+result: `v0.54.81 OK · Listening on 10.117.95.168:34501,
+10.143.126.171:34501, 10.184.19.169:34501, 192.168.124.113:34501 (+1
+more)` / `no other devices seen yet · pid 3330921`. Three separate
+faults visible in two lines.
+
+- **A missing `nearby` field read as "nothing seen".** A pre-0.54.82
+  daemon omits the key; the wrapper decoded that to `[]` and the UI
+  announced no devices found — a false negative produced by version
+  drift alone, on a machine with four addresses listening. `nearby` is
+  now `None` when the daemon didn't say, and the renderer emits
+  nothing for `None` rather than a claim. (The two processes are
+  independently versioned; this is exactly the drift trap in the
+  client/server-version memory.)
+- **The pid dangled off the nearby block.** 0.54.82 appended the
+  multi-line block before the ` · pid N` suffix, so the pid landed at
+  the end of the block's last line. Everything belonging to the first
+  line is now complete before the block starts.
+- **Own-address list capped at 2, was 4.** A field host enumerates
+  VPN, docker, libvirt and tether addresses; four plus "(+1 more)" is
+  a wall of numbers the user can't act on (Kent: "any reason to see
+  this?"). Two still shows which subnet we're on, and since 0.54.82
+  the peers' own addresses are on the same screen — so
+  subnet-matching, the reason the full list existed (field
+  2026-07-23), no longer needs all of ours.
+
+UI + client + one daemon constant → restart the daemon, relaunch the
+UI. **Restarting the daemon matters here:** the nearby list only
+appears once the daemon is 0.54.82+.
+
+## 0.54.82 — "who can I see?" stops being a gesture
+
+Kent 2026-07-25: the health verdict, version and `Listening on …` were
+already polled, so the only thing the Check-cable-link button uniquely
+*told* you was the nearby-devices list — and that list is an in-memory
+dict plus one `peers.json` read. No reason for it to need a press.
+
+- **`nearby` rides the toggle response** (`_nearby_devices()`, shared
+  with the cable-link handler), so the settings LAN line shows the
+  same "Servers on other devices:" block continuously. No new RPC —
+  the 5 s tick already calls `lan_toggle`; cost is a dict copy and
+  one small file read.
+- **Full format kept, not a count** (Kent: "any reason not to keep
+  the current format?"). None — that label already renders multi-line
+  text, and a peer list is data rather than prose, so the 0.54.81
+  terseness rule doesn't apply. Empty reads "no other devices seen
+  yet", which is its own prompt to press the button.
+- **One renderer** (`_nearby_block`) for the polled line and the
+  button's report, so the two can't disagree about who's visible.
+  Re-renders on content change only, so a steady list neither
+  repaints every tick nor clobbers transient label text.
+- **Button relabelled "Look for devices now"** — it now names the one
+  action nothing else performs (re-arm discovery). "Check cable link"
+  read as the only way to learn whether the link was up, which is
+  exactly the dependency this removes.
+
+Daemon + client + UI → restart the daemon, relaunch the UI.
+
 ## 0.54.81 — status strings trimmed to phrases
 
 Kent 2026-07-25: *"enough with the dictionary attacks; people have to
