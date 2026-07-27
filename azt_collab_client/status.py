@@ -282,6 +282,10 @@ LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
 # Scanned a project-share QR, paired, but the owner refused the project
 # (its QR offer had lapsed) — see azt_collabd/status.py.
 LAN_SHARE_QR_EXPIRED = 'LAN_SHARE_QR_EXPIRED'
+# Every address we hold for the peer is on a network this device isn't
+# on (different wifi / hotspot) — see azt_collabd/status.py. Remedy is
+# "join the same network", not "retry".
+LAN_PEER_OTHER_NETWORK = 'LAN_PEER_OTHER_NETWORK'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

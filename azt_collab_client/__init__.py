@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.7"
+__version__ = "0.55.13"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -991,6 +991,15 @@ def lan_peer_sync():
         capped         — bool: to_send hit the cap (render 'N+'),
         incoming       — bool: the peer holds commits we don't
                          (count unknown by design),
+        incoming_known — bool: False when we have never observed this
+                         peer's tip for this project, so the
+                         ``incoming: False`` above means 'unknown',
+                         NOT 'verified nothing waiting'. Do not render
+                         a two-way-clean phrase ('up to date') unless
+                         this is True — ``to_send`` can be satisfied by
+                         an outbound delivery confirmation alone, and
+                         that same confirmation refreshes
+                         ``observed_at`` (0.55.11),
         incoming_held  — bool: when incoming, True = we already hold
                          their tip and just haven't merged it ('to
                          merge' — our own chore, data safe); False =

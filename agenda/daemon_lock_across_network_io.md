@@ -109,6 +109,42 @@ admin-restart mechanism, rate-limited, with a 90 s startup grace.
 `iface-watch` heartbeats at ~3 s (the most sensitive signal). Wired
 into `server.serve` AND `server_apk/service.py:main`.
 
+**First field catch, 2026-07-27 13:24 — detector fired, dump didn't
+(FIXED 0.55.12).** On the tablet:
+
+```
+[watchdog] STALL DETECTED (first detection): loop 'watcher' last ticked 120s ago
+[watchdog] threads=10 fds=277
+[watchdog] --- all thread stacks follow ---
+[watchdog] traceback dump failed: AttributeError("'ProcessingStream' object has no attribute 'fileno'")
+```
+
+`faulthandler.dump_traceback(file=…)` needs a real fd; Android's
+`sys.stderr` is Kivy's `ProcessingStream`. So the one platform where we
+have no shell access was also the one where the dump could never print.
+0.55.12 replaces it with `_dump_all_thread_stacks()` —
+`sys._current_frames()` + `traceback.format_stack`, printed line-by-line
+through the normal log path (which also gets it into the shared
+per-day log).
+
+**So this item's precondition is not yet met: there is still no stack
+dump to read.** It needs one stall on a build ≥ 0.55.12. Surrounding
+log context from that episode, for whenever the dump arrives:
+
+- 13:22:47 push to `8f19208f` → `[Errno 113] No route to host`;
+  sweep `0/2 delivered`.
+- 13:22:52 hello to `192.168.31.71:54154` → connect timeout (5 s);
+  13:22:58 share-offer to the same → connect timeout; sweep aborts
+  remaining projects (0.55.x unreachable-abort behaving as designed).
+- 13:24:01 stall detected — `watcher` last ticked 120 s ago, i.e. the
+  tick before ~13:22:00, straddling that run of 5 s connect timeouts.
+- 13:24:28 a post-receive reset for `nml` completes and the loop
+  resumes; so this episode self-cleared well inside `restart_s`.
+
+That timing is consistent with the hypothesis this item exists for —
+serialized network waits inside the watcher's critical section — but
+consistent-with is not evidence-of, and the dump is what would name it.
+
 **Answering "are all causes visible?" — no. Remaining blind spots:**
 
 - **No heartbeat** on the listener/serve loop, the advertise thread, or

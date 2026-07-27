@@ -9,6 +9,237 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.13 — reverse delivery was a mutual amplifier (regression, 0.55.10)
+
+**Fixes a regression I shipped in 0.55.10.** Its changelog claimed a
+match "costs one cheap debounced sweep". There was no debounce on that
+path. `sweep_peer`'s per-peer debounce covers only the bare-hello
+fallback; `_reverse_deliver_by_addr` always passes a langcode, which
+takes the unlimited `_push_to_peer` branch — so **every** git route hit,
+including every `info/refs` probe, spawned a thread that dialed the
+peer. Our dial made them serve us, their listener's reverse delivery
+dialed back, ours fired again.
+
+Field 2026-07-27, one tablet, ten seconds:
+
+```
+[lan-push] dialing '8f19208f' at 192.168.124.22:34501 for 'nml'   (×dozens)
+[lan-listener] reverse delivery: checking 'nml' for '8f19208f' …   (×dozens)
+[lan-push] '8f19208f' already at 'c63ce9251ae5' — no-op
+ssl.SSLEOFError: EOF occurred in violation of protocol (_ssl.c:2427)
+```
+
+~330 threads spawned (tids 12071 → 12397), every delivery a no-op, both
+sides SSL-EOFing as they drowned each other, `:provider` exhausted.
+
+- **Per-(peer, project) cooldown, 60 s**, checked before the thread is
+  spawned and stamped at **admission** so a slow delivery can't leave
+  the gate open behind it. Convergence needs one look per contact
+  burst, not one per HTTP request — the cooldown costs nothing real.
+- **Hard in-flight cap of 2**, with the slot released in `finally` and
+  on spawn failure. A limiter that can itself be defeated by a future
+  bug isn't a limiter; this one bounds the damage regardless.
+- The gate sits in `_reverse_deliver`, so both callers — identified
+  contact and the by-address heuristic — are covered.
+
+**The peer table disappearing after a reinstall** turned out to be a
+second, unrelated defect in the same family: `lan_peer_sync()` returns
+`[]` both for "the daemon says there are no peers" and for "I couldn't
+ask" (a query-shaped wrapper must never raise), and `_tick_peer_sync`
+rendered that ambiguity — wiping the entire table. Right after a
+reinstall the daemon process is precisely what's unavailable, so the
+board blanked. `lan_toggle` in the same tick *does* report unreachable,
+so it's now the liveness witness: **empty + daemon silent ⇒ hold the
+last good rows** and retry in 5 s; empty + daemon answering ⇒ genuinely
+no peers, render it. Nothing was lost — `peers.json` is written
+tempfile-plus-`os.replace`, and the display was the only casualty.
+
+Also: the **Retry** button's board refresh never ran. It called
+`self._tick_peer_sync(0)` — that method takes no argument, so it raised
+`TypeError` straight into a bare `except: pass` on every tap.
+
+## 0.55.12 — the watchdog's stack dump now actually prints
+
+First real stall the 0.54.90 watchdog caught in the field, 2026-07-27,
+and the diagnostic half failed:
+
+```
+[watchdog] STALL DETECTED (first detection): loop 'watcher' last ticked 120s ago
+[watchdog] threads=10 fds=277
+[watchdog] --- all thread stacks follow ---
+[watchdog] traceback dump failed: AttributeError("'ProcessingStream' object has no attribute 'fileno'")
+```
+
+`faulthandler.dump_traceback(file=…)` requires a real file descriptor.
+On Android `sys.stderr` is Kivy's `ProcessingStream`, which has none —
+so on the platform where we have the least access, the watchdog could
+detect a stall and never say what was stuck. It caught the thing it was
+built for and came back empty-handed.
+
+- **`_dump_all_thread_stacks()`** walks `sys._current_frames()` and
+  formats each thread's stack with `traceback.format_stack`, labelled
+  with the thread's name, printed one line at a time through the normal
+  log path. Pure Python, no fd required, works on both platforms and
+  survives a host swapping stderr for anything file-like.
+- **It lands in the shipped log.** Going through `print` puts the
+  stacks in the per-day daemon log that 'Share diagnostics' bundles; a
+  raw-fd write could have landed outside it. That matters precisely in
+  the remote-support case this was written for.
+- `faulthandler` is no longer imported.
+
+Still unexplained from that log: what the `watcher` loop was blocked on
+for 120 s. The next stall on a build with this fix will say — which is
+the input `agenda/daemon_lock_across_network_io.md` (#9, dated
+2026-07-28) has been waiting for.
+
+## 0.55.11 — "up to date" no longer covers for a question never asked
+
+**Corrects the explanation given in 0.55.10.** Kent challenged it —
+*"what, what? 'up to date' is not a claim that we have the peer's
+tip?"* — and he was right; I read `_peer_sync_row` instead of
+asserting from memory. The row does carry `incoming`, and the UI
+renders "up to date" only when there is neither `to_send` nor
+`incoming`. So it IS a two-way phrase. The 0.55.10 bullet claiming it
+is outbound-only is wrong; the reverse-delivery fix it shipped stands
+on its own merits.
+
+The actual defect is one line of default-value reasoning in
+`repo._peer_sync_row`:
+
+```python
+incoming = False
+if main_hex:            # only if we've ever recorded their tip
+```
+
+`incoming` is computed **only if we have ever observed the peer's
+tip**. With no observation it stays `False` — indistinguishable from
+"verified they hold nothing new". Meanwhile `to_send` is satisfied by
+`coverage = _held(main_hex) or _held(cov_hex)`, so a confirmed
+delivery of *ours* zeroes it without any look at *theirs*. Both
+setters bump the same per-project stamp (0.54.70). Result: **"up to
+date" with a fresh date, backed by no inbound evidence at all** —
+exactly the phone/tablet pair Kent was staring at.
+
+- **`incoming_known` on every row** (`repo._peer_sync_row`), the
+  inbound mirror of the existing `to_send_known`. False ⇒ never
+  observed their tip.
+- **The board stops claiming parity it can't back.** With nothing to
+  send and no tip observation, the row now reads **"nothing to send ·
+  theirs unknown"** instead of "up to date". Renderers must not print
+  a two-way-clean phrase without `incoming_known` — noted in the
+  client's `lan_peer_sync` docstring, which is what peers read.
+- **And it collects the missing observation.** `_merge_then_push`
+  already resolves the peer's `HEAD` from its own fetch result and
+  then threw it away, recording coverage only. It now calls
+  `set_peer_last_seen_main` at the point of resolution, so every
+  downstream branch — converged, fast-forward, we're-behind,
+  identical-trees, three-way — leaves a real tip observation behind.
+
+The unknown state should therefore be rare and self-clearing: one
+successful exchange in either direction fills it in. Where it persists,
+it is now saying something true and useful — *we have never managed to
+look at that device.*
+
+## 0.55.10 — serving a fetch now teaches us something
+
+Kent 2026-07-27: *"why does a phone say up to date with a current stamp,
+when the tablet it's talking about says 392 to send with a 7hrs old
+stamp? If the one is truly up to date, how can the other 1. have
+commits to share since their last exchange and 2. not have a more
+recent stamp?"*
+
+Both reports were honest, and the second half of the question is the
+bug. Two things were being conflated by the reader (including me,
+earlier):
+
+- **"Up to date" is outbound-only** — "nothing of MINE left to send
+  you". It is not a claim about what the peer holds, so it coexists
+  fine with the peer having 392 to send.
+- **A row's stamp advances only on that device's OWN ref-level
+  observation** (0.54.70). The git smart-protocol routes carry no peer
+  identity — no body, TLS is `CERT_NONE` — so **serving a peer's fetch
+  taught us nothing**: not who asked, not what refs they hold. The
+  tablet had been serving the phone's fetches for hours and could only
+  learn about the phone by dialing it, which is exactly the direction
+  that was failing. Hence a seven-hour-old number sitting beside a
+  fresh one, each correct about a different moment.
+
+- **`_reverse_deliver_by_addr`** identifies the fetcher by source
+  address against paired peers' known endpoints, and on a hit runs the
+  same look-and-deliver as identified contact, scoped to the project in
+  the URL: push what we owe, fetch what they have, refresh the
+  observation. The peer is demonstrably present at that instant; that
+  is the moment to look.
+- **Heuristic and powerless on purpose.** A match only triggers work we
+  would already do for that peer, grants no access and touches no
+  allowlist — so a wrong guess (NAT, shared host) costs one cheap
+  debounced sweep, not a permission. This closes the gap 0.55.5 left
+  open, where reverse delivery only fired on identified routes.
+
+Expected effect on the observed pair: the tablet's stale 392 resolves
+on the phone's next fetch — either to 0 (it had already arrived) or to a
+real, current count.
+
+## 0.55.9 — a matching remote already answers "is this the same project?"
+
+Field 2026-07-27, from one log line Kent kept pointing at:
+
+```
+[lan-listener] share-offer from '80570dd9' for 'nml':
+    remote_url matches local (same repo, different spelling); no-op
+```
+
+Three facts in it: that peer IS sharing `nml`; this device ALREADY has
+`nml`; and the two remotes are the same repo. So there was nothing to
+receive — yet every QR scan that evening went down the
+existing-project branch and burned itself on an ls-remote peek whose
+only purpose was to decide relatedness, a question the matching
+`remote_url` had already settled locally.
+
+- **`clone_from_peer` now short-circuits** when the project is present
+  and its stored `remote_url` wan-normalizes equal to the offer's URL:
+  record the peer as a sharer, return `LAN_PROJECT_REOPENED`, and dial
+  nothing. `_handle_share_offer` has treated a matching remote as proof
+  of the same repo all along (comparing normalized, so ssh and https
+  spellings count as equal per 0.54.11) — the clone path was asking the
+  network a question the registry could answer.
+
+Effect on the observed case: instant success instead of minutes of
+peeks that could fail for any of four unrelated reasons (peer asleep,
+different network, transient registry read on the owner, ghost working
+tree) — none of which have anything to do with whether the local
+project is the right one.
+
+Unchanged: when the URLs DON'T match, or either side has none, the peek
+still runs and 0.55.3's rule holds — a peek we couldn't complete never
+becomes a "different project" verdict.
+
+## 0.55.8 — "different network" is not "unreachable peer"
+
+An hour of 2026-07-27 went into telling these apart by hand. A computer
+correctly reported `Listening on 10.191.129.91:55870` — an address on a
+phone-hotspot subnet — while the phone had moved to `192.168.31.x`.
+Nothing was stale and nothing was lying; the two were simply on
+different networks. But the symptom was a bare "unreachable peer",
+identical to a peer that is asleep, wedged, or holding a dead address —
+and the remedies are opposite: **join the same network** versus
+**retry**.
+
+Hotspot subnets make this the normal case, not an exotic one: a hotspot
+exists only while its host shares it, everyone on it holds a 10.x
+lease, and a device that joins ordinary wifi instead silently loses
+every peer left behind.
+
+- **New `LAN_PEER_OTHER_NETWORK`**, raised when no address we hold for
+  the peer is on a subnet this device has an address on: "That device
+  is on a different wifi or hotspot from this one. Put both on the same
+  network, then try again."
+- **Annotation, never a gate.** A routed network can be reachable
+  off-subnet, so every candidate is still dialed; this only explains
+  the failure afterwards. /24 comparison is a heuristic and is treated
+  as one — `_no_shared_subnet` returns False whenever it can't
+  enumerate local addresses, so it never claims what it doesn't know.
+
 ## 0.55.7 — the pair-accept hello uses the address ladder, not just the QR
 
 Kent 2026-07-27, on a suggestion of mine to prefer mDNS over the QR:

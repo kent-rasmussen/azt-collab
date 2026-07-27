@@ -1270,7 +1270,8 @@ class SettingsScreen(Screen):
                 rows = lan_peer_sync() or []
                 current = (last_project() or '').strip()
             except Exception:
-                rows, current = [], ''
+                # None, NOT [] — see the hold-on-failure note below.
+                rows, current = None, ''
             # Piggyback: re-fetch the LAN toggle state so the status
             # line tracks daemon-side changes. The label otherwise
             # held whatever the screen opened with — the AUTO-bind
@@ -1287,8 +1288,26 @@ class SettingsScreen(Screen):
             except Exception:
                 lan_state = None
 
+            # Hold the board on a failed poll (0.55.13). ``rows == []``
+            # is ambiguous — the client wrapper returns [] both for
+            # "daemon says no peers" and for "couldn't ask", because a
+            # query-shaped wrapper must never raise. Rendering the
+            # ambiguous case wiped the whole table, which is what Kent
+            # saw after a reinstall: the daemon process was restarting,
+            # the poll came back empty, and the peer table simply
+            # disappeared — an absence of information displayed as
+            # information. ``lan_toggle`` in this same tick DOES report
+            # unreachable (None), so use it as the liveness witness:
+            # empty + daemon silent ⇒ hold the last good rows and try
+            # again in 5 s. Empty + daemon answering ⇒ genuinely no
+            # peers, render it.
+            rows_out = rows
+            if rows_out == [] and lan_state is None:
+                rows_out = None
+
             def _land(_dt):
-                self._render_peer_sync(rows, current)
+                if rows_out is not None:
+                    self._render_peer_sync(rows_out, current)
                 if lan_state is None:
                     return
                 on = bool(lan_state.get('on'))
@@ -1416,7 +1435,19 @@ class SettingsScreen(Screen):
                 parts.append(_tr('to merge'))
             else:
                 parts.append(_tr('incoming'))
-        base = ' · '.join(parts) if parts else _tr('up to date')
+        if parts:
+            base = ' · '.join(parts)
+        elif row.get('incoming_known', True):
+            base = _tr('up to date')
+        else:
+            # 'up to date' would be a two-way claim we can't back:
+            # nothing to send is established (our delivery was
+            # confirmed), but we have never observed their tip, so
+            # 'nothing incoming' is an absence of evidence. Field
+            # 2026-07-27: phone read 'up to date' with a fresh stamp
+            # while the tablet it named read '392 to send'. The stamp
+            # was refreshed by the outbound confirmation alone.
+            base = _tr('nothing to send · theirs unknown')
         # Strictly the per-project ref observation time — never the
         # peer-level "we talked" stamp (0.54.70).
         as_of = self._fmt_as_of(row.get('observed_at', ''))
@@ -1505,7 +1536,11 @@ class SettingsScreen(Screen):
                 # coverage, so the cached board re-reads with new
                 # counts / "(time)" suffixes.
                 try:
-                    self._tick_peer_sync(0)
+                    # No argument: this is not a Clock callback.
+                    # ``_tick_peer_sync(0)`` raised TypeError into the
+                    # bare except below, so the post-Retry refresh
+                    # silently never happened (0.55.13).
+                    self._tick_peer_sync()
                 except Exception:
                     pass
             Clock.schedule_once(_report, 0)

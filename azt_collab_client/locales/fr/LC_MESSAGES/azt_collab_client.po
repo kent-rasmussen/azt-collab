@@ -190,6 +190,9 @@ msgstr "Échec de la mise à jour : {detail}"
 msgid "up to date"
 msgstr "à jour"
 
+msgid "nothing to send · theirs unknown"
+msgstr "rien à envoyer · le leur inconnu"
+
 msgid "incoming"
 msgstr "en réception"
 
@@ -1340,6 +1343,9 @@ msgstr "Jumelé sur cet appareil, mais {device_name} n’a pas pu être contact�
 
 msgid "Paired with {device_name}, but it did not share {langcode} — its share QR had expired. Show the project’s QR again and keep it on screen while this phone copies."
 msgstr "Jumelé avec {device_name}, mais il n’a pas partagé {langcode} — son code QR de partage avait expiré. Affichez de nouveau le code QR du projet et laissez-le à l’écran pendant la copie."
+
+msgid "That device is on a different wifi or hotspot from this one. Put both on the same network, then try again."
+msgstr "Cet appareil est sur un wifi ou un point d’accès différent de celui-ci. Placez les deux sur le même réseau, puis réessayez."
 
 msgid "Contacting the other phone…"
 msgstr "Connexion à l’autre téléphone…"

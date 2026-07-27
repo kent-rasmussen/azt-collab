@@ -954,6 +954,22 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
                   f'fetch result; refs={list(peer_refs.keys())!r}',
                   file=sys.stderr, flush=True)
             return False
+        # A live ref-level observation of the peer's tip — record it
+        # HERE, once, so every downstream branch (converged / FF /
+        # we're-behind / identical-trees / three-way) leaves the board
+        # with a real ``last_seen_main``. Without this the only tip
+        # observations came from ``_peek_peer_main``; a delivery that
+        # reached the merge path recorded coverage only, which reads
+        # back as ``incoming_known=False`` — "nothing to send · theirs
+        # unknown" (0.55.11).
+        try:
+            _peers.set_peer_last_seen_main(
+                pid, project.langcode,
+                peer_head.decode('ascii', 'replace')
+                if isinstance(peer_head, bytes) else str(peer_head))
+        except Exception as ex:
+            print(f'[lan-merge] set_peer_last_seen_main {pid[:8]!r} '
+                  f'raised: {ex!r}', file=sys.stderr, flush=True)
         try:
             local_head = repo.refs[b'HEAD']
         except KeyError:

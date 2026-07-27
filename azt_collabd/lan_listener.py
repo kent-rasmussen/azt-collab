@@ -102,6 +102,18 @@ _STATE = {
 _QR_OFFER_KEEPALIVE_S = 30.0
 _pending_qr_offers = {}   # langcode (str) → last-heartbeat unix ts
 
+# Reverse-delivery gate (0.55.13). ``_reverse_deliver`` fires from the
+# git routes, which a fetching peer hits several times per exchange —
+# and each delivery dials the peer, whose own reverse delivery dials
+# back. Ungated (0.55.10–0.55.12) that is a mutual amplifier: ~330
+# threads in ~10 s and a dead ``:provider`` process, every delivery a
+# no-op. One look per contact burst is all convergence needs.
+_REVERSE_COOLDOWN_S = 60.0
+_REVERSE_MAX_INFLIGHT = 2
+_reverse_gate_lock = threading.Lock()
+_reverse_last_at = {}      # (peer_id, langcode) → admission unix ts
+_reverse_inflight = [0]    # one-slot list: mutable under the lock
+
 
 def record_qr_offered(langcode):
     """Heartbeat: the share QR for *langcode* is currently displayed.
@@ -666,6 +678,48 @@ def _note_inbound_endpoint(peer_id, environ, payload=None,
               file=sys.stderr, flush=True)
 
 
+def _reverse_deliver_by_addr(environ, path_info):
+    """Git-route counterpart of ``_reverse_deliver`` (0.55.10).
+
+    These routes are unauthenticated by design (URL-level ACL, no body
+    to claim identity in), so the ONLY signal about who is calling is
+    the source address. Match it against paired peers' known endpoints;
+    on a hit, treat it exactly like identified contact — look at that
+    peer's refs for the project they just asked about, push what we owe,
+    fetch what they have.
+
+    Why it matters: without this, serving a fetch taught us nothing, so
+    our record of a peer's refs went stale for as long as our own
+    dialing failed — producing two devices reporting confidently from
+    different hours (field 2026-07-27: "up to date" beside "392 to
+    send, 7 hrs old"). The peer is demonstrably present at this
+    instant; that is the moment to look.
+
+    Heuristic and deliberately powerless: a match only triggers work we
+    would do for that peer anyway. It grants no access and changes no
+    allowlist, so a wrong guess costs one cheap sweep, not a
+    permission."""
+    try:
+        host = str(environ.get('REMOTE_ADDR', '') or '').strip()
+        if not host:
+            return
+        norm = str(path_info or '').lstrip('/')
+        langcode = (norm.split('.git', 1)[0] if '.git' in norm
+                    else norm.split('/', 1)[0])
+        if not langcode:
+            return
+        for peer in (_peers.list_peers() or []):
+            for ep in (list(peer.get('endpoints') or [])
+                       + list(peer.get('static_endpoints') or [])):
+                if str(ep).rsplit(':', 1)[0] == host:
+                    _reverse_deliver(peer.get('peer_id', ''),
+                                     langcode=langcode)
+                    return
+    except Exception as ex:
+        print(f'[lan-listener] reverse-by-address raised: {ex!r}',
+              file=sys.stderr, flush=True)
+
+
 def _reverse_deliver(peer_id, langcode=''):
     """"Do I owe this peer anything?" — asked the moment they reach us
     (0.55.5). Scoped to *langcode* when the inbound request names one.
@@ -689,7 +743,41 @@ def _reverse_deliver(peer_id, langcode=''):
     ordinary sweep. Without one (a bare hello), fall back to
     ``sweep_peer``, which is debounced per peer and no-ops cheaply when
     they're already current. Either way on a thread, so a listener
-    response never waits on git."""
+    response never waits on git.
+
+    **Rate-limited per (peer, project), and capped in flight
+    (0.55.13).** 0.55.10 wired this to the git routes via
+    ``_reverse_deliver_by_addr`` with no limiter on the langcode-scoped
+    path — ``sweep_peer``'s per-peer debounce covers only the bare-hello
+    fallback. Every ``info/refs`` probe therefore spawned a thread that
+    dialed the peer; our dial made them serve us, their listener's
+    reverse delivery dialed back, and ours fired again. Field
+    2026-07-27: ~330 threads in ~10 s on one tablet, every delivery a
+    no-op (``already at 'c63ce9251ae5'``), both sides SSLEOFing, and the
+    ``:provider`` process dying of exhaustion — twice, on two devices.
+    Convergence needs ONE look per contact burst, not one per HTTP
+    request, so the cooldown costs nothing real."""
+    key = (str(peer_id or ''), str(langcode or ''))
+    now = _time.time()
+    with _reverse_gate_lock:
+        last = _reverse_last_at.get(key, 0.0)
+        if now - last < _REVERSE_COOLDOWN_S:
+            return
+        if _reverse_inflight[0] >= _REVERSE_MAX_INFLIGHT:
+            print(f'[lan-listener] reverse delivery for '
+                  f'{key[0][:8]!r} skipped — '
+                  f'{_reverse_inflight[0]} already in flight',
+                  file=sys.stderr, flush=True)
+            return
+        # Stamp at ADMISSION, not completion: a slow delivery must not
+        # leave the gate open for a burst behind it.
+        _reverse_last_at[key] = now
+        _reverse_inflight[0] += 1
+        if len(_reverse_last_at) > 512:
+            for k, t in list(_reverse_last_at.items()):
+                if now - t > _REVERSE_COOLDOWN_S * 10:
+                    _reverse_last_at.pop(k, None)
+
     def _work():
         try:
             from . import lan_push as _lan_push
@@ -711,10 +799,17 @@ def _reverse_deliver(peer_id, langcode=''):
             print(f'[lan-listener] reverse delivery for '
                   f'{peer_id[:8]!r} raised: {ex!r}',
                   file=sys.stderr, flush=True)
+        finally:
+            with _reverse_gate_lock:
+                _reverse_inflight[0] = max(0, _reverse_inflight[0] - 1)
     try:
         threading.Thread(target=_work, daemon=True,
                          name='lan-reverse-deliver').start()
     except Exception as ex:
+        # Never leak the slot the gate above reserved — a spawn failure
+        # would otherwise permanently shrink the in-flight budget.
+        with _reverse_gate_lock:
+            _reverse_inflight[0] = max(0, _reverse_inflight[0] - 1)
         print(f'[lan-listener] reverse delivery thread raised: '
               f'{ex!r}', file=sys.stderr, flush=True)
 
@@ -1483,6 +1578,20 @@ def _peer_acl_middleware(app):
         # and without it a serve of ``/X.git`` is unattributable in
         # the daemon log (field, 2026-07-17: could not tell which of
         # two paired machines fetched a project).
+        # Identify the fetcher by ARRIVAL ADDRESS and look at them in
+        # return (0.55.10). The git smart-protocol routes carry no
+        # identity — no body, and TLS is CERT_NONE — so a peer fetching
+        # from us taught us nothing, and our knowledge of THEIR refs
+        # could only advance when WE managed to dial THEM. Field
+        # 2026-07-27: a phone reporting "up to date" (fresh observation,
+        # it can reach the tablet) beside a tablet reporting "392 to
+        # send" stamped 7 h old — the tablet had served the phone's
+        # fetches all along and never got to look back. Matching
+        # REMOTE_ADDR against paired peers' endpoints is a heuristic
+        # (NAT, shared hosts), so it only ever triggers the same
+        # look-and-deliver we already do on identified contact; it
+        # grants nothing and changes no ACL.
+        _reverse_deliver_by_addr(environ, path_info)
         print(f'[lan-listener] {method} {path_info} from '
               f'{environ.get("REMOTE_ADDR", "?")}',
               file=sys.stderr, flush=True)

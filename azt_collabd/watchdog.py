@@ -12,8 +12,9 @@ culprit. Recovery was a human noticing and pressing Restart server.
 The two halves here are deliberately ordered **diagnose, then
 recover**, because a restart destroys the evidence:
 
-1. On the first sign of a stall, log one line plus
-   ``faulthandler.dump_traceback()`` — every thread's stack. That is
+1. On the first sign of a stall, log one line plus every thread's
+   stack (``_dump_all_thread_stacks``, via
+   ``sys._current_frames()``). That is
    what identifies the stuck code on a machine we don't have access
    to, and it is why the dump happens even when restarting is
    disabled.
@@ -53,7 +54,6 @@ Since 0.54.90.
 
 from __future__ import annotations
 
-import faulthandler
 import os
 import sys
 import threading
@@ -134,11 +134,48 @@ def _dump_state(reason, lines):
               file=sys.stderr, flush=True)
     except Exception:
         pass
+    _dump_all_thread_stacks()
+
+
+def _dump_all_thread_stacks():
+    """All-thread stacks via ``sys._current_frames()``, printed line by
+    line through the ordinary log path.
+
+    NOT ``faulthandler.dump_traceback`` (0.55.12). It needs a real file
+    descriptor, and on Android ``sys.stderr`` is Kivy's
+    ``ProcessingStream`` — field 2026-07-27, on the very first real
+    stall the watchdog caught: ``traceback dump failed:
+    AttributeError("'ProcessingStream' object has no attribute
+    'fileno'")``. The dump is the entire diagnostic value of the warn
+    stage, so it must not depend on the stream being an fd.
+
+    Going through ``print`` also puts the stacks in the per-day daemon
+    log, which is what 'Share diagnostics' ships — a raw-fd write could
+    land outside it. Pure-Python and stream-agnostic, so it works on
+    both platforms and on whatever a host has swapped stderr for."""
     try:
         print('[watchdog] --- all thread stacks follow ---',
               file=sys.stderr, flush=True)
-        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-        sys.stderr.flush()
+        import traceback as _tb
+        names = {}
+        try:
+            for t in threading.enumerate():
+                names[t.ident] = t.name
+        except Exception:
+            pass
+        frames = sys._current_frames()
+        for tid, frame in list(frames.items()):
+            label = names.get(tid, '?')
+            print(f'[watchdog] thread {tid} ({label}):',
+                  file=sys.stderr, flush=True)
+            try:
+                for line in _tb.format_stack(frame):
+                    for sub in line.rstrip().splitlines():
+                        print(f'[watchdog]   {sub}',
+                              file=sys.stderr, flush=True)
+            except Exception as ex:
+                print(f'[watchdog]   <stack unavailable: {ex!r}>',
+                      file=sys.stderr, flush=True)
         print('[watchdog] --- end thread stacks ---',
               file=sys.stderr, flush=True)
     except Exception as ex:

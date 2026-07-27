@@ -541,6 +541,23 @@ LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
 #                       before that the refusal was log-only on the
 #                       owner and the scanner saw nothing.
 LAN_SHARE_QR_EXPIRED = 'LAN_SHARE_QR_EXPIRED'
+# LAN_PEER_OTHER_NETWORK: every address we hold for the peer is on a
+#                       subnet this device has no address on — the two
+#                       are on different wifi / hotspots, so no dial
+#                       could ever have succeeded. Distinct from
+#                       LAN_PEER_UNREACHABLE (right network, no
+#                       answer: asleep, wedged, stale address), because
+#                       the remedy is different: join the same network,
+#                       don't retry. Common rather than exotic in the
+#                       field — hotspot subnets exist only while their
+#                       host shares them, and a device that joins
+#                       ordinary wifi instead silently loses every peer
+#                       left behind. Params: ``peer_id``, ``langcode``.
+#                       Since 0.55.8. Diagnostic, /24 heuristic: a
+#                       routed network can be reachable off-subnet, so
+#                       this is only ever raised AFTER every candidate
+#                       has actually been tried and failed.
+LAN_PEER_OTHER_NETWORK = 'LAN_PEER_OTHER_NETWORK'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

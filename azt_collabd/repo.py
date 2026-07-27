@@ -3132,8 +3132,19 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
     #     commit THEY made) and that we must still receive to be safe.
     # Whoever merges first produces a commit the other must fetch, so a
     # held/unmerged pair flips to not-held the instant the peer merges.
+    # ``incoming_known`` (0.55.11): have we EVER observed this peer's
+    # tip for this project? Without it, ``incoming=False`` was
+    # indistinguishable from "verified they hold nothing new" — so a row
+    # could render "up to date" on the strength of an outbound delivery
+    # alone (``coverage`` accepts ``cov_hex``), while the inbound
+    # question had never been asked. Both setters bump the row's stamp
+    # (0.54.70), so the date looked current too. Field 2026-07-27: a
+    # phone showing "up to date" with a fresh stamp beside a tablet
+    # showing "392 to send" — the phone had confirmed its own delivery
+    # and never peeked the tablet's main.
     incoming = False
     incoming_held = False
+    incoming_known = bool(main_hex)
     if main_hex:
         try:
             main_b = main_hex.encode('ascii')
@@ -3154,6 +3165,12 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         'to_send_known': to_send_known,
         'capped': capped,
         'incoming': incoming,
+        # False ⇒ we have never observed this peer's tip for this
+        # project, so ``incoming: False`` above means "don't know",
+        # NOT "verified nothing waiting". Mirrors ``to_send_known``
+        # on the outbound side; renderers must not print a
+        # two-way-clean phrase without it (0.55.11).
+        'incoming_known': incoming_known,
         # True ⇒ 'awaiting merge' (we hold their bytes, unmerged);
         # False + incoming ⇒ 'incoming' (data still only on the peer).
         'incoming_held': incoming_held,
@@ -3219,7 +3236,11 @@ def _compute_peer_sync_rows(count_limit=100000):
                           coverage commit for the peer) → UI shows '?',
         capped         — True if to_send hit the cap (show 'N+'),
         incoming       — True when the peer holds commits we don't
-                          (count unknown by design).
+                          (count unknown by design),
+        incoming_known — False when we have never observed this peer's
+                          tip, so ``incoming: False`` is "don't know",
+                          not "verified clean". Renderers must not
+                          print a two-way-clean phrase without it.
 
     Read-only, never raises (→ [] on failure), and fd-safe: every repo
     is opened inside ``_track_opened_repos`` and auto-closed at scope

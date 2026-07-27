@@ -543,6 +543,40 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
 
     existing = _projects.get(langcode)
     if existing is not None:
+        # SAME REMOTE ⇒ same repo, no network needed (0.55.9).
+        # ``_handle_share_offer`` already treats a matching remote_url
+        # as proof of the same project ("remote_url matches local (same
+        # repo, different spelling); no-op"), comparing wan-normalized
+        # so ssh and https spellings of one repo count as equal
+        # (0.54.11). The clone path asked the SAME question over the
+        # network instead — an ls-remote peek purely to decide
+        # relatedness — and every failure of that peek (timeout, 404,
+        # transient registry read on the owner) blocked an answer we
+        # already had locally. Field 2026-07-27: a whole evening of QR
+        # scans for a project this device already held, from the very
+        # repo the QR named, each one grinding through peeks to
+        # rediscover it.
+        incoming = str(incoming_url or '').strip()
+        local_url = str(getattr(existing, 'remote_url', '') or '').strip()
+        if incoming and local_url:
+            try:
+                from . import repo as _repo_mod
+                same = (_repo_mod.wan_url(local_url)
+                        == _repo_mod.wan_url(incoming))
+            except Exception:
+                same = (local_url == incoming)
+            if same:
+                print(f'[lan-clone] {langcode!r}: already here and '
+                      f'remote_url matches the offer ({local_url!r}) '
+                      f'— same repo, nothing to copy; skipping the '
+                      f'relatedness peek',
+                      file=sys.stderr, flush=True)
+                try:
+                    _peers.add_shared_project(peer_id, langcode)
+                except Exception:
+                    pass
+                result.add(_S.LAN_PROJECT_REOPENED, langcode=langcode)
+                return result
         # Compare via ls-remote — cheap. Try each candidate address
         # until one answers (the peer may only be routable on some).
         refs = None
@@ -581,8 +615,16 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
                   f'{len(candidates)} candidate address(es) — '
                   f'refusing to judge whether the local project is '
                   f'related', file=sys.stderr, flush=True)
-            result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
-                       langcode=langcode)
+            if _no_shared_subnet(candidates):
+                print(f'[lan-clone] {langcode!r}: none of the peer\'s '
+                      f'addresses is on a network this device has an '
+                      f'address on — different wifi / hotspot',
+                      file=sys.stderr, flush=True)
+                result.add(_S.LAN_PEER_OTHER_NETWORK, peer_id=peer_id,
+                           langcode=langcode)
+            else:
+                result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
+                           langcode=langcode)
             return result
         related = _shares_commits_with(refs, existing.working_dir)
         if not related:
