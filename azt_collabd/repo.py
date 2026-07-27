@@ -488,6 +488,115 @@ def _commits_between(repo, base_sha, tip_sha, limit=20):
     return out
 
 
+def changes_since(project_dir, base_sha, cap=2000, max_authors=12):
+    """What landed between *base_sha* and HEAD: how many commits, and
+    by whom. 0.54.92.
+
+    Exists because a collab-mode whole-file editor never touches
+    ``.git`` itself (hard rule #1) and so has no way to answer "what
+    changed under me?" — leaving its reload prompt unable to say why it
+    appeared, which makes a justified prompt indistinguishable from a
+    spurious one (AZT team, 2026-07-27). Base-relative by necessity:
+    the daemon can't infer the caller's base, so it's a parameter.
+
+    Returns ``{'known': bool, 'count': int, 'bot_count': int,
+    'capped': bool, 'authors': [str]}``:
+
+    - ``known`` is False when *base_sha* is empty or absent from the
+      repo (a re-clone, GC'd history). Distinguishes "we can't tell"
+      from "nothing changed" — the caller must not render the latter
+      for the former.
+    - ``count`` counts **human** commits only. Merge commits are
+      minted under ``merge_commit.bot_identity()``, so a raw total
+      reports the daemon's own merge activity as team changes — "5
+      commits" that are four bot merges plus one real edit is a lie,
+      and an all-merges range would claim changes from nobody. That is
+      exactly the empty-merge noise from the F8 arc (AZT team,
+      2026-07-27). ``count == 0`` with ``bot_count > 0`` means "HEAD
+      moved but nobody edited anything" — a reason NOT to prompt, not
+      a reason to prompt with a number.
+    - ``bot_count`` is those excluded merges, kept for diagnosis
+      (and for a caller that wants to explain a HEAD advance without
+      claiming team activity).
+    - ``authors`` are display names (the part before ``<email>``),
+      distinct, sorted, bot excluded to match ``count``. An author
+      named ``…[bot]`` counts as a bot even if the slug differs from
+      this daemon's, so a peer's differently-configured bot doesn't
+      leak in either.
+    - ``capped`` marks a walk that hit *cap*; the counts are then
+      floors, not exact. Bounded on purpose — this rides a 5–15 s
+      status poll, and a caller whose base is thousands of commits
+      back must not make the poll expensive.
+
+    Never raises."""
+    out = {'known': False, 'count': 0, 'bot_count': 0,
+           'capped': False, 'authors': []}
+    base = (base_sha or '').strip()
+    if not base:
+        return out
+    base_b = base.encode('ascii', 'replace') \
+        if not isinstance(base, bytes) else base
+    repo = _get_repo(project_dir)
+    if repo is None:
+        return out
+    try:
+        head = repo.refs[b'HEAD']
+    except Exception:
+        return out
+    try:
+        repo[base_b]
+    except Exception:
+        # Base not in this repo — say "unknown", never "zero".
+        return out
+    out['known'] = True
+    if _sha_str(head) == _sha_str(base_b):
+        return out
+    try:
+        bot_name = merge_commit.bot_identity().split('<')[0].strip()
+    except Exception:
+        bot_name = ''
+    names = set()
+    human = 0
+    bots = 0
+    walked = 0
+    try:
+        walker = repo.get_walker(include=[head], exclude=[base_b])
+        for entry in walker:
+            walked += 1
+            if walked > cap:
+                out['capped'] = True
+                break
+            try:
+                raw = entry.commit.author or b''
+                who = raw.decode('utf-8', 'replace').split('<')[0]
+                who = who.strip()
+            except Exception:
+                who = ''
+            # A bot is this daemon's own merge identity, or ANY author
+            # ending in '[bot]' — a peer configured with a different
+            # app_slug mints merges under its own bot name, and those
+            # are no more "team changes" than ours.
+            if who and (who == bot_name or who.endswith('[bot]')):
+                bots += 1
+                continue
+            human += 1
+            if who and len(names) < max_authors:
+                names.add(who)
+    except Exception as ex:
+        print(f'[changes-since] {project_dir!r} walk raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return out
+    out['count'] = human
+    out['bot_count'] = bots
+    out['authors'] = sorted(names)
+    if bots and not human:
+        print(f'[changes-since] {os.path.basename(project_dir)!r}: '
+              f'HEAD advanced by {bots} merge commit(s) with no human '
+              f'edits since {base[:12]!r} — not team activity',
+              file=sys.stderr, flush=True)
+    return out
+
+
 def _count_commits_ahead(repo, exclude_sha, head_sha, cap=100000):
     """Count commits reachable from *head_sha* but NOT *exclude_sha*,
     via a walker — no per-commit dict allocation (unlike

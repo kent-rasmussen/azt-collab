@@ -1335,6 +1335,9 @@ msgstr "Rechercher des appareils maintenant"
 msgid "applying…"
 msgstr "application…"
 
+msgid "Paired on this device, but {device_name} could not be reached to confirm it. Bring the devices onto the same network and try again."
+msgstr "Jumelé sur cet appareil, mais {device_name} n’a pas pu être contacté pour le confirmer. Placez les appareils sur le même réseau et réessayez."
+
 msgid "Other servers:"
 msgstr "Autres serveurs :"
 

@@ -1215,6 +1215,12 @@ class SettingsScreen(Screen):
         # screen, and polling ``last_project()`` per tick was
         # adding two RPCs and two log lines per second.
         self._cawl_cache_langcode = (last_project() or '').strip()
+        # Fresh screen entry re-arms the empty-index backoff and the
+        # change-only log signature (0.54.94), so re-entering Settings
+        # is the documented way to re-check a project whose index
+        # hadn't arrived yet.
+        self._cawl_empty_ticks = 0
+        self._cawl_status_sig = None
         self._tick_cawl_cache_status()  # immediate first read
         self._cawl_cache_event = Clock.schedule_interval(
             lambda _dt: self._tick_cawl_cache_status(), 1.0)
@@ -1564,18 +1570,48 @@ class SettingsScreen(Screen):
         # process boundary that drops the field. Will be removed
         # or rate-limited once the bug is found.
         import sys
-        print(f'[cache-status] (server-ui) cached={cached} '
-              f"total={total} offline={offline} "
-              f"circuit_open={circuit_open} "
-              f"last_source={status.get('last_source', '')!r} "
-              f"from_cache={status.get('from_cache', 0)} "
-              f"from_lan={status.get('from_lan', 0)} "
-              f"from_upstream={status.get('from_upstream', 0)} "
-              f"image_repo={status.get('image_repo', '')!r}",
-              file=sys.stderr, flush=True)
+        # Log on CHANGE only (0.54.94). This fired every second — the
+        # comment above always said "will be removed or rate-limited
+        # once the bug is found", and a 1 Hz line whose fields never
+        # change is pure noise (Kent 2026-07-27). Steady state is now
+        # silent; a transition still logs, which is all the
+        # triangulation ever needed.
+        _sig = (cached, total, offline, circuit_open,
+                status.get('last_source', ''),
+                status.get('from_cache', 0), status.get('from_lan', 0),
+                status.get('from_upstream', 0))
+        if _sig != getattr(self, '_cawl_status_sig', None):
+            self._cawl_status_sig = _sig
+            print(f'[cache-status] (server-ui) cached={cached} '
+                  f"total={total} offline={offline} "
+                  f"circuit_open={circuit_open} "
+                  f"last_source={status.get('last_source', '')!r} "
+                  f"from_cache={status.get('from_cache', 0)} "
+                  f"from_lan={status.get('from_lan', 0)} "
+                  f"from_upstream={status.get('from_upstream', 0)} "
+                  f"image_repo={status.get('image_repo', '')!r}",
+                  file=sys.stderr, flush=True)
         if total == 0:
+            # No index for this project. Pre-0.54.94 this hid the
+            # banner and RETURNED — never reaching the ``cached >=
+            # total`` stop below — so a project with no CAWL images
+            # polled at 1 Hz forever, each tick spawning a thread and
+            # an RPC to learn "still nothing", with nothing to display
+            # ever. Back off instead of stopping instantly, because
+            # total==0 can also mean "the index hasn't arrived yet"
+            # and a later arrival should still be picked up.
             self._hide_cawl_cache_banner(banner, label)
+            empties = int(getattr(self, '_cawl_empty_ticks', 0)) + 1
+            self._cawl_empty_ticks = empties
+            if empties >= 10:
+                print(f'[cache-status] (server-ui) no image index for '
+                      f'{self._cawl_cache_langcode!r} after {empties} '
+                      f'polls — stopping the cache poll; re-enter '
+                      f'Settings to re-check', file=sys.stderr,
+                      flush=True)
+                self._stop_cawl_cache_poll()
             return
+        self._cawl_empty_ticks = 0
         if cached >= total:
             # Cache is warm; stop polling.
             self._hide_cawl_cache_banner(banner, label)
@@ -2680,9 +2716,12 @@ class SettingsScreen(Screen):
             listening = info.get('listening') or []
             peers = info.get('peers') or []
             if not ifaces:
-                text = _tr('No local-network link found — plug in the '
-                           'cable and turn on USB tethering on the '
-                           'phone.')
+                # Same wording as the steady-state line's no-address
+                # case (0.55.0) — one msgid, and short. The old
+                # sentence survived 0.54.81's trim because it doesn't
+                # live in `_refresh_lan_status`.
+                text = _tr('no network address — turn on USB '
+                           'tethering or wifi')
             else:
                 # Line 1: OUR service state — "Listening on ip:port"
                 # (same vocabulary as the LAN-toggle line) when the
@@ -3167,7 +3206,17 @@ class SettingsScreen(Screen):
         project has ever been touched, hiding the publish row is the
         correct UX."""
         import sys
-        langcode = (last_project() or '').strip()
+        recent = last_project()
+        if recent is None:
+            # Couldn't ask — NOT "there is none" (0.54.95). Claiming
+            # the latter on an unreachable daemon told a user with two
+            # registered projects that they had none (field
+            # 2026-07-27).
+            print('[settings] last_project: unknown — the '
+                  'collaboration service did not answer',
+                  file=sys.stderr, flush=True)
+            return None
+        langcode = recent.strip()
         if not langcode:
             print('[settings] last_project: empty (no project '
                   'touched on this device yet)',

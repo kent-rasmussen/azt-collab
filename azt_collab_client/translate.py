@@ -323,6 +323,10 @@ _HANDLERS = {
         'then try sharing again.'),
     S.PEER_UNKNOWN:           lambda p: _tr(
         'That phone is not paired with this one anymore.'),
+    S.LAN_PAIR_UNCONFIRMED:   lambda p: _fmt(
+        _tr('Paired on this device, but {device_name} could not be '
+            'reached to confirm it. Bring the devices onto the same '
+            'network and try again.'), p),
     # Diagnostics pull over the cable / local network (0.54.74).
     S.LAN_PULL_DONE:          lambda p: _fmt(
         _tr('Got the diagnostics from {device_name}.'), p),

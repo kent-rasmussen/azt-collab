@@ -1378,7 +1378,21 @@ def _h_lan_pair_request_send(body):
         'peer_id': ident['peer_id'],
         'fp': ident['fp'],
         'device_name': store.get_device_name(),
-        'endpoint': _lan_push._our_endpoint_str(),
+        # Subnet-matched to the peer we're dialing (0.54.99), so an
+        # older receiver that reads only this single field still gets
+        # an address it can reach us on.
+        'endpoint': _lan_push._our_endpoint_for(host),
+        # ALL our addresses, not just the default-route guess
+        # (0.54.96). The QR path has advertised every interface since
+        # 0.54.35; this flow never got that fix, and it's the same bug:
+        # the accepter can only reply to what we send, so one wrong
+        # address means its hello-back AND its pair_response both fail
+        # — it records the pair, we never do, our request expires, and
+        # the button drops back to "Pair" while the phone shows paired
+        # (field 2026-07-27, reproduced on two multi-homed desktops:
+        # four tether subnets plus wifi, one advertised address).
+        # ``endpoint`` stays for pre-0.54.96 receivers.
+        'endpoints': _lan_listener.bound_endpoints_all(),
         'langcode': langcode,
     }
     status, _resp = _lan_push._https_post_signalling(
@@ -1431,32 +1445,85 @@ def _h_lan_pair_request_resolve(body):
     # use (per-pair auto-share when histories related) but not
     # acted on at pair time today — share is its own gesture.
     result = Result()
-    sender_host, sender_port = '', 0
+    # Reply candidates, best-proven first (0.54.96):
+    #   1. the address the request ARRIVED from, paired with the
+    #      advertised listener port — packets came from that host, so
+    #      it is proven reachable;
+    #   2. every address the sender advertised (0.54.96 senders);
+    #   3. the single legacy ``endpoint``.
+    # Pre-0.54.96 this used ONLY (3), so one wrong self-reported
+    # address on a multi-homed sender meant the hello-back and the
+    # pair_response both failed — the accepter recorded the pair, the
+    # requester never did, and the pairing was permanently one-sided
+    # (field 2026-07-27, two desktops).
+    reply_eps = []
+
+    def _add_ep(host, port):
+        if host and port:
+            cand = f'{host}:{int(port)}'
+            if cand not in reply_eps:
+                reply_eps.append(cand)
+
+    legacy_host, legacy_port = '', 0
     if endpoint:
         try:
-            sender_host, port_str = endpoint.rsplit(':', 1)
-            sender_port = int(port_str)
+            legacy_host, port_str = endpoint.rsplit(':', 1)
+            legacy_port = int(port_str)
         except (ValueError, TypeError):
-            sender_host, sender_port = '', 0
+            legacy_host, legacy_port = '', 0
+    from_addr = str(params.get('from_addr', '') or '')
+    if from_addr and legacy_port:
+        _add_ep(from_addr, legacy_port)
+    for ep in (params.get('endpoints') or []):
+        try:
+            h, p = str(ep).rsplit(':', 1)
+            _add_ep(h, int(p))
+        except (ValueError, TypeError):
+            continue
+    _add_ep(legacy_host, legacy_port)
+    sender_host, sender_port = ((reply_eps[0].rsplit(':', 1)[0],
+                                 int(reply_eps[0].rsplit(':', 1)[1]))
+                                if reply_eps else ('', 0))
     if accept:
         _peers.record_pair(peer_id, fp, device_name, endpoint)
-        # Hello-back: standard flow records the pair on the
-        # sender side. langcode='' here — we don't auto-share
-        # at pair time (per the architecture-discussion
-        # decision; explicit per-project share comes later).
-        # The mutual-share contract for the QR/share-offer
-        # paths handles auto-sharing in their own gestures.
-        if sender_host:
+        # Hello-back: this is what records the pair on the SENDER
+        # side, so its success is the difference between a mutual
+        # pairing and a one-sided one. Try every candidate until one
+        # connects, and report the outcome instead of claiming a clean
+        # accept regardless (langcode='' — share is its own gesture).
+        reached = ''
+        for cand in reply_eps:
             try:
-                _lan_push.hello_to_peer(
-                    sender_host, sender_port, fp,
-                    store.get_device_name(), langcode='')
+                h, p = cand.rsplit(':', 1)
+                if _lan_push.hello_to_peer(
+                        h, int(p), fp,
+                        store.get_device_name(), langcode=''):
+                    reached = cand
+                    break
             except Exception as ex:
                 print(f'[server] pair-accept hello-back to '
-                      f'{peer_id[:8]!r} raised: {ex!r}',
+                      f'{peer_id[:8]!r} via {cand!r} raised: {ex!r}',
                       file=sys.stderr, flush=True)
-        result.add(S.LAN_PAIR_REQUEST_ACCEPTED, peer_id=peer_id,
-                   device_name=device_name)
+        if reached:
+            print(f'[server] pair-accept: told {peer_id[:8]!r} via '
+                  f'{reached!r} (candidates={len(reply_eps)})',
+                  file=sys.stderr, flush=True)
+            try:
+                _peers.set_pair_confirmed(peer_id, True)
+            except Exception:
+                pass
+            result.add(S.LAN_PAIR_REQUEST_ACCEPTED, peer_id=peer_id,
+                       device_name=device_name)
+        else:
+            # Recorded here, unknown there. Say so — a silent
+            # one-sided pair is how the user ends up sharing projects
+            # with a device that will reject them.
+            print(f'[server] pair-accept: could NOT reach '
+                  f'{peer_id[:8]!r} on any of '
+                  f'{reply_eps!r} — pairing recorded locally only',
+                  file=sys.stderr, flush=True)
+            result.add(S.LAN_PAIR_UNCONFIRMED, peer_id=peer_id,
+                       device_name=device_name)
     else:
         result.add(S.LAN_PAIR_REQUEST_DECLINED, peer_id=peer_id)
     # Best-effort pair_response → sender's listener. Non-fatal;
@@ -1511,6 +1578,15 @@ def _h_lan_accept_offer(body):
             or decision.get('kind') != _pending.KIND_SHARE_OFFER):
         return 200, {"ok": False, "error": "not_found"}
     params = decision.get('params') or {}
+    # An accept supersedes any earlier decline for this (peer,
+    # project) — otherwise the 0.54.98 suppression would silently
+    # drop the very offers the user has now said yes to.
+    try:
+        _peers.clear_declined_share(
+            str(params.get('peer_id', '') or ''),
+            str(params.get('langcode', '') or ''))
+    except Exception:
+        pass
     result = _lan_clone_mod.clone_from_peer(
         str(params.get('peer_id', '') or ''),
         str(params.get('langcode', '') or ''),
@@ -1564,11 +1640,22 @@ def _h_lan_decline_offer(body):
         return 200, {"ok": False, "error": "not_found"}
     params = decision.get('params') or {}
     _pending.remove(decision_id)
+    offer_peer = str(params.get('peer_id', '') or '')
+    offer_lang = str(params.get('langcode', '') or '')
+    # Make the decline STICK (0.54.98). Removing the decision isn't
+    # enough: the inbound handler re-stashed on every offer, so the
+    # decline survived only if the nack below reached the sender —
+    # and the case where it can't (they reach us, we can't reach
+    # them) is exactly the case that keeps re-offering. Persist the
+    # refusal so re-arriving offers are dropped locally regardless.
+    try:
+        _peers.add_declined_share(offer_peer, offer_lang)
+    except Exception as ex:
+        print(f'[server] declined-share record raised: {ex!r}',
+              file=sys.stderr, flush=True)
     # Best-effort nack to the sender so their UI / log reflects it.
     try:
-        _lan_push.share_declined(
-            str(params.get('peer_id', '') or ''),
-            str(params.get('langcode', '') or ''))
+        _lan_push.share_declined(offer_peer, offer_lang)
     except Exception as ex:
         print(f'[server] share_declined nack raised: {ex!r}',
               file=sys.stderr, flush=True)
@@ -1754,6 +1841,13 @@ def _h_lan_send_share_offer(body):
     entry = _peers.add_shared_project(peer_id, langcode)
     if entry is None:
         return 200, {"ok": False, "error": "peer_unknown"}
+    # We're now offering this project to them, which supersedes any
+    # earlier refusal WE recorded from them for it (0.54.98) — the two
+    # users are evidently talking about this project again.
+    try:
+        _peers.clear_declined_share(peer_id, langcode)
+    except Exception:
+        pass
     # Look up our own remote_url + vernlang for this project so the
     # offer carries them. receiver uses repo_url for the always-
     # confirm adopt-origin prompt and vernlang to tag the LIFT
@@ -1829,6 +1923,16 @@ def _h_lan_unpair(body):
     removed = _peers.remove_peer(peer_id)
     if not removed:
         return 200, {"ok": False, "error": "peer_unknown"}
+    # Tombstone the revocation (0.54.97). The peer may still hold a
+    # record of us and keep saying hello; the hello handler records
+    # pairings for any caller, so without this the arrival-time heal
+    # would resurrect a pairing the user just removed. Cleared by a
+    # fresh pairing gesture.
+    try:
+        _peers.add_unpair_tombstone(peer_id)
+    except Exception as ex:
+        print(f'[server] unpair tombstone raised: {ex!r}',
+              file=sys.stderr, flush=True)
     result = Result()
     result.add(S.LAN_UNPAIRED, peer_id=peer_id)
     return 200, {"ok": True, "result": result.to_dict()}
@@ -3385,7 +3489,21 @@ def _h_project_sync(langcode, body):
                  "head_sha": repo_mod.head_sha_of(p.working_dir)}
 
 
-def _h_project_status(langcode, _body):
+def _changes_since_payload(project, since_sha):
+    """``repo.changes_since`` for the status response, or None when the
+    caller passed no base. None (rather than a zeroed dict) so a peer
+    can tell "didn't ask" from "asked, nothing changed"."""
+    if not since_sha:
+        return None
+    try:
+        return repo_mod.changes_since(project.working_dir, since_sha)
+    except Exception as ex:
+        print(f'[changes-since] payload raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _h_project_status(langcode, _body, since_sha=''):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
@@ -3640,6 +3758,16 @@ def _h_project_status(langcode, _body):
         # for desktop whole-file editors (see the computation above).
         # Pre-0.53.8 peers ignore the unknown key.
         "lift_blob_sha": lift_blob_sha,
+        # What landed between the CALLER's base and HEAD: count +
+        # distinct author display names (0.54.92). Only present when
+        # the caller supplied a base (``/status/<base_sha>``) —
+        # base-relative by necessity, since the daemon can't infer it.
+        # A collab-mode whole-file editor never touches .git itself, so
+        # this is its only route to "who changed what", and without it
+        # a reload prompt can't say why it appeared. See
+        # ``repo.changes_since`` for the ``known`` / ``capped``
+        # semantics.
+        "changes_since": _changes_since_payload(p, since_sha),
         # Foreign-device topic-branch orphan count (since 0.50.15,
         # audit finding #3). Number of
         # ``refs/remotes/origin/azt-pending-*`` refs whose
@@ -5389,6 +5517,14 @@ def dispatch(method, path, body):
                 return _h_get_project(parts[3], body)
             if len(parts) == 5 and parts[4] == 'status':
                 return _h_project_status(parts[3], body)
+            # ``/status/<base_sha>`` — same payload plus
+            # ``changes_since`` relative to the caller's base
+            # (0.54.92). A path segment rather than a query string:
+            # this dispatcher matches on exact segments, so ``?since=``
+            # would land inside ``parts[4]`` and miss the route.
+            if len(parts) == 6 and parts[4] == 'status' and parts[5]:
+                return _h_project_status(parts[3], body,
+                                         since_sha=parts[5])
             if len(parts) == 6 and parts[4] == 'cawl' \
                     and parts[5] == 'index':
                 return _h_cawl_index(parts[3], body)

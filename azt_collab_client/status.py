@@ -276,6 +276,9 @@ PEER_UNKNOWN = 'PEER_UNKNOWN'
 
 # Diagnostics pull over the LAN/cable link (0.54.74) — see
 # azt_collabd/status.py for the per-code body.
+# Accepted a pair request but couldn't tell the other device — see
+# azt_collabd/status.py for the per-code body.
+LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

@@ -80,6 +80,17 @@ class LoopbackTransport(Transport):
                 outcome = ''
                 if attempt < _MAX_ATTEMPTS - 1:
                     outcome = self._spawn_server()
+                if outcome == 'wedged':
+                    # A daemon is running and not answering. Retrying
+                    # can't help and neither can spawning; fail with a
+                    # message that names the actual remedy instead of
+                    # "start the service", which is wrong and sends the
+                    # user to start a second one.
+                    raise ServerUnavailable(
+                        'the collaboration service is running but not '
+                        'responding — restart it (Restart server in '
+                        'settings, or kill the pid in '
+                        f'{server_info_path()})')
                 if outcome:
                     if saw_first_attempt and outcome == 'spawned':
                         print('[azt_collab_client] SERVICE_RESTARTED '
@@ -200,11 +211,35 @@ class LoopbackTransport(Transport):
         if not self._autospawn_enabled():
             return ''
         with self._spawn_lock:
+            info = None
             try:
-                if self._server_alive(self._read_server_info()):
+                info = self._read_server_info()
+                if self._server_alive(info):
                     return 'alive'
             except ServerUnavailable:
                 pass
+            # ALIVE BUT NOT ANSWERING (0.54.95). ``_server_alive``
+            # returns False for a health TIMEOUT as well as for a dead
+            # process, and the next thing this function does is delete
+            # ``server.json`` — so a wedged daemon got its discovery
+            # file removed, the replacement exited on the still-held
+            # ``server.lock``, and from then on every client reported
+            # "server.json not found. Start the service" while the real
+            # daemon was still running and holding the lock. The
+            # 2026-07-10 fix covered the answered-non-200 case
+            # (HTTPError → alive); a timeout took the destructive path.
+            #
+            # If the recorded pid is alive, there IS a daemon: don't
+            # delete its discovery file and don't spawn a rival that
+            # cannot take the lock. Say so instead — the remedy is a
+            # restart of THAT process, which the caller can name.
+            if info is not None and self._pid_alive(info.get('pid')):
+                print(f'[azt_collab_client] SERVICE_WEDGED (pid '
+                      f'{info.get("pid")} is running but not answering '
+                      f'/v1/health) — not respawning, not touching '
+                      f'server.json; restart that process',
+                      file=sys.stderr, flush=True)
+                return 'wedged'
             # Cooldown: a spawn that just failed (usually because a
             # wedged-but-alive daemon still holds server.lock) will
             # fail again immediately; don't burn a process per poll.

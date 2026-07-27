@@ -135,6 +135,36 @@ def _normalize_entry(entry):
             if isinstance(s, str)],
         'paired_at': str(entry.get('paired_at', '') or ''),
         'last_seen_at': str(entry.get('last_seen_at', '') or ''),
+        # Do we have EVIDENCE the other side also holds this pairing?
+        # (0.54.97) Set when our hello reached them (they recorded us)
+        # or when their hello reached us (they clearly have us).
+        # ``False`` means the pairing may be one-sided — both users
+        # consented, but the confirmation never got delivered — which
+        # is the state the arrival-time heal exists to close. Missing
+        # key reads as False so pairings made before this shipped get
+        # one heal attempt on their next arrival; the cost is a single
+        # hello per peer per arrival until it lands.
+        'pair_confirmed': bool(entry.get('pair_confirmed', False)),
+        # Langcodes this peer's user DECLINED from us (0.54.98).
+        # ``_handle_share_offer`` re-stashed an offer on every inbound
+        # POST, so a decline was undone by the sender's next burst
+        # whenever we couldn't reach them to nack — the offer recurred
+        # forever. Checked before stashing; cleared by a later accept
+        # or by us offering that project to them ourselves.
+        'declined_shares': [
+            str(s) for s in (entry.get('declined_shares') or [])
+            if isinstance(s, str)],
+        # Langcodes we have EVIDENCE this peer also shares with us
+        # (0.54.98) — either a delivery to them succeeded (their side
+        # mounts it) or they offered it to us (it's in their
+        # allowlist). ``shared_projects`` minus this is the set that
+        # may be one-sided, which the arrival heal re-offers. A
+        # one-sided share is not "one-way sync": the side without the
+        # entry doesn't MOUNT the project, so the other side's pushes
+        # 404 and nothing moves either way.
+        'shares_confirmed': [
+            str(s) for s in (entry.get('shares_confirmed') or [])
+            if isinstance(s, str)],
         # Per-project SHA of this peer's main as last observed via
         # ls-remote / verified push. Keyed by langcode. Drives the
         # honest ``lan_unshared`` / ``at_risk`` computation (was
@@ -210,6 +240,70 @@ def _invalidate_sync_board():
         pass
 
 
+def set_pair_confirmed(peer_id, confirmed=True):
+    """Record whether we have evidence the OTHER side holds this
+    pairing (0.54.97). Called when our hello reached them, or when
+    their hello reached us. No-op for an unknown peer."""
+    with _LOCK:
+        data = _load_raw()
+        peers = data.get('peers') or {}
+        entry = peers.get(str(peer_id))
+        if entry is None:
+            return False
+        if bool(entry.get('pair_confirmed', False)) == bool(confirmed):
+            return True
+        entry['pair_confirmed'] = bool(confirmed)
+        peers[str(peer_id)] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    _invalidate_sync_board()
+    return True
+
+
+def add_unpair_tombstone(peer_id):
+    """Remember that the USER deliberately unpaired *peer_id*
+    (0.54.97).
+
+    Load-bearing for the arrival-time pairing heal: a peer that still
+    holds a stale record of us will keep saying hello, and the hello
+    handler records pairings for any caller (body-claimed identity —
+    see ``lan_listener._build_server``). Without a tombstone, an
+    auto-heal would silently resurrect a pairing the user had
+    revoked, which is a completely different situation from a
+    confirmation that failed to arrive (Kent 2026-07-27: *"Not the
+    same as if one side unpaired, or didn't accept"*). Cleared by a
+    fresh local pairing gesture."""
+    with _LOCK:
+        data = _load_raw()
+        tombs = data.get('unpaired') or {}
+        tombs[str(peer_id)] = _now_iso()
+        data['unpaired'] = tombs
+        _save_raw(data)
+    return True
+
+
+def is_unpair_tombstoned(peer_id):
+    """True when the user unpaired this peer and hasn't re-paired."""
+    with _LOCK:
+        data = _load_raw()
+        tombs = data.get('unpaired') or {}
+        return str(peer_id) in tombs
+
+
+def clear_unpair_tombstone(peer_id):
+    """Drop the tombstone — a fresh, user-gestured pairing supersedes
+    the earlier revocation."""
+    with _LOCK:
+        data = _load_raw()
+        tombs = data.get('unpaired') or {}
+        if str(peer_id) not in tombs:
+            return False
+        tombs.pop(str(peer_id), None)
+        data['unpaired'] = tombs
+        _save_raw(data)
+    return True
+
+
 def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
     """Insert or update a peer entry on pair-accept. Preserves
     existing ``shared_projects`` and ``static_endpoints`` if the
@@ -245,9 +339,20 @@ def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
             'shared_projects': existing['shared_projects'],
             'paired_at': existing['paired_at'] or _now_iso(),
             'last_seen_at': _now_iso(),
+            # Preserved across a re-pair; the caller sets it once it
+            # knows whether the other side was told (0.54.97).
+            'pair_confirmed': bool(existing.get('pair_confirmed',
+                                                False)),
         }
         peers[str(peer_id)] = entry
         data['peers'] = peers
+        # A pairing recorded now supersedes any earlier revocation —
+        # this call only happens behind a user gesture (QR scan,
+        # accept, or an inbound hello the handler already vetted).
+        tombs = data.get('unpaired') or {}
+        if str(peer_id) in tombs:
+            tombs.pop(str(peer_id), None)
+            data['unpaired'] = tombs
         _save_raw(data)
     _invalidate_sync_board()  # a new/updated pairing changes the board
     out = dict(entry)
@@ -286,6 +391,74 @@ def set_shared_projects(peer_id, langcodes):
     out = dict(entry)
     out['peer_id'] = str(peer_id)
     return out
+
+
+def _set_entry_list(peer_id, key, langcode, present):
+    """Add/remove *langcode* in a per-peer list field. Returns True
+    when the file changed."""
+    with _LOCK:
+        data = _load_raw()
+        peers = data.get('peers') or {}
+        entry = peers.get(str(peer_id))
+        if entry is None:
+            return False
+        current = [str(s) for s in (entry.get(key) or [])
+                   if isinstance(s, str)]
+        want = str(langcode)
+        if present and want in current:
+            return True
+        if not present and want not in current:
+            return True
+        if present:
+            current.append(want)
+        else:
+            current = [s for s in current if s != want]
+        entry[key] = sorted(set(current))
+        peers[str(peer_id)] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    _invalidate_sync_board()
+    return True
+
+
+def add_declined_share(peer_id, langcode):
+    """Remember that this peer's user DECLINED *langcode* from us
+    (0.54.98) so a re-arriving offer can be dropped instead of
+    re-stashed. Without it, a decline only stuck when we could reach
+    the sender to nack — the exact case that fails."""
+    return _set_entry_list(peer_id, 'declined_shares', langcode, True)
+
+
+def is_declined_share(peer_id, langcode):
+    entry = get_peer(peer_id)
+    if entry is None:
+        return False
+    return str(langcode) in (entry.get('declined_shares') or [])
+
+
+def clear_declined_share(peer_id, langcode):
+    """Drop the suppression — a later accept, or us offering that
+    project to them, supersedes the earlier decline."""
+    return _set_entry_list(peer_id, 'declined_shares', langcode, False)
+
+
+def set_share_confirmed(peer_id, langcode, confirmed=True):
+    """Record whether we have evidence this peer ALSO shares
+    *langcode* with us (0.54.98): a successful delivery to them, or
+    an offer of it from them."""
+    return _set_entry_list(peer_id, 'shares_confirmed', langcode,
+                           bool(confirmed))
+
+
+def unconfirmed_shares(peer_id):
+    """Langcodes we share with this peer but have no evidence they
+    share back — the set the arrival heal re-offers."""
+    entry = get_peer(peer_id)
+    if entry is None:
+        return []
+    confirmed = set(entry.get('shares_confirmed') or [])
+    return [s for s in (entry.get('shared_projects') or [])
+            if s not in confirmed]
 
 
 def add_shared_project(peer_id, langcode):
@@ -327,6 +500,53 @@ def set_static_endpoints(peer_id, endpoints):
     out = dict(entry)
     out['peer_id'] = str(peer_id)
     return out
+
+
+def promote_endpoint(peer_id, endpoint, max_endpoints=8):
+    """Move *endpoint* (``'host:port'``) to the HEAD of this peer's
+    ``endpoints`` list, inserting it if new (0.54.99).
+
+    The mirror of ``demote_static_endpoint``: that one exists because a
+    dead address must stop being re-dialed, and this one exists because
+    a PROVEN address should be tried first. Resolution reads the lists
+    head-first, so ordering the list by recency of evidence is the
+    whole mechanism — no guessing which of a peer's addresses is
+    "the real one" (Kent 2026-07-27: *"prioritize an address by putting
+    it first … always trying first the last one we heard from"*).
+
+    Two things count as evidence, and they're the same event seen from
+    the two ends:
+
+    - we RECEIVED a request from that address (its source host is
+      proven reachable in the direction that matters);
+    - we SENT to it successfully.
+
+    mDNS stays authoritative and is consulted before these lists —
+    this is what to do when mDNS has nothing, which on a tethered
+    Android host is most of the time.
+
+    Capped at *max_endpoints* so a device that roams between many
+    networks doesn't accumulate an unbounded tail of dead addresses;
+    the oldest (least recently proven) fall off the end."""
+    ep = str(endpoint or '').strip()
+    if not ep or ':' not in ep:
+        return False
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if str(peer_id) not in peers:
+            return False
+        entry = _normalize_entry(peers[str(peer_id)])
+        current = [str(e) for e in (entry.get('endpoints') or []) if e]
+        if current and current[0] == ep:
+            return True          # already first; nothing to write
+        reordered = [ep] + [e for e in current if e != ep]
+        entry['endpoints'] = reordered[:max(1, int(max_endpoints))]
+        peers[str(peer_id)] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    _invalidate_sync_board()
+    return True
 
 
 def demote_static_endpoint(peer_id, endpoint):

@@ -178,6 +178,26 @@ class ProjectStatus:
     # content). Empty when HEAD has no LIFT path yet or on a
     # pre-0.53.8 daemon.
     lift_blob_sha: str = ''
+    # What landed between the CALLER's base and HEAD — HUMAN commit
+    # count plus distinct author display names (0.54.92, bot-excluded
+    # count since 0.54.93). ``None`` unless the caller passed
+    # ``since_sha`` to ``project_status``; otherwise
+    # ``{'known': bool, 'count': int, 'bot_count': int,
+    # 'capped': bool, 'authors': [str]}``.
+    #
+    # A collab-mode whole-file editor never touches ``.git`` (hard
+    # rule #1), so this is its ONLY route to "what changed under me,
+    # and by whom" — which is what lets a reload prompt say why it
+    # appeared instead of being indistinguishable from a spurious one.
+    #
+    # ``count`` EXCLUDES merge commits, which are minted under the
+    # daemon's bot identity: counting them reports the daemon's own
+    # merge activity as team changes. So:
+    #   known=False              → "can't tell", NEVER "nothing changed"
+    #   count == 0, bot_count > 0 → HEAD moved, nobody edited: don't prompt
+    #   count > 0                 → real team work; name the authors
+    #   capped=True               → counts are floors; phrase as "N+"
+    changes_since: dict | None = None
     # Foreign-device topic-branch orphan count. Number of
     # ``refs/remotes/origin/azt-pending-*`` refs whose
     # device-name suffix isn't this daemon's — i.e. cross-device
@@ -223,6 +243,12 @@ class ProjectStatus:
             lan_pushed_sha=str(d.get('lan_pushed_sha', '') or ''),
             head_sha=str(d.get('head_sha', '') or ''),
             lift_blob_sha=str(d.get('lift_blob_sha', '') or ''),
+            # Absent (pre-0.54.92 daemon, or no base supplied) stays
+            # None — NOT an empty dict, so "didn't ask / can't tell"
+            # never renders as "nothing changed".
+            changes_since=(d['changes_since']
+                           if isinstance(d.get('changes_since'), dict)
+                           else None),
             foreign_topic_orphan_count=int(
                 d.get('foreign_topic_orphan_count', 0) or 0),
         )

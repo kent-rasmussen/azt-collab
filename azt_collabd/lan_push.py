@@ -304,6 +304,20 @@ def _push_to_peer(project, peer_entry):
             pass
         _consec_failures.pop(pid, None)  # success: reset counter
         _record_reachable(pid)  # clear fast-fail gate
+        # A completed exchange for this project proves the peer's
+        # listener MOUNTS it — i.e. the share exists on their side too
+        # (0.54.98). One-sided shares 404 here instead, so reaching
+        # this point is the evidence the heal is looking for.
+        try:
+            _peers.set_share_confirmed(pid, project.langcode, True)
+        except Exception:
+            pass
+        # This address just worked — put it first so the next dial
+        # starts there (0.54.99, mirror of demote-on-failure).
+        try:
+            _peers.promote_endpoint(pid, f'{host}:{int(port)}')
+        except Exception:
+            pass
         return True
 
     # Pre-flight fast-forward check (since 0.46.4). dulwich's
@@ -1233,9 +1247,12 @@ def hello_to_peer(host, port, expected_fp, device_name='',
     # later sessions, but that path isn't reliable on every network
     # (AP isolation, hotspot, etc.) — the QR / hello pair is the
     # baseline.
-    from . import lan_listener as _lan_listener
-    bound = _lan_listener.bound_endpoint()
-    our_endpoint = f'{bound[0]}:{bound[1]}' if bound else ''
+    # Subnet-matched (0.54.99): advertise OUR address on the same
+    # subnet as *host*, not the default-route guess. We are talking to
+    # them at *host*, so an address of ours in that /24 is one they can
+    # actually dial — the previous guess left multi-homed hosts telling
+    # a tethered phone to reach them on wifi.
+    our_endpoint = _our_endpoint_for(host)
     body = json.dumps({
         'peer_id': ident['peer_id'],
         'fp': ident['fp'],
@@ -1273,6 +1290,45 @@ def _our_endpoint_str():
     from . import lan_listener as _lan_listener
     bound = _lan_listener.bound_endpoint()
     return f'{bound[0]}:{bound[1]}' if bound else ''
+
+
+def _our_endpoint_for(peer_host):
+    """Our listener address **on the same subnet as *peer_host***,
+    falling back to the default-route guess (0.54.99).
+
+    We advertise a single ``endpoint`` in signalling payloads, and the
+    remote records it as the way to reach us. Guessing our
+    default-route address gets that wrong on any multi-homed host: with
+    four USB-tether subnets plus wifi, the default route is one of five
+    and almost never the one a given phone is on — so the phone stored
+    an address it can never reach, and Retry re-dialled that same
+    stored value forever (Kent 2026-07-27: *"why can a phone attached
+    by USB to a computer not reach the computer, when the computer is
+    clearly reaching the phone?"* — it could; it was dialling the
+    wrong address for it).
+
+    We know which address they reached us on, or which we reached them
+    on, so pick ours from the same /24. That is a plain-old-LAN
+    heuristic, not a routing table, but it is exactly right for the
+    tether and hotspot cases this exists for, and it degrades to the
+    previous behaviour when nothing matches.
+
+    Works against UNMODIFIED peers: it fills the existing single
+    ``endpoint`` field, so an old phone records a reachable address
+    without any change on its side."""
+    from . import lan_listener as _lan_listener
+    host = str(peer_host or '').strip()
+    fallback = _our_endpoint_str()
+    if not host or '.' not in host:
+        return fallback
+    want = host.rsplit('.', 1)[0] + '.'
+    try:
+        for cand in _lan_listener.bound_endpoints_all():
+            if cand.split(':', 1)[0].startswith(want):
+                return cand
+    except Exception:
+        pass
+    return fallback
 
 
 def _https_post_signalling(host, port, path, payload):
@@ -1398,6 +1454,11 @@ def _https_post_to_peer(peer_id, path, payload, force=False):
         return 0, b''
     if 200 <= resp.status < 300:
         _record_reachable(peer_id)
+        # Proven address → head of the list (0.54.99).
+        try:
+            _peers.promote_endpoint(peer_id, f'{host}:{int(port)}')
+        except Exception:
+            pass
     return resp.status, resp.data
 
 
@@ -1676,6 +1737,63 @@ def sweep_peer(peer_id, exclude_langcode=''):
               f'{_UNREACHABLE_COOLDOWN_S:.0f}s',
               file=sys.stderr, flush=True)
         return {}
+    # Complete an interrupted pairing handshake (0.54.97). Both users
+    # consented — someone invited, someone accepted — and only the
+    # confirmation failed to arrive, leaving the pairing one-sided: we
+    # hold them, they don't hold us, so everything we send gets
+    # rejected. Now that they're reachable, say hello; their handler
+    # records us and the pairing becomes mutual. Distinct from a
+    # revocation (they tombstone us and refuse) and from a
+    # never-accepted invite (no hello is ever sent), neither of which
+    # this can manufacture.
+    if not entry.get('pair_confirmed', False):
+        try:
+            from . import peer_id as _peer_id_mod
+            from . import store as _store_mod
+            ident = _peer_id_mod.ensure()
+            ep = _resolve_endpoint(entry)
+            if ep is not None:
+                host, port = ep
+                print(f'[lan-sweep] {peer_id[:8]!r}: pairing not '
+                      f'confirmed — saying hello to complete it',
+                      file=sys.stderr, flush=True)
+                if hello_to_peer(host, int(port), entry.get('fp', ''),
+                                 _store_mod.get_device_name(),
+                                 langcode=''):
+                    _peers.set_pair_confirmed(peer_id, True)
+                    entry = _peers.get_peer(peer_id) or entry
+                    print(f'[lan-sweep] {peer_id[:8]!r}: pairing '
+                          f'confirmed both ways',
+                          file=sys.stderr, flush=True)
+                else:
+                    print(f'[lan-sweep] {peer_id[:8]!r}: hello not '
+                          f'delivered; will retry on a later arrival',
+                          file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[lan-sweep] {peer_id[:8]!r} pairing heal raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+    # Complete an interrupted SHARE the same way (0.54.98). A share we
+    # hold that the peer doesn't is not "one-way sync": their listener
+    # won't mount the project, so our pushes 404 and nothing moves in
+    # either direction — functionally identical to not sharing, which
+    # is why it has to heal rather than sit there looking fine. Safe to
+    # re-offer: their handler no-ops when they already have it, and
+    # (since the decline suppression above) drops it outright if their
+    # user declined, nacking us so we roll the share back.
+    try:
+        for lang in _peers.unconfirmed_shares(peer_id):
+            print(f'[lan-sweep] {peer_id[:8]!r}: share of {lang!r} '
+                  f'unconfirmed — re-offering',
+                  file=sys.stderr, flush=True)
+            try:
+                send_share_offer(peer_id, lang)
+            except Exception as ex:
+                print(f'[lan-sweep] {peer_id[:8]!r} re-offer of '
+                      f'{lang!r} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-sweep] {peer_id[:8]!r} share heal raised: {ex!r}',
+              file=sys.stderr, flush=True)
     shared = entry.get('shared_projects') or []
     out = {}
     for langcode in shared:

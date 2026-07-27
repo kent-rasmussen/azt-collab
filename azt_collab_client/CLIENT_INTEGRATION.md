@@ -533,6 +533,36 @@ Obligations:
 3. **§ 17b still applies.** Poll ``project_status`` (5–15 s) and
    reload on ``head_sha`` change — ``submit_file`` protects your
    *writes*; the poll bounds how long you *display* stale peer data.
+3a. **Say WHY you're offering a reload** (daemon 0.54.92+; bot-excluded
+   count since 0.54.93). Pass your base to
+   ``project_status(langcode, since_sha=base)`` and the response
+   carries ``changes_since`` — ``{'known': bool, 'count': int,
+   'bot_count': int, 'capped': bool, 'authors': [str]}`` — the commits
+   between your base and HEAD, with distinct author display names. You
+   cannot compute this yourself: hard rule #1 means no reading
+   ``.git``, and a whole-file editor has no other route to it. A prompt
+   that can't say what changed is indistinguishable from a spurious
+   one, and users learn to dismiss both (field 2026-07-27).
+
+   **``count`` is HUMAN commits only.** Merge commits are minted under
+   the daemon's bot identity, so counting them reports the daemon's own
+   merge activity as team changes: "5 commits" that are four bot merges
+   plus one real edit is a lie, and an all-merges range would claim
+   changes from nobody. Rendering rules:
+   - ``known: False`` (empty/unknown base — re-clone, GC'd history)
+     means **can't tell**; never render it as "nothing changed".
+   - ``count == 0`` with ``bot_count > 0`` means HEAD moved but nobody
+     edited anything. **Don't prompt** — this is a suppression signal
+     in its own right, independent of ``merged_identical``.
+   - ``count > 0`` → real team work; name the authors ("3 changes from
+     Marie"). An empty ``authors`` alongside a non-zero count means
+     the human commits carried no parseable author; show the bare
+     count.
+   - ``capped: True`` makes both counts floors, not exact; phrase as
+     "N+".
+   - The walk is bounded daemon-side, but it is still extra work per
+     call: pass ``since_sha`` on the polls whose result you'd show,
+     not on every liveness ping.
 4. **Commit cadence.** ``submit_file`` commits synchronously per save.
    Non-LIFT artifacts (settings files, audio, chart output) are picked
    up by whole-tree staging on the next commit — call
@@ -1591,6 +1621,20 @@ returns ``''`` exactly once in a device's lifetime: on first
 boot, before any project has ever been touched. The key in
 ``$AZT_HOME/config.json :: recent.last_langcode`` doesn't
 exist yet, so the getter returns ``''``.
+
+**``None`` is NOT ``''`` (since 0.54.95).** ``None`` means the
+wrapper couldn't ask — transport failure, daemon unreachable or
+wedged. ``''`` is the daemon's answer; ``None`` is the absence of
+one, and a peer must never render it as "no project yet". Field
+2026-07-27: the daemon settings UI announced "no project touched on
+this device yet" on a machine with two registered projects, purely
+because the daemon wasn't answering. Both values are falsy, so
+``if not last_project():`` and ``(last_project() or '').strip()``
+behave exactly as they always did — the distinction matters only
+where you TELL THE USER something, or decide to clear state on the
+strength of an empty answer. Same rule as the daemon-owned-state
+table in ``CLAUDE.md``: a getter that can't answer must not return a
+value indistinguishable from a real one.
 
 **Picker-cancel writes nothing.** When the user opens the
 picker and backs out without choosing, the picker issues no

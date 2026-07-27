@@ -18,7 +18,7 @@ Public API::
 
     from azt_collab_client import last_project, set_last_project
 
-    last_project()                       # read; '' if unset / server down
+    last_project()                       # '' = none set; None = couldn't ask
     set_last_project('lol-x-his30100')   # explicit override
 
 The langcode is the daemon's ``projects.json`` key — the same value
@@ -34,10 +34,22 @@ import sys
 from .rpc import call, ServerUnavailable
 
 
-def last_project() -> str:
-    """Return the daemon-tracked last-opened project langcode, or
-    ``''`` when the server is unreachable / no project has been
-    touched yet."""
+def last_project():
+    """Return the daemon-tracked last-opened project langcode.
+
+    ``''`` means the DAEMON said there is none — no project has been
+    touched on this device. ``None`` means we couldn't ask (transport
+    failure / daemon unreachable), which is NOT the same thing and
+    must not be rendered as "no project yet" (0.54.95; field
+    2026-07-27: the settings UI announced "no project touched on this
+    device yet" on a machine with two registered projects, because the
+    daemon was simply unreachable).
+
+    Both are falsy, so existing ``if not last_project():`` callers
+    behave exactly as before; callers that report the state to a user
+    should distinguish them. This mirrors the daemon-owned-state rule
+    in CLAUDE.md — a getter that can't answer must not return a value
+    indistinguishable from a real answer."""
     # No success log here — callers poll this at high frequency
     # (the daemon UI's cache-status indicator reads it every
     # second to know which project to query), and a per-call log
@@ -48,11 +60,11 @@ def last_project() -> str:
     except ServerUnavailable as ex:
         print(f'[recent] last_project: ServerUnavailable: {ex}',
               file=sys.stderr, flush=True)
-        return ''
+        return None
     if not resp.get('ok'):
         print(f'[recent] last_project: not ok, resp={resp!r}',
               file=sys.stderr, flush=True)
-        return ''
+        return None
     return (resp.get('langcode', '') or '').strip()
 
 

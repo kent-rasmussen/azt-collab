@@ -505,8 +505,40 @@ def _handle_hello_bodyauth(environ, start_response):
     # (``no endpoint for <peer_id>``). Empty incoming endpoint =
     # pre-fix sender, falls back to the legacy no-endpoint record.
     incoming_endpoint = str(payload.get('endpoint', '') or '')
+    # Was this pairing deliberately REVOKED here? (0.54.97) The heal
+    # that completes an interrupted handshake works by the other side
+    # re-saying hello, and this handler records a pairing for any
+    # caller — so without this check, a peer holding a stale record
+    # would silently resurrect a pairing the user had removed. An
+    # invite-plus-accept whose confirmation got lost and a revocation
+    # are entirely different situations; only the first may self-heal.
+    # A local gesture (QR display for the auto-share case, or a fresh
+    # pair/accept) clears the tombstone.
+    try:
+        if _peers.is_unpair_tombstoned(actual_peer_id):
+            already = _peers.get_peer(actual_peer_id) is not None
+            if not already:
+                print(f'[lan-listener] hello from '
+                      f'{actual_peer_id[:8]!r} ({device_name!r}) '
+                      f'REFUSED: this device was unpaired here — '
+                      f're-pair to reconnect',
+                      file=sys.stderr, flush=True)
+                return _json_response(
+                    start_response, '200 OK',
+                    {'ok': False, 'error': 'unpaired_here'})
+    except Exception as ex:
+        print(f'[lan-listener] tombstone check raised: {ex!r}',
+              file=sys.stderr, flush=True)
     _peers.record_pair(actual_peer_id, actual_fp,
                        device_name, incoming_endpoint)
+    # Their hello proves they hold this pairing, so it's mutual from
+    # here (0.54.97) — this is the receiving half of the heal.
+    try:
+        _peers.set_pair_confirmed(actual_peer_id, True)
+    except Exception:
+        pass
+    # The address it arrived from beats the one it claims (0.54.99).
+    _note_inbound_endpoint(actual_peer_id, environ, payload)
     # Symmetric auto-share: if the hello carried a langcode (the
     # project the scanner just LAN-cloned FROM us), add it to our
     # shared_projects allowlist for them too. Saves the owner a
@@ -580,6 +612,40 @@ def _json_response(start_response, status_line, body_dict):
         ('Content-Length', str(len(body_bytes))),
     ])
     return [body_bytes]
+
+
+def _note_inbound_endpoint(peer_id, environ, payload=None):
+    """Promote the address this request ARRIVED from to the head of
+    the peer's endpoint list (0.54.99).
+
+    Their source host is proven reachable — packets came from it — so
+    it belongs first in the list our fan-out reads head-first. The
+    listener port isn't the source port, so pair the arrival host with
+    a port we already know: the one they advertise in this payload,
+    else the port from an endpoint we already hold for them.
+
+    Best-effort and silent on failure: this is an optimisation of which
+    address to try first, never a correctness requirement."""
+    try:
+        host = str(environ.get('REMOTE_ADDR', '') or '').strip()
+        if not host or not peer_id:
+            return
+        port = ''
+        claimed = str((payload or {}).get('endpoint', '') or '')
+        if ':' in claimed:
+            port = claimed.rsplit(':', 1)[1]
+        if not port:
+            entry = _peers.get_peer(peer_id) or {}
+            for ep in (entry.get('endpoints') or []):
+                if ':' in str(ep):
+                    port = str(ep).rsplit(':', 1)[1]
+                    break
+        if not port.isdigit():
+            return
+        _peers.promote_endpoint(peer_id, f'{host}:{port}')
+    except Exception as ex:
+        print(f'[lan-listener] endpoint promote raised: {ex!r}',
+              file=sys.stderr, flush=True)
 
 
 def _paired_claimant(payload):
@@ -841,6 +907,41 @@ def _handle_share_offer(environ, start_response, peer_id,
         return _json_response(start_response, '400 Bad Request',
                               {'ok': False,
                                'error': 'langcode required'})
+    # DECLINED-SHARE SUPPRESSION (0.54.98). This handler used to
+    # re-stash an offer on every inbound POST, so a decline only stuck
+    # while we could reach the sender to nack it — and the case where
+    # we can't (one-way reachability: they reach us, we can't reach
+    # them) is precisely the case that keeps re-offering. The offer
+    # came back on the sender's next burst, forever. Now a declined
+    # (peer, langcode) is dropped here and the nack is re-attempted;
+    # the sender rolls back its own allowlist when that lands. Also
+    # the prerequisite for the arrival-time share heal — without it,
+    # automatic re-offers would make an unwanted offer permanent.
+    try:
+        if _peers.is_declined_share(peer_id, langcode):
+            print(f'[lan-listener] share-offer for {langcode!r} from '
+                  f'{peer_id[:8]!r} DROPPED: declined here — '
+                  f're-sending the decline',
+                  file=sys.stderr, flush=True)
+            try:
+                from . import lan_push as _lan_push
+                _lan_push.share_declined(peer_id, langcode)
+            except Exception as ex:
+                print(f'[lan-listener] re-nack raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+            return _json_response(start_response, '200 OK',
+                                  {'ok': True,
+                                   'dispatch': 'declined_here'})
+    except Exception as ex:
+        print(f'[lan-listener] decline-suppression check raised: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+    # Their offer proves this project IS in their allowlist for us, so
+    # our side of the share is confirmed mutual (0.54.98).
+    try:
+        _peers.set_share_confirmed(peer_id, langcode, True)
+    except Exception:
+        pass
+    _note_inbound_endpoint(peer_id, environ, payload)
     try:
         local_proj = _projects.get(langcode)
     except Exception:
@@ -1179,9 +1280,23 @@ def _handle_pair_request(environ, start_response):
         return _json_response(start_response, '400 Bad Request',
                               {'ok': False,
                                'error': 'peer_id / fp wrong length'})
+    # The address this request actually ARRIVED from (0.54.96). Packets
+    # came from there, so it is PROVEN reachable — unlike the
+    # body-claimed ``endpoint``, which is only the sender's guess about
+    # its own address and is routinely wrong on a multi-homed host
+    # (field 2026-07-27: a desktop with four tether subnets plus wifi
+    # advertised one address the phone couldn't reach, so the accepter's
+    # hello-back and pair_response both failed and the pairing went
+    # one-sided). REMOTE_ADDR carries the ephemeral SOURCE port, not
+    # the listener port, so the resolver pairs this host with the
+    # advertised port.
+    from_addr = str(environ.get('REMOTE_ADDR', '') or '')
+    endpoints = [str(e) for e in (payload.get('endpoints') or [])
+                 if e]
     _pending.add(_pending.KIND_PAIR_REQUEST, {
         'peer_id': peer_id, 'fp': fp,
         'device_name': device_name, 'endpoint': endpoint,
+        'endpoints': endpoints, 'from_addr': from_addr,
         'langcode': langcode,
     })
     print(f'[lan-listener] pair-request from {peer_id[:8]!r} '

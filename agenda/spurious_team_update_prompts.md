@@ -28,6 +28,32 @@
 
 ## Plans
 
+### Justification, not just suppression (AZT team spec, 2026-07-27)
+
+The prompt kept appearing "without any justification for it" — and a
+prompt that can't say what changed is indistinguishable from a
+spurious one, so users learn to dismiss both. AZT team's spec:
+*"project_status would have to report the commits between azt's base
+and HEAD — count plus distinct author names — since azt in collab mode
+never touches .git itself and has no other way to know. That's a
+small, well-shaped endpoint change (the daemon already walks that
+range for the board), then a one-line format change in
+collab_offer_reload."*
+
+**Daemon half SHIPPED 0.54.92:** `repo.changes_since()` +
+`GET /v1/projects/<lang>/status/<base_sha>` +
+`project_status(langcode, since_sha=…)` →
+`ProjectStatus.changes_since` = `{known, count, capped, authors}`.
+Contract in CLIENT_INTEGRATION.md § 8b obligation 3a. Base is a path
+segment (the dispatcher matches exact segments, so `?since=` would
+miss the route). Merge bot excluded from authors; `known: False` means
+can't-tell and must never render as nothing-changed; the walk is
+capped for poll safety, with `capped: True` making the count a floor.
+
+**azt half OPEN:** the one-line format change in
+`collab_offer_reload` to render it — alongside the three suppression
+legs below, which are also still open.
+
 Fix legs, in likely order of payoff:
 
 1. **azt-side (one-liner): re-record the lift stat after the legacy

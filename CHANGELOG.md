@@ -9,6 +9,357 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.0 — one long string trimmed; 0.54.x patch space exhausted
+
+**Why 0.55.0 and not 0.54.100:** the patch field ran out at 99. A
+three-digit patch risks buildozer's default `versionCode` packing (and
+per the standing rule we don't hand-set `android.numeric_version`), and
+a bad encoding is what locked out future installs as
+`INSTALL_FAILED_VERSION_DOWNGRADE` before. Rolling the minor is the
+safe move; nothing about this change is minor-sized.
+
+- **`No local-network link found — plug in the cable and turn on USB
+  tethering on the phone.`** → the existing short
+  `no network address — turn on USB tethering or wifi`. It survived
+  0.54.81's trim because it lives in `_check_cable_link`, not
+  `_refresh_lan_status`. Same wording as the steady-state line's
+  no-address case now, so it's one msgid instead of two saying the same
+  thing at different lengths.
+- Four verification checks were themselves stale — they asserted string
+  literals that later versions deliberately changed (0.54.83's `nearby`
+  None-sentinel, 0.54.93's bot-excluded count, a comment quoting the old
+  "seen yet" line, and `_CARRIED_BYTE_CAP` tripping a ban on `_CAP`).
+  Rewritten to check current shapes and scoped to the functions they're
+  about. A checker that cries wolf costs more than no checker.
+
+UI string → relaunch the UI.
+
+## 0.54.99 — endpoints ordered by evidence, not by guesswork
+
+Kent 2026-07-27: *"mDNS is supposed to be authoritative, but short of
+that, it feels like we're just guessing… prioritize an address by
+putting it first. This would happen whenever we receive something from
+that host on that address, or we send something successfully. Then we
+iterate over the list, always trying first the last one we heard
+from."* Right, and half the mechanism was already here: 0.54.3 added
+demote-on-failure precisely so a dead address stops being re-dialled.
+Nothing ever promoted.
+
+- **`peers.promote_endpoint()`** — the mirror of
+  `demote_static_endpoint`: move a proven address to the HEAD of the
+  peer's list (inserting if new), capped at 8 so a device that roams
+  many networks doesn't accumulate an unbounded tail. Resolution
+  already reads head-first, so ordering the list by recency of
+  evidence *is* the selection algorithm. mDNS stays authoritative and
+  is consulted first; this governs the case where it has nothing,
+  which on a tethered Android host is most of the time.
+- **Promoted on both kinds of evidence**, which as Kent notes are the
+  same event from two ends: a request RECEIVED from that address (the
+  listener's `_note_inbound_endpoint`, pairing the arrival host with a
+  port we already know, since the source port isn't the listener port),
+  and a successful send (`_push_to_peer` no-op/confirm path and every
+  `_https_post_to_peer` 2xx).
+- **Also fixed the reverse guess** (`_our_endpoint_for`): the single
+  `endpoint` we advertise is now our address on the *same subnet as
+  the peer we're dialing*, not our default-route guess. On a host with
+  four tether subnets plus wifi, that guess told a tethered phone to
+  reach us on wifi — so the phone stored an address it could never
+  dial, and Retry re-used that stored value forever. This one matters
+  for un-upgraded peers, because it fills the field they already read.
+
+Note how the two combine: once both ends promote on receipt, a wrong
+advertised address self-corrects — the receiver learns our real address
+from the packets instead of from our claim. The subnet match is the
+belt; recency-ordering is the braces.
+
+Daemon-side → restart the daemon; rebuild peers for their side of the
+promotion.
+
+## 0.54.98 — declines stick; one-sided shares heal
+
+Kent 2026-07-27: *"are we doing the same thing with shares? … I have a
+lot of phones that think they're sharing on one side, but not the
+other. I assume that's the functional equivalent of not sharing."* Same
+class as the pairing bug, and the assumption is right for a sharper
+reason than one-way sync: the listener mounts only projects present in
+some paired peer's `shared_projects` **on that device**, so a peer
+without the entry 404s our pushes — and its own fan-out skips us. Both
+directions dead.
+
+Suppression first, because automatic re-offers on top of the known
+re-stash bug would make an unwanted offer permanent.
+
+**Declines stick (the prerequisite).** `_handle_share_offer` re-stashed
+on every inbound POST, so a decline survived only while we could reach
+the sender to nack it — and one-way reachability (they reach us, we
+can't reach them) is exactly the case that keeps re-offering, so the
+offer returned forever (the open bug in
+`agenda/sync_status_board.md`). Declining now records the refusal in
+`peers.json` (`declined_shares`), re-arriving offers are dropped
+locally and the nack re-attempted, and the sender rolls its own
+allowlist back when that lands. Superseded by a later accept, or by us
+offering that project to them.
+
+**One-sided shares heal.** New `shares_confirmed` per peer: langcodes
+we have evidence they share back — either a completed exchange for it
+(their listener mounted it; a one-sided share would have 404'd) or an
+offer of it from them (it's in their allowlist). `sweep_peer` re-offers
+anything unconfirmed on arrival. Safe by construction now: their
+handler no-ops if they already have the project, and drops-plus-nacks
+if their user declined.
+
+Same three-case discipline as 0.54.97's pairing heal — complete what
+both users consented to, never resurrect a refusal, never manufacture
+consent.
+
+Daemon-side (`peers.json` gains `declined_shares` + `shares_confirmed`,
+both additive) → restart the daemon; rebuild peers for their side.
+
+## 0.54.97 — an interrupted handshake heals itself; a revocation does not
+
+Kent 2026-07-27: *"if we have an invite on one side and an accept on
+the other, that's enough for mutual trust, and we should heal
+automatically if we can. Not the same as if one side unpaired, or
+didn't accept…"* That draws the line exactly, and it needs three cases
+kept apart:
+
+| situation | consent | behaviour |
+|---|---|---|
+| invited + accepted, confirmation lost | **both users gestured** | heal automatically |
+| one side unpaired | revoked on purpose | never resurrect |
+| invited, never accepted | no consent | never create |
+
+- **`pair_confirmed` per peer** — do we have EVIDENCE the other side
+  also holds this pairing? Set when our hello reached them (they
+  recorded us) or when theirs reached us (they clearly have us).
+  Missing key reads False, so pairings made before this shipped get one
+  heal attempt on their next arrival.
+- **Heal at arrival.** `sweep_peer` fires on mDNS arrival; when the
+  pairing isn't confirmed it now says hello first. Their handler
+  records us and the pairing becomes mutual — completing a handshake
+  both users already consented to, with no gesture. Logged either way
+  ("pairing confirmed both ways" / "hello not delivered; will retry on
+  a later arrival").
+- **Unpair writes a tombstone.** This is what keeps the heal honest.
+  The hello handler records a pairing for ANY caller (body-claimed
+  identity — the documented threat model), so a peer holding a stale
+  record would otherwise silently resurrect a pairing the user
+  removed. Unpair now records the revocation; an inbound hello from a
+  tombstoned, non-paired peer is refused with `unpaired_here` and a log
+  line naming the remedy. A fresh pairing gesture clears the
+  tombstone, since a deliberate re-pair supersedes the earlier
+  revocation.
+- **Never-accepted stays impossible** by construction: a decliner
+  sends no hello, so there is nothing to heal from — no new guard
+  needed.
+
+Side benefit: refusing tombstoned hellos closes a standing hole where
+any device on the LAN could POST `/v1/lan/hello` and re-add itself
+after being removed.
+
+Daemon-side (peers.json gains `pair_confirmed` + an `unpaired` map) →
+restart the daemon; rebuild peers for the accepter-side heal.
+
+## 0.54.96 — reply to the address the pair request came FROM
+
+Kent 2026-07-27, on two desktops (Linux and Windows): a phone showing
+paired while the desktop shows nothing, the desktop's button going
+`pairing… → Pair` on refresh, and the phone happily "sharing two
+projects with a computer that isn't paired with it."
+
+The nearby-pair flow told the accepter exactly ONE address to reply to
+— `'endpoint': _lan_push._our_endpoint_str()`, the default-route guess.
+The QR path has advertised every interface since 0.54.35; this flow
+never got that fix. On a multi-homed desktop (four tether subnets plus
+wifi) that one address is likely unreachable from the phone, so the
+accepter's hello-back AND its pair_response both failed. It had already
+recorded the pair unconditionally and returned
+`LAN_PAIR_REQUEST_ACCEPTED` regardless, so: phone paired, desktop
+never told, request expires, button reverts. Permanently one-sided,
+with nothing retrying and nothing reporting it.
+
+- **Reply to `REMOTE_ADDR` first** (Kent: *"But it JUST received a
+  pair request… does it not reply on the same address it heard on?"*).
+  It didn't. The inbound connection's source host is proven reachable —
+  packets came from it — whereas the body-claimed endpoint is the
+  sender's guess about itself. The listener now stashes `REMOTE_ADDR`
+  with the pending decision, and the resolver tries candidates
+  best-proven first: **(1)** arrival host + advertised listener port
+  (`REMOTE_ADDR` carries the ephemeral source port, not the listener's),
+  **(2)** every address the sender advertised, **(3)** the legacy
+  single `endpoint`.
+- **Senders advertise all their addresses** (`endpoints`, from
+  `bound_endpoints_all()`), matching the QR path. `endpoint` stays for
+  older receivers.
+- **Try every candidate, then tell the truth.** The hello-back walks
+  the list until one connects and logs which. If none does, the accept
+  returns the new **`LAN_PAIR_UNCONFIRMED`** instead of a flat success:
+  "Paired on this device, but {device_name} could not be reached to
+  confirm it." A silent one-sided pair is how a user ends up sharing
+  projects with a device that rejects them.
+
+Mirrored status code + FR translation. Daemon-side → restart the
+daemon; rebuild the phone to get the new accept path there too.
+
+**Existing one-sided pairs:** re-pair to fix — the accepter's hello now
+lands, and `record_pair` preserves `shared_projects`, so nothing is
+lost. No manual unpair needed.
+
+## 0.54.95 — a wedged daemon no longer gets its discovery file deleted
+
+Kent 2026-07-27: `python -m azt_collabd ui` reporting `server.json not
+found. Start the service` — *"and that last line is NOT correct"*,
+about the UI then announcing "no project touched on this device yet"
+on a machine with two registered projects.
+
+Two bugs, one of which manufactures the state it then misreports.
+
+- **`_spawn_server` deleted a LIVE daemon's `server.json`.**
+  `_server_alive` returns False for a health **timeout** as well as
+  for a dead process, and the next thing that function did was
+  `os.remove(server_info_path())` before spawning. So a wedged daemon
+  — alive, holding `server.lock`, not answering health — lost its
+  discovery file; the replacement then exited on the still-held lock;
+  and from then on every client reported "server.json not found. Start
+  the service" while the real daemon was still running. The 2026-07-10
+  fix covered the answered-non-200 case (`HTTPError` → alive); a
+  timeout took the destructive path. Now: if the recorded pid is
+  alive, return `'wedged'` — don't delete, don't spawn a rival that
+  can't take the lock — and fail with the remedy that actually
+  applies ("running but not responding — restart it"), rather than
+  advice that sends the user to start a second one. New
+  `SERVICE_WEDGED` log line.
+- **`last_project()` returned `''` for "couldn't ask".** So the
+  settings UI printed "no project touched on this device yet" —
+  asserting a fact about the user's data from a transport failure.
+  It now returns `None` when it couldn't ask and `''` only when the
+  daemon says there is none. Both are falsy, so every existing
+  `(last_project() or '').strip()` caller is unchanged; the settings
+  log distinguishes them, and § 14a documents the difference.
+
+**Also answering the question:** `python -m azt_collabd ui` starts
+only the Kivy UI. The daemon comes from `python -m azt_collabd` (no
+args) or from the client auto-spawning on its first RPC — which is why
+the autospawn path being destructive mattered so much here.
+
+Client + UI → relaunch. If a wedged daemon is still holding the lock,
+restart that process; nothing else will reach it.
+
+## 0.54.94 — two dead diagnostics removed, and the work behind one of them
+
+Kent 2026-07-27, photographing a screen of nothing but two alternating
+lines: *"Is there any point to these log entries? Even worse, do they
+indicate pointless work going on in the background?"* No point, and
+yes — a thread and a cross-process RPC every second, forever.
+
+- **The `total == 0` branch never stopped the poll.** In
+  `_render_cawl_status`, "no CAWL index for this project" hid the
+  banner and `return`ed — short-circuiting the `cached >= total` branch
+  immediately below, which is the one that calls
+  `_stop_cawl_cache_poll()`. So a project with no image index polled at
+  1 Hz indefinitely, each tick spawning a thread and an RPC to the
+  daemon to learn "still nothing", with nothing to display ever. It now
+  backs off and stops after 10 empty polls — a backoff rather than an
+  instant stop because `total == 0` can also mean "the index hasn't
+  arrived yet", and re-entering Settings re-arms it (logged, so the
+  stop isn't silent).
+- **`[first-try]` gating restored.** That module's own docstring has
+  said "restore the gate once the crash is diagnosed" since the
+  0.41.15 window; the crash was diagnosed and the lines stayed on
+  through 0.54.x — where the call sites include per-RPC
+  (`transport.call.post`), per-file-open
+  (`lift_io.openFileDescriptor`) and the 1 Hz settings tick. Now
+  gated on `AZT_DEBUG_FIRST_TRY`, default off, checked once at import
+  so a disabled call costs an attribute load. Call sites deliberately
+  left in place: re-enabling a probe should be an env var, not a code
+  change.
+- **`[cache-status]` logs on change only.** Its comment always said
+  "will be removed or rate-limited once the bug is found"; a 1 Hz line
+  whose fields never change is noise. Steady state is silent now,
+  transitions still log — which is all the cross-process
+  triangulation ever needed.
+
+Worth noting where this sat: it was 1 Hz of daemon RPCs from the
+settings screen, alongside the decisions watcher's 1 Hz and the board's
+5 s — on the same daemon whose overload produced tonight's wedge.
+
+UI + client → relaunch the UI; rebuild peers to silence `[first-try]`
+there too.
+
+## 0.54.93 — the change count excludes bot merges (fixes 0.54.92)
+
+AZT team, 2026-07-27: *"the count needs to exclude bot-authored
+commits… a raw count will report the daemon's own merge activity as
+team changes — which is exactly the empty-merge noise from the F8 arc.
+'3 changes from Marie' is honest; '5 commits' that are four bot merges
+is not."* Correct — 0.54.92 excluded the bot from `authors` but left it
+in `count`, so four merges plus one edit from Marie rendered as "5
+changes from Marie", and an all-merges range claimed changes from
+nobody.
+
+- **`count` is now human commits only.** Merge commits (minted under
+  `merge_commit.bot_identity()`) are counted separately as
+  `bot_count`, kept for diagnosis and for a caller that wants to
+  explain a HEAD advance without claiming team activity.
+- **`count == 0` with `bot_count > 0` is a suppression signal** — HEAD
+  moved, nobody edited — independent of 0.54.73's `merged_identical`,
+  and it covers the case where the advance came from a peer's merge
+  rather than from our own save. The daemon logs that state once per
+  computation so the log shows the same conclusion the UI reaches.
+- **Bot detection widened:** this daemon's bot name, *or* any author
+  ending in `[bot]`. A peer configured with a different `app_slug`
+  mints merges under its own bot name, and those aren't team changes
+  either.
+- `authors` unchanged in meaning, now consistent with `count`.
+- Contract § 8b obligation 3a rewritten with the four rendering rules
+  and the "count is HUMAN commits only" statement made prominent,
+  since a peer that gets this wrong produces exactly the dishonest
+  message quoted above.
+
+Daemon + client → restart the daemon; peers pick it up on rebuild.
+
+## 0.54.92 — `changes_since`: the reload prompt can say who changed what
+
+Spec from the AZT team, 2026-07-27: *"project_status would have to
+report the commits between azt's base and HEAD — count plus distinct
+author names — since azt in collab mode never touches .git itself and
+has no other way to know."* Exactly right, and it's the missing
+justification half of `agenda/spurious_team_update_prompts.md`:
+suppression removes prompts that shouldn't exist; this explains the
+ones that should.
+
+- **`repo.changes_since(project_dir, base_sha)`** → `{known, count,
+  capped, authors}`. One `get_walker(include=[HEAD],
+  exclude=[base])` — the same range machinery the board already uses.
+  - **`known: False`** when the base is empty or absent from the repo
+    (re-clone, GC'd history). Distinguishes "can't tell" from
+    "nothing changed", which a caller must not conflate.
+  - **Merge bot excluded** from `authors`: a merge commit isn't a
+    person, and "changes from azt-collaboration[bot]" is noise. So
+    `count > 0` with no authors is legitimate (all merges) and should
+    render as a bare count.
+  - **Bounded** (`cap=2000`, 12 authors) because this rides a 5–15 s
+    poll; `capped: True` makes the count a floor, phrased "N+".
+- **`GET /v1/projects/<lang>/status/<base_sha>`** — the base is a path
+  segment, not a query string, because the dispatcher matches exact
+  segments and `?since=` would land inside `parts[4]` and miss the
+  route. The plain `/status` path is untouched.
+- **Client:** `project_status(langcode, since_sha='')`, decoding into
+  a new `ProjectStatus.changes_since`. Absent stays `None` rather than
+  an empty dict, so "didn't ask" / "old daemon" can't be mistaken for
+  "nothing changed".
+- **Contract:** `CLIENT_INTEGRATION.md` § 8b obligation 3a, with the
+  three rendering rules (unknown-base, authorless count, capped) and
+  the note to pass `since_sha` only on polls whose result you'd show.
+
+Remaining azt-side work is unchanged and still outside this repo: the
+one-line format change in `collab_offer_reload` to use this, plus the
+three suppression legs (consume `merged_identical`, re-record the lift
+stat after a fallback write, content-hash fallback in
+`_lift_changed_on_disk`) — all specified in § 8b obligations 2 and 6.
+
+Daemon + client → restart the daemon; peers pick it up on rebuild.
+
 ## 0.54.91 — deterministic merge commits: two devices meeting no longer manufactures merges
 
 Kent 2026-07-27: *"when no one is working on any of these phones

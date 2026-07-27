@@ -518,6 +518,17 @@ PEER_UNKNOWN = 'PEER_UNKNOWN'
 #                            local write failed.
 # LAN_RESTART_SENT:          Remote restart accepted; the peer's
 #                            daemon is going down and back up.
+# LAN_PAIR_UNCONFIRMED: we accepted a pair request and recorded the
+#                       peer, but could not reach them on ANY candidate
+#                       address to tell them — so THEY don't have us.
+#                       A one-sided pairing looks fine on this device
+#                       while the other rejects everything we send
+#                       (field 2026-07-27). Params: ``peer_id``,
+#                       ``device_name``. Heals when the two devices can
+#                       reach each other and a hello lands; the UI
+#                       should say "accepted, not yet confirmed" rather
+#                       than a flat success.
+LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

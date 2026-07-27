@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.54.91"
+__version__ = "0.55.0"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -2391,10 +2391,26 @@ def clone_project_status(job_id, last_index=0):
     return resp
 
 
-def project_status(langcode):
-    """Return a ProjectStatus for *langcode*, or None."""
+def project_status(langcode, since_sha=''):
+    """Return a ProjectStatus for *langcode*, or None.
+
+    *since_sha* (daemon 0.54.92+) asks the daemon what landed between
+    that commit and HEAD, delivered as ``status.changes_since`` —
+    ``{'known', 'count', 'capped', 'authors'}``. Pass the base your
+    in-memory model derives from; a whole-file editor in collab mode
+    can't read ``.git`` itself, so this is the only way to tell the
+    user WHO changed WHAT before offering a reload. Omit it and the
+    field is ``None`` (also None against an older daemon), which must
+    render as "can't tell" rather than "nothing changed".
+
+    Cheap enough for the ordinary poll — the daemon caps the walk —
+    but it is extra work per call, so pass it on the polls whose
+    result you'd actually show, not on every liveness ping."""
+    path = f'/v1/projects/{langcode}/status'
+    if since_sha:
+        path = f'{path}/{since_sha}'
     try:
-        resp = call('GET', f'/v1/projects/{langcode}/status')
+        resp = call('GET', path)
     except ServerUnavailable:
         return None
     if not resp.get('ok'):
