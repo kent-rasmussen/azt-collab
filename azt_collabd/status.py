@@ -529,6 +529,18 @@ PEER_UNKNOWN = 'PEER_UNKNOWN'
 #                       should say "accepted, not yet confirmed" rather
 #                       than a flat success.
 LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
+# LAN_SHARE_QR_EXPIRED: we scanned a project-share QR and paired, but
+#                       the owner refused the project because its QR
+#                       offer was no longer armed (the "valid while
+#                       displayed" 30 s keepalive from 0.52.26). Pairing
+#                       succeeded; the project did not come with it, so
+#                       a clone would fail with NotGitRepository. The
+#                       fix is on the owner: show the project's Share QR
+#                       again and keep it up. Params: ``peer_id``,
+#                       ``device_name``, ``langcode``. Since 0.55.3 —
+#                       before that the refusal was log-only on the
+#                       owner and the scanner saw nothing.
+LAN_SHARE_QR_EXPIRED = 'LAN_SHARE_QR_EXPIRED'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

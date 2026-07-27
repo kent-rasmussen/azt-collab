@@ -228,15 +228,70 @@ def _build_pool_manager(expected_fp):
         # ``resolve_cert_reqs(cert_reqs)`` — passing 'CERT_NONE'
         # explicitly preserves the unverified behavior.
         cert_reqs='CERT_NONE',
+        # ONE attempt per address (0.55.4). urllib3's default retries
+        # three times, and the clone path already walks every candidate
+        # endpoint — so an unreachable peer cost candidates × 3 × the
+        # 5 s connect timeout, minutes of a progress popup for a
+        # verdict that was settled on the first refusal (field
+        # 2026-07-27, the `Retrying (Retry(total=2…))` triplets). The
+        # retry that matters here is the NEXT ADDRESS, not the same
+        # dead one again.
+        retries=urllib3.Retry(total=0, connect=0, read=0,
+                              redirect=0, status=0),
     )
+
+
+def _no_shared_subnet(candidates):
+    """True when NONE of *candidates* is on a subnet this device holds
+    an address on (0.55.8).
+
+    Diagnostic only — never a gate. A routed network can legitimately
+    be reachable off-subnet, so we still dial every candidate; this
+    just explains the failure afterwards, in the terms the user can
+    act on: "that computer is on a network this device isn't joined
+    to" rather than a bare timeout.
+
+    Field 2026-07-27, an hour of confusion: a computer correctly
+    reported `Listening on 10.191.129.91:55870` — an address on a
+    phone-hotspot subnet — while this phone had moved to
+    `192.168.31.x`. Nothing was stale or lying; the two were on
+    different networks. Hotspot subnets make this the NORMAL case
+    rather than an edge one: the hotspot exists only while its host
+    shares it, everyone on it gets a 10.x lease, and the moment a
+    device joins ordinary wifi instead it silently loses every peer
+    that stayed behind. Yet the symptom is a bare "unreachable peer",
+    indistinguishable from a peer that is asleep, wedged, or holding a
+    bad address. /24 comparison is a heuristic, which is exactly why
+    this annotates rather than decides."""
+    try:
+        from . import lan_listener as _lan_listener
+        mine = set()
+        for ip in (_lan_listener._interface_ipv4s() or []):
+            if '.' in ip:
+                mine.add(ip.rsplit('.', 1)[0])
+        if not mine:
+            return False        # we know nothing; claim nothing
+        for host, _port in candidates:
+            host = str(host or '')
+            if '.' in host and host.rsplit('.', 1)[0] in mine:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _peek_remote_refs(url, expected_fp):
     """``ls-remote`` against a LAN URL. Returns a dict
-    ``{ref_name: sha_hex}`` or ``None`` on any failure (caller
-    treats None as "couldn't check; assume no overlap" — safe
-    because the worst that does is refuse a collision we couldn't
-    confirm was related)."""
+    ``{ref_name: sha_hex}`` or ``None`` on any failure.
+
+    **None means "couldn't ask", NOT "no overlap"** (corrected
+    0.55.3). The old docstring claimed treating None as no-overlap was
+    safe "because the worst that does is refuse a collision we
+    couldn't confirm was related" — but the caller's refusal text tells
+    the user a DIFFERENT project of that name exists and invites them
+    to rename or remove it. On an unreachable peer that advised
+    deleting data on the strength of a network timeout. Callers must
+    branch on None before judging relatedness."""
     try:
         from dulwich.client import HttpGitClient
         pm = _build_pool_manager(expected_fp)
@@ -491,13 +546,45 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         # Compare via ls-remote — cheap. Try each candidate address
         # until one answers (the peer may only be routable on some).
         refs = None
+        peeked = set()
         for host, port in candidates:
+            peeked.add((host, int(port)))
             url = f'https://{host}:{int(port)}/{langcode}.git'
             refs = _peek_remote_refs(url, expected_fp)
             if refs is not None:
                 break
-        related = _shares_commits_with(
-            refs or {}, existing.working_dir)
+        if refs is None:
+            # Same re-resolve as the clone loop below (0.55.6): an
+            # address the peer proved while we were dialing the stale
+            # one is worth a try before we give a verdict.
+            for host, port in _candidate_endpoints(
+                    _peers.get_peer(peer_id) or entry):
+                if (host, int(port)) in peeked:
+                    continue
+                url = f'https://{host}:{int(port)}/{langcode}.git'
+                refs = _peek_remote_refs(url, expected_fp)
+                if refs is not None:
+                    break
+        if refs is None:
+            # WE NEVER REACHED THEM — say that, and nothing more
+            # (0.55.3). ``_peek_remote_refs`` returns None on any
+            # failure, and falling through to the comparison below
+            # turned "couldn't ask" into "no shared commits" into
+            # ``LAN_PROJECT_COLLISION_UNRELATED`` — whose UI text tells
+            # the user a DIFFERENT project of this name exists and
+            # invites them to rename or REMOVE it. Field 2026-07-27:
+            # every candidate failed with `Network is unreachable` and
+            # the user was advised to delete a project on the strength
+            # of that. Unknown is not unrelated, and a verdict that can
+            # cost data must never be reached by a network timeout.
+            print(f'[lan-clone] {langcode!r}: could not peek any of '
+                  f'{len(candidates)} candidate address(es) — '
+                  f'refusing to judge whether the local project is '
+                  f'related', file=sys.stderr, flush=True)
+            result.add(_S.LAN_PEER_UNREACHABLE, peer_id=peer_id,
+                       langcode=langcode)
+            return result
+        related = _shares_commits_with(refs, existing.working_dir)
         if not related:
             result.add(_S.LAN_PROJECT_COLLISION_UNRELATED,
                        langcode=langcode)
@@ -552,7 +639,9 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
     # over the cable/10.x but not its wifi IP (or vice versa) still
     # clones instead of dead-ending on the first address.
     lift_path, err = '', 'no reachable endpoint'
+    tried = set()
     for host, port in candidates:
+        tried.add((host, int(port)))
         print(f'[lan-clone] start: {langcode!r} from {peer_id!r} '
               f'at {host}:{port}', file=sys.stderr, flush=True)
         lift_path, err = _do_lan_clone(
@@ -562,6 +651,27 @@ def clone_from_peer(peer_id, langcode, incoming_url='',
         print(f'[lan-clone] {langcode!r} from {peer_id!r}: '
               f'{host}:{port} failed ({err}) — trying next candidate '
               f'if any', file=sys.stderr, flush=True)
+    if err:
+        # RE-RESOLVE, then try anything NEW (0.55.6). The candidate
+        # list was snapshotted before the first dial, and the peer may
+        # have reached US in the meantime — which promotes their proven
+        # address into peers.json (0.54.99) after our snapshot was
+        # taken. Field 2026-07-27: the phone timed out dialing a stale
+        # QR address (10.191.129.91:55870) at :32.9, and the desktop
+        # reached it from its real address (192.168.31.60) at :34.8 —
+        # two seconds too late to be in the list, so a clone failed
+        # with a working address sitting in the registry.
+        fresh = [c for c in _candidate_endpoints(
+            _peers.get_peer(peer_id) or entry)
+            if (c[0], int(c[1])) not in tried]
+        for host, port in fresh:
+            print(f'[lan-clone] retry on newly-learned address '
+                  f'{host}:{port} for {langcode!r}',
+                  file=sys.stderr, flush=True)
+            lift_path, err = _do_lan_clone(
+                host, port, langcode, expected_fp, dest_dir)
+            if not err:
+                break
     if err:
         print(f'[lan-clone] failed: {langcode!r} from {peer_id!r} '
               f'(all {len(candidates)} candidate(s)): {err}',

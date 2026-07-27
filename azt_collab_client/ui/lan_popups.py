@@ -535,6 +535,10 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
             except Exception:
                 return
             if snap.get('active') and snap.get('text'):
+                if not seen['progress']:
+                    # First real sideband line — bytes are moving, so
+                    # NOW the label may say so (0.55.4).
+                    _set_phase(_tr('Copying project to this phone…'))
                 seen['progress'] = True
                 sub_label.text = snap['text']
             elif not seen['progress']:
@@ -562,9 +566,17 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                 # key) since 0.45.0.
                 if (langcode and peer_id
                         and w_result.has(S.LAN_PAIRED)):
+                    # NOT "Copying…" yet (0.55.4): nothing is copying
+                    # until the transfer actually starts. With an
+                    # unreachable peer this phase lasts minutes —
+                    # candidate addresses × dulwich retries × connect
+                    # timeout — and claiming a copy throughout is
+                    # simply false (field 2026-07-27: "it still says
+                    # copying"). ``_poll_progress`` promotes the label
+                    # the moment real sideband progress arrives.
                     Clock.schedule_once(
                         lambda dt: _set_phase(
-                            _tr('Copying project to this phone…')),
+                            _tr('Contacting the other phone…')),
                         0)
                     clone_result = lan_clone(peer_id, langcode,
                                              repo_url,
@@ -740,6 +752,34 @@ def scan_to_pair(on_done=None, on_status=None, font_name='Roboto'):
                     _tr('The pairing call did not succeed: '
                         '{detail}').format(detail=detail or '?'),
                     font_name)
+            elif not got_project:
+                # CATCH-ALL (0.55.2). The branches above name five
+                # specific failures; anything else fell off the end of
+                # the chain and reached ``_final_done`` with NO message
+                # — the popup closed, the picker repopulated, and the
+                # user was told nothing at all. Field 2026-07-27: a
+                # clone failed with `[lan-clone] ls-remote … [Errno
+                # 101] Network is unreachable` in the daemon log, and
+                # the UI simply returned to the picker. The log knowing
+                # why is not the same as the user knowing why.
+                #
+                # Render whatever codes we DID get, translated. Vaguer
+                # than the tailored branches by construction — it fires
+                # precisely when we have no specific advice — but a
+                # user who can see "did not finish: <reason>" can act,
+                # or report it. Silence is the one outcome that leaves
+                # them stuck.
+                from ..translate import translate_result
+                detail = ''
+                try:
+                    detail = (translate_result(result) or '').strip()
+                except Exception:
+                    detail = ''
+                if not detail:
+                    detail = ', '.join(result.codes()) or _tr('unknown')
+                _show_lan_failure_popup(
+                    _tr('Could not receive the project'),
+                    detail, font_name)
             if result.has(S.LAN_ADOPT_ORIGIN_NEEDED):
                 _resolve_adopt_origin_then_done(
                     result, _final_done, font_name)

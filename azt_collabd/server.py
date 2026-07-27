@@ -973,23 +973,56 @@ def _h_lan_pair_accept(body):
         # gesture — symmetric share without a second tap on the owner
         # side. Empty payload langcode = pair-only QR (no auto-share).
         qr_langcode = str(payload.get('langcode', '') or '')
-        for ep in endpoints:
-            try:
-                host, port_str = ep.rsplit(':', 1)
-            except ValueError:
-                continue
+        hello_out = {}
+        # Use the full resolution ladder, not just the QR's list
+        # (0.55.7). A QR is a SNAPSHOT of the owner's addresses at draw
+        # time; leave it up across a network change and every address in
+        # it can be stale at once. ``_candidate_endpoints`` orders
+        # mDNS-resolved → manual → observed → QR, so a live resolution
+        # wins. Field 2026-07-27: the scanner had already resolved this
+        # peer at 192.168.31.60:34501 via NSD, yet the hello dialed the
+        # QR's dead 10.191.129.91:55870 and timed out — it held a good
+        # address and never looked at it. The clone path has consulted
+        # this ladder since 0.54.x; the hello was the odd one out.
+        try:
+            from . import lan_clone as _lan_clone_mod
+            hello_cands = _lan_clone_mod._candidate_endpoints(entry)
+        except Exception as ex:
+            print(f'[server] hello candidate resolution raised: '
+                  f'{ex!r} — falling back to the QR list',
+                  file=sys.stderr, flush=True)
+            hello_cands = []
+        if not hello_cands:
+            for ep in endpoints:
+                try:
+                    h, p = ep.rsplit(':', 1)
+                    hello_cands.append((h, int(p)))
+                except (ValueError, TypeError):
+                    continue
+        for host, port_num in hello_cands:
             try:
                 if _lan_push.hello_to_peer(
-                        host, int(port_str), fp,
+                        host, int(port_num), fp,
                         store.get_device_name(),
-                        langcode=qr_langcode):
+                        langcode=qr_langcode, out=hello_out):
                     break   # reached them on this address; done
             except Exception as ex:
                 print(f'[server] hello to {peer_id[:8]!r} via '
-                      f'{ep!r} raised: {ex!r}',
+                      f'{host}:{port_num} raised: {ex!r}',
                       file=sys.stderr, flush=True)
+    else:
+        hello_out = {}
     result = Result()
     result.add(S.LAN_PAIRED, peer_id=peer_id, device_name=device_name)
+    # The owner recorded the pair but refused the project our QR scan
+    # asked for — its share-QR offer had lapsed (0.55.3). Surface it
+    # HERE, where the user's gesture just happened, instead of letting
+    # the clone proceed and fail with ``NotGitRepository`` several
+    # steps later with nothing on screen.
+    refused = str(hello_out.get('share_refused', '') or '')
+    if refused:
+        result.add(S.LAN_SHARE_QR_EXPIRED, peer_id=peer_id,
+                   device_name=device_name, langcode=refused)
     return 200, {"ok": True, "result": result.to_dict(),
                  "peer": entry}
 

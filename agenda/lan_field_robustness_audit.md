@@ -1,4 +1,67 @@
-# LAN field-robustness audit — 2026-07-21 session
+# LAN field-robustness audit
+
+## Windows network profile (Public vs Private) blocks discovery (2026-07-27)
+
+Kent: *"can we observe or change the public/private setting on these
+connections on windows? it seems to be blocking the computers' ability
+to see phones that are connected by cable, as well as by wifi (at
+times)."* Very likely a real cause, and it is **per-interface** —
+which is why a cable link can be blocked while wifi works, or vice
+versa.
+
+**Why it bites us specifically.** On a `Public` profile, Windows
+Defender Firewall blocks inbound by default, including:
+
+- **UDP 5353 inbound** → mDNS answers never arrive, so we discover
+  nothing even though our own advertisement goes out. Presents exactly
+  like the Android-NSD asymmetry we chased on Linux, from the other
+  side.
+- **inbound TCP to the listener port** → paired peers can't reach us
+  at all, so shares and pulls fail while our outbound pushes succeed.
+
+A freshly-plugged USB-tether (RNDIS) interface and a newly-joined
+wifi network both default to **Public**, and the profile is per-NIC —
+so setting wifi to Private does nothing for the tether link.
+
+**Observable without admin:**
+
+```
+powershell -Command "Get-NetConnectionProfile | Select-Object InterfaceAlias,NetworkCategory,IPv4Connectivity"
+```
+
+**Changeable with admin** (elevated PowerShell):
+
+```
+powershell -Command "Set-NetConnectionProfile -InterfaceAlias 'Ethernet 5' -NetworkCategory Private"
+```
+
+Also worth checking whether our python/APK binary was ever allowed
+through at all — the first-bind "Windows Defender Firewall has blocked
+some features" prompt is commonly dismissed, or allowed for Private
+only:
+
+```
+powershell -Command "Get-NetFirewallRule -DisplayName '*python*' | Format-Table DisplayName,Profile,Direction,Action,Enabled"
+```
+
+**What to build (not built yet):**
+
+1. **Detect and say so.** On Windows, read `Get-NetConnectionProfile`
+   (no elevation needed) and surface it in the settings LAN line /
+   cable check: "this network is Public — Windows blocks incoming
+   connections; set it to Private or allow AZT through the firewall."
+   That turns a silent, per-interface failure into a named one, in the
+   place the user already looks (same principle as 0.54.75's
+   `link_state`).
+2. **Don't change it silently.** The profile is a system-wide security
+   setting and needs elevation; offer the command and/or a deep link to
+   the Windows network settings page rather than flipping it. The
+   conventional fix is a firewall rule added at INSTALL time (installer
+   runs elevated), scoped to our port — worth folding into
+   [[rework_install_procedure]].
+3. **Firewall-rule check as a diagnostic field** in the health/link
+   report, so "allowed for Private only, currently on Public" is
+   visible rather than inferred. — 2026-07-21 session
 
 - **Scope & relationships:** azt-collab/daemon (lan_push, lan_discovery,
   lan_listener, peers allowlist). Findings from a live phone↔desktop

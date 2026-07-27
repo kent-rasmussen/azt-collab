@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.0"
+__version__ = "0.55.7"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1507,13 +1507,24 @@ def lan_clone(peer_id, langcode, remote_url='', vernlang='',
     Returns a ``Result`` carrying one of ``LAN_PROJECT_CLONED`` /
     ``LAN_PROJECT_REOPENED`` / ``LAN_PROJECT_COLLISION_UNRELATED``
     / ``LAN_PEER_UNREACHABLE``, optionally overlaid with
-    ``LAN_ADOPT_ORIGIN_NEEDED`` or ``LAN_REMOTE_CONFLICT``."""
+    ``LAN_ADOPT_ORIGIN_NEEDED`` or ``LAN_REMOTE_CONFLICT``.
+
+    Bounded at 150 s (0.55.4) instead of inheriting ``rpc.call``'s
+    300 s default. A real first copy over LAN takes tens of seconds;
+    the long tail was an UNREACHABLE peer, where the daemon walks each
+    candidate address and dulwich retries every one — so the user sat
+    on a progress popup for minutes waiting for a verdict already
+    determined. On expiry the wrapper returns a typed
+    ``SERVER_UNAVAILABLE`` the receive UI renders, rather than a
+    spinner. A genuinely slow-but-live transfer keeps reporting
+    sideband progress, which is what ``lan_clone_progress`` is for."""
     try:
         resp = call('POST', '/v1/lan/clone',
                     {'peer_id': peer_id, 'langcode': langcode,
                      'remote_url': remote_url,
                      'vernlang': vernlang,
-                     'user_initiated': bool(user_initiated)})
+                     'user_initiated': bool(user_initiated)},
+                    timeout=150)
     except ServerUnavailable as ex:
         return Result(statuses=[Status(
             'SERVER_UNAVAILABLE', {'error': str(ex)})])

@@ -279,6 +279,9 @@ PEER_UNKNOWN = 'PEER_UNKNOWN'
 # Accepted a pair request but couldn't tell the other device — see
 # azt_collabd/status.py for the per-code body.
 LAN_PAIR_UNCONFIRMED = 'LAN_PAIR_UNCONFIRMED'
+# Scanned a project-share QR, paired, but the owner refused the project
+# (its QR offer had lapsed) — see azt_collabd/status.py.
+LAN_SHARE_QR_EXPIRED = 'LAN_SHARE_QR_EXPIRED'
 LAN_PULL_DONE = 'LAN_PULL_DONE'
 LAN_PULL_PEER_UNREACHABLE = 'LAN_PULL_PEER_UNREACHABLE'
 LAN_PULL_REFUSED = 'LAN_PULL_REFUSED'

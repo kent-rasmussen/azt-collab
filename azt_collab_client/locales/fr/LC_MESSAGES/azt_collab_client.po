@@ -1338,6 +1338,18 @@ msgstr "application…"
 msgid "Paired on this device, but {device_name} could not be reached to confirm it. Bring the devices onto the same network and try again."
 msgstr "Jumelé sur cet appareil, mais {device_name} n’a pas pu être contacté pour le confirmer. Placez les appareils sur le même réseau et réessayez."
 
+msgid "Paired with {device_name}, but it did not share {langcode} — its share QR had expired. Show the project’s QR again and keep it on screen while this phone copies."
+msgstr "Jumelé avec {device_name}, mais il n’a pas partagé {langcode} — son code QR de partage avait expiré. Affichez de nouveau le code QR du projet et laissez-le à l’écran pendant la copie."
+
+msgid "Contacting the other phone…"
+msgstr "Connexion à l’autre téléphone…"
+
+msgid "Could not receive the project"
+msgstr "Impossible de recevoir le projet"
+
+msgid "unknown"
+msgstr "inconnu"
+
 msgid "Other servers:"
 msgstr "Autres serveurs :"
 

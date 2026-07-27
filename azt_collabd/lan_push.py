@@ -1195,7 +1195,7 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
 
 
 def hello_to_peer(host, port, expected_fp, device_name='',
-                  langcode=''):
+                  langcode='', out=None):
     """Initiate a TLS hello handshake to *host*:*port*, pinning
     *expected_fp*, and POST our identity to ``/v1/lan/hello`` so the
     remote daemon auto-reverse-records us.
@@ -1209,6 +1209,13 @@ def hello_to_peer(host, port, expected_fp, device_name='',
 
     Returns ``True`` on success, ``False`` on any failure. Logs
     detail; never raises.
+
+    *out*, when a dict is passed, receives ``share_refused`` /
+    ``share_refused_reason`` if the remote recorded the pair but
+    REFUSED the langcode we asked for (its share-QR offer had lapsed).
+    The return stays ``True`` in that case — the hello succeeded; it's
+    the project that didn't come with it — so callers that only check
+    the bool are unaffected (0.55.3).
 
     Called from the daemon's ``_h_lan_pair_accept`` right after a
     successful QR-scan recording, so the remote side doesn't need a
@@ -1277,6 +1284,30 @@ def hello_to_peer(host, port, expected_fp, device_name='',
               f'{resp.status}: {resp.data!r}',
               file=sys.stderr, flush=True)
         return False
+    # Did they REFUSE the project we asked for? (0.55.3) The hello
+    # carries a langcode when we've just scanned a project-share QR,
+    # and the owner grants it only while that QR's offer is still
+    # armed. A refusal here is the real cause of a clone that then
+    # fails with ``NotGitRepository``, so hand it to the caller
+    # through *out* rather than leaving it in the peer's log — the
+    # bool return is unchanged, since the hello itself succeeded.
+    if out is not None:
+        try:
+            import json as _json_mod
+            decoded = _json_mod.loads((resp.data or b'').decode(
+                'utf-8', 'replace') or '{}')
+            if isinstance(decoded, dict):
+                refused = str(decoded.get('share_refused', '') or '')
+                if refused:
+                    out['share_refused'] = refused
+                    out['share_refused_reason'] = str(
+                        decoded.get('share_refused_reason', '') or '')
+                    print(f'[lan-hello] {host}:{port} did NOT share '
+                          f'{refused!r} — its QR offer had lapsed',
+                          file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[lan-hello] response decode raised: {ex!r}',
+                  file=sys.stderr, flush=True)
     print(f'[lan-hello] auto-reverse-recorded on {host}:{port}',
           file=sys.stderr, flush=True)
     return True

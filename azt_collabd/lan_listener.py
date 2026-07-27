@@ -560,6 +560,7 @@ def _handle_hello_bodyauth(environ, start_response):
     # refuse the auto-share — the user can still tap Share
     # manually if they meant to allow this peer.
     langcode_offered = str(payload.get('langcode', '') or '')
+    share_refused = ''
     if langcode_offered:
         if qr_offer_active(langcode_offered):
             try:
@@ -570,12 +571,27 @@ def _handle_hello_bodyauth(environ, start_response):
                       f'{langcode_offered!r} raised: {ex!r}',
                       file=sys.stderr, flush=True)
         else:
+            # TELL THE SCANNER (0.55.3). This refusal used to be
+            # log-only: the phone asked for a langcode by name, got a
+            # pair without it, and discovered the consequence three
+            # steps later as ``NotGitRepository`` from a clone that
+            # could never work — with nothing on screen. The scan is
+            # the user's whole gesture; if it didn't grant what it
+            # asked for, that belongs in the reply.
+            share_refused = langcode_offered
             print(f'[lan-listener] hello from {actual_peer_id[:8]!r} '
                   f'claimed langcode={langcode_offered!r} but no '
                   f'recent QR offer for it; pair recorded, '
-                  f'auto-share refused',
+                  f'auto-share refused — telling the scanner',
                   file=sys.stderr, flush=True)
-    resp = _json.dumps({'ok': True, 'peer_id': actual_peer_id})
+    resp_body = {'ok': True, 'peer_id': actual_peer_id}
+    if share_refused:
+        # The QR's keepalive window (30 s) had lapsed, or its screen
+        # was dismissed. Deliberately specific: the fix is "show the
+        # project's Share QR again", not anything about the network.
+        resp_body['share_refused'] = share_refused
+        resp_body['share_refused_reason'] = 'qr_offer_expired'
+    resp = _json.dumps(resp_body)
     body_bytes = resp.encode('utf-8')
     start_response('200 OK', [
         ('Content-Type', 'application/json'),
@@ -614,7 +630,8 @@ def _json_response(start_response, status_line, body_dict):
     return [body_bytes]
 
 
-def _note_inbound_endpoint(peer_id, environ, payload=None):
+def _note_inbound_endpoint(peer_id, environ, payload=None,
+                           langcode=''):
     """Promote the address this request ARRIVED from to the head of
     the peer's endpoint list (0.54.99).
 
@@ -643,9 +660,63 @@ def _note_inbound_endpoint(peer_id, environ, payload=None):
         if not port.isdigit():
             return
         _peers.promote_endpoint(peer_id, f'{host}:{port}')
+        _reverse_deliver(peer_id, langcode=langcode)
     except Exception as ex:
         print(f'[lan-listener] endpoint promote raised: {ex!r}',
               file=sys.stderr, flush=True)
+
+
+def _reverse_deliver(peer_id, langcode=''):
+    """"Do I owe this peer anything?" — asked the moment they reach us
+    (0.55.5). Scoped to *langcode* when the inbound request names one.
+
+    Kent 2026-07-27: *"would it not be possible to ask, when receiving
+    something from a peer: do I have anything for this peer? and if so,
+    immediately send it on the address that we know is good?"* Yes, and
+    it is the missing half of 0.54.99: that change promotes the address
+    a peer just proved reachable, but nothing acted on it.
+
+    Why it matters: reachability is routinely ONE-WAY. A phone whose
+    stored address for us is stale (or which can't route to us at all)
+    keeps failing its own fan-out — while its inbound requests arrive
+    here perfectly. Convergence then waits on the broken direction. But
+    at this instant we hold a proven-good address for them, so the
+    working direction can carry BOTH directions' data: we push what we
+    owe, and ``_push_to_peer`` fetches + merges when they're ahead.
+
+    With a *langcode*, push exactly that project: the peer just told us
+    which one they care about, so catching up the rest can wait for the
+    ordinary sweep. Without one (a bare hello), fall back to
+    ``sweep_peer``, which is debounced per peer and no-ops cheaply when
+    they're already current. Either way on a thread, so a listener
+    response never waits on git."""
+    def _work():
+        try:
+            from . import lan_push as _lan_push
+            if langcode:
+                from . import projects as _proj
+                project = _proj.get(langcode)
+                if project is None:
+                    return
+                print(f'[lan-listener] reverse delivery: checking '
+                      f'{langcode!r} for {peer_id[:8]!r} on the '
+                      f'address they just reached us from',
+                      file=sys.stderr, flush=True)
+                entry = _peers.get_peer(peer_id)
+                if entry is not None:
+                    _lan_push._push_to_peer(project, entry)
+                return
+            _lan_push.sweep_peer(peer_id)
+        except Exception as ex:
+            print(f'[lan-listener] reverse delivery for '
+                  f'{peer_id[:8]!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+    try:
+        threading.Thread(target=_work, daemon=True,
+                         name='lan-reverse-deliver').start()
+    except Exception as ex:
+        print(f'[lan-listener] reverse delivery thread raised: '
+              f'{ex!r}', file=sys.stderr, flush=True)
 
 
 def _paired_claimant(payload):
@@ -941,7 +1012,11 @@ def _handle_share_offer(environ, start_response, peer_id,
         _peers.set_share_confirmed(peer_id, langcode, True)
     except Exception:
         pass
-    _note_inbound_endpoint(peer_id, environ, payload)
+    # Scoped to the project they just named (0.55.5): they told us
+    # which one they care about, and we now hold an address that
+    # provably reaches them.
+    _note_inbound_endpoint(peer_id, environ, payload,
+                           langcode=langcode)
     try:
         local_proj = _projects.get(langcode)
     except Exception:

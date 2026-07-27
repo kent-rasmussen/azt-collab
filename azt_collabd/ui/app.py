@@ -2117,10 +2117,18 @@ class SettingsScreen(Screen):
         highlight and section label are correct on screen entry.
         Tolerant of transport failure on either side (policy
         defaults to False, label falls back to the generic
-        translation)."""
-        self._cawl_variants_all = bool(get_cawl_prefetch_all_variants())
-        self._refresh_cawl_variants_buttons()
-        self._refresh_cawl_section_label()
+        translation).
+
+        Off the main thread since 0.55.1: this runs from ``refresh()``
+        on screen entry, and a blocked RPC here is part of the
+        measured 44 s of main-thread silence between the version probe
+        and the first settings line (logcat 2026-07-27 17:05)."""
+        def _apply(value, err):
+            self._cawl_variants_all = (
+                False if err is not None else bool(value))
+            self._refresh_cawl_variants_buttons()
+            self._refresh_cawl_section_label()
+        self._rpc_then(get_cawl_prefetch_all_variants, _apply)
 
     def _refresh_cawl_variants_buttons(self):
         all_variants = bool(getattr(self, '_cawl_variants_all', False))
@@ -2140,24 +2148,36 @@ class SettingsScreen(Screen):
         wordlist name. Source: ``cawl_cache_status(langcode)``
         carries ``image_repo`` already, so we don't need a new RPC.
         Empty langcode or empty image_repo falls back to the
-        generic ``Wordlist images`` label."""
+        generic ``Wordlist images`` label.
+
+        Off the main thread since 0.55.1 — it makes TWO RPCs
+        (``last_project`` then ``cawl_cache_status``), and converting
+        only its caller would have moved the block rather than removed
+        it."""
         label = self.ids.get('cawl_section_label')
         if label is None:
             return
-        langcode = (last_project() or '').strip()
-        repo = ''
-        if langcode:
+
+        def _fetch():
+            langcode = (last_project() or '').strip()
+            if not langcode:
+                return ''
             try:
                 status = cawl_cache_status(langcode)
-                repo = (status.get('image_repo') or '').strip()
+                return (status.get('image_repo') or '').strip()
             except Exception:
-                repo = ''
-        from azt_collabd import cawl as _cawl_mod
-        name = _cawl_mod.wordlist_name(repo)
-        if name:
-            label.text = _tr('Wordlist ({name}) images').format(name=name)
-        else:
-            label.text = _tr('Wordlist images')
+                return ''
+
+        def _apply(repo, err):
+            from azt_collabd import cawl as _cawl_mod
+            name = _cawl_mod.wordlist_name(
+                '' if err is not None else (repo or ''))
+            if name:
+                label.text = _tr(
+                    'Wordlist ({name}) images').format(name=name)
+            else:
+                label.text = _tr('Wordlist images')
+        self._rpc_then(_fetch, _apply)
 
     def set_work_offline_mode(self, enabled):
         """Set the work-offline toggle explicitly. Bound from the

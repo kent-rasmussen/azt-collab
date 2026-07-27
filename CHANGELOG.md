@@ -9,6 +9,233 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.7 — the pair-accept hello uses the address ladder, not just the QR
+
+Kent 2026-07-27, on a suggestion of mine to prefer mDNS over the QR:
+*"I thought the qr code was supposed to publish ALL addresses?"* It
+does, and the clone already prefers mDNS — `_candidate_endpoints`
+orders mDNS-resolved → manual → observed → QR. That suggestion was
+redundant.
+
+Chasing it found the real gap: **the hello in `_h_lan_pair_accept`
+iterated the QR's raw endpoint list only**, consulting neither mDNS nor
+the promoted/observed addresses. Field log: the scanner had already
+resolved this peer at `192.168.31.60:34501` via NSD, yet the hello
+dialed the QR's `10.191.129.91:55870` and timed out — it held a good
+address and never looked at it. The hello was the one path that hadn't
+been moved onto the ladder.
+
+- `_h_lan_pair_accept` now resolves candidates through
+  `_candidate_endpoints(entry)`, falling back to the QR list only if
+  that raises or comes back empty.
+
+## 0.55.6 — re-resolve before giving up: the good address may have arrived mid-dial
+
+Field log 2026-07-27 18:22, and it's a two-second race:
+
+| t | event |
+|---|---|
+| :25.8 | QR scanned |
+| :32.9 | phone times out dialing the desktop at `10.191.129.91:55870` (stale QR address — old tether subnet, old listener port) |
+| :34.8 | the desktop reaches the PHONE from `192.168.31.60`, and both share-offers land as `remote_url matches local; no-op` |
+
+Nothing was wrong with the pairing, the sharing, or the desktop. The
+phone simply held a stale address, and the working one showed up two
+seconds after the candidate list had been snapshotted — so a clone
+failed with a reachable address sitting in the registry, put there by
+0.54.99's promotion moments too late.
+
+- **Both loops now re-resolve after exhausting their candidates** — the
+  collision peek and the clone itself — and retry any address that
+  wasn't in the original snapshot. Bounded by construction: only
+  genuinely NEW candidates are tried, so a truly absent peer adds no
+  attempts.
+
+Doesn't fix the stale QR itself (a displayed QR keeps advertising
+whatever was true when it was drawn, and this desktop's tether subnet
+and listener port had both changed). But it stops a QR that has gone
+stale mid-session from failing a clone the daemon could otherwise
+complete.
+
+## 0.55.5 — when a peer reaches us, send them what we owe them
+
+Kent 2026-07-27: *"would it not be possible to ask, when receiving
+something from a peer: do I have anything for this peer? and if so,
+immediately send it on the address that we know is good?"* — *"for a
+particular project."*
+
+This is the missing half of 0.54.99. That change promotes the address a
+peer just proved reachable to the head of their endpoint list; nothing
+ever acted on it. Meanwhile reachability is routinely ONE-WAY: a phone
+whose stored address for us is stale keeps failing its own fan-out
+while its inbound requests arrive here perfectly, so convergence sits
+waiting on the broken direction — the shape behind "a computer stamped
+up to date 2 minutes ago on a phone that has the computer stamped 238
+to send, 6 hrs ago."
+
+- **`_reverse_deliver(peer_id, langcode)`** fires on authenticated
+  inbound contact, right after the endpoint promotion, on a thread so
+  no listener response waits on git.
+- **Scoped to the project named in the request** (Kent's refinement):
+  a share-offer for `nml` triggers a check of `nml` only — they told us
+  what they care about, and catching up the rest can wait for the
+  ordinary sweep. A bare hello with no langcode falls back to
+  `sweep_peer`, which is debounced per peer and no-ops cheaply.
+- Because `_push_to_peer` fetches and merges when the peer is ahead,
+  the working direction now carries **both** directions' data: we push
+  what we owe and pull what they have, over the one address that
+  demonstrably works.
+
+Not covered: the git smart-protocol routes carry a langcode but no peer
+identity (TLS gives none, and the body is empty), so a plain fetch
+can't trigger this. Inferring the peer from `REMOTE_ADDR` against
+`peers.json` would extend it there and is worth considering.
+
+**On the 238-vs-up-to-date discrepancy itself:** one of those two
+numbers is computed from a six-hour-old observation and the other from
+a two-minute-old one, so the phone's 238 may be stale bookkeeping
+rather than real pending work — `last_seen_main` only advances when the
+holder observes the peer's ref. The reverse delivery settles it either
+way: the next inbound contact makes the computer look, and whichever
+side is genuinely behind gets caught up.
+
+## 0.55.4 — "Copying" only when copying; the wait is bounded
+
+Kent 2026-07-27: *"agreed copying shouldn't be there if it's not"* —
+after watching "Copying project to this phone…" sit for minutes while
+the daemon was failing to reach the peer at all.
+
+Three changes, smallest lie first:
+
+- **The label waits for evidence.** The pre-clone phase now reads
+  "Contacting the other phone…", and `_poll_progress` promotes it to
+  "Copying project to this phone…" on the first real sideband line from
+  `lan_clone_progress()`. The poll already ran at 1 Hz and already knew
+  whether bytes were moving; it just wasn't allowed to say.
+- **One attempt per address.** `_build_pool_manager` now passes
+  `Retry(total=0, …)`. urllib3 defaults to three tries, and the clone
+  path *already* walks every candidate endpoint — so an unreachable
+  peer cost candidates × 3 × the 5 s connect timeout. Those
+  `Retrying (Retry(total=2…))` triplets in the log were the bulk of the
+  wait. The retry that helps here is the next address, not the same
+  dead one again.
+- **`lan_clone` bounded at 150 s** instead of `rpc.call`'s 300 s
+  default, returning a typed `SERVER_UNAVAILABLE` the receive UI
+  renders. A slow-but-live transfer keeps emitting progress, which is
+  what distinguishes it from a hang.
+
+Also corrected the `_peek_remote_refs` docstring, which had claimed
+treating `None` as "no overlap" was safe "because the worst that does
+is refuse a collision we couldn't confirm was related". The worst it
+actually did was tell the user to delete a project (see 0.55.3).
+
+## 0.55.3 — an unreachable peer no longer tells you to delete your project
+
+**The serious one.** Kent 2026-07-27: the UI said *"a different project
+named nml exists, rename or remove first"* — while the log shows the
+clone never reached the peer at all (`Network is unreachable` on every
+candidate address).
+
+`_peek_remote_refs` returns `None` on any failure. The collision check
+then did `_shares_commits_with(refs or {}, …)`, so **"couldn't ask"
+became "no shared commits" became `LAN_PROJECT_COLLISION_UNRELATED`** —
+a verdict whose UI text invites the user to rename or REMOVE a project,
+on the strength of a network timeout. The docstring on
+`_shares_commits_with` even says empty refs are treated as "no relation"
+because that's "the conservative answer"; for a verdict that can cost
+data it is the opposite of conservative.
+
+- **`refs is None` now returns `LAN_PEER_UNREACHABLE`** and refuses to
+  judge relatedness at all, with a log line naming how many candidates
+  were tried. Unknown is not unrelated.
+
+**Also (the cause behind the earlier silent failures):** a scan that
+pairs but is refused the project now says so at the moment of the scan.
+
+- The owner's hello handler returns `share_refused` +
+  `share_refused_reason` when it records the pair but declines the
+  langcode because its share-QR offer had lapsed (the 30 s
+  "valid while displayed" keepalive from 0.52.26). Previously log-only
+  on the owner.
+- `hello_to_peer(..., out={})` passes it back; the bool return is
+  unchanged, since the hello itself succeeded.
+- `_h_lan_pair_accept` adds new **`LAN_SHARE_QR_EXPIRED`** to the
+  Result, so the scanner says "Paired with X, but it did not share
+  nml — its share QR had expired. Show the project's QR again and keep
+  it on screen while this phone copies." That is the actual fix, and it
+  arrives before the clone that would have failed with
+  `NotGitRepository`.
+
+**Known, not fixed here:** "Copying project to this phone…" is set
+before the clone RPC and stays up for its whole duration — with an
+unreachable peer that's candidates × dulwich's 3 retries × 5 s connect,
+inside a 300 s client timeout. The label is a lie for minutes. Needs a
+bounded clone timeout, retries trimmed to 1 per candidate, and a phase
+text driven by `lan_clone_progress().active` rather than optimism.
+
+## 0.55.2 — a failed clone can no longer return to the picker in silence
+
+Kent 2026-07-27, repeatedly: a QR clone drops back to the picker with
+"NO indication of the failed clone, nor the reason for it, in the UI."
+The daemon log said exactly why — `[lan-clone] ls-remote against
+'https://10.132.131.95:55870/nml.git' failed … [Errno 101] Network is
+unreachable` — and I initially called the symptom "not a mystery" on
+that basis. Wrong framing: **the log knowing why is not the user
+knowing why**, and the silence was the bug.
+
+Cause: `_finish_on_main`'s failure chain names five specific codes
+(`LAN_CLONE_TIMEOUT`, `LAN_LOCAL_TLS_ERROR`, `LAN_PROJECT_NOT_SHARED`,
+`LAN_PEER_UNREACHABLE`, `CONTRIBUTOR_UNSET`, plus paired-but-no-project
+and `SERVER_ERROR`) and had **no `else`**. Any other outcome fell
+through to `_final_done`, which closed the popup and repopulated the
+picker — no toast, no status line, nothing.
+
+- **Catch-all branch:** when nothing landed and no specific branch
+  matched, show "Could not receive the project" with
+  `translate_result(result)`, falling back to the raw codes and finally
+  to "unknown". Deliberately vaguer than the tailored branches — it
+  fires exactly when we have no specific advice — but a user who sees
+  "did not finish: <reason>" can act or report it. Silence is the only
+  outcome that leaves them stuck.
+
+**Still open** (needs a fresh session, scoped in the item): the clone
+builds ONE url from a single endpoint, so one unreachable candidate
+fails the whole clone even when the same QR carries a reachable
+address — `_h_lan_pair_accept` already walks candidates for its hello
+and the clone should too, with dulwich's retry ladder trimmed (three
+retries ≈ 10 s per dead candidate, which is also the unresponsive
+window the user sees).
+
+## 0.55.1 — CAWL section RPCs off the main thread (2 of the load blockers)
+
+Kent 2026-07-27, after several turns of me writing notes instead of
+code: *"So did you do any actual fix? … You said there's no reason to
+wait for tomorrow, so why are we waiting?"* Correct — the missing logs
+were never the reason, and I substituted a different excuse. Landing
+the part that's safely landable now, against the measured 44 s of
+main-thread silence in that launch (logcat 17:05).
+
+- **`_refresh_cawl_variants_state`** → through `_rpc_then`. Called from
+  `refresh()` on screen entry; its `get_cawl_prefetch_all_variants()`
+  blocked the UI thread.
+- **`_refresh_cawl_section_label`** → same, and this one mattered more:
+  it makes **two** RPCs (`last_project`, then `cawl_cache_status`) and
+  is called BY the applier above, so converting only the caller would
+  have relocated the block rather than removed it. Fetch both in the
+  worker, set the label on the main thread.
+- **Correction to 0.54.86's list:** `_refresh_debug_503_state` is a
+  local `os.path.exists` on the sentinel file, not an RPC. It was never
+  a blocker and I was wrong to name it as one.
+
+**Still main-thread, and it is the big one:** the
+`get_credentials_status()` + `is_online()` pair in `refresh()`, where
+`is_online` runs a real connectivity probe daemon-side. Everything
+after it consumes `status`/`online` for button state, and both the
+daemon-answered retry ladder and the presplash release hang off its
+result — so it needs the whole downstream block moved into an applier
+in one careful pass, not a partial conversion. Scoped in
+`agenda/presplash_hold_until_responsive.md`.
+
 ## 0.55.0 — one long string trimmed; 0.54.x patch space exhausted
 
 **Why 0.55.0 and not 0.54.100:** the patch field ran out at 99. A

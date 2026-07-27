@@ -323,6 +323,11 @@ _HANDLERS = {
         'then try sharing again.'),
     S.PEER_UNKNOWN:           lambda p: _tr(
         'That phone is not paired with this one anymore.'),
+    S.LAN_SHARE_QR_EXPIRED:   lambda p: _fmt(
+        _tr('Paired with {device_name}, but it did not share '
+            '{langcode} — its share QR had expired. Show the '
+            'project’s QR again and keep it on screen while this '
+            'phone copies.'), p),
     S.LAN_PAIR_UNCONFIRMED:   lambda p: _fmt(
         _tr('Paired on this device, but {device_name} could not be '
             'reached to confirm it. Bring the devices onto the same '
