@@ -696,6 +696,17 @@ def main():
     # restores parity with the desktop daemon.
     scheduler.start_watcher()
 
+    # Self-monitor (0.54.90): stall → all-thread traceback in the log;
+    # persistent wedge → restart. Desktop wires this in
+    # ``server.serve``; both entry paths need it, and a hook added to
+    # only one hides for versions (0.50.53–.55 precedent).
+    try:
+        from azt_collabd import watchdog as _watchdog
+        _watchdog.start()
+    except Exception as ex:
+        print(f'[service] watchdog start raised: {ex!r}',
+              file=sys.stderr, flush=True)
+
     # Auto-start the LAN listener if the persisted toggle is on.
     # ``lan.allow_sync`` survives a daemon restart in config.json
     # but the listener thread + WifiLock + FGS state don't, so

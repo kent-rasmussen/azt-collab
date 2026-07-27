@@ -25,6 +25,144 @@
   needs ranking.
 - **Waiting on:** Nothing.
 
+## Field wedge with a silent log (2026-07-27)
+
+Four Android devices tethered to the dev desktop. Symptoms, in the
+order Kent hit them:
+
+1. OS "'Python (v3.13)' Is Not Responding / Force Quit" on the daemon
+   settings UI (main-thread RPCs — fixed 0.54.86, but the *reason*
+   they blocked is this item).
+2. A dozen `SERVICE_RESTARTED (connection failed: timed out)` lines in
+   minutes — which turned out to be a false signal (fixed 0.54.87:
+   the daemon was alive and answering `/v1/health`, so nothing had
+   restarted; loopback calls were simply timing out).
+3. **None of the four phones listed the computer**, despite every one
+   of them having a live USB link and multiple addresses.
+
+**The log is the tell: it stops dead at 08:24:57** and records nothing
+afterwards, while the UI polled every 5 s and timed out. Immediately
+before the silence, a phone at 192.168.31.187 fetched `/baf.git` and
+`/nml.git` successfully — so the listener was serving normally right up
+to the wedge.
+
+Diagnosis: the daemon process is **alive and answering the lock-free
+`/v1/health`, but wedged for everything else** — including its
+zeroconf advertise/browse threads, which live in the same process.
+That single fact explains all three symptoms at once, and it explains
+why phones can still *fetch* (they hold a cached endpoint) while no
+longer *discovering* (no advertisement is going out).
+
+Watch for on the next occurrence: whether the log silence and the
+timeouts start at the same instant (one wedge) or the log dies first
+(the separate 2026-07-08 "tee starvation" failure, where writes stopped
+~80 s after startup while serving continued). Distinguishing them
+decides whether logging needs its own fix.
+
+**Progression observed, and it names a mechanism.** The client errors
+changed shape as the evening went on: first `timed out`, later
+`Remote end closed connection without response`. Accepted-then-dropped
+is not slowness — it's what `ThreadingHTTPServer` does when it can no
+longer serve: a thread per request, blocked handlers accumulating,
+until `Thread.start()` fails or fds run out (cf. 0.54.1 EMFILE) and new
+connections are accepted and dropped with no reply. So the likely chain
+is **blocked handlers → thread/fd exhaustion → total wedge**, with the
+initial block being this item's lock-across-network-I/O (or a
+GIL-saturating whole-LIFT merge).
+
+### Why the addresses were stale (answered 2026-07-27)
+
+Kent: *"why would the USB addresses be stale? are those that haven't
+completed connection?"* No — they're the peers we've heard **no mDNS
+announcement from this session**. Grepping the day's log,
+`74453504` and `841d43a8` appear ONLY in outbound dials, never in an
+`add` line, while the two reachable phones appear in `add` lines
+repeatedly with stable ports. So the only address held for them is
+the one persisted from a previous session, and nothing refreshed it.
+
+The two failures are diagnostically different, and the distinction is
+worth keeping:
+
+- **connect timeout** (`10.143.126.7:41455`) — that IS a live tether
+  subnet (this desktop is `10.143.126.171`), so the route exists and
+  nothing answered: the phone is cabled but its daemon isn't listening
+  there. Candidates: daemon not running, or it re-bound to a different
+  ephemeral port. **Watch item:** every phone showed an ephemeral port
+  (40975 / 38141 / 41455 / 43009) rather than 34501, so if the
+  `lan_listener_port` memo doesn't persist on Android, every phone
+  daemon restart invalidates every cached endpoint.
+- **`No route to host`** (`192.168.31.240:40975`) — the device isn't on
+  that subnet at all. Cheap to discover (~3 s) versus the timeout's
+  ~15–30 s.
+
+### Wedge detector + self-recovery (BUILT 0.54.89–0.54.90)
+
+Shipped 0.54.89 on `/v1/health`: `threads`, `fds`, `locks_held`
+(holder + held_s, from `locks.py` at depth 1), `heartbeats`.
+
+Shipped 0.54.90: `azt_collabd/watchdog.py` — diagnose then recover.
+Stall (heartbeat or held lock past `watchdog.warn_s`, default 120 s) →
+one summary line + thread/fd counts +
+`faulthandler.dump_traceback(all_threads=True)`, once per episode.
+Persisting past `watchdog.restart_s` (default 600 s) → restart via the
+admin-restart mechanism, rate-limited, with a 90 s startup grace.
+`iface-watch` heartbeats at ~3 s (the most sensitive signal). Wired
+into `server.serve` AND `server_apk/service.py:main`.
+
+**Answering "are all causes visible?" — no. Remaining blind spots:**
+
+- **No heartbeat** on the listener/serve loop, the advertise thread, or
+  the log writer. A stall confined to one of those is invisible unless
+  it also blocks a lock or another loop. The listener is the awkward
+  one: `serve_forever` blocks in `select`, so "alive" can't be bumped
+  from inside the loop — it needs either a per-request stamp (which
+  goes stale legitimately when idle) or a synthetic self-probe.
+- **The log writer can't monitor itself.** If the tee dies (2026-07-08
+  precedent), the watchdog's own output dies with it — the failure
+  would present as total silence, indistinguishable from a dead
+  process. An out-of-band marker file touched per tick would cover it.
+- **GIL saturation** from an O(whole-LIFT) merge presents as slowness,
+  not a stall: loops keep ticking, just late. Needs per-operation
+  duration logging to separate "working hard" from "stuck".
+- **`_push_to_peer`'s internal peek retry** is still unbounded (two
+  connect timeouts per dial), so 0.54.89's one-dial-per-sweep is
+  really ~2 timeouts per sweep.
+
+### Original design notes (2026-07-27)
+
+Kent: *"Can we determine a wedge programmatically? Any idea why and how
+to prevent it?"* A wedge is by definition "the lock-free path answers,
+the working paths don't", so the detector is a comparison:
+
+- **Loop heartbeats in `/v1/health`** — monotonic timestamps bumped by
+  the watcher tick, scheduler tick, listener bind, last advertise, last
+  log write. Health then means "these loops ticked N s ago" rather than
+  "the socket accepted", and a stale heartbeat beside a live HTTP
+  thread IS the signature.
+- **`threading.active_count()` + open-fd count** — the two cheapest
+  fields, and either one would have identified the 07-27 exhaustion
+  immediately.
+- **Lock table** — `locks.py` is the single acquisition point, so
+  recording holder + held-duration per `project_lock` and exposing it
+  names WHICH operation is stuck.
+- **Internal watchdog thread** — on any loop going stale past a
+  threshold, log one line plus `faulthandler.dump_traceback()` (stdlib,
+  all thread stacks). This is how the culprit gets identified without a
+  debugger, on a machine we don't have.
+- **Client half already exists:** `service_health()` is lock-free while
+  a real RPC isn't; disagreement is reported as `SERVICE_SLOW` /
+  `SERVICE_DROPPED` (0.54.87/.88).
+
+Prevention, in payoff order: the phase-split this item specifies;
+a timeout on EVERY lock acquisition (a deadlock degrades to typed BUSY
+instead of a hang); connect+read timeouts on every socket path; a cap on
+concurrent request threads with 503 beyond it, so one stuck operation
+can't consume the pool. Stopgap while that lands: let the watchdog
+restart the daemon itself when a loop goes stale — restart is already
+designed safe (jobs → `JOB_INTERRUPTED`, transfers retried, listener
+re-binds its port), the same reasoning as the 0.54.77 local
+auto-restart, turned inward.
+
 ## Evidence (2026-07-22)
 
 - `_run_to_completion` (scheduler.py) explicitly yields `project_lock`
@@ -84,7 +222,26 @@ Kent wiped + re-cloned it; wiping the phone can't unwind commits the
 desktop already merged). The real defects, all visible in the graph as
 a criss-cross staircase of merge commits that never collapses:
 
-  - **Non-deterministic merge commit identity.** `_merge_diverged`
+  - **FIXED 0.54.91.** Three things were side-dependent, not one:
+    wall-clock time, parent order (`merge_heads` puts our HEAD first,
+    so A wrote `[A,B]` and B `[B,A]`), and the message itself
+    ("Local commits:" flips between peers). All three now canonical —
+    stamp from max(parent times), sorted parents, and
+    `build_canonical_merge_message`. Cost accepted: first-parent
+    convention is sacrificed (`git log --first-parent` may follow the
+    other device's line); ancestry and all coverage walkers consider
+    every parent, so correctness is unaffected. Written via an explicit
+    `Commit` object since the worktree API can't express sorted
+    parents, with fallback to the old path on any unexpected dulwich
+    shape.
+  - **Reprioritisation that followed (Kent 2026-07-27):** with merges
+    no longer manufactured by two devices merely meeting, the
+    both-sides-changed merge only runs when two people genuinely edit
+    concurrently — so the O(whole-LIFT) incremental rewrite (the
+    riskiest change on this item, touching the truncation guards and
+    the duplicate/gloss rules) drops well down the list. Do it only if
+    field evidence shows real concurrent editing making it hurt.
+  - **Original diagnosis, kept:** `_merge_diverged`
     produces a deterministic merge *tree* (same inputs → same tree, by
     design), but the merge *commit object* is created via
     `get_worktree().commit(...)` with the wall-clock time, so two peers

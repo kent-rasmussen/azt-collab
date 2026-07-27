@@ -330,7 +330,56 @@ def _h_health(_body):
             payload['last_native_crash'] = native
     except Exception:
         pass
+    payload.update(_health_liveness())
     return 200, payload
+
+
+def _health_liveness():
+    """Wedge-detection fields for ``/v1/health`` (0.54.89).
+
+    Health is lock-free and served on its own thread, so it answers
+    while the daemon's real work is stuck — which is exactly what made
+    the 2026-07-27 field incident undiagnosable: a silent log, timing-
+    out RPCs, and no way to tell "busy" from "broken" or to name the
+    culprit. These four fields make a wedge programmatically visible:
+
+    - ``threads`` — ``ThreadingHTTPServer`` starts one per request, so
+      a climbing count means handlers are blocking rather than
+      returning. Once ``Thread.start()`` fails, new connections get
+      accepted and dropped with no response (the ``SERVICE_DROPPED``
+      signature from 0.54.88).
+    - ``fds`` — the other exhaustion axis; cf. the 0.54.1 EMFILE
+      incident.
+    - ``locks_held`` — which project lock is held, by which thread,
+      for how long. Tens of seconds means network I/O under the lock
+      (agenda/daemon_lock_across_network_io.md) or a deadlock. This is
+      the field that NAMES the stuck operation.
+    - ``heartbeats`` — seconds since each daemon loop last ticked. A
+      stale heartbeat beside a live HTTP thread IS the wedge.
+
+    Every field is best-effort; a probe must never be the thing that
+    breaks."""
+    out = {}
+    try:
+        out['threads'] = threading.active_count()
+    except Exception:
+        pass
+    try:
+        # Linux only; absent elsewhere rather than guessed at.
+        out['fds'] = len(os.listdir('/proc/self/fd'))
+    except Exception:
+        pass
+    try:
+        from .locks import held_snapshot
+        out['locks_held'] = held_snapshot()
+    except Exception:
+        pass
+    try:
+        from . import scheduler as _sched
+        out['heartbeats'] = _sched.heartbeat_ages()
+    except Exception:
+        pass
+    return out
 
 
 def _h_online(_body):
@@ -6285,6 +6334,18 @@ def run(host='127.0.0.1', port=0):
     # Start the connectivity watcher so projects with pending_push get
     # drained on offline→online transitions.
     scheduler.start_watcher()
+
+    # Self-monitor: dump all thread stacks when a loop or a project
+    # lock stalls, and restart out of a persistent wedge (0.54.90).
+    # Started AFTER the watcher so its heartbeats exist. Mirrored in
+    # the Android path (server_apk/service.py) per the "startup hooks
+    # live in both" rule.
+    try:
+        from . import watchdog as _watchdog
+        _watchdog.start()
+    except Exception as ex:
+        print(f'[watchdog] start raised: {ex!r}',
+              file=sys.stderr, flush=True)
 
     # Auto-start the LAN listener if the persisted toggle is on.
     # ``lan.allow_sync`` survives a daemon restart in config.json

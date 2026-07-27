@@ -60,6 +60,8 @@ class _ReentrantFileLock:
                 self._rlock.release()
                 raise
         self._depth += 1
+        if self._depth == 1:
+            _record_holder(self._path)
 
     def _acquire_flock(self, deadline):
         if _fcntl is None:
@@ -92,6 +94,7 @@ class _ReentrantFileLock:
     def release(self):
         self._depth -= 1
         if self._depth == 0:
+            _forget_holder(self._path)
             if self._fd is not None and _fcntl is not None:
                 try:
                     _fcntl.flock(self._fd, _fcntl.LOCK_UN)
@@ -107,6 +110,53 @@ class _ReentrantFileLock:
 
 _registry_lock = threading.Lock()
 _locks: dict = {}
+
+# Currently-held locks: path → (thread name, monotonic acquire time).
+# In-process only, and deliberately so: this exists to answer "WHICH
+# operation is the daemon stuck in?" from ``/v1/health`` (0.54.89).
+# A wedge presents as health answering while everything else times
+# out, and without this the next step was guesswork — the 2026-07-27
+# incident cost an evening of inference over a silent log. Anything
+# holding a project lock for tens of seconds is either doing network
+# I/O under it (the regression tracked in
+# agenda/daemon_lock_across_network_io.md) or deadlocked.
+_held_lock = threading.Lock()
+_held: dict = {}
+
+
+def _record_holder(path):
+    try:
+        with _held_lock:
+            _held[path] = (threading.current_thread().name,
+                           time.monotonic())
+    except Exception:
+        pass
+
+
+def _forget_holder(path):
+    try:
+        with _held_lock:
+            _held.pop(path, None)
+    except Exception:
+        pass
+
+
+def held_snapshot():
+    """Currently-held project locks as
+    ``[{'key', 'holder', 'held_s'}]``, longest-held first. Cheap
+    (a dict copy); safe to call from a health handler."""
+    now = time.monotonic()
+    try:
+        with _held_lock:
+            items = list(_held.items())
+    except Exception:
+        return []
+    out = [{'key': os.path.basename(p),
+            'holder': holder,
+            'held_s': round(now - since, 1)}
+           for p, (holder, since) in items]
+    out.sort(key=lambda d: d['held_s'], reverse=True)
+    return out
 
 
 def _lock_path(working_dir):

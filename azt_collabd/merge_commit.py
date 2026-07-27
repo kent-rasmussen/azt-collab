@@ -61,6 +61,60 @@ def _format_commit_line(commit_dict):
     return f'  {sha} {subj}  ({name})' if name else f'  {sha} {subj}'
 
 
+def build_canonical_merge_message(branch, commits_a, commits_b,
+                                  conflicts):
+    """A merge message that does NOT depend on which side you're on
+    (0.54.91).
+
+    ``build_merge_message`` labels one side "Local" and the other
+    "Remote" — but which is which flips between the two peers, so the
+    same merge produced different messages, hence different commit
+    SHAs, hence neither peer could fast-forward to the other and both
+    re-merged forever (the ping-pong in
+    agenda/daemon_lock_across_network_io.md). This renders both sides
+    as one set, ordered by SHA, so peer A and peer B produce byte-
+    identical text for the same pair of parents.
+
+    Kept alongside the side-relative version rather than replacing it:
+    a human reading `git log` on one device benefits from
+    "local vs remote", so that wording stays for the non-convergence
+    call sites."""
+    lines = [f'Merge {branch} (converged)', '']
+    seen = {}
+    for c in list(commits_a) + list(commits_b):
+        sha = str(c.get('sha', '') or '')
+        if sha and sha not in seen:
+            seen[sha] = c
+    if seen:
+        lines.append('Merged commits:')
+        for sha in sorted(seen):
+            lines.append(_format_commit_line(seen[sha]))
+        lines.append('')
+    if conflicts:
+        lines.append('Conflicts (azt-lift-conflict markers added):')
+        rows = []
+        for cf in conflicts:
+            rows.append(
+                f'  {getattr(cf, "path", "") or "?"}: '
+                f'{getattr(cf, "guid", "") or "?"} '
+                f'({getattr(cf, "kind", "") or "?"})')
+        # Sorted: conflict discovery order can differ between peers
+        # even when the resulting set is the same.
+        lines.extend(sorted(rows))
+        lines.append('')
+    trailers = set()
+    for c in seen.values():
+        a = _author_str(c.get('author', '')).strip()
+        if not a:
+            continue
+        if '<' not in a:
+            slug = a.lower().replace(' ', '_') or 'contributor'
+            a = f'{a} <{slug}@device>'
+        trailers.add(f'Co-authored-by: {a}')
+    lines.extend(sorted(trailers))
+    return '\n'.join(lines).rstrip() + '\n'
+
+
 def build_merge_message(branch, local_commits, remote_commits, conflicts):
     """Build a merge commit message.
 

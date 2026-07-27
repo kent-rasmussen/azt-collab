@@ -1662,11 +1662,35 @@ def sweep_peer(peer_id, exclude_langcode=''):
     entry = _peers.get_peer(peer_id)
     if entry is None:
         return {}
+    # Don't re-dial a peer we just found unreachable (0.54.89). This
+    # is a BACKGROUND path — unlike the user-gesture paths, which
+    # deliberately bypass the gate — and an absent peer costs real
+    # foreground time: field 2026-07-27, a stale tether address burned
+    # 30 s on ONE project (connect timeout, then the push attempt),
+    # and a wifi peer that had left the subnet cost ~19 s across two.
+    # Sweeps fire on every mDNS arrival, and a phone flapping between
+    # tether and wifi produces one every ~30 s.
+    if _recently_unreachable(peer_id):
+        print(f'[lan-sweep] {peer_id[:8]!r}: skipped — seen '
+              f'unreachable within the last '
+              f'{_UNREACHABLE_COOLDOWN_S:.0f}s',
+              file=sys.stderr, flush=True)
+        return {}
     shared = entry.get('shared_projects') or []
     out = {}
     for langcode in shared:
         if langcode == exclude_langcode:
             continue
+        # Stop after the FIRST project that proves the peer is
+        # unreachable: every remaining project would pay the same
+        # connect timeout for the same absent device. ``_push_to_peer``
+        # records the gate on its failure paths, so this reads what it
+        # just learned.
+        if _recently_unreachable(peer_id):
+            print(f'[lan-sweep] {peer_id[:8]!r}: aborting remaining '
+                  f'project(s) — peer went unreachable mid-sweep',
+                  file=sys.stderr, flush=True)
+            break
         try:
             project = _proj.get(langcode)
         except Exception:

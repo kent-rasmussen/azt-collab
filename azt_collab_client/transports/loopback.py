@@ -77,8 +77,11 @@ class LoopbackTransport(Transport):
                 info = self._read_server_info()
             except ServerUnavailable as ex:
                 last_err = ex
-                if attempt < _MAX_ATTEMPTS - 1 and self._spawn_server():
-                    if saw_first_attempt:
+                outcome = ''
+                if attempt < _MAX_ATTEMPTS - 1:
+                    outcome = self._spawn_server()
+                if outcome:
+                    if saw_first_attempt and outcome == 'spawned':
                         print('[azt_collab_client] SERVICE_RESTARTED '
                               '(server.json missing → spawned)')
                     continue
@@ -88,9 +91,33 @@ class LoopbackTransport(Transport):
                 return self._call_once(info, method, path, body, timeout)
             except (urllib.error.URLError, OSError) as ex:
                 last_err = ex
-                if attempt < _MAX_ATTEMPTS - 1 and self._spawn_server():
+                outcome = ''
+                if attempt < _MAX_ATTEMPTS - 1:
+                    outcome = self._spawn_server()
+                if outcome == 'spawned':
                     print('[azt_collab_client] SERVICE_RESTARTED '
                           f'(connection failed: {ex}) — retrying')
+                    continue
+                if outcome == 'alive':
+                    # The daemon is UP and answering /v1/health, so
+                    # this is a busy/broken daemon, not a dead one.
+                    # Distinguish HOW the call failed (0.54.88): a
+                    # timeout means handlers are slow; a connection
+                    # closed with no response means the daemon
+                    # ACCEPTED and then dropped us — which points at
+                    # resource exhaustion (handler threads piling up
+                    # on blocked work until ``Thread.start()`` fails,
+                    # or fds) rather than slowness. Calling that
+                    # "timed out" sent the reader down the wrong
+                    # path (field 2026-07-27).
+                    if isinstance(ex, TimeoutError):
+                        print('[azt_collab_client] SERVICE_SLOW '
+                              f'(call timed out: {ex}) — daemon is '
+                              f'alive; retrying')
+                    else:
+                        print('[azt_collab_client] SERVICE_DROPPED '
+                              f'(daemon alive but dropped the call: '
+                              f'{ex}) — retrying')
                     continue
                 raise ServerUnavailable(f'connection failed: {ex}')
         raise ServerUnavailable(str(last_err))
@@ -156,12 +183,26 @@ class LoopbackTransport(Transport):
         return os.environ.get('AZT_CLIENT_AUTOSPAWN', '1') != '0'
 
     def _spawn_server(self):
+        """Ensure a daemon is reachable. Returns ``'alive'`` (one was
+        already up — NOTHING was spawned), ``'spawned'`` (we launched
+        one and it answered), or ``''`` (no daemon).
+
+        The three-way return exists because callers were printing
+        ``SERVICE_RESTARTED`` on a truthy result, and the
+        already-alive path is truthy — so a call that merely TIMED OUT
+        against a busy daemon reported a restart that never happened
+        (field 2026-07-27: a dozen such lines in minutes while the
+        daemon was wedged-but-answering-health). ``SERVICE_RESTARTED``
+        is the canonical signal that a daemon actually restarted;
+        spending it on "alive but slow" destroys the one thing it was
+        good for. Truthiness is unchanged, so existing
+        ``if self._spawn_server():`` callers keep working."""
         if not self._autospawn_enabled():
-            return False
+            return ''
         with self._spawn_lock:
             try:
                 if self._server_alive(self._read_server_info()):
-                    return True
+                    return 'alive'
             except ServerUnavailable:
                 pass
             # Cooldown: a spawn that just failed (usually because a
@@ -198,18 +239,18 @@ class LoopbackTransport(Transport):
                     [sys.executable, '-m', 'azt_collabd'], **kwargs)
             except OSError as ex:
                 print(f'[azt_collab_client] spawn failed: {ex}')
-                return False
+                return ''
             deadline = time.time() + _SPAWN_WAIT
             while time.time() < deadline:
                 try:
                     info = self._read_server_info()
                     if self._server_alive(info):
-                        return True
+                        return 'spawned'
                 except ServerUnavailable:
                     pass
                 time.sleep(0.1)
             self._last_failed_spawn = time.time()
-            return False
+            return ''
 
     @staticmethod
     def _call_once(info, method, path, body, timeout):

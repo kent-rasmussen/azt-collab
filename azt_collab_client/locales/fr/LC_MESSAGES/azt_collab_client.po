@@ -1332,6 +1332,9 @@ msgstr "aucune adresse réseau — activez le partage USB ou le wifi"
 msgid "Look for devices now"
 msgstr "Rechercher des appareils maintenant"
 
+msgid "applying…"
+msgstr "application…"
+
 msgid "Other servers:"
 msgstr "Autres serveurs :"
 

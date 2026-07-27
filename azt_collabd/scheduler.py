@@ -126,6 +126,33 @@ _pending_timers: dict = {}     # langcode → threading.Timer
 _pending_jobs: dict = {}       # langcode → Job (the next to run)
 _jobs: "OrderedDict[str, Job]" = OrderedDict()
 
+# Liveness heartbeats: loop name → monotonic timestamp of its last
+# tick (0.54.89). Surfaced by ``/v1/health`` so a wedge is detectable
+# programmatically: HTTP answering while a heartbeat goes stale means
+# the daemon is up but its working loops are not. See
+# agenda/daemon_lock_across_network_io.md.
+_heartbeats: dict = {}
+
+
+def heartbeat(name):
+    """Mark *name*'s loop as having ticked just now. Cheap enough to
+    call every iteration; never raises."""
+    try:
+        _heartbeats[str(name)] = time.monotonic()
+    except Exception:
+        pass
+
+
+def heartbeat_ages():
+    """``{name: seconds_since_last_tick}``, rounded. Empty before the
+    first tick of anything."""
+    now = time.monotonic()
+    try:
+        return {k: round(now - v, 1) for k, v in _heartbeats.items()}
+    except Exception:
+        return {}
+
+
 # connectivity watcher
 _watcher_thread = None
 _watcher_stop = None
@@ -755,6 +782,10 @@ def _iface_watcher_loop():
     probe's cadence with it (0.54.46)."""
     global _last_net_sig
     while _iface_watch_stop is not None and not _iface_watch_stop.is_set():
+        # ~3 s cadence makes this the most sensitive wedge signal we
+        # have: if THIS heartbeat goes stale, the daemon is badly stuck
+        # (0.54.90).
+        heartbeat('iface-watch')
         try:
             if _settings.lan_allow_sync():
                 # Auto-bind: LAN is ON but the listener isn't bound
@@ -823,6 +854,13 @@ def _iface_watcher_loop():
 def _watcher_loop():
     global _last_online_state, _online_since, _last_net_sig
     while _watcher_stop is not None and not _watcher_stop.is_set():
+        # Liveness heartbeat (0.54.89). ``/v1/health`` is lock-free and
+        # answered by its own HTTP thread, so it stays green while the
+        # daemon's real work is wedged — that gap is what made the
+        # 2026-07-27 incident undiagnosable. A timestamp bumped here
+        # each tick turns health into "the working loops are alive N s
+        # ago" rather than "the socket accepted".
+        heartbeat('watcher')
         try:
             online = _has_internet()
         except Exception:

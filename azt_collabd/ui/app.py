@@ -1352,7 +1352,18 @@ class SettingsScreen(Screen):
         """Render an ISO8601-UTC ``last_seen_at`` as a short LOCAL
         absolute time ('Jul 23 14:32'). Absolute (not relative) so it
         needn't be re-rendered on a timer, and local so it matches the
-        clock on the device. Empty string on missing / unparseable."""
+        clock on the device. Empty string on missing / unparseable.
+
+        A timestamp with NO offset is treated as UTC rather than shown
+        verbatim (0.54.91). Every producer today emits a trailing 'Z'
+        (``peers._now_iso`` and friends), so this changes nothing now —
+        but rendering a naive string as-is would print UTC digits
+        labelled as local time, beside correctly-converted ones on the
+        same screen. Storage stays UTC everywhere (including the
+        now-pinned merge-commit timezone); display is always device
+        local (Kent 2026-07-27: "whatever TZ is stored on disk, let's
+        make sure we're showing users the same local time across the
+        same device")."""
         if not iso:
             return ''
         import datetime as _dt
@@ -1361,8 +1372,9 @@ class SettingsScreen(Screen):
             dt = _dt.datetime.fromisoformat(s)
         except Exception:
             return ''
-        if dt.tzinfo is not None:
-            dt = dt.astimezone()          # → local TZ
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        dt = dt.astimezone()              # → local TZ
         return dt.strftime('%b %d %H:%M')
 
     def _peer_sync_status_text(self, row):
@@ -2140,12 +2152,14 @@ class SettingsScreen(Screen):
         ``refresh()`` so the button highlight is correct on
         screen entry."""
         from azt_collab_client import get_work_offline as _gwo
-        try:
-            self._work_offline_enabled = bool(_gwo())
-        except Exception:
-            self._work_offline_enabled = False
-        self._refresh_work_offline_buttons()
-        self._refresh_work_offline_status_text(just_toggled_off=False)
+
+        def _apply(value, err):
+            self._work_offline_enabled = (
+                False if err is not None else bool(value))
+            self._refresh_work_offline_buttons()
+            self._refresh_work_offline_status_text(
+                just_toggled_off=False)
+        self._rpc_then(_gwo, _apply)
 
     def _refresh_work_offline_status_text(self, just_toggled_off=False):
         """Compose the status line under the Work-offline yes/no
@@ -2171,11 +2185,12 @@ class SettingsScreen(Screen):
             else:
                 status.text = ''
             return
-        try:
-            from azt_collab_client import lan_toggle as _lt
-            lan_on = bool(_lt().get('on'))
-        except Exception:
-            lan_on = False
+        # Cached, NOT a fresh RPC (0.54.86): the 5 s board tick and
+        # ``_refresh_lan_state`` already keep this current, and this
+        # method runs on the main thread from button handlers — an
+        # extra synchronous ``lan_toggle`` here was one of the calls
+        # that could freeze the UI.
+        lan_on = bool(getattr(self, '_lan_enabled', False))
         if lan_on:
             status.text = _tr(
                 'LAN-only mode. GitHub push is suppressed, but '
@@ -2201,16 +2216,26 @@ class SettingsScreen(Screen):
     # scan-to-pair flow from the same module.
 
     def set_lan_allow_sync(self, enabled):
+        # Off the main thread (0.54.86). This is the SLOWEST RPC in the
+        # settings screen: the daemon's ``apply_toggle`` runs inline —
+        # WifiLocks, FGS promotion, socket bind, zeroconf teardown /
+        # start — any of which can take seconds. Blocking the UI on it
+        # produced the OS "not responding" dialog on a busy daemon.
         from azt_collab_client import lan_set_toggle as _lst
         new_state = bool(enabled)
-        try:
-            applied = _lst(new_state)
-        except Exception as ex:
+        label = self.ids.get('lan_status_label')
+        if label is not None:
+            label.text = _tr('applying…')
+        self._rpc_then(lambda: _lst(new_state),
+                       self._apply_lan_toggle_result)
+
+    def _apply_lan_toggle_result(self, applied, err):
+        if err is not None or not isinstance(applied, dict):
             label = self.ids.get('lan_status_label')
             if label is not None:
                 label.text = _tr(
                     'Failed to update local-network setting: {error}'
-                ).format(error=str(ex))
+                ).format(error=str(err))
             return
         self._lan_enabled = bool(applied.get('on'))
         self._lan_endpoint = applied.get('endpoint', '')
@@ -2247,12 +2272,35 @@ class SettingsScreen(Screen):
         except Exception:
             pass
 
+    def _rpc_then(self, fetch, apply_):
+        """Run *fetch* (an RPC) on a worker thread and hand the result
+        to *apply_* on the Kivy main thread (0.54.86).
+
+        Every daemon RPC from this UI must go through here or an
+        equivalent thread. The settings screen and the daemon live in
+        different processes, so ANY call can block for as long as the
+        daemon is busy — and ``rpc.call``'s default timeout is 300 s
+        with auto-spawn retries in between. A blocked main thread is
+        the OS "Python is not responding / Force Quit" dialog (field
+        2026-07-25, with four peers mid-sweep; same class as 0.54.69's
+        decisions watcher, reached through different callers).
+
+        *apply_* receives ``(result, error)`` — exactly one is set."""
+        def _work():
+            try:
+                data, err = fetch(), None
+            except Exception as ex:
+                data, err = None, ex
+            Clock.schedule_once(lambda _dt: apply_(data, err), 0)
+        threading.Thread(target=_work, daemon=True).start()
+
     def _refresh_lan_state(self):
         from azt_collab_client import lan_toggle as _lt
-        try:
-            state = _lt()
-        except Exception:
-            # A raise here is itself a liveness answer — don't let it
+        self._rpc_then(_lt, self._apply_lan_state)
+
+    def _apply_lan_state(self, state, err):
+        if err is not None or not isinstance(state, dict):
+            # A failure here is itself a liveness answer — don't let it
             # decode as the same shape a healthy "sharing off" gives
             # (0.54.75).
             state = {'on': False, 'endpoint': '', 'alive': False}

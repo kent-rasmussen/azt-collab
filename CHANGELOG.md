@@ -9,6 +9,256 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.54.91 — deterministic merge commits: two devices meeting no longer manufactures merges
+
+Kent 2026-07-27: *"when no one is working on any of these phones
+(certainly not two people at the same time!), it should be essentially
+nonexistent. If we're causing merges without reason, that's another
+problem."* We were. This is the ping-pong this item has carried as a
+known defect since 2026-07-23.
+
+`_merge_diverged` already produced a deterministic merge **tree** —
+same inputs, same tree, by design. The commit **object** did not, in
+three independent ways, and fixing only one leaves the SHAs different:
+
+1. **Wall-clock time.** Now derived from the inputs: the later of the
+   two parents' commit times.
+2. **Parent order.** `merge_heads` always puts our own HEAD first, so
+   peer A wrote `[A, B]` and peer B wrote `[B, A]`. Now sorted, so the
+   order can't encode which side we were on. **Cost, stated:** git's
+   convention that first-parent is "the branch you were on" is
+   sacrificed, so `git log --first-parent` across a converged merge may
+   follow the other device's line. Ancestry, containment and every
+   coverage walker consider all parents, so correctness is unaffected —
+   only that readability convention.
+3. **The message.** `build_merge_message` labels one side "Local" and
+   the other "Remote", and which is which flips between peers. New
+   `build_canonical_merge_message` renders both sides as one
+   SHA-ordered set, with sorted conflict lines and sorted
+   `Co-authored-by` trailers. The side-relative version is kept for
+   non-convergence callers, where "local vs remote" genuinely helps a
+   human reading `git log`.
+
+Same two parents now give the same SHA on every device, so each peer
+can fast-forward to the other instead of both seeing
+`DivergedBranches` and re-merging forever. Written via an explicit
+`Commit` object (the worktree API can't express sorted parents), with a
+fallback to the old path on any unexpected dulwich shape — degrading to
+churn beats failing a merge.
+
+**Timezones** (Kent, same session): storage stays UTC — the pinned
+commit timezone is 0, and `peers._now_iso` and friends already emit a
+trailing `Z`. Display is always device-local: `_fmt_as_of` converts via
+`astimezone()`, and now treats an offset-less timestamp as UTC instead
+of printing its digits verbatim, so a future producer that forgets the
+`Z` can't put UTC times beside local ones on the same screen. The
+daemon log is deliberately local (`server.py:6056`) and matches.
+
+Daemon-side → restart the daemon / rebuild the server APK. Existing
+non-deterministic merge commits stay as they are; convergence applies
+to merges made from here on.
+
+## 0.54.90 — the daemon notices its own wedge, dumps stacks, and restarts out of it
+
+Kent 2026-07-27: *"so at this point, all causes of wedges are visible,
+and we're doing what we can to restart when they happen?"* Not yet on
+either count — 0.54.89 made the state observable, but only the
+`watcher` loop had a heartbeat, nothing captured *where* the code was
+stuck, and the one auto-restart that existed (0.54.77) fires only when
+health goes **silent** — deliberately not the case where health answers
+while work is stuck, which is the wedge actually observed. So recovery
+was still a human pressing Restart server.
+
+- **New `azt_collabd/watchdog.py`**, ordered **diagnose then recover**
+  because a restart destroys the evidence:
+  1. First sign of a stall → one summary line, the thread/fd counts,
+     and `faulthandler.dump_traceback(all_threads=True)`. That is what
+     names the stuck code on a machine we can't attach a debugger to,
+     so it happens even when restarting is disabled. Dumped **once per
+     episode**, not per tick — a repeating all-thread dump would bury
+     the log it exists to illuminate. A "stall cleared" line closes the
+     episode.
+  2. Stall persisting past `watchdog.restart_s` → restart, reusing the
+     admin-restart mechanism (execv on desktop, exit-for-respawn on
+     Android). Defensible only because restart is already cheap by
+     design: jobs → typed `JOB_INTERRUPTED`, transfers retried by the
+     sender, uncommitted bytes power-cut-contained, listener re-binds
+     its remembered port, backoff curves survive.
+- **Signals:** loop heartbeats plus held-lock durations. A lock held
+  for minutes is network I/O under the lock or a deadlock; a heartbeat
+  minutes old means that loop isn't running.
+- **`iface-watch` now heartbeats too** — at a ~3 s cadence it's the
+  most sensitive stall signal available, far tighter than the
+  connectivity watcher's backoff-driven ~60 s.
+- **Wired into BOTH entry paths** — `server.serve` and the server
+  APK's `service.py:main` — per the rule that a startup hook added to
+  only one hides for versions (0.50.53–.55 precedent).
+- **Thresholds in minutes, not seconds** (`watchdog.warn_s` 120,
+  `watchdog.restart_s` 600, `interval_s` 30, all in
+  `$AZT_HOME/config.json`), plus a 90 s startup grace and a
+  rate limit. A merge or a slow push is not a wedge, and restarting
+  legitimate work would trade one bad evening for a livelock on a slow
+  machine. `watchdog.restart_s: 0` keeps the diagnostics without the
+  automatic restart.
+
+**Still not covered, stated plainly:** the listener/serve loop, the
+advertise thread and the log writer have no heartbeat, so a stall
+confined to one of those is invisible unless it also blocks a lock or
+another loop. GIL saturation from a whole-LIFT merge still presents as
+slowness rather than a stall. And the log writer can't monitor itself —
+if the tee dies (2026-07-08 precedent), the watchdog's own output goes
+with it.
+
+Daemon-side → restart the daemon / rebuild the server APK.
+
+## 0.54.89 — stop paying for absent peers; make a wedge visible
+
+Kent 2026-07-27: *"Can we just do both fixes? seems like we should
+address both causes as early as possible."* Both causes, from the
+08:32–08:39 log.
+
+**Cause 1 — sweeps spend their time on peers that aren't there.** Two
+of four paired devices held addresses nothing answered at:
+`10.143.126.7:41455` burned **30 s on one project** (connect timeout,
+then the push attempt), and `192.168.31.240:40975` cost ~19 s across
+two with `No route to host` ×4. Sweeps fire on every mDNS arrival, and
+a phone flapping between tether and wifi produces one every ~30 s, so
+the daemon spent much of its life dialing the dead.
+
+- **`sweep_peer` now honours the recently-unreachable gate** (60 s)
+  instead of walking straight past it. It's a background path; the
+  user-gesture paths still bypass the gate deliberately.
+- **And aborts the remaining projects** once one has proved the peer
+  unreachable — every further project would pay the identical connect
+  timeout for the same absent device. Four dials become one.
+- Diagnostic note for later: `_push_to_peer` still retries its
+  ls-remote peek internally (two failures per project in the log), so
+  a single dial is ~2 connect timeouts, not one. Bounding that is a
+  separate change.
+
+**Cause 2 — a wedge was undiagnosable.** `/v1/health` is lock-free and
+served on its own thread, so it stays green while real work is stuck.
+Four new fields make the gap visible:
+
+- **`threads`** — one per request under `ThreadingHTTPServer`, so a
+  climbing count means handlers are blocking rather than returning.
+  Past the point where `Thread.start()` fails, connections get
+  accepted and dropped unanswered — the `SERVICE_DROPPED` signature
+  from 0.54.88.
+- **`fds`** — the other exhaustion axis (cf. the 0.54.1 EMFILE
+  incident). Linux only; simply absent elsewhere rather than guessed.
+- **`locks_held`** — which project lock, held by which thread, for how
+  long. This is the field that NAMES the stuck operation: tens of
+  seconds means network I/O under the lock, or a deadlock.
+  `locks.py` was already the single acquisition point, so recording
+  holders is a dict write on acquire and a pop on release, at depth 1
+  only (re-entrant acquires don't overwrite).
+- **`heartbeats`** — seconds since each daemon loop last ticked;
+  `scheduler._watcher_loop` bumps one per iteration. A stale heartbeat
+  beside a live HTTP thread *is* the wedge.
+
+All four are best-effort — a probe must never be the thing that
+breaks.
+
+Daemon-side → restart the daemon.
+
+## 0.54.88 — "closed the connection" is not "timed out"
+
+Immediately after 0.54.87 landed, the field produced
+`SERVICE_SLOW (call timed out: Remote end closed connection without
+response)` — my own new line, describing a closed connection as a
+timeout. The branch catches every `URLError`/`OSError`, so the wording
+can't assume which.
+
+- **Timeout → `SERVICE_SLOW`** ("call timed out"): handlers are slow.
+- **Anything else → `SERVICE_DROPPED`** ("daemon alive but dropped the
+  call"): the daemon ACCEPTED the connection and then closed it
+  without answering.
+
+The distinction is the diagnosis, which is why the wrong word was
+costly. A drop-without-response is the signature of **resource
+exhaustion, not slowness**: `ThreadingHTTPServer` starts a thread per
+request, blocked handlers accumulate, and once `Thread.start()` fails
+(or fds run out — cf. the 0.54.1 EMFILE incident) new connections get
+accepted and dropped with no reply. That fits the observed sequence
+exactly: timeouts first as handlers block, then drops as the pool
+gives out.
+
+Which also names the two cheapest additions for the wedge detector
+under discussion: `threading.active_count()` and the open-fd count in
+`/v1/health`. Either would have identified this in one glance instead
+of an evening of inference.
+
+Client transport → relaunch peer processes.
+
+## 0.54.87 — SERVICE_RESTARTED was reporting restarts that never happened
+
+Kent 2026-07-27: *"isn't this a bit much for the last couple minutes?"*
+— four `SERVICE_RESTARTED (connection failed: timed out)` lines, then
+more than double that. The count was real; the message was false.
+
+`_spawn_server()` checks health FIRST and returns early when a daemon
+is already up — spawning nothing. That early return was `True`, and
+`call()` prints `SERVICE_RESTARTED` on any truthy result. So a call
+that merely **timed out against a live daemon** reported a restart
+that never occurred. `SERVICE_RESTARTED` is documented as the
+canonical signal that a daemon actually restarted mid-session; spending
+it on "alive but slow" destroyed the one thing it was good for, and hid
+the real condition.
+
+- **`_spawn_server()` now returns `'alive'` / `'spawned'` / `''`.**
+  Truthiness is unchanged, so existing callers keep working.
+- **New `SERVICE_SLOW` line** for the alive-but-timed-out case:
+  "daemon is alive; retrying". A busy or wedged daemon is a different
+  problem from a dead one and now reads differently.
+- No behavioural change to retries or spawning — only which signal is
+  emitted.
+
+**Field context (the actual condition this exposed):** the daemon's
+own log went silent after 08:24:57 while the UI kept polling and
+timing out — a wedged-but-health-answering daemon, its zeroconf
+advertise/browse threads stuck in the same process, which is why the
+phones stopped listing the computer despite live USB links. Belongs to
+`agenda/daemon_lock_across_network_io.md`.
+
+Client transport → relaunch the UI / restart peer processes.
+
+## 0.54.86 — settings-screen RPCs off the main thread (the Force Quit dialog)
+
+Kent 2026-07-25, screenshotting the OS dialog: *"This is getting old."*
+It is — 0.54.69 fixed this class in the decisions watcher, and it came
+back through different callers. `refresh()` runs on the Kivy main
+thread and fired synchronous RPCs; with four peers mid-sweep, any one
+of them blocks long enough for "'Python (v3.13)' Is Not Responding".
+The UI and daemon are separate processes, so ANY call can block for as
+long as the daemon is busy — and `rpc.call`'s default timeout is 300 s
+with auto-spawn retries in between.
+
+- **New `_rpc_then(fetch, apply_)`** — runs the RPC on a worker,
+  hands `(result, error)` to the applier on the main thread. Every
+  daemon call from this screen should go through it; having one seam
+  makes a future violation visible instead of silent.
+- **Converted:** `_refresh_lan_state` (screen-enter + Refresh Status)
+  and `_refresh_work_offline_state`, both of which ran on the main
+  thread from `refresh()`.
+- **`set_lan_allow_sync` was the worst of them** — the daemon's
+  `apply_toggle` runs inline (WifiLocks, FGS promotion, socket bind,
+  zeroconf teardown/start), so a LAN toggle tap could freeze the
+  window for seconds. Now off-thread, with an immediate "applying…".
+- **One RPC deleted outright:** `_refresh_work_offline_status_text`
+  re-fetched `lan_toggle` just to read the on/off bit the 5 s tick
+  already caches. It reads the cache now.
+- `_probe_server_version` was already threaded (checked, not
+  assumed) — despite carrying the same `check_server_compat`
+  auto-spawn behaviour flagged in 0.54.77, it wasn't a contributor.
+
+**Still main-thread, same class, not fixed here** (pre-existing, named
+so the next pass has a list): the credentials / `is_online` fetches
+later in `refresh()`, `_refresh_cawl_variants_state`, and
+`_refresh_debug_503_state`.
+
+UI-side → relaunch the UI.
+
 ## 0.54.85 — "Other servers:" — self excluded, no "yet"
 
 Kent 2026-07-25, testing across four devices ("they're all up to date,

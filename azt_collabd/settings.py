@@ -49,6 +49,16 @@ _DEFAULTS = {
     'sync.post_online_grace_s': 60,
     'sync.work_offline': False,
     'sync.push_budget_s': 300,
+    # Wedge self-monitor (0.54.90) — see azt_collabd/watchdog.py.
+    # Thresholds are in MINUTES on purpose: a merge or a slow push is
+    # not a wedge, and restarting legitimate work would trade one bad
+    # evening for a livelock on slow machines. Set
+    # ``watchdog.restart_s`` to 0 to keep the diagnostics (traceback
+    # dump) without the automatic restart.
+    'watchdog.enabled': True,
+    'watchdog.warn_s': 120,
+    'watchdog.restart_s': 600,
+    'watchdog.interval_s': 30,
     # LAN sync, 0.50+ semantics.
     #
     # ``lan.autodiscovery`` (default False since 0.50.2): when

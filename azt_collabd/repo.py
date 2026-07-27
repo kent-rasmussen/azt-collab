@@ -956,12 +956,20 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
 
     local_log = _commits_between(repo, base_sha, local_sha) if base_sha else []
     remote_log = _commits_between(repo, base_sha, remote_sha) if base_sha else []
-    msg_str = merge_commit.build_merge_message(
-        branch=branch, local_commits=local_log, remote_commits=remote_log,
+    # Side-INDEPENDENT message (0.54.91): see
+    # ``build_canonical_merge_message``. The old wording labelled one
+    # side "Local", which flips between the two peers and made the
+    # same merge produce different commit objects.
+    msg_str = merge_commit.build_canonical_merge_message(
+        branch=branch, commits_a=local_log, commits_b=remote_log,
         conflicts=conflicts)
     msg = msg_str.encode('utf-8')
 
     bot = _enc(merge_commit.bot_identity())
+    det = _deterministic_merge_commit(
+        repo, msg, bot, local_sha, remote_sha)
+    if det is not None:
+        return det, conflicts
     # ``porcelain.commit`` does NOT expose ``merge_heads`` as a public
     # kwarg (it's used internally only for ``amend``). Passing it
     # raises ``TypeError`` on dulwich 1.2.x, and the older grafting
@@ -4063,6 +4071,86 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
         repo, project_dir, contributor_name, result,
         message=message or f'A-Z+T edit by {contributor_name}')
     return result, head_sha_of(project_dir)
+
+
+def _deterministic_merge_commit(repo, msg, bot, local_sha, remote_sha):
+    """Write the merge commit so that BOTH peers merging the same two
+    parents produce the same SHA (0.54.91). Returns the new commit id,
+    or ``None`` to fall back to the ordinary worktree commit.
+
+    Why: ``_merge_diverged`` already produces a deterministic merge
+    *tree* — same inputs, same tree, by design. The commit OBJECT
+    wasn't: it took wall-clock time, and ``merge_heads`` always puts
+    our own HEAD first, so peer A wrote parents ``[A, B]`` at time Ta
+    and peer B wrote ``[B, A]`` at time Tb. Same content, two SHAs,
+    neither an ancestor of the other → ``DivergedBranches`` on both
+    sides → each re-merges → the criss-cross staircase that never
+    collapses. Two devices meeting was enough to manufacture endless
+    merges with nobody editing anything (Kent 2026-07-27: "when no one
+    is working on any of these phones … if we're causing merges
+    without reason, that's another problem").
+
+    Three things have to be canonical, and all three matter — fixing
+    only the clock leaves the SHAs different:
+
+    1. **Timestamp** — derived from the inputs (the later of the two
+       parents' commit times), never ``time.time()``.
+    2. **Timezone** — pinned to 0. Storage only; user-facing times are
+       rendered in device-local time from ``project_status``
+       timestamps, not from a commit's stored offset.
+    3. **Parent order** — sorted, so it can't encode which side we
+       were on. This is the one real cost: git's convention that
+       first-parent is "the branch you were on" is sacrificed, so
+       ``git log --first-parent`` on a converged merge may follow the
+       other device's line. Ancestry, containment and the coverage
+       walkers all consider every parent, so correctness is unaffected
+       — only that one readability convention.
+
+    The message must be side-independent too; the caller uses
+    ``merge_commit.build_canonical_merge_message`` for that.
+
+    Falls back (returns None) rather than raising: an unexpected
+    dulwich shape should degrade to the old non-deterministic commit,
+    which merely churns, instead of failing the merge outright."""
+    try:
+        from dulwich.objects import Commit
+
+        def _hex(s):
+            if isinstance(s, bytes):
+                return s if len(s) == 40 else s.hex().encode('ascii')
+            return str(s).encode('ascii')
+
+        p_local, p_remote = _hex(local_sha), _hex(remote_sha)
+        times = []
+        for p in (p_local, p_remote):
+            try:
+                times.append(int(repo[p].commit_time))
+            except Exception:
+                pass
+        if not times:
+            return None
+        stamp = max(times)
+        tree_id = repo.open_index().commit(repo.object_store)
+        c = Commit()
+        c.tree = tree_id
+        c.parents = sorted([p_local, p_remote])
+        c.author = c.committer = bot
+        c.author_time = c.commit_time = stamp
+        c.author_timezone = c.commit_timezone = 0
+        c.encoding = b'utf-8'
+        c.message = msg
+        repo.object_store.add_object(c)
+        repo.refs[b'HEAD'] = c.id
+        print(f'[merge] deterministic merge commit {c.id[:12]!r} '
+              f'(parents {c.parents[0][:8]!r}+{c.parents[1][:8]!r} '
+              f'stamp={stamp}) — same inputs give this SHA on every '
+              f'device', file=sys.stderr, flush=True)
+        return c.id
+    except Exception as ex:
+        print(f'[merge] deterministic commit unavailable ({ex!r}); '
+              f'falling back to wall-clock merge commit',
+              file=sys.stderr, flush=True)
+        return None
 
 
 def _rand_hex8():
