@@ -1148,6 +1148,24 @@ def _github_backup_line(ps):
     if offline:
         return _tr('GitHub backup: {n} commit(s) to go '
                    '(paused — work offline)').format(n=wan)
+    # Liveness, when a chunk is actually in flight (0.55.83). The count
+    # above can sit unchanged for hours on one oversize chunk, and a user
+    # who can't tell "working" from "stuck" interrupts it — which discards
+    # the chunk. ``push_progress`` is None when nothing is running or the
+    # last report went stale, so this never claims activity that stopped.
+    try:
+        prog = getattr(ps, 'push_progress', None)
+        if isinstance(prog, dict):
+            banked = int(prog.get('banked') or 0)
+            total = int(prog.get('total') or 0)
+            if total > 0:
+                return _tr('GitHub backup: {n} to go — uploading '
+                           '{done} of {total}').format(
+                               n=wan, done=banked, total=total)
+            return _tr('GitHub backup: {n} commit(s) to go '
+                       '— uploading…').format(n=wan)
+    except Exception:
+        pass
     return _tr('GitHub backup: {n} commit(s) to go').format(n=wan)
 
 

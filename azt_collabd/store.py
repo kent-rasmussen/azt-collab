@@ -145,6 +145,13 @@ def _set_github_refresh_broken(error):
         block['refresh_broken'] = True
         block['refresh_error'] = str(error)
         block['refresh_checked_at'] = time.time()
+        # Persist the permanent/transient split (0.55.67) so a UI or a
+        # diagnostic can tell "retry later" from "a human must re-run
+        # Connect" without re-parsing the error text at every read site.
+        _t = f'{error!r} {error}'.lower()
+        block['refresh_permanent'] = any(k in _t for k in (
+            'incorrect_client_credentials', 'unauthorized_client',
+            'invalid_client', 'incorrect_client_secret'))
         d['github'] = block
     _update(mut)
 
@@ -248,7 +255,50 @@ def get_valid_github_token():
             )
             token = new_data['access_token']
         except Exception as ex:
-            print(f'[collab.store] github refresh failed: {ex}')
+            # LOUDLY, and distinguish permanent from transient (0.55.67).
+            # Kent 2026-07-28: *"let's make sure that if that other ever
+            # surfaces again, it surfaces loudly."*
+            #
+            # Two failures wore one line before this. A timeout or a 5xx
+            # self-heals on the next call. ``incorrect_client_credentials``
+            # / ``unauthorized_client`` are the OAuth app's own identity
+            # being wrong or incomplete (a missing ``client_secret`` on the
+            # refresh POST is the classic) — that NEVER recovers on its
+            # own, and it is invisible until the current access token hits
+            # its 8 h cliff, at which point every push stops with what
+            # looks like a network problem.
+            #
+            # The old line also went to stdout unflushed, so in a captured
+            # daemon log it could be lost or land out of order relative to
+            # the stderr stream around it.
+            _text = f'{ex!r} {ex}'.lower()
+            _permanent = any(k in _text for k in (
+                'incorrect_client_credentials', 'unauthorized_client',
+                'invalid_client', 'incorrect_client_secret'))
+            try:
+                _cliff = time.strftime(
+                    '%Y-%m-%d %H:%M',
+                    time.localtime(float(token_time) + 8 * 3600))
+            except Exception:
+                _cliff = 'unknown'
+            if _permanent:
+                print(f'[data-quality] github-refresh-BROKEN '
+                      f'(permanent): {ex!r} — this is the OAuth app\'s '
+                      f'own credentials being rejected, not a network '
+                      f'fault, so it will NOT self-heal. The stored '
+                      f'access token keeps working until about '
+                      f'{_cliff}, after which every push and fetch '
+                      f'fails. Fix: re-run Connect (device flow) at the '
+                      f'GitHub screen, and check the App\'s client_id / '
+                      f'client_secret configuration',
+                      file=sys.stderr, flush=True)
+            else:
+                print(f'[data-quality] github-refresh-failed '
+                      f'(possibly transient): {ex!r} — keeping the '
+                      f'existing access token, which expires about '
+                      f'{_cliff}. Retried on the next token check; if '
+                      f'this repeats past that time, treat it as '
+                      f'permanent', file=sys.stderr, flush=True)
             _set_github_refresh_broken(ex)
             # Return the old token — it might still work until cliff.
     return username, token

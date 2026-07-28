@@ -333,17 +333,32 @@ def post_online_grace_s():
 
 
 def work_offline():
-    """Deprecated 0.50: WAN backoff replaces the work_offline
-    toggle. Always returns False. The persisted ``sync.work_offline``
-    key is left on disk for back-compat with older peers / a
-    possible downgrade; this accessor ignores it.
+    """Read the daemon-wide work-offline toggle.
 
-    Callers were either:
-      - gating push attempts (now handled by ``wan_backoff``), or
-      - surfacing ``S.WORK_OFFLINE_ENABLED`` to the user.
-    Both flows go away. The "save power on metered network" use
-    case is left to a future per-network policy (see audit doc)."""
-    return False
+    **Un-deprecated 0.55.77.** From 0.50 this was hardcoded
+    ``return False`` on the reasoning that ``wan_backoff`` had replaced
+    it. `set_work_offline` kept writing the bit, the settings UI kept
+    offering yes/no, and nothing ever read the answer — so the switch
+    was inert for dozens of versions while continuing to look
+    functional.
+
+    That took a read-back log line to catch (0.55.76), on the same
+    evening a guard was added in `_drain_pending_push` (0.55.42) "so the
+    daemon-wide work-offline setting actually stops the daemon from
+    going to the network" — a guard whose condition could never be true.
+    Kent: *"It was never settable."*
+
+    The replacement reasoning was also wrong on its own terms. A backoff
+    curve answers "how hard should I retry a failing remote"; it cannot
+    express "I am on an expensive or fragile link, leave the network
+    alone." Only the user knows that, and on a metered hotspot the cost
+    of guessing wrong is their money and a frozen UI — the field
+    complaint that reopened this (WAN push holds `project_lock` across
+    the transfer, so an unprompted drain stalls local saves).
+
+    Default False: absent key means online, which is what every existing
+    install expects."""
+    return bool(get('sync.work_offline', False))
 
 
 def push_budget_s():

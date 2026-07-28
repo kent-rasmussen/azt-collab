@@ -110,6 +110,44 @@ When adding a new suite component:
     origin + extra, never push twice. Don't add code that rewrites
     a stored spelling or that compares remote URLs literally.
 
+15. **Announce at the point of action, not the point of intent
+    (0.55.64).** A log line must not be placed before the check or
+    the call that decides whether the line is true. Print it at the
+    last statement before the thing happens, or print the outcome
+    after — never the intention ahead of the gate.
+
+    This is the single most repeated defect class in this daemon.
+    Five instances in one field day (2026-07-28), all the same shape:
+
+    - `WAN drain: pushing to github ['en']` every 15 s for a project
+      parked 22 h out by `wan_backoff` — the line sat before the
+      due-check, and the skip line was rate-limited. Fixed twice:
+      0.55.58 moved it behind the due + credential checks, 0.55.64
+      moved it into `_attempt_push` immediately before the socket,
+      which is the only place it can't lie.
+    - `post-receive reset: lock busy (5s timeout)` hardcoding "5s"
+      after the timeout became a parameter — asserting a value the
+      line could not know.
+    - `[not_served]` for every failed peek, when the peer might have
+      been mid-clone or hiccupping (0.55.60).
+    - `NotGitRepository` covering seven distinct conditions, two of
+      them retryable within seconds (0.55.60) — one exception
+      standing in for answers with opposite remedies.
+    - A `_reverse_deliver` debounce claimed in a CHANGELOG that the
+      code did not implement.
+
+    The cost is not cosmetic. Each one sent a diagnosis in the wrong
+    direction for at least one round trip, and two of them were
+    written while fixing a previous instance. **When adding or
+    editing any log line, ask: what must be true for this sentence
+    to be accurate, and has the code established it yet at this
+    point?** If a message must be emitted before its truth is known,
+    word it as the attempt or the candidate set — not the act.
+
+    Corollary: a rate-limited or deduplicated failure line beside an
+    unconditional intent line reads as success. If you suppress the
+    failure, suppress the intent.
+
 ## Common commands
 
 ```bash

@@ -614,12 +614,14 @@ class _DynamicBackend:
             raise NotGitRepository(
                 f'project {langcode!r} not registered')
         try:
-            return self._track(Repo(project.working_dir))
+            repo = self._track(Repo(project.working_dir))
         except Exception as ex:
             print(f'[lan-listener] open repo {langcode!r} failed: '
                   f'{ex!r}', file=sys.stderr, flush=True)
             raise NotGitRepository(
                 f'project {langcode!r} repo failed to open') from ex
+        _warn_if_advertising_unservable_head(langcode, repo)
+        return repo
 
 
 def _build_dict_backend():
@@ -2312,6 +2314,105 @@ def _note_reset_hard_failure(langcode, ex):
               f'{wait:.0f}s', file=sys.stderr, flush=True)
 
 
+_unservable_head_logged = {}     # {langcode: last head reported}
+
+
+def _flag_received_work_for_backup(langcode):
+    """Mark *langcode* as needing a github push after a peer's work has
+    landed here (0.55.70).
+
+    ``pending_push`` was raised only by LOCAL commit / publish paths, so a
+    receive-pack that fast-forwarded our head left it clear — and the
+    drain, whose only trigger is that flag, honestly reported "nothing
+    pending" while sitting well ahead of ``origin/main``. Field evidence:
+    ``origin/main`` at ``2ed963b4`` under a long run of commits authored
+    on a peer, received, merged, and never offered to github.
+
+    Kent: *"once I FF or merge, it is now my head. If my head is behind
+    github, I don't push, just because I got it from someone else?"*
+    Provenance is not a reason. github here is off-site durability, so the
+    consequence of the gap was data that existed only on devices staying
+    that way while internet was available.
+
+    0.55.69 taught the user-gesture path to ask ``_wan_unshared``
+    directly, which is the more correct question. This is the cheap
+    counterpart for the PERIODIC path: the 15 s tick can't afford a
+    history walk per project, but it can honour a flag, so raising one
+    here means received work gets backed up without waiting for someone
+    to tap Sync.
+
+    Never raises: a backup hint must not be able to fail a receive that
+    already succeeded."""
+    try:
+        from . import scheduler as _scheduler
+        _scheduler._set_pending_push(langcode, True)
+        print(f'[lan-listener] {langcode!r}: flagged for github backup — '
+              f'received work advances our head, so it needs backing up '
+              f'the same as anything we committed ourselves',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-listener] {langcode!r}: could not flag for github '
+              f'backup: {ex!r} — a nudge will still catch it via the '
+              f'ahead-of-github check', file=sys.stderr, flush=True)
+
+
+def _warn_if_advertising_unservable_head(langcode, repo):
+    """Name it when we are advertising a head we cannot serve (0.55.63).
+
+    Field 2026-07-28, and this is what finally pinned it down. The tablet
+    peeked a Windows peer and was told its head was `303950c45456`; ninety
+    seconds later that peer's own log:
+
+        dulwich.errors.GitProtocolError:
+            Client wants invalid object b'303950c4545696825f666a77c11a29d1e35277c0'
+
+    Same sha. The peer **advertised it in `info/refs` and then refused it
+    from `upload-pack`** — so this was never a client asking for the wrong
+    thing. A device in that state poisons every peer that talks to it: the
+    peek succeeds, the fetch 500s, the merge can't run, and nothing in
+    either log says the advertised ref was the problem.
+
+    A cheap object-store membership test on the head, once per served
+    request. Not full reachability — that would walk the history on every
+    poll; this catches the case that actually bites, where the commit the
+    ref names is itself absent.
+
+    Deliberately does NOT refuse the request. Read-only diagnosis: the
+    honest repair is the ladder in ``_note_reset_hard_failure``, and a
+    peer whose head is merely *unreachable-deep* can still legitimately
+    serve older refs. Rate-limited to once per changed head, because
+    something producing a new broken head every two minutes would
+    otherwise flood the log it needs to be visible in."""
+    try:
+        head = repo.refs.get(b'HEAD') or repo.refs.get(b'refs/heads/main')
+    except Exception:
+        return
+    if not head:
+        return
+    try:
+        if head in repo.object_store:
+            if _unservable_head_logged.pop(langcode, None):
+                print(f'[data-quality] head-servable-again '
+                      f'langcode={langcode!r} head={head[:12].decode()}',
+                      file=sys.stderr, flush=True)
+            return
+    except Exception:
+        return
+    hex_head = head[:12].decode('ascii', 'replace')
+    if _unservable_head_logged.get(langcode) == hex_head:
+        return
+    _unservable_head_logged[langcode] = hex_head
+    print(f'[data-quality] advertising-unservable-head '
+          f'langcode={langcode!r} head={hex_head} — this ref is in our '
+          f'advertisement but the commit object is NOT in our store, so '
+          f'every peer that peeks us will fetch and get "Client wants '
+          f'invalid object". Our writes are not landing: check whether '
+          f'the repo is on cloud-synced storage (OneDrive / Dropbox) '
+          f'whose files cannot rehydrate offline, or an antivirus '
+          f'quarantining new git objects',
+          file=sys.stderr, flush=True)
+
+
 def _rebuild_missing_tree_from_worktree(langcode, want_sha, rel_path):
     """Reconstruct a missing TREE object from the working directory
     (0.55.57).
@@ -3230,6 +3331,7 @@ def _post_receive_pack_middleware(inner_app):
                     s = status_holder[0] or ''
                     if s.startswith('200'):
                         _reset_working_tree_after_receive(langcode)
+                        _flag_received_work_for_backup(langcode)
                 except Exception as ex:
                     print(f'[lan-listener] post-receive '
                           f'middleware raised: {ex!r}',

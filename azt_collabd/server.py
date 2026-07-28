@@ -1217,9 +1217,12 @@ def _h_lan_set_toggle(body):
     refuse with ``CONTRIBUTOR_UNSET`` and the peer UI routes the
     user to the contributor field."""
     desired = bool((body or {}).get('on', False))
+    _prev = _settings.lan_allow_sync()
     if desired:
         refusal = _refuse_if_contributor_unset()
         if refusal is not None:
+            print(f'[lan] toggle to True REFUSED: contributor unset '
+                  f'(still {_prev!r})', file=sys.stderr, flush=True)
             return refusal
     _settings.set_lan_allow_sync(desired)
     try:
@@ -1228,6 +1231,18 @@ def _h_lan_set_toggle(body):
         print(f'[server] lan toggle apply failed: {ex!r}',
               file=sys.stderr, flush=True)
     on = _settings.lan_allow_sync()
+    # SAY WHAT THE GESTURE DID, INCLUDING WHEN IT CHANGED NOTHING
+    # (0.55.75). Same reason as the work_offline line: a button that
+    # never sent, a set-to-the-same-value, and a setter that didn't
+    # persist are otherwise indistinguishable in the log. Prints the
+    # value read back AFTER the write, so a setter that silently failed
+    # shows up as ``requested=True stored=False`` rather than looking
+    # like success.
+    print(f'[lan] toggle: requested={desired!r} was={_prev!r} '
+          f'stored={on!r}'
+          + ('' if on == desired else '  ← STORED VALUE DOES NOT MATCH '
+             'THE REQUEST; the setter did not persist'),
+          file=sys.stderr, flush=True)
     endpoint = _lan_endpoint_display()
     pid = os.getpid()
     # Daemon-wide change — push-notify all observers (every project's
@@ -2032,9 +2047,40 @@ def _h_set_work_offline(body):
     prev = _settings.work_offline()
     enabled = bool(body.get('enabled', False))
     _settings.set_work_offline(enabled)
-    if prev and not enabled:
+    # ALWAYS SAY THE GESTURE ARRIVED (0.55.74). Without this, a button
+    # that never sent and a set-to-the-same-value are indistinguishable
+    # in the log — which is exactly the ambiguity Kent hit: *"I toggled
+    # offline and waited, nothing. Then I confirmed github credentials,
+    # and it immediately took off."*
+    # Read the value BACK after the write (0.55.76), matching the LAN
+    # toggle. ``set to X (was Y)`` only reported what we asked for; a
+    # setter that didn't persist still printed as though it had, which
+    # is the exact failure this line exists to expose.
+    _stored = _settings.work_offline()
+    print(f'[work_offline] requested={enabled!r} was={prev!r} '
+          f'stored={_stored!r}'
+          + ('' if _stored == enabled else '  ← STORED VALUE DOES NOT '
+             'MATCH THE REQUEST; the setter did not persist'),
+          file=sys.stderr, flush=True)
+    # NUDGE ON EVERY EXPLICIT "no", NOT ONLY ON THE TRANSITION (0.55.74).
+    #
+    # This used to be ``if prev and not enabled`` — so pressing "no"
+    # while work_offline was ALREADY off did nothing at all, silently.
+    # That is the difference Kent observed between the two paths: the
+    # GitHub verify nudge has no such gate and fired immediately, while
+    # the toggle looked broken. I had claimed they ran identical code;
+    # they did not.
+    #
+    # Pressing "no" is a user saying "go online and sync". Whether the
+    # setting already held that value is irrelevant to the intent, and
+    # the nudge is idempotent, cheap, and reports its own no-op — so
+    # there is no reason to gate it on a transition.
+    if not enabled:
         try:
-            _scheduler.drain_pushes_now()
+            # ASYNC (0.55.78) — running this inline meant the toggle's
+            # HTTP response was withheld for the whole push, so the
+            # settings UI sat unresponsive for as long as it took.
+            _scheduler.drain_pushes_now_async()
         except Exception as ex:
             print(f'[work_offline] drain_pushes_now failed: {ex}',
                   file=sys.stderr, flush=True)
@@ -2782,6 +2828,29 @@ def _h_test_github(body):
         print(f'[_h_test_github] saved: app_installed='
               f'{bool(info.get("app_installed"))!r} confirmed=True',
               file=sys.stderr, flush=True)
+        # NATURAL NUDGE (0.55.68). Kent 2026-07-28: verifying github IS
+        # the "try now" gesture — nobody presses Test to admire a
+        # checkmark; they press it having just fixed something, and then
+        # expect their pending work to go out. Without this, the fix
+        # landed and the projects sat behind whatever wan_backoff curve
+        # the previous failures had built (baf was parked 21 h out at 25
+        # consecutive failures), so a successful Test looked like it had
+        # achieved nothing.
+        #
+        # Only on the success branch: a failed test proves the opposite
+        # and must not clear the curve. Nudge covers every pending
+        # project (empty langcode); it is WAN-only, matching the
+        # credential it just validated, and it no-ops with a logged line
+        # when there's no internet.
+        try:
+            from . import scheduler as _scheduler
+            # ASYNC (0.55.78) — 0.55.68 ran this inline, so verifying
+            # credentials didn't return until the whole push finished
+            # and the settings UI sat unresponsive for the duration.
+            _scheduler.drain_pushes_now_async()
+        except Exception as ex:
+            print(f'[_h_test_github] post-verify nudge failed: {ex!r}',
+                  file=sys.stderr, flush=True)
     else:
         store.set_github_confirmed(False)
     return 200, {"ok": True, **info}
@@ -3838,7 +3907,33 @@ def _h_project_status(langcode, _body, since_sha=''):
         # warning or a "this remote is messy" diagnostic without
         # acting on it. Pre-0.50.15 peers ignore the unknown key.
         "foreign_topic_orphan_count": foreign_topic_orphan_count,
+        # Live position inside a chunked push (0.55.83). ``wan_unshared``
+        # already counts down as chunks land, so this is not a duplicate
+        # of it — it answers the question that number cannot: is a chunk
+        # currently in flight, or is nothing happening? A single oversize
+        # chunk can run for hours with the count legitimately frozen
+        # (field: an 8.9 GB merge, 26+ minutes, no signal of any kind),
+        # and a user who can't tell "working" from "stuck" presses
+        # something — which is what discarded progress repeatedly.
+        #
+        # None when no push is in flight, or when the last report is
+        # older than ``PUSH_PROGRESS_STALE_S`` (daemon restarted or the
+        # push died). Pre-0.55.83 peers ignore the unknown key, so no
+        # client floor bump is needed.
+        "push_progress": _push_progress_for(p.working_dir),
     }
+
+
+def _push_progress_for(working_dir):
+    """Live chunked-push position for *working_dir*, or None (0.55.83).
+
+    Never raises: a progress read must not be able to fail the status
+    call that every UI poll depends on."""
+    try:
+        from . import repo as _repo_mod
+        return _repo_mod.get_push_progress(working_dir)
+    except Exception:
+        return None
 
 
 def _h_set_project_last_sync(langcode, body):
@@ -5864,13 +5959,41 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # those dead responses as "daemon gone" and spawn-
             # stormed. The typed 500 keeps the wire honest:
             # alive-but-failing, with the reason attached.
+            # A CLIENT HANGING UP IS NOT A DAEMON CRASH (0.55.82).
+            # ``BrokenPipeError`` / ``ConnectionResetError`` here mean the
+            # caller stopped waiting and closed the socket — nothing is
+            # wrong with us. Recording it as a crash pollutes the crash
+            # record that drives recovery surfaces, and there is no point
+            # trying to send a response down a dead pipe.
+            #
+            # Field 2026-07-28: a nudge RPC held its connection for the
+            # duration of an hour-long push (fixed properly in 0.55.78 by
+            # making nudges async); the push completed and logged
+            # ``PUSHED``, then the reply hit a broken pipe and was filed
+            # as a daemon crash.
+            if isinstance(ex, (BrokenPipeError, ConnectionResetError)):
+                print(f'[server] {method} {self.path!r}: client hung up '
+                      f'before the response could be written '
+                      f'({ex.__class__.__name__}) — request work already '
+                      f'completed; not a crash',
+                      file=sys.stderr, flush=True)
+                return
             _record_crash(ex, where=f'dispatch {method} {self.path}')
             print(f'[server] dispatch {method} {self.path!r} '
                   f'raised: {ex!r}', file=sys.stderr, flush=True)
             status, response = 500, {
                 "ok": False, "error": "internal_error",
                 "detail": f'{ex.__class__.__name__}: {ex}'}
-        self._send_json(status, response)
+        try:
+            self._send_json(status, response)
+        except (BrokenPipeError, ConnectionResetError) as ex:
+            # Same case, one layer out: the handler succeeded and the
+            # caller left. Don't let it surface as an unhandled
+            # socketserver traceback.
+            print(f'[server] {method} {self.path!r}: client hung up '
+                  f'before the response could be written '
+                  f'({ex.__class__.__name__})',
+                  file=sys.stderr, flush=True)
 
     def do_GET(self):
         # Binary endpoint: route directly so we can stream raw

@@ -127,6 +127,13 @@ def _fire_arrival(peer_id_hex):
             # short-circuit through ``_recently_unreachable`` and
             # never even try the now-fresh endpoint.
             _lan_push._record_reachable(peer_id_hex)
+            # Also forget per-endpoint dead markers (0.55.83): an mDNS
+            # announcement is fresh information about EVERY address we
+            # hold for this peer, not just the one that last failed.
+            try:
+                _lan_push.clear_endpoint_dead(peer_id_hex)
+            except Exception:
+                pass
             _lan_push.sweep_peer(peer_id_hex)
             # Auto-complete any share-offers the user already
             # affirmed while this peer was absent. Guarded on its own

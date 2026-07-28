@@ -5520,23 +5520,110 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     # oldest commit reachable from tip that descends from base (base→C
     # is a valid fast-forward). Excludes sibling parent-line commits
     # (which would DivergedBranches) while still advancing in chunks.
+    # ONE WALK, NOT AN ANCESTRY TEST PER CANDIDATE (0.55.83).
+    #
+    # This used to call ``_is_ancestor(base, c)`` for every commit in the
+    # delta, and each of those walks history and decompresses pack
+    # objects — quadratic in the delta size. Field 2026-07-28: 134–145 s
+    # per call on an 816-commit delta, with ``project_lock`` held
+    # throughout, which is what made LAN post-receive resets time out at
+    # 5 s and AZT saves return BUSY (agenda:
+    # daemon_lock_across_network_io). The watchdog also read it as a
+    # stall and, before 0.55.73, restarted the daemon over it.
+    #
+    # Same answer, computed once: build a parent→children map over the
+    # delta and BFS out from *base*. Everything reached descends from
+    # base, which is exactly what the per-candidate test established.
     try:
-        walker = repo.get_walker(include=[tip_sha], exclude=[base_sha])
-        delta = [entry.commit.id for entry in walker]
+        commits = [entry.commit for entry in
+                   repo.get_walker(include=[tip_sha], exclude=[base_sha])]
     except Exception:
         return tip_sha
-    if not delta:
+    if not commits:
         return tip_sha
-    delta.reverse()  # oldest first
-    picked = None
-    count = 0
-    for c in delta:
-        if _is_ancestor(repo, base_sha, c):
-            picked = c
-            count += 1
-            if count >= n:
-                break
-    return picked if picked is not None else tip_sha
+    try:
+        children = {}
+        for c in commits:
+            for p in (c.parents or []):
+                children.setdefault(p, []).append(c.id)
+        descends = set()
+        stack = list(children.get(base_sha, []))
+        while stack:
+            sha = stack.pop()
+            if sha in descends:
+                continue
+            descends.add(sha)
+            stack.extend(children.get(sha, []))
+        # Walker yields newest-first; we want the n-th OLDEST descendant.
+        ordered = [c.id for c in reversed(commits) if c.id in descends]
+    except Exception:
+        return tip_sha
+    if not ordered:
+        return tip_sha
+    return ordered[min(n, len(ordered)) - 1]
+
+
+class _PushProgressStream:
+    """File-like sink for ``porcelain.push(errstream=…)`` that surfaces
+    the remote's sideband progress instead of discarding it (0.55.79).
+
+    Every push call site passed ``io.BytesIO()`` — dulwich dutifully
+    wrote git's progress there and we threw it away. Kent 2026-07-28,
+    26 minutes into an 8.9 GB push: *"I assume there will be no notice
+    of any kind until the 9GB finishes?"* Exactly so, and by our own
+    choice: the only liveness signal was the watchdog's lock-age line
+    climbing.
+
+    That matters most precisely when it hurts most. A multi-GB first
+    push is the case where the user most needs to know whether bytes are
+    moving or the link has died — and the difference decides whether to
+    wait or to intervene. Silence made "working" and "hung"
+    indistinguishable for hours.
+
+    Rate-limited to one line per ``min_interval_s`` because git emits
+    progress continuously and this goes to the daemon log. Newline- AND
+    carriage-return-delimited: git uses ``\\r`` to redraw counters in
+    place, so splitting on ``\\n`` alone would buffer the entire transfer
+    into one record and defeat the purpose.
+
+    Never raises. A progress reporter must not be able to fail the
+    transfer it is reporting on."""
+
+    def __init__(self, label='', min_interval_s=15.0):
+        self._label = label or 'push'
+        self._buf = b''
+        self._min = float(min_interval_s)
+        self._last = 0.0
+
+    def write(self, data):
+        try:
+            if not data:
+                return
+            if isinstance(data, str):
+                data = data.encode('utf-8', 'replace')
+            self._buf += data
+            # Keep only the newest record; intermediate counter redraws
+            # have no value once superseded.
+            for sep in (b'\r', b'\n'):
+                if sep in self._buf:
+                    self._buf = self._buf.rsplit(sep, 1)[-1]
+            now = time.monotonic()
+            if now - self._last < self._min:
+                return
+            text = self._buf.decode('utf-8', 'replace').strip()
+            if not text:
+                return
+            self._last = now
+            lift_merge.trace(
+                f'[sync-trace] {self._label} remote: {text}')
+        except Exception:
+            pass
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
 
 
 def _check_large_files_in_commit(repo, commit_sha, threshold_bytes):
@@ -5593,14 +5680,57 @@ def _estimate_delta_size(repo, have_sha, want_sha):
     receive-pack timeout window?'
 
     Returns ``(0, 0)`` on any walk failure (treated by callers as
-    'estimate unavailable, don't gate on it')."""
+    'estimate unavailable, don't gate on it').
+
+    **Counts every remote-tracking ref as a `have` (0.55.80).** This used
+    to pass exactly one — the local chunk base — so it counted objects
+    the server demonstrably already holds: everything under
+    ``origin/main`` and every blob banked by a prior pre-seed run
+    (``refs/remotes/origin/azt-blob-seed-*``). The real push negotiates
+    with receive-pack and sends far less, so the estimate could exceed
+    the truth by orders of magnitude.
+
+    That is not a cosmetic inaccuracy: this number gates the oversize
+    bail and the pre-seed decision. Field 2026-07-28, `nml`: 2,330
+    objects / **8.9 GB** reported against a 3 MB budget for a merge
+    commit, on a repo with 3,425 commits and 501 seed refs already on
+    the remote — i.e. measured as though nothing had ever been uploaded.
+    `_enumerate_new_blobs` already excluded the seed refs for exactly
+    this reason; the estimate never learned the same lesson.
+
+    Haves are filtered to objects actually present locally, so a
+    tracking ref pointing at something we don't have can't make the
+    whole estimate raise (which would silently disable the gate)."""
     if not want_sha:
         return (0, 0)
     try:
         from dulwich.object_store import MissingObjectFinder
+        haves = [have_sha] if have_sha else []
+        try:
+            tracked = repo.refs.as_dict(b'refs/remotes/origin')
+            extra = []
+            for _name, _sha in (tracked or {}).items():
+                if not _sha or _sha in haves:
+                    continue
+                try:
+                    if _sha in repo.object_store:
+                        extra.append(_sha)
+                except Exception:
+                    pass
+            if extra:
+                haves.extend(extra)
+                lift_merge.trace(
+                    f'[sync-trace] pack-size estimate: counting '
+                    f'{len(extra)} remote-tracking ref(s) as already '
+                    f'on the server (was: local base only)')
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] pack-size estimate: could not read '
+                f'remote-tracking refs ({exc!r}); estimating against '
+                f'the local base only — may overstate')
         finder = MissingObjectFinder(
             repo.object_store,
-            haves=[have_sha] if have_sha else [],
+            haves=haves,
             wants=[want_sha],
         )
         count = 0
@@ -6132,9 +6262,220 @@ def _topic_branch_name(langcode, device_name):
     return f'azt-pending-{safe_lang}-{safe_dev}'
 
 
+_MAX_SIDE_DEPTH = 3
+
+# Live push progress, keyed by project_dir (0.55.83). Phase A of a
+# topic-branch push can run for hours while ``wan_unshared`` — the number
+# the UI shows — cannot move, because Phase A advances
+# ``refs/remotes/origin/azt-pending-*`` and that figure is measured
+# against ``origin/main``. Only Phase B advances main, and it lands in
+# seconds at the very end.
+#
+# So the display sat at "816 commit(s) to go" for hours of real, banked
+# progress. Kent 2026-07-28: the practical consequence is that the UI
+# teaches users to interrupt a working push — and interrupting is what
+# discarded progress repeatedly all evening. A server left with a team
+# has to show movement, or someone will press something.
+#
+# Deliberately in-memory and not persisted: it describes work in flight,
+# so a daemon restart correctly forgets it. ``at`` lets a reader treat a
+# stale entry as "no push running" without needing a cleanup pass.
+_push_progress = {}
+_push_progress_lock = threading.Lock()
+# A reader treats progress older than this as stale (the push died or the
+# daemon was restarted mid-flight).
+PUSH_PROGRESS_STALE_S = 180.0
+
+
+def set_push_progress(project_dir, *, banked, total, ref='', phase='A'):
+    """Record how far the current chunked push has banked."""
+    try:
+        with _push_progress_lock:
+            _push_progress[str(project_dir)] = {
+                'banked': int(banked or 0),
+                'total': int(total or 0),
+                'ref': str(ref or ''),
+                'phase': str(phase or ''),
+                'at': time.time(),
+            }
+    except Exception:
+        pass
+
+
+def clear_push_progress(project_dir):
+    try:
+        with _push_progress_lock:
+            _push_progress.pop(str(project_dir), None)
+    except Exception:
+        pass
+
+
+def get_push_progress(project_dir):
+    """Return the live progress dict, or None when nothing is in flight
+    (or the last entry is stale)."""
+    try:
+        with _push_progress_lock:
+            row = _push_progress.get(str(project_dir))
+            if not row:
+                return None
+            if time.time() - float(row.get('at') or 0) > \
+                    PUSH_PROGRESS_STALE_S:
+                return None
+            return dict(row)
+    except Exception:
+        return None
+
+
+def _server_known_commits(repo, cap=200000):
+    """Commit shas reachable from any ``refs/remotes/origin/*`` ref —
+    i.e. what we believe the server already holds (0.55.81).
+
+    Includes the ``azt-blob-seed-*`` and ``azt-side-*`` tracking refs, so
+    work banked by an earlier run counts as present and is not re-sent."""
+    known = set()
+    try:
+        tracked = repo.refs.as_dict(b'refs/remotes/origin')
+    except Exception:
+        return known
+    tips = []
+    for _sha in (tracked or {}).values():
+        try:
+            if _sha and _sha in repo.object_store:
+                tips.append(_sha)
+        except Exception:
+            pass
+    if not tips:
+        return known
+    try:
+        for i, entry in enumerate(repo.get_walker(include=tips)):
+            known.add(entry.commit.id)
+            if i >= cap:
+                break
+    except Exception:
+        pass
+    return known
+
+
+def _bank_merge_side_branches(
+    repo, project_dir, username, token, remote_url,
+    merge_sha, branch_for_main, _side_depth=0,
+):
+    """Push a merge's not-yet-on-server parent lines onto their own refs
+    so the merge itself becomes a trees+commit push (0.55.81).
+
+    **Why a separate ref is required, and no path selection substitutes
+    for it.** Every push to a ref must fast-forward that ref. When a
+    merge's second-parent line diverged BEFORE the chunk base (the normal
+    shape when a peer records offline for hours and then merges in), none
+    of its commits are descendants of ``origin/main`` — so none can be
+    pushed to the topic ref at all, at any chunk size.
+    ``_pick_intermediate_sha`` correctly reports the merge as the first
+    FF-valid boundary, and that boundary carries the entire side.
+
+    Field 2026-07-28, `nml`: 2,330 objects / 8.9 GB in one indivisible
+    step, running 26+ minutes with nothing banked — receive-pack is atomic
+    per push, so an interrupted link discards all of it. The same shape is
+    already on record for another device (``_pick_intermediate_sha``
+    docstring: *"aztobt2-ui, base=old origin/main off the merge spine,
+    estimate 9.3 GB — CHANGELOG 0.52.31"*), mitigated then, never solved.
+    Kent: *"not exotic … likely stuff collected from a machine, that then
+    caused a merge, which is now going up."* It recurs on every offline
+    batch.
+
+    A **fresh** ref has no FF constraint on its first push, so it can be
+    planted at the divergence point — ``merge_base(main, parent)`` — from
+    which the parent's line IS descended, and chunked forward normally.
+    Each step banks. Once the side is on the server the merge is tiny.
+
+    Side refs hold REAL commits, so the existing orphan sweep retires them
+    once they are reachable from ``main`` — no separate cleanup contract,
+    unlike the synthetic-commit ``azt-blob-seed-*`` refs which are the
+    crude form of this same idea.
+
+    Returns True if at least one side was banked (caller should retry the
+    merge push). Never raises — on any failure the caller falls through to
+    the blob pre-seed path, i.e. today's behaviour."""
+    if _side_depth >= _MAX_SIDE_DEPTH:
+        lift_merge.trace(
+            f'[sync-trace] side-bank: depth cap {_MAX_SIDE_DEPTH} reached '
+            f'at {_sha_str(merge_sha)[:8]!r}; leaving it to blob pre-seed')
+        return False
+    try:
+        parents = list(repo[merge_sha].parents)
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] side-bank: cannot read parents of '
+            f'{_sha_str(merge_sha)[:8]!r}: {exc!r}')
+        return False
+    if len(parents) < 2:
+        return False        # not a merge; nothing to bank separately
+    known = _server_known_commits(repo)
+    main_tip = None
+    try:
+        _b = branch_for_main
+        if isinstance(_b, str):
+            _b = _b.encode()
+        if not _b:
+            _b = b'main'
+        main_tip = repo.refs[b'refs/remotes/origin/' + _b]
+    except Exception:
+        main_tip = None
+    banked = False
+    for p in parents:
+        if p in known:
+            continue                     # server already has this side
+        sha8 = _sha_str(p)[:8]
+        # Plant at the divergence point: the parent's line descends from
+        # there, so chunking is FF-valid on the side ref.
+        base = None
+        try:
+            from dulwich.graph import find_merge_base
+            if main_tip:
+                # Takes the REPO (it needs ``get_parents``), not the
+                # object store. Wrong arg here would raise into the
+                # handler below and silently chunk from the root — slow
+                # but still correct, which is why this is worth getting
+                # right rather than relying on the fallback.
+                bases = find_merge_base(repo, [main_tip, p])
+                if bases:
+                    base = bases[0]
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] side-bank {sha8}: merge-base lookup '
+                f'failed ({exc!r}); chunking from the start of history')
+        side_ref = f'azt-side-{sha8}'
+        lift_merge.trace(
+            f'[sync-trace] side-bank: {sha8} is not on the server; '
+            f'banking its line onto {side_ref!r} from base '
+            f'{(_sha_str(base)[:8] if base else "(root)")!r} '
+            f'(depth={_side_depth})')
+        try:
+            ok, status, _last = _push_chunked_to_ref(
+                repo, project_dir, username, token, remote_url,
+                p, side_ref, branch_for_main,
+                chunk_base_override=base, _side_depth=_side_depth + 1,
+            )
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] side-bank {sha8}: raised {exc!r}')
+            continue
+        if ok:
+            banked = True
+            lift_merge.trace(
+                f'[sync-trace] side-bank: {sha8} banked on {side_ref!r} '
+                f'— the merge should now be a small push')
+        else:
+            lift_merge.trace(
+                f'[sync-trace] side-bank: {sha8} did not complete '
+                f'(status={status!r}); partial progress is still banked '
+                f'on {side_ref!r} and the next run resumes from it')
+    return banked
+
+
 def _push_chunked_to_ref(
     repo, project_dir, username, token, remote_url,
     target_sha, topic_ref_name, branch_for_main,
+    chunk_base_override=None, _side_depth=0,
 ):
     """Phase A of the topic-branch push: push *target_sha* to
     ``refs/heads/<topic_ref_name>`` on the remote in adaptive chunks
@@ -6237,7 +6578,17 @@ def _push_chunked_to_ref(
     # potentially new to the server). Falling back to ``None`` is
     # safe — ``_pick_intermediate_sha`` returns the tip in that
     # case and the chunk-halving still drives the loop.
-    if server_topic_tip is not None:
+    if chunk_base_override is not None:
+        # Side-ref banking (0.55.81) supplies the divergence point as the
+        # base. Without this a fresh side ref would default to
+        # ``origin/main`` — precisely the base its target is NOT descended
+        # from, which is the whole reason the side ref exists.
+        chunk_base = chunk_base_override
+        lift_merge.trace(
+            f'[sync-trace] topic-push: chunk base overridden to '
+            f'{_sha_str(chunk_base)[:8]!r} (side-ref banking, '
+            f'depth={_side_depth})')
+    elif server_topic_tip is not None:
         chunk_base = server_topic_tip
     else:
         try:
@@ -6263,6 +6614,13 @@ def _push_chunked_to_ref(
     # this function and the deterministic-batch / side-ref-aware
     # enumeration in pre-seed picks up where we left off.
     preseed_attempted = False
+    # Denominator for live progress (0.55.83); set on the first
+    # measurement of this run.
+    initial_remaining = None
+    # One side-branch banking attempt per topic-push call (0.55.81).
+    # Recursion is bounded by _MAX_SIDE_DEPTH; this stops a single call
+    # re-walking the same merge after the attempt has been made.
+    side_bank_attempted = False
     # Bounded re-sync on DivergedBranches. With FF-clean intermediates
     # (see _pick_intermediate_sha) our own picks never diverge; a
     # DivergedBranches here means the server topic ref genuinely moved
@@ -6288,6 +6646,11 @@ def _push_chunked_to_ref(
             pass  # keep prior (main or None)
         remaining = _count_commits_between(repo, chunk_base, target_sha) \
             if chunk_base else None
+        # First measurement of this run is the denominator for progress
+        # (0.55.83) — ``remaining`` shrinks as chunks land, so the total
+        # has to be captured once rather than re-read.
+        if initial_remaining is None and remaining:
+            initial_remaining = int(remaining)
         if remaining == 0:
             # Server caught up to target via the last chunk push.
             _cleanup_temp_ref()
@@ -6310,6 +6673,19 @@ def _push_chunked_to_ref(
             f'[sync-trace] topic-push attempt target={label} '
             f'chunk_n={chunk_n} remaining={remaining} '
             f'consecutive_failures={consecutive_failures}')
+        # Publish live position so the UI can show movement during Phase A
+        # (0.55.83). Only the main topic ref reports; side refs would
+        # otherwise overwrite the headline figure with their own smaller
+        # counts.
+        if _side_depth == 0:
+            try:
+                _total = int(initial_remaining or remaining or 0)
+                set_push_progress(
+                    project_dir,
+                    banked=max(0, _total - int(remaining or 0)),
+                    total=_total, ref=topic_ref_name, phase='A')
+            except Exception:
+                pass
 
         # Pre-flight pack-size estimate. Pre-compression upper bound;
         # the wire pack will be smaller, but raw_bytes is the right
@@ -6341,6 +6717,79 @@ def _push_chunked_to_ref(
                 chunk_n = shrunk
                 continue
 
+        # PRE-SEED BEFORE ATTEMPTING A PUSH WE'VE ALREADY MEASURED AS
+        # HOPELESS (0.55.79).
+        #
+        # At chunk_n=1 there is no smaller unit, so the old code pushed
+        # regardless of size and only pre-seeded from the FAILURE
+        # handler. That assumed an oversize push fails promptly. It does
+        # not: ``_socket_timeout`` bounds one blocking socket operation,
+        # not total transfer time, so while bytes keep moving a doomed
+        # push runs indefinitely.
+        #
+        # Field 2026-07-28: a merge commit estimated at 2,330 objects /
+        # 8.9 GB against a 3 MB budget ran 26+ minutes with no failure,
+        # no progress signal, and — because receive-pack is ATOMIC per
+        # push — nothing banked on the server. The mechanism built for
+        # exactly this case never got its turn, because it waits for a
+        # failure that may take hours or never arrive. Meanwhile the
+        # project lock is held throughout, so LAN resets and AZT saves
+        # queue behind it.
+        #
+        # Pre-seeding lands blobs in batches, each its own push, so
+        # progress BANKS incrementally and an interrupted link loses one
+        # batch instead of everything. When the estimate already says the
+        # unit cannot fit, seed first and retry — don't spend hours
+        # proving the arithmetic.
+        if (chunk_n == 1 and budget > 0 and raw_bytes > budget
+                and not preseed_attempted):
+            # FIRST, try banking the merge's off-server parent lines onto
+            # their own refs (0.55.81). This is the real fix: it moves
+            # REAL commits, banks each chunk, and leaves refs the orphan
+            # sweep already knows how to retire. Blob pre-seeding below is
+            # the fallback — same idea with synthetic commits and cleanup
+            # debt. Guarded: any failure falls through to the old path.
+            if not side_bank_attempted:
+                side_bank_attempted = True
+                try:
+                    if _bank_merge_side_branches(
+                            repo, project_dir, username, token,
+                            remote_url, intermediate, branch_for_main,
+                            _side_depth=_side_depth):
+                        lift_merge.trace(
+                            '[sync-trace] topic-push: side branch(es) '
+                            'banked; re-estimating this unit')
+                        continue
+                except Exception as exc:
+                    lift_merge.trace(
+                        f'[sync-trace] topic-push: side-bank raised '
+                        f'{exc!r}; falling back to blob pre-seed')
+            preseed_attempted = True
+            lift_merge.trace(
+                f'[sync-trace] topic-push: chunk_n=1 est {raw_bytes:,} '
+                f'> budget {budget:,} — pre-seeding blobs BEFORE '
+                f'attempting the push (atomic receive-pack banks '
+                f'nothing on failure; seeding banks per batch)')
+            seed_ok, seed_status = _preseed_oversize_blobs(
+                repo, chunk_base, intermediate,
+                remote_url, username, token, budget,
+            )
+            if seed_ok:
+                lift_merge.trace(
+                    '[sync-trace] topic-push: pre-seed complete; '
+                    'retrying chunk_n=1 (pack should now be tiny)')
+                chunk_n_1_failures = 0
+                backoff_s = 1.0
+                continue
+            # Seeding didn't help (or found nothing to seed) — fall
+            # through and attempt the push anyway. The failure handler
+            # keeps its own bail logic; ``preseed_attempted`` stops it
+            # repeating the work.
+            lift_merge.trace(
+                f'[sync-trace] topic-push: pre-seed did not shrink the '
+                f'unit (status={seed_status!r}); attempting the '
+                f'oversize push anyway')
+
         # Park the intermediate sha under TEMP_REF so dulwich can
         # resolve the lhs of the refspec.
         _cleanup_temp_ref()
@@ -6352,7 +6801,12 @@ def _push_chunked_to_ref(
                 porcelain.push(
                     repo, remote_url, refspec,
                     username=username, password=token,
-                    errstream=io.BytesIO(),
+                    # Surface the remote's sideband progress instead of
+                    # discarding it (0.55.79) — this is the call that can
+                    # run for hours, and it was the one with no liveness
+                    # signal at all.
+                    errstream=_PushProgressStream(
+                        label=f'topic-push {label}'),
                 )
             lift_merge.trace(
                 f'[sync-trace] topic-push chunk OK '
@@ -6372,6 +6826,11 @@ def _push_chunked_to_ref(
                     f'[sync-trace] topic-push batch size '
                     f'locked at {working_n}')
             if intermediate == target_sha:
+                # Phase A complete for this ref — stop reporting live
+                # progress so the UI doesn't show a frozen "uploading"
+                # while Phase B merges to main (0.55.83).
+                if _side_depth == 0:
+                    clear_push_progress(project_dir)
                 _cleanup_temp_ref()
                 return True, None, target_sha
             continue

@@ -153,6 +153,47 @@ def heartbeat_ages():
         return {}
 
 
+_heartbeat_intervals: dict = {}
+
+
+def heartbeat_interval(name, interval_s):
+    """Publish the sleep *interval_s* a loop is about to wait, so the
+    watchdog can judge lateness against the loop's OWN cadence instead
+    of a fixed bar (0.55.66).
+
+    Field 2026-07-28, desktop, four cycles in twenty minutes:
+
+        STALL DETECTED: loop 'watcher' last ticked 145s ago
+        threads=5 fds=16 … _watcher_loop → _watcher_stop.wait(timeout=interval)
+        stall cleared — loops and locks are moving again
+
+    Every thread parked in ``wait()``, sixteen fds, nothing held: an idle
+    daemon. The connectivity-probe backoff had stretched the watcher's
+    interval past the watchdog's fixed 120 s bar, so a loop sleeping
+    exactly as designed was reported as stalled — then "cleared" when it
+    woke, then again. `_stall_report`'s own comment assumed "watcher up
+    to ~60 s with backoff"; the streak goes well beyond that.
+
+    A watchdog that cries wolf on healthy idling is worse than useless:
+    it trains you to skip the line that will one day be real (yesterday's
+    147 s lock held in an ``ssl.read`` was real, and looked identical at
+    a glance)."""
+    try:
+        _heartbeat_intervals[str(name)] = float(interval_s)
+    except Exception:
+        pass
+
+
+def heartbeat_expectations():
+    """``{name: expected_interval_s}`` for loops that have published one.
+    The watchdog treats a missing entry as "no expectation" and falls
+    back to its fixed bar."""
+    try:
+        return dict(_heartbeat_intervals)
+    except Exception:
+        return {}
+
+
 # connectivity watcher
 _watcher_thread = None
 _watcher_stop = None
@@ -693,6 +734,47 @@ def is_online_cached():
     return _last_online_state
 
 
+def drain_pushes_now_async(langcode=''):
+    """Fire ``drain_pushes_now`` on a background thread and return at
+    once (0.55.78).
+
+    **Every user-gesture caller wants this one, not the blocking form.**
+    A nudge from an RPC handler used to run the whole push inline, so the
+    HTTP response was withheld until the push finished — and a first
+    push of a large history takes an hour. Kent 2026-07-28: *"it nudged
+    before finishing the settings work, so there was settings work
+    trying to get through the new fetch push, and the UI didn't clear
+    for a long time."* The watchdog stack showed it plainly:
+    ``dispatch → _h_set_work_offline → drain_pushes_now →
+    _push_chunked_to_ref``.
+
+    Nobody needs the push result in the nudge's response — the caller
+    already knows they asked, and progress shows up in the status board
+    and the log. Withholding the reply only made the UI look wedged
+    while the daemon was working correctly.
+
+    Concurrent nudges may each spawn a thread; the loser gets ``BUSY``
+    from ``project_lock``, which since 0.55.73 costs nothing (no backoff
+    advance, no access error). A WAN in-flight guard — the LAN path got
+    one in 0.55.55 — would avoid making the attempt at all."""
+    def _work():
+        try:
+            drain_pushes_now(langcode)
+        except Exception as ex:
+            print(f'[scheduler] async WAN nudge failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+    try:
+        threading.Thread(
+            target=_work, name='wan-nudge', daemon=True).start()
+    except Exception as ex:
+        # Couldn't spawn — fall back to inline rather than dropping the
+        # user's gesture entirely.
+        print(f'[scheduler] could not spawn WAN nudge thread ({ex!r}); '
+              f'running inline — this call may block',
+              file=sys.stderr, flush=True)
+        drain_pushes_now(langcode)
+
+
 def drain_pushes_now(langcode=''):
     """User-nudge entry point: clear WAN backoff and fire a push
     pass immediately. Used by ``sync_nudge`` (the unified "try
@@ -709,6 +791,17 @@ def drain_pushes_now(langcode=''):
     knows they tried; the next ``ConnectivityManager`` event or
     the user's next nudge will drive the actual push."""
     if not _has_internet():
+        # SAY SO (0.55.66). This was a silent return: the user made a
+        # gesture — turned work_offline off, tapped Sync, saved
+        # credentials — and nothing happened, with nothing in the log to
+        # show the gesture had even arrived. Indistinguishable from a
+        # dead code path during diagnosis, which is the same complaint as
+        # invariant #15 seen from the other side: don't announce acts you
+        # aren't performing, but DO report the ones you're declining.
+        print(f'[scheduler] WAN nudge {langcode or "(all)"!r} declined: '
+              f'no internet — nothing attempted. The next connectivity '
+              f'change or nudge will drive it',
+              file=sys.stderr, flush=True)
         return
     # User-gestured nudge → the watcher's probe-backoff streak
     # should reset so the next periodic tick fires at base
@@ -1048,6 +1141,9 @@ def _watcher_loop():
                 interval = min(interval, 15.0)
         except Exception:
             pass
+        # Tell the watchdog what cadence to expect BEFORE sleeping, so a
+        # backoff-stretched interval isn't mistaken for a stall (0.55.66).
+        heartbeat_interval('watcher', interval)
         if _watcher_stop.wait(timeout=interval):
             break
 
@@ -1258,7 +1354,85 @@ def _drain_pending_push(ignore_backoff=False):
         return
     candidates = [lang for lang, entry in data.items()
                   if entry.get('pending_push')]
+    # AHEAD OF GITHUB IS ENOUGH — PROVENANCE IS NOT A GATE (0.55.69).
+    #
+    # Kent 2026-07-28: *"once I FF or merge, it is now my head. If my head
+    # is behind github, I don't push, just because I got it from someone
+    # else? That's weird."* Right. ``pending_push`` is set by the LOCAL
+    # commit path, so work that arrived over LAN advanced ``main`` without
+    # ever raising it — and the drain, whose only trigger is that flag,
+    # correctly reported "nothing pending" while sitting dozens of commits
+    # ahead of ``origin/main``.
+    #
+    # Field evidence: this desktop's ``git log --graph`` showed
+    # ``origin/main`` at ``2ed963b4`` with a long run of "A-Z+T edit by
+    # Idjop Protais" commits above it — received over LAN, merged, and
+    # never offered to github. github is off-site DURABILITY here, not a
+    # convergence mechanism, so the consequence is data that exists only
+    # on devices staying that way while internet is available. That is
+    # exactly what ``at_risk`` counts, which means the daemon already knew
+    # and still didn't act.
+    #
+    # ``_wan_unshared`` is the existing, tested answer to "how many of my
+    # commits aren't on github" (the ``[wan-unshared]`` lines), so ask it
+    # rather than inventing a ref comparison. USER-GESTURE PATH ONLY: it
+    # walks history, which is too costly for the 15 s periodic tick — the
+    # tick keeps using the flag, and a nudge catches whatever the flag
+    # missed.
+    if ignore_backoff:
+        from . import repo as _repo
+        for _lang in data:
+            if _lang in candidates:
+                continue
+            # ``repo_status_summary(project_dir)`` — a project DIRECTORY,
+            # and it returns a TUPLE
+            # ``(branch, remote_url, n_changes, wan_unshared)``, or None
+            # when the path isn't a git repo. 0.55.69 passed a langcode
+            # and read an attribute, so it raised every time; the bare
+            # ``except`` turned that into a silent 0 and the check never
+            # found anything. Field: nml sat at 816 unshared while the
+            # nudge reported "nothing pending".
+            _ahead = 0
+            try:
+                _proj = projects.get(_lang)
+                _wd = (getattr(_proj, 'working_dir', '') or ''
+                       ) if _proj else ''
+                _summary = _repo.repo_status_summary(_wd) if _wd else None
+                if _summary:
+                    _ahead = int(_summary[3] or 0)
+            except Exception as ex:
+                # Say it. A swallowed exception here is why the previous
+                # version looked like "nothing to push" instead of
+                # "couldn't tell".
+                print(f'[scheduler] WAN nudge: ahead-of-github check '
+                      f'failed for {_lang!r}: {ex!r} — falling back to '
+                      f'the pending_push flag for this project',
+                      file=sys.stderr, flush=True)
+            if _ahead > 0:
+                candidates.append(_lang)
+                print(f'[scheduler] WAN nudge: {_lang!r} is '
+                      f'{_ahead} commit(s) ahead of github but was not '
+                      f'flagged pending_push (work received over LAN '
+                      f'never raises that flag) — pushing anyway; being '
+                      f'ahead is the only thing that matters',
+                      file=sys.stderr, flush=True)
     if not candidates:
+        # A USER GESTURE ALWAYS GETS AN ANSWER (0.55.68). Kent
+        # 2026-07-28, after flipping work_offline off: *"I'm watching the
+        # log, and I see nothing."* There were three silent exits between
+        # that toggle and a push — no internet, no pending projects, and
+        # the rate-limited per-project backoff skip — so "nothing to do"
+        # and "the gesture never arrived" looked identical.
+        #
+        # Only speaks for the nudge path: the periodic tick hits this
+        # same line every 15 s and must stay quiet.
+        if ignore_backoff:
+            print(f'[scheduler] WAN nudge: nothing pending — no project '
+                  f'is flagged pending_push, so there is nothing to '
+                  f'send to github. (Everything committed here has '
+                  f'already been pushed, or nothing has been committed '
+                  f'since the last push.)',
+                  file=sys.stderr, flush=True)
         return
     # Honour ``sync.work_offline`` (0.55.42). Until now the toggle was
     # enforced ONLY in the Sync-button RPC handler
@@ -1357,15 +1531,37 @@ def _drain_pending_push(ignore_backoff=False):
             # user gesture routes AUTH_REQUIRED. Don't advance the
             # backoff curve: nothing failed network-wise.
             continue
-        # NOW it's true (0.55.58): due (or escalating), credentials in
-        # hand, about to hit the network.
-        print(f'[scheduler] WAN drain: pushing {langcode!r} to github'
-              + (' (run-to-completion)' if escalate else ''),
-              file=sys.stderr, flush=True)
-        if escalate:
-            _run_to_completion(langcode, p, git_user, token)
-            continue
-        res = _attempt_push(langcode, p, git_user, token)
+        # ONE WAN PUSH PER PROJECT AT A TIME (0.55.83). The LAN path got
+        # this in 0.55.55; WAN relied on ``project_lock`` to sort out
+        # collisions, so a second trigger built a whole chunk plan, hit
+        # the lock, and returned ``BUSY`` — wasted work that until
+        # 0.55.73 was also charged to the backoff curve as a github
+        # failure. Field 2026-07-28: a nudge-initiated push held the lock
+        # 10+ minutes while the periodic drain and a second nudge both
+        # tried the same project.
+        _wkey = str(langcode)
+        with _wan_inflight_lock:
+            if _wkey in _wan_inflight:
+                print(f'[scheduler] WAN push {langcode!r}: already in '
+                      f'flight — skipping this trigger',
+                      file=sys.stderr, flush=True)
+                continue
+            _wan_inflight.add(_wkey)
+        try:
+            # No announcement here (0.55.64) — ``_attempt_push`` says it
+            # immediately before the network call, so the line can't
+            # appear without an attempt. Only the run-to-completion MODE
+            # is worth noting at this level: it changes what follows.
+            if escalate:
+                print(f'[scheduler] WAN push {langcode!r}: escalating '
+                      f'to run-to-completion',
+                      file=sys.stderr, flush=True)
+                _run_to_completion(langcode, p, git_user, token)
+                continue
+            res = _attempt_push(langcode, p, git_user, token)
+        finally:
+            with _wan_inflight_lock:
+                _wan_inflight.discard(_wkey)
         if res is None:
             wan_backoff.record_failure(langcode)
             continue
@@ -1387,6 +1583,32 @@ def _drain_pending_push(ignore_backoff=False):
         elif 'NOTHING_TO_COMMIT' in codes or 'NO_REMOTE' in codes:
             # No-op outcomes don't advance the backoff curve.
             pass
+        elif 'BUSY' in codes:
+            # OUR OWN LOCK, NOT GITHUB'S FAULT (0.55.73). ``BUSY`` is a
+            # ``project_lock`` timeout — another thread in THIS daemon
+            # holds the project. Charging it to ``wan_backoff`` punished
+            # a project for our internal contention, and
+            # ``_note_access_error`` additionally mislabelled it as a
+            # GitHub ACCESS problem, which is a different diagnosis
+            # entirely and the one a user would act on.
+            #
+            # Field 2026-07-28, ~10 minutes into the 816-commit 'nml'
+            # push: the nudge-initiated push held the lock (watchdog:
+            # held 145 s in ``_pick_intermediate_sha``) while a second
+            # trigger tried and got ``codes=['BUSY']``. Nothing was
+            # wrong; two triggers wanted the same project.
+            #
+            # This is very likely where the large failure counts came
+            # from — 'baf' at 25 consecutive, 'en' at 178. Overlapping
+            # attempts bouncing off each other, every bounce recorded as
+            # a github failure, curves inflating to 21 h with no
+            # external cause. Same rule as the LAN merge curve, which
+            # deliberately leaves ``LockTimeout`` off the curve.
+            print(f'[scheduler] WAN push {langcode!r} deferred: the '
+                  f'project is locked by another operation in this '
+                  f'daemon (probably a push already running). Not a '
+                  f'github failure — backoff curve and access state '
+                  f'left untouched', file=sys.stderr, flush=True)
         else:
             wan_backoff.record_failure(langcode)
             _note_access_error(langcode, res)
@@ -1473,6 +1695,10 @@ _ACCESS_REPROBE_CODES = (
 # Langcodes already reported as drain ghosts (0.55.58) — log once, not
 # every tick.
 _ghost_drain_logged = set()
+# Langcodes with a WAN push in flight (0.55.83) — the WAN counterpart to
+# ``lan_push._push_inflight``.
+_wan_inflight = set()
+_wan_inflight_lock = threading.Lock()
 _ACCESS_REPROBE_MIN_INTERVAL_S = 300.0
 _access_reprobe_last = {}   # langcode -> monotonic time of last probe
 # Rate limit for the work_offline suppression notice (0.55.44). The
@@ -1618,6 +1844,17 @@ def _attempt_push(langcode, p, git_user, token):
     ``_push_repo`` raised. Outcome handling is the caller's job."""
     with sync_flight.guard():
         wan_backoff.mark_push_started(langcode)
+        # ANNOUNCE HERE, not in the caller (0.55.64). Kent: *"It would be
+        # nice to not see in logs 'pushing to github' if we're not at
+        # least trying to do that."* 0.55.58 moved this out of the
+        # candidate-enumeration spot and behind the due + credentials
+        # checks, which was better but still not the same claim: any bail
+        # between there and the socket would have printed "pushing" and
+        # pushed nothing. This is the last statement before
+        # ``_push_repo`` touches the network, so the line cannot appear
+        # without an attempt, and a result or a raise always follows it.
+        print(f'[scheduler] WAN push {langcode!r} → github',
+              file=sys.stderr, flush=True)
         try:
             return _push_repo(p.working_dir, git_user, token)
         except Exception as ex:

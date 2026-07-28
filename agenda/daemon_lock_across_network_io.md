@@ -21,6 +21,68 @@
   client-handled "busy, retry" — never a 300 s hang. Result: a fast
   machine on a bad link stays responsive.
 
+  **Amendment 2026-07-28 (evening): the WAN half is NOT primarily a
+  network-I/O problem, and the phase-split alone will not fix it.**
+  Watchdog, desktop, during the 816-commit `nml` topic push —
+  `project_lock 'e1081fb4390d0ac0.lock' held 145s`:
+
+  ```
+  _h_test_github → drain_pushes_now → _drain_pending_push → _attempt_push
+    → push_repo → _push_repo_locked → _push_step_locked
+    → _push_chunked_to_ref → _pick_intermediate_sha → _is_ancestor
+    → repo[sha] → object_store.get_raw → pack.read_zlib_chunks
+  ```
+
+  **No network frame anywhere in that stack.** It is parked in
+  `read_zlib_chunks` on a LOCAL pack file: `_pick_intermediate_sha`
+  calls `_is_ancestor` per candidate to choose chunk boundaries, and
+  each call walks history and decompresses pack objects. Across ~816
+  commits that behaves quadratically, hence minutes rather than
+  seconds.
+
+  Contrast with the 2026-07-27 stall on the same lock, which WAS
+  network (`lan-reverse-deliver` parked 147 s in `ssl.read`). Two
+  different causes wearing one symptom, which is why "hold the lock
+  across network I/O" undersold the problem.
+
+  So the WAN work splits in two:
+  1. **Hoist the transfer out of the lock** (the original plan, still
+     right for the send/receive phase).
+  2. **Make chunk-boundary selection cheap** — one ordered walk, or
+     generation numbers / commit-graph lookups, instead of repeated
+     pairwise `_is_ancestor`. Without this, the lock is still held for
+     minutes on a large push even with the transfer hoisted out, and
+     every LAN post-receive reset behind it keeps timing out at 5 s.
+
+  **This item is why the big project never finishes backing up — raise
+  its severity accordingly.** The long lock hold has three surfaces,
+  not one:
+
+  - AZT saves stall or return `BUSY` (the symptom that opened the item);
+  - LAN post-receive resets time out at 5 s (all day 2026-07-28), so
+    received data sits unabsorbed;
+  - **the watchdog restarts the daemon over the push.** Field, ten
+    minutes into the 816-commit `nml` push:
+
+    ```
+    [watchdog] stall persisted 625s — restarting the daemon
+        (project lock … held 625s by 'Thread-54'; … held 313s by 'Thread-356')
+    ```
+
+    A large first push cannot complete inside `watchdog.restart_s`
+    (600 s), so every attempt was killed, marked interrupted, and
+    re-entered the backoff curve — looking identical to a network
+    failure from outside. Mitigated in 0.55.73 by making the watchdog
+    honour `sync_flight.in_flight()`, but that is a guard around the
+    symptom: while the lock is held for minutes, everything queued
+    behind it still suffers.
+
+  Related same-day finding, fixed in 0.55.73: a `BUSY` (lock-timeout)
+  push result was charged to `wan_backoff` **and** recorded as a GitHub
+  *access* error, so self-contention inflated the curves and produced a
+  misleading remote diagnosis. Suspected origin of the large failure
+  counts (`baf` 25, `en` 178) that made projects look network-cursed.
+
 - **Deadline:** none — but this is a **confirmed field regression**,
   needs ranking.
 - **Waiting on:** Nothing.

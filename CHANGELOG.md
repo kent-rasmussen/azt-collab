@@ -9,6 +9,741 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.83 — one walk instead of N² ancestry tests; push liveness; per-endpoint reachability; WAN in-flight guard
+
+**`_pick_intermediate_sha` was quadratic.** Its fallback called
+`_is_ancestor(base, c)` for every commit in the delta, and each of those
+walks history and decompresses pack objects. Field: **134–145 s per call**
+on an 816-commit delta, with `project_lock` held the whole time — which is
+what made LAN post-receive resets time out at 5 s, AZT saves return `BUSY`,
+and the watchdog read a working push as a stall (and, before 0.55.73,
+restart the daemon over it).
+
+Same answer, computed once: build a parent→children map over the delta and
+BFS out from base. Everything reached descends from base, which is exactly
+what the per-candidate test established. This is the second half of
+`agenda/daemon_lock_across_network_io.md` — the half that isn't about
+network I/O at all.
+
+**Push liveness (`push_progress`).** `wan_unshared` already counts down as
+chunks land, so this is not a duplicate: it answers what that number
+cannot — *is a chunk in flight right now?* A single oversize chunk can run
+for hours with the count legitimately frozen (an 8.9 GB merge, 26+ minutes,
+no signal of any kind), and a user who can't tell "working" from "stuck"
+interrupts it — which discards the chunk in flight. A missing liveness
+signal actively destroys progress. Renders as *"816 to go — uploading 173
+of 816"*. `None` when nothing is running or the report went stale, so a
+dead push never displays as ongoing. Additive field; pre-0.55.83 peers
+ignore it, so no client floor bump.
+
+**Hello now feeds the unreachable gate.** `hello_to_peer` builds its own
+PoolManager instead of going through `_https_post_to_peer`, so it never
+recorded reachability — and the next step in the same sweep re-paid the
+full 5 s connect timeout against an address hello had just proven dead
+(20:27:09.127 hello fails; the share-offer to the same endpoint starts
+145 ms later and times out again; three dials follow — ~25 s establishing
+what the first line knew). Only connect-level failures count: a 4xx or a
+TLS pin mismatch proves the peer IS reachable, and recording those would
+suppress pushes that would have worked. Automatic sweep only; the two
+pair-accept call sites are user gestures walking a candidate list.
+
+**Reachability is now per-endpoint, not per-peer.** `_unreachable_at`
+conflated "this address is dead" with "this device is unreachable" — field:
+a phone recorded at `10.184.19.6` from an earlier network while live at
+`192.168.31.179`; one timeout condemned the peer for the cooldown though
+another endpoint in the ladder would have worked. `_resolve_endpoint` walks
+past dead entries; an all-dead ladder still retries the first rather than
+reporting "no endpoint" and stopping. Cleared on any successful contact and
+on mDNS arrival, which is fresh information about every address.
+
+**WAN in-flight guard**, the counterpart to LAN's (0.55.55). A second
+trigger used to build a whole chunk plan, hit the lock, and return `BUSY` —
+wasted work that until 0.55.73 was also charged to the backoff curve as a
+github failure.
+
+## 0.55.82 — a client hanging up is not a daemon crash
+
+```
+[scheduler] drain push 'baf' codes=['PUSHED']
+Exception occurred during processing of request from ('127.0.0.1', 39602)
+…
+BrokenPipeError: [Errno 32] Broken pipe
+```
+
+The caller stopped waiting for a nudge RPC that was holding its connection for
+the duration of an hour-long push (fixed properly in 0.55.78 by making nudges
+async) and closed the socket. The push **completed and logged `PUSHED`** — then
+the reply hit a dead pipe and `_record_crash` filed it as a daemon crash.
+
+Two harms, both worth removing: the crash record drives recovery surfaces, so a
+routine client disconnect can present as a daemon fault; and the unhandled
+error printed a full socketserver traceback that reads like a real failure in a
+log people are scanning for real failures.
+
+`BrokenPipeError` / `ConnectionResetError` from the dispatch call now log one
+line and return — the request's work is already done, and there is nothing to
+send down a closed socket. The same pair is caught around `_send_json` for the
+case where the handler succeeded and the caller left.
+
+Incidentally confirms a question from earlier in the session: a client timeout
+does **not** kill an in-flight push. The transfer finished; only the reply
+failed.
+
+## 0.55.81 — bank a merge's off-server parent lines on their own refs
+
+The fix for the class of stall that has blocked large offline batches from
+reaching github since at least 0.52.31.
+
+**The constraint that rules out every simpler approach.** Every push to a ref
+must fast-forward *that* ref. When a merge's second-parent line diverged
+**before** the chunk base — the normal shape when a peer records offline for
+hours and then merges in — none of its commits descend from `origin/main`, so
+none can be pushed to the topic ref at any chunk size.
+`_pick_intermediate_sha` correctly reports the merge as the first FF-valid
+boundary, and that boundary carries the entire side.
+
+Field, `nml`: **2,330 objects / 8.9 GB in one indivisible step**, running 26+
+minutes with nothing banked — receive-pack is atomic per push, so an
+interrupted link discards all of it. Already on record for another device:
+*"aztobt2-ui, base=old origin/main off the merge spine, estimate 9.3 GB"*
+(0.52.31) — mitigated then, never solved. Kent: *"not exotic … likely stuff
+collected from a machine, that then caused a merge, which is now going up."*
+It recurs on every offline batch, which is why it matters for a server left
+running without anyone to nurse it.
+
+**What breaks the deadlock:** a *fresh* ref has no FF constraint on its first
+push. `azt-side-<sha8>` is planted at the divergence point —
+`merge_base(main, parent)` — from which the parent's line *is* descended, and
+chunked forward normally. Every step banks. Once the side is on the server the
+merge's own delta is trees + commit.
+
+Side refs carry **real commits**, so the existing orphan sweep retires them
+once they are reachable from `main` — no new cleanup contract, unlike the
+synthetic-commit `azt-blob-seed-*` refs, which are the crude form of this same
+idea and remain the fallback.
+
+Details worth knowing:
+
+- `chunk_base_override` — without it a fresh side ref would default to
+  `origin/main`, precisely the base its target isn't descended from.
+- `_server_known_commits` walks all `refs/remotes/origin/*` (including
+  `azt-blob-seed-*` and `azt-side-*`), so work banked by an earlier run isn't
+  re-sent.
+- Recursion bounded at `_MAX_SIDE_DEPTH = 3`, one attempt per topic-push call.
+- Fully guarded: any failure falls through to blob pre-seed, i.e. today's
+  behaviour. A partial side-ref run still leaves its chunks banked and the
+  next run resumes from them.
+
+Two hazards found while writing it, both of which would have degraded silently
+rather than failed loudly: `find_merge_base` takes the **repo** (it needs
+`get_parents`), not the object store; and the `main_tip` ref key needed
+explicit bytes handling rather than an inline conditional.
+
+**Untested against a real repo.** The design changed three times in the hour
+before implementation, each time on Kent's evidence, and the last change
+inverted which mechanism was primary. Watch the first `side-bank:` lines
+closely, and expect the fallback to matter.
+
+## 0.55.80 — the pack-size estimate stops ignoring everything already uploaded
+
+`_estimate_delta_size` passed **one** `have` to `MissingObjectFinder` — the
+local chunk base:
+
+```python
+haves=[have_sha] if have_sha else [],
+```
+
+So it counted objects the server demonstrably already holds: everything under
+`origin/main`, and every blob banked by a prior pre-seed run
+(`refs/remotes/origin/azt-blob-seed-*`). The real push negotiates with
+receive-pack and sends far less.
+
+That number **gates the oversize bail and the pre-seed decision**, so the
+inaccuracy isn't cosmetic. Field, `nml`: 2,330 objects / **8.9 GB** reported
+against a 3 MB budget for one merge commit — on a repo with 3,425 commits and
+501 seed refs already on the remote. Measured as though nothing had ever been
+uploaded. `_enumerate_new_blobs` already excluded the seed refs for precisely
+this reason; the estimate never learned the same lesson, and the two have been
+disagreeing ever since.
+
+Now counts every remote-tracking ref as a `have`, filtered to objects present
+locally so a dangling tracking ref can't make the estimate raise — which would
+silently disable the gate rather than loosen it. Logs how many refs it
+counted, and says so when it can't read them and is therefore liable to
+overstate.
+
+**Measured, and it is not decisive — recorded so nobody repeats my
+expectation.** `git rev-list --disk-usage --objects
+--glob=refs/remotes/origin/azt-blob-seed-* --not main` on `nml` returns
+**158 MB**. Since the estimate's baseline is effectively `origin/main`, the
+seed refs are exactly what this fix adds as new `haves` — so it shaves ~158 MB
+off 8.9 GB. Correct, worth having, marginal.
+
+Which means the 8.9 GB is **genuine**: ~2,330 objects averaging 3.8 MB is
+audio the merge introduces that github does not have. No estimate fix and no
+walk reordering makes it smaller; it is data that has to travel. The goal is
+therefore **resumability, not shrinkage** — see
+`agenda/merge_aware_chunk_ordering.md`, which now carries the worked design.
+
+## 0.55.79 — pre-seed before a push we've already measured as hopeless; show push progress
+
+**Pre-seed ordering.** At `chunk_n=1` there is no smaller unit, so the code
+pushed regardless of size and only pre-seeded from the *failure* handler.
+That assumed an oversize push fails promptly. It doesn't: `_socket_timeout`
+bounds one blocking socket operation, not total transfer time, so while bytes
+keep moving a doomed push runs indefinitely.
+
+Field: a merge commit estimated at **2,330 objects / 8.9 GB** against a 3 MB
+budget ran 26+ minutes with no failure, no progress, and — because
+receive-pack is **atomic per push** — nothing banked on the server. An
+interrupted link would have discarded every byte. The mechanism built for
+exactly this case never got its turn, because it waits for a failure that may
+never arrive, while the project lock stays held and LAN resets plus AZT saves
+queue behind it.
+
+Pre-seeding lands blobs in batches, each its own push, so progress banks
+incrementally. When the estimate already says the unit cannot fit, seed first
+and retry rather than spending hours re-deriving the arithmetic. Falls
+through to the old behaviour if seeding finds nothing to shrink.
+
+**Push progress is no longer discarded.** Every `porcelain.push` call site
+passed `errstream=io.BytesIO()` — git wrote its sideband progress there and we
+threw it away. Kent, 26 minutes into the 8.9 GB push: *"I assume there will be
+no notice of any kind until the 9GB finishes?"* Yes, by our own choice; the
+only liveness signal was the watchdog's lock-age line climbing.
+
+`_PushProgressStream` traces the remote's progress, rate-limited to one line
+per 15 s, splitting on `\r` as well as `\n` (git redraws counters in place, so
+newline-only buffering would hold the whole transfer in one record). Wired
+into the topic-push chunk call — the one that can run for hours. Never
+raises: a progress reporter must not be able to fail the transfer it reports
+on.
+
+## 0.55.78 — nudges run on a background thread
+
+Kent: *"on the settings nudge, it nudged before finishing the settings work
+… and the UI didn't clear for a long time."* The watchdog stack showed why:
+
+```
+dispatch → _h_set_work_offline → drain_pushes_now → … → _push_chunked_to_ref
+```
+
+Both nudge call sites ran the drain **inline**, so the HTTP response was
+withheld until the entire push finished — an hour, for a large first push —
+and every other settings request queued behind it. 0.55.68 introduced this on
+the credentials path.
+
+Nobody needs the push result in a nudge's response: the caller knows they
+asked, and progress shows up in the status board and the log. Withholding the
+reply only made the UI look wedged while the daemon worked correctly.
+`drain_pushes_now_async` spawns a `wan-nudge` thread and returns at once;
+falls back to inline if the thread can't be spawned, rather than dropping the
+gesture.
+
+Concurrent nudges may each spawn one; the loser takes `BUSY` from
+`project_lock`, which costs nothing since 0.55.73. A WAN in-flight guard (the
+LAN path got one in 0.55.55) would stop the duplicate attempt being made at
+all — still outstanding.
+
+## 0.55.77 — work_offline was never settable; un-deprecate the accessor
+
+```
+[work_offline] requested=True was=False stored=False  ← STORED VALUE DOES NOT
+    MATCH THE REQUEST; the setter did not persist
+```
+
+Kent: *"It was never settable."* Correct. Since 0.50 `settings.work_offline()`
+has been hardcoded `return False`, on the reasoning that `wan_backoff`
+replaced it. Meanwhile `set_work_offline` kept writing the bit and the
+settings UI kept offering yes/no — so the switch was **inert for dozens of
+versions while looking functional**.
+
+It took the read-back line added minutes earlier (0.55.76) to catch, on the
+same evening 0.55.42 added a guard in `_drain_pending_push` "so the
+daemon-wide work-offline setting actually stops the daemon from going to the
+network" — a guard whose condition could never be true. That CHANGELOG entry
+was wrong, and no amount of reading the drain would have revealed it; the lie
+was three files away in a one-line accessor.
+
+The replacement reasoning was also wrong on its own terms. A backoff curve
+answers *"how hard should I retry a failing remote"*; it cannot express *"I am
+on an expensive or fragile link, leave the network alone."* Only the user
+knows that, and on a metered hotspot a wrong guess costs their money and
+freezes the UI — the field complaint that reopened this, since the WAN push
+holds `project_lock` across the transfer and an unprompted drain stalls local
+saves.
+
+`work_offline()` now reads `sync.work_offline`, default False. Every consumer
+— the drain guard, `S.WORK_OFFLINE_ENABLED` on the Sync RPC, the
+`project_status` mirror — becomes live for the first time since 0.50.
+
+## 0.55.76 — the work_offline line reads the value back too
+
+0.55.74's line reported `set to X (was Y)` — what we *asked for*. A setter
+that didn't persist printed as though it had, which is the one failure the
+line exists to expose. Now matches the LAN toggle:
+
+```
+[work_offline] requested=True was=False stored=True
+[work_offline] requested=True was=False stored=False  ← STORED VALUE DOES NOT
+    MATCH THE REQUEST; the setter did not persist
+```
+
+Field note that closed out the surrounding investigation: toggling on stops
+an in-progress github push and toggling off restarts it, so the setter, the
+suppression and the nudge were all working the whole time. The earlier
+"toggled and nothing happened" was 0.55.69's broken ahead-of-github check —
+the nudge fired, found nothing, and on that build reported nothing. Dead
+buttons and a non-persisting setter are both ruled out.
+
+## 0.55.75 — the LAN toggle reports what it did
+
+0.55.68 gave LAN a line on the **dial** path (`LAN sync is off — not
+dialing`); the toggle handler itself said nothing. So the same ambiguity
+work_offline had applied here: a button that never sent, a
+set-to-the-same-value, and a setter that didn't persist all looked identical
+in the log — which is precisely the confusion that cost a round trip on the
+work_offline path this evening.
+
+```
+[lan] toggle: requested=True was=False stored=True
+[lan] toggle: requested=True was=False stored=False  ← STORED VALUE DOES NOT
+    MATCH THE REQUEST; the setter did not persist
+```
+
+Prints the value **read back after the write**, so a setter that silently
+failed is visible rather than assumed successful — the "no silent empty /
+setter durability" obligations in `azt_collab_client/CLAUDE.md` are stated
+for daemon-owned state, and this is how you'd actually notice a violation.
+
+The contributor-unset refusal now logs too, since "I pressed on and nothing
+happened" and "on was refused because contributor is unset" are different
+problems with different fixes.
+
+## 0.55.74 — the work_offline toggle nudges on every "no", not only on a transition
+
+Kent, after a restart: *"I toggled offline and waited, nothing. Then I
+confirmed github credentials, and it immediately took off. So whatever it
+looks like, they nudge differently."*
+
+They did. I had claimed both paths ran identical code; they did not.
+`_h_set_work_offline` gated its nudge on `if prev and not enabled` — so
+pressing **"no"** while `work_offline` was **already off** did nothing, and
+said nothing. `_h_test_github` has no such gate, which is why that path fired
+immediately.
+
+The gate was wrong regardless of the confusion it caused. Pressing "no" is a
+user saying *"go online and sync"*; whether the stored setting already held
+that value has nothing to do with the intent, and the nudge is idempotent,
+cheap, and now reports its own no-op (0.55.68). Nudges on every explicit
+"no".
+
+Also logs `[work_offline] set to X (was Y)` unconditionally. Without it, a
+button that never sent and a set-to-the-same-value were indistinguishable in
+the log — which is what made this look like dead UI rather than a gate.
+
+## 0.55.73 — stop killing our own pushes (watchdog + BUSY accounting)
+
+Two defects that together look exactly like "github never works on the big
+project," and neither involves github.
+
+**1. The watchdog restarted the daemon over a healthy push.** Ten minutes
+into the 816-commit `nml` push:
+
+```
+[watchdog] stall persisted 625s — restarting the daemon
+    (project lock … held 625s by 'Thread-54 (process_request_thread)';
+     project lock … held 313s by 'Thread-356 (process_request_thread)')
+```
+
+Both locks were held by push threads doing real work. A large first push
+**cannot** finish inside `watchdog.restart_s` (600 s), so every attempt died
+here, was marked interrupted, and re-entered the backoff curve — a
+self-inflicted reason a big history never converges, indistinguishable from a
+network fault from outside.
+
+`sync_flight` already means "a push is in flight, don't kill this process";
+Android's idle-stop honours it. The watchdog now does too. Loop heartbeats
+are unaffected — a genuinely stuck loop still triggers a restart once no push
+is running.
+
+**2. `BUSY` was charged to github.** A `project_lock` timeout means another
+thread in *this daemon* holds the project. It fell through to the generic
+failure branch, so it advanced `wan_backoff` **and** called
+`_note_access_error` — mislabelling internal contention as a GitHub *access*
+problem, which is the diagnosis a user would act on.
+
+Field: `drain push 'nml' codes=['BUSY']` while the nudge-initiated push held
+the lock. Nothing was wrong; two triggers wanted the same project.
+
+This is a strong candidate for where the large failure counts came from —
+`baf` at 25 consecutive, `en` at 178. Overlapping attempts bouncing off each
+other, every bounce recorded as a github failure, curves inflating to 21 h
+with no external cause. Same rule the LAN merge curve already follows, where
+`LockTimeout` deliberately stays off the curve.
+
+Follow-up: there is no in-flight guard on the WAN push path (LAN got one in
+0.55.55), so the collision is only prevented by the lock. A guard would stop
+the duplicate attempt from being made at all.
+
+## 0.55.72 — the ahead-of-github check actually works now
+
+0.55.69 shipped with two wrong assumptions about one call, and an `except`
+that hid both:
+
+- `repo_status_summary` takes a **project directory**, not a langcode;
+- it returns a **tuple** `(branch, remote_url, n_changes, wan_unshared)`,
+  not an object or a dict.
+
+So it raised `TypeError` on every project, the bare `except Exception`
+converted that to `_ahead = 0`, and the nudge reported *"nothing pending"*
+for `nml` minutes after the same daemon had logged
+`[wan-unshared] … → 816`. The feature looked like it worked and did nothing —
+the failure mode the whole change existed to eliminate.
+
+Now reads `_summary[3]`, resolves the working directory through
+`projects.get`, and **logs the exception** rather than swallowing it:
+
+```
+[scheduler] WAN nudge: ahead-of-github check failed for 'nml': … —
+    falling back to the pending_push flag for this project
+```
+
+Third time today a broad `except` concealed a defect of mine (after
+`_peers.get_their_shared_projects` in 0.55.60 and the bare `time.time()` in
+0.55.71). The rule that keeps emerging: an `except` around code whose
+contract you have not verified is not defensive, it is a way to ship a
+guess that reports success.
+
+## 0.55.71 — fix NameError in the merge backoff (regression from 0.55.62)
+
+```
+[lan-sweep] 'db033cd4' 'nml' raised: NameError("name 'time' is not defined")
+```
+
+`lan_push.py` imports the module as `import time as _time_mod`; 0.55.62's
+merge-backoff helpers called bare `time.time()`.
+
+It fires only on the FAILURE path — `_merge_attempt_due` returns early
+before touching the clock when no prior failure is recorded, so the first
+attempt and every successful merge were unaffected. But the moment a fetch
+or merge failed, `_note_merge_failure` raised instead of recording, which
+made things worse than before the backoff existed: the exception propagated
+out of `_merge_then_push` and **aborted the sweep for that project**, and no
+backoff was ever stored, so the curve the whole change existed to create
+never formed.
+
+Existing local `import time as _time` inside two functions is what hid this
+— the module reads as though `time` is unavailable in some places and
+available in others, and neither convention is followed consistently.
+
+## 0.55.70 — received work is flagged for backup on arrival
+
+The periodic counterpart to 0.55.69. A successful receive-pack now raises
+`pending_push`, so the 15 s tick backs up work that arrived from a peer
+without waiting for someone to tap Sync.
+
+Both halves are wanted. The nudge path asks `_wan_unshared` — the correct
+question, too expensive to walk every tick — and this raises a flag the tick
+can afford to honour. Neither replaces the other: the flag catches arrivals
+promptly, the walk catches anything the flag ever misses again.
+
+Never raises. A backup hint must not be able to fail a receive that already
+succeeded.
+
+## 0.55.69 — being ahead of github is enough; provenance was never a reason
+
+The push decision and the "am I backed up" measurement have been two
+unconnected systems since the drain existed.
+
+- **The decision** was only ever the `pending_push` boolean. Raised from six
+  sites, all local commit / publish paths — **none in `lan_listener`**.
+- **The measurement** is `_wan_unshared`, which is accurate and produces the
+  `[wan-unshared] → N` lines and the at-risk / "N to send" indicators. It
+  fed display only.
+
+So the daemon could report "N commits aren't on github" and simultaneously
+decide there was nothing to push. Field evidence, this desktop's
+`git log --graph`: `origin/main` at `2ed963b4` with a long run of *"A-Z+T
+edit by Idjop Protais"* commits above it — received over LAN, merged, never
+offered to github, while the drain honestly reported nothing pending.
+
+Kent: *"once I FF or merge, it is now my head. If my head is behind github, I
+don't push, just because I got it from someone else? That's weird."* It is.
+The gap is specifically **inbound receive-pack**: a peer pushes, our head
+fast-forwards, no flag. Work we commit ourselves — and merges our own
+outbound path performs (`repo.py:1712`) — did set it.
+
+The nudge path now asks `_wan_unshared` and pushes anything ahead of github
+regardless of who authored it, naming what it found:
+
+```
+[scheduler] WAN nudge: 'nml' is 47 commit(s) ahead of github but was not
+    flagged pending_push (work received over LAN never raises that flag) —
+    pushing anyway; being ahead is the only thing that matters
+```
+
+**User-gesture path only.** The comparison walks history, which is too
+costly for the 15 s periodic tick; the tick keeps using the flag, and a nudge
+catches what the flag missed. Making the periodic path cheap enough to use
+the real answer is the follow-up.
+
+Also corrected in the invariants' spirit if not yet their text: github here
+is **off-site durability**, not a convergence mechanism (Kent, same
+session). LAN is where peers converge. That makes this a data-at-risk bug
+rather than a convergence bug — the daemon knew the data existed only on
+devices, which is what `at_risk` counts, and still did not act.
+
+## 0.55.68 — LAN off means off outbound too; and three silent exits learn to speak
+
+**`lan.allow_sync` off only ever stopped the listener.** `lan_push.py`
+contained zero references to the setting, so every outbound trigger — sweep,
+fan-out, reverse delivery, arrival, burst — kept dialing peers with LAN
+switched off. Field, desktop:
+
+```
+19:23:57  [lan-listener] stopped          ← toggled off
+19:24:03  [lan-push] dialing '3a0285ec' …
+19:24:21  [lan-push] dialing '7aeb3fac' …      (and on, for minutes)
+```
+
+Same defect shape as `work_offline` before 0.55.42: the toggle was enforced
+where enforcement was cheap, not where the network is actually touched. A
+user turning LAN off is asking us to leave the radio alone, and
+half-honouring that is worse than not offering the switch — the battery cost
+continues invisibly. Gate added at `_push_to_peer`, the seam every trigger
+funnels through, alongside the in-flight and one-sided-share guards.
+
+**Verifying GitHub is now a nudge.** Nobody presses Test to admire a
+checkmark — they press it having just fixed something, then expect their
+pending work to go out. Without a nudge the fix landed and projects sat
+behind whatever `wan_backoff` curve the earlier failures had built (`baf` was
+parked 21 h out at 25 consecutive failures), so a successful Test appeared to
+achieve nothing. Success branch only: a failed test proves the opposite and
+must not clear the curve.
+
+**A user nudge that finds nothing pending now says so.** Kent, after
+flipping `work_offline` off: *"I'm watching the log, and I see nothing."*
+There were three silent exits between that toggle and a push — no internet
+(0.55.66 fixed), nothing flagged `pending_push`, and the rate-limited
+per-project backoff skip. "Nothing to do" and "the gesture never arrived"
+looked identical. The nudge path now reports an empty candidate set; the
+periodic tick stays quiet, since it hits the same line every 15 s.
+
+## 0.55.67 — a broken GitHub token refresh surfaces loudly, and says whether it can recover
+
+Kent: *"let's make sure that if that other ever surfaces again, it surfaces
+loudly."*
+
+The refresh failure path was not silent — `_set_github_refresh_broken`
+already flags the store and peers get `AUTH_REFRESH_STALE` on user-initiated
+sync — but it was quiet in the two ways that cost time today:
+
+- the log line was a bare `print` to **stdout, unflushed**, so in a captured
+  daemon log it could be lost or land out of order against the stderr
+  stream around it;
+- **every failure wore the same line.** A timeout or a 5xx self-heals on the
+  next call. `incorrect_client_credentials` / `unauthorized_client` /
+  `invalid_client` mean the OAuth app's own identity is being rejected — a
+  missing `client_secret` on the refresh POST is the classic — and that
+  never recovers on its own.
+
+The permanent case is the dangerous one because it is *invisible while it
+matters*: the stored access token keeps working until its 8 h cliff, and
+only then does every push and fetch start failing, looking like a network
+fault. So the line now names the cliff time and the remedy:
+
+```
+[data-quality] github-refresh-BROKEN (permanent): … — this is the OAuth app's
+    own credentials being rejected, not a network fault, so it will NOT
+    self-heal. The stored access token keeps working until about
+    2026-07-29 02:14, after which every push and fetch fails. Fix: re-run
+    Connect (device flow) …
+```
+
+The transient case says so, names the same deadline, and tells you when to
+stop believing it's transient.
+
+The split is persisted as `github.refresh_permanent` so a UI or diagnostic
+can distinguish "retry later" from "a human must re-run Connect" without
+re-parsing error text at every read site.
+
+Also worth recording, since it caused a wrong claim today: `incorrect_client_credentials`
+is an **OAuth-client** error from the user-token refresh path. Pushes
+authenticate with a **GitHub App installation token** — what
+`test_github_credentials` reports as `valid / app_installed / installation_id`.
+The two are different subsystems, and a passing installation test neither
+proves nor disproves the refresh path.
+
+## 0.55.66 — the watchdog stops crying wolf at an idle daemon
+
+Desktop, four cycles in twenty minutes:
+
+```
+STALL DETECTED (first detection): loop 'watcher' last ticked 145s ago
+threads=5 fds=16 … _watcher_loop → _watcher_stop.wait(timeout=interval)
+stall cleared — loops and locks are moving again
+```
+
+Every thread parked in `wait()`, sixteen fds, no lock held — an idle
+daemon. The connectivity-probe backoff had stretched the watcher's sleep
+past the watchdog's fixed 120 s bar, so a loop sleeping exactly as designed
+was reported stalled, then "cleared" when it woke, then reported again.
+`_stall_report`'s own comment assumed *"watcher up to ~60 s with backoff"*;
+the idle streak goes well beyond that.
+
+Loops now publish their upcoming sleep via `heartbeat_interval(name, s)`,
+and the watchdog judges each against **2.5× its own published cadence,
+never below the fixed bar**. A loop that publishes nothing keeps the old
+behaviour. The stall line now also names the expected interval, so a real
+one is self-explaining.
+
+This matters beyond the noise: yesterday's *real* stall — `project_lock`
+held 147 s by `lan-reverse-deliver`, parked in `ssl.read` — looked identical
+at a glance. A monitor that fires on healthy idling trains you to skip the
+line that is one day true.
+
+Also: `drain_pushes_now` no longer returns silently when offline. A user
+gesture — work_offline off, Sync, credentials saved — that reaches a
+no-internet check now says so (`WAN nudge declined: no internet`) instead
+of vanishing without trace, which was indistinguishable from a dead code
+path during diagnosis.
+
+## 0.55.65 — a dial failure says whether a route to the peer exists
+
+Four subnets were in play at once on 2026-07-28 — `10.191.129.x`,
+`10.184.19.x`, `192.168.31.x`, `192.168.124.x` — with some devices
+multi-homed across two. A large share of the day's `no_route` and
+connect-timeout volume was peers dialing addresses on segments they had no
+path to, and establishing that took lining up IPs from two machines' logs
+by hand.
+
+`_route_hint` appends one of two things to the dial-failure line:
+
+```
+… timed out [would route from 10.191.129.91] — invalidated mDNS cache …
+… timed out [NO ROUTE from any local address — the peer is on a network
+    this device cannot reach; same-subnet is a requirement, not a preference]
+```
+
+A UDP `connect` is the probe: it sends nothing, asks the kernel's routing
+table which local source address would reach the host, and fails outright
+when no route exists. That beats enumerating interfaces — which answers
+"what have I got" rather than "can I get there" — and the existing
+`_interface_ipv4s` is `SIOCGIFCONF`-based, so it returns nothing on
+Windows, which is where this was most needed.
+
+Returns '' on any unexpected error. A diagnostic must never be what breaks
+the path it describes.
+
+## 0.55.64 — the github line moves to the last statement before the socket
+
+Kent: *"It would be nice to not see in logs 'pushing to github' if we're not
+at least trying to do that."*
+
+0.55.58 moved this out of the candidate-enumeration spot and behind the
+`wan_backoff.is_due` + credentials checks. Better, but still not the same
+claim as the sentence made: any bail between that point and the socket —
+no remote configured, `NOT_A_REPO`, a guard inside `_push_repo` — would
+print "pushing" and push nothing.
+
+It now lives in `_attempt_push`, immediately before `_push_repo` touches
+the network, so **the line cannot appear without an attempt** and a result
+or a raise always follows it. Shortened to `WAN push 'nml' → github`;
+`_run_to_completion` inherits it for free, since it goes through the same
+function.
+
+The run-to-completion *mode* is still announced at the caller, because that
+changes what follows. Nothing else in the daemon prints a github-push line
+— verified, one live site.
+
+(The line in the field log was that machine running older code; this repo
+had one site, and it was already the 0.55.58 version.)
+
+## 0.55.63 — say when we are advertising a head we cannot serve
+
+The two halves finally met. Tablet, 15:01:45:
+
+```
+[lan-push] '80570dd9' 'nml': peer at '303950c45456' is NOT ancestor of local
+```
+
+That Windows peer's own log, ninety seconds later:
+
+```
+dulwich.errors.GitProtocolError:
+    Client wants invalid object b'303950c4545696825f666a77c11a29d1e35277c0'
+```
+
+**Same sha.** The peer advertised it in `info/refs` and then refused it from
+`upload-pack` — so this was never a client asking for the wrong thing, and
+"the moving head" and "the corrupt repo" are one fault: every commit that
+machine makes is instantly unreadable, so it publishes a new unservable head
+every couple of minutes.
+
+A device in that state poisons every peer it talks to — the peek succeeds,
+the fetch 500s, the merge can't run, and *neither* log says the advertised
+ref was the problem. Finding it took correlating two devices' logs by sha.
+
+`_warn_if_advertising_unservable_head` does one object-store membership test
+on the advertised head per served request (not full reachability — that
+would walk history on every poll) and names it, with the storage causes to
+check first. Rate-limited to once per changed head, since something minting
+a broken head every two minutes would flood the log it needs to be visible
+in; a `head-servable-again` line closes it out.
+
+Read-only by design: it does not refuse the request. The repair ladder is
+0.55.56–0.55.57, and a peer whose head is merely unreachable-deep can still
+legitimately serve older refs.
+
+Leading suspect for that machine, from the path in the traceback
+(`C:\Users\OBT\Desktop\azt-collab`): Windows Desktop is commonly redirected
+into OneDrive, and Files On-Demand dehydrates objects to cloud-only
+placeholders. Reads then need a rehydrate that **cannot happen on a hotspot
+with no upstream internet** — git writes the object, OneDrive dehydrates it,
+dulwich can't read it back. Not a code fault; the repo needs to live off
+cloud-synced storage.
+
+## 0.55.62 — back off a doomed merge; say when the peer's head is moving
+
+Field 2026-07-28, one peer across 15 minutes — six full merge attempts,
+each burning a ~90 s fetch, every one failing:
+
+```
+14:48:59  fetch from '80570dd9' failed: GitProtocolError('EOF occurred in violation of protocol')
+14:53:06  … EOF …          14:56:45  … EOF …        14:57:59  … EOF …
+14:59:36  fetch from '80570dd9' failed: unexpected http resp 500 for …/nml.git/git-upload-pack
+```
+
+`lan_backoff` governs the post-commit burst, but reverse delivery and mDNS
+arrival call straight into the push path, so **nothing throttled this at
+all** — two radios, two CPUs, two batteries, every two minutes, for a fetch
+that cannot succeed while the far end can't serve. That trailing `500` is
+the `Client wants invalid object` signature from 0.55.56, so this peer
+likely needs the same repair as the other one.
+
+`_merge_attempt_due` / `_note_merge_failure` add a per-(peer, project)
+curve: 60 s doubling to 15 min, dropped entirely on success. A `LockTimeout`
+deliberately does **not** advance it — penalising a peer for our own local
+contention would push a healthy link out to 15 minutes.
+
+And the thing that was invisible: **their head moved on every dial.**
+
+```
+14:46:52  ddbda3c2111f     14:50:32  bbba4be8a455     14:55:03  6d2a3946443e
+14:56:47  96af1a19e0cb     14:58:53  14690538e206     15:01:45  303950c45456
+```
+
+Six heads in 15 minutes while ours sat frozen at `c7fe8fded95f`. I only
+found it by hand-diffing six log lines. If a peer commits faster than we can
+fetch-and-merge, retrying cannot converge no matter how patient we are — so
+`_note_merge_attempt_head` now names it:
+
+```
+peer head MOVED ddbda3c2111f → bbba4be8a455 since our last attempt — they
+    are committing faster than we can absorb; retrying alone will not converge
+```
+
 ## 0.55.61 — the one-sided-share gate covers every trigger
 
 `sweep_peer` was the **only** caller consulting the hello manifest before

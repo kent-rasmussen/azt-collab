@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import ssl
+import socket
 import sys
 import tempfile
 import threading
@@ -46,6 +47,48 @@ from .locks import LockTimeout, project_lock
 # was observed in the field to recover stale NsdManager state.
 # Counter goes back to 0 after restart so we don't restart in a
 # tight loop.
+def _route_hint(host):
+    """`` [no route from any local address]`` or `` [would route from
+    <ip>]`` — appended to a dial-failure line so "the peer is on a
+    different network" is one line, not a cross-machine IP comparison
+    (0.55.65).
+
+    Field 2026-07-28: four subnets in play at once
+    (`10.191.129.x`, `10.184.19.x`, `192.168.31.x`, `192.168.124.x`),
+    some devices multi-homed across two. Half a day of `no_route` and
+    connect-timeout volume was peers dialing addresses on segments they
+    had no path to — obvious only after lining up IPs from two
+    machines' logs by hand.
+
+    A UDP ``connect`` is the right probe: it sends nothing, it asks the
+    kernel's routing table which local source address would be used to
+    reach *host*, and it fails outright when no route exists. Better
+    than enumerating interfaces, which answers "what have I got"
+    rather than "can I get there" — and ``_interface_ipv4s`` is
+    ``SIOCGIFCONF``-based, so it returns nothing on Windows, where this
+    is most needed.
+
+    Returns '' on any unexpected error: a diagnostic must never be what
+    breaks the path it is describing."""
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.settimeout(0.5)
+            probe.connect((host, 9))        # discard port; no packet sent
+            local = probe.getsockname()[0]
+        finally:
+            probe.close()
+    except OSError:
+        return (' [NO ROUTE from any local address — the peer is on a '
+                'network this device cannot reach; same-subnet is a '
+                'requirement, not a preference]')
+    except Exception:
+        return ''
+    if not local or local.startswith('127.'):
+        return ''
+    return f' [would route from {local}]'
+
+
 _consec_failures = {}   # peer_id_hex → int
 _RESTART_DISCOVERY_THRESHOLD = 3
 
@@ -91,6 +134,54 @@ def _record_reachable(peer_id):
     successful-contact paths (push 2xx, no-op confirmation,
     share-offer round-trip)."""
     _unreachable_at.pop(peer_id, None)
+    _endpoint_dead.pop(str(peer_id), None)
+
+
+# Per-ENDPOINT dead marker (0.55.83): ``peer_id → {(host, port): ts}``.
+#
+# ``_unreachable_at`` above is keyed per PEER, which conflates "this
+# address is dead" with "this device is unreachable". Field 2026-07-28:
+# a phone was recorded at ``10.184.19.6`` (a previous network) while
+# actually live at ``192.168.31.179``. One timeout against the stale
+# address condemned the whole peer for the cooldown, even though another
+# endpoint in the mDNS→static→QR ladder would have worked.
+#
+# So: mark the ENDPOINT dead and let resolution move down the ladder;
+# only when every known endpoint has failed at connect level does the
+# peer itself get gated. Cleared wholesale on any successful contact,
+# and on an mDNS arrival (a fresh announcement is new information about
+# every address).
+_endpoint_dead = {}
+_ENDPOINT_DEAD_COOLDOWN_S = 60.0
+
+
+def _record_endpoint_dead(peer_id, host, port):
+    """Mark one (host, port) of *peer_id* as unreachable."""
+    import time as _time
+    try:
+        _endpoint_dead.setdefault(str(peer_id), {})[
+            (str(host), int(port))] = _time.monotonic()
+    except Exception:
+        pass
+
+
+def _endpoint_recently_dead(peer_id, host, port):
+    """True iff this specific endpoint failed within the cooldown."""
+    import time as _time
+    try:
+        ts = _endpoint_dead.get(str(peer_id), {}).get(
+            (str(host), int(port)))
+    except Exception:
+        return False
+    if ts is None:
+        return False
+    return (_time.monotonic() - ts) < _ENDPOINT_DEAD_COOLDOWN_S
+
+
+def clear_endpoint_dead(peer_id):
+    """Forget every dead-endpoint marker for *peer_id* — called on an
+    mDNS arrival, which is fresh information about where they are."""
+    _endpoint_dead.pop(str(peer_id), None)
 
 
 def _resolve_endpoint(peer_entry):
@@ -98,17 +189,37 @@ def _resolve_endpoint(peer_entry):
     endpoints → QR-hint endpoint. Returns ``(host, port)`` or
     ``None``."""
     pid = peer_entry.get('peer_id', '')
+    # SKIP ENDPOINTS THAT JUST FAILED, RATHER THAN THE WHOLE PEER
+    # (0.55.83). A peer can hold one stale address and one live one at
+    # the same moment — field: a phone recorded at 10.184.19.6 from an
+    # earlier network while actually reachable at 192.168.31.179. The
+    # per-peer gate condemned the device on the stale address; walking
+    # past just that entry finds the live one.
+    #
+    # Collected rather than returned-first so an all-dead ladder still
+    # returns something: better to retry a known-bad address than to
+    # report "no endpoint" and stop trying entirely.
+    candidates = []
     mdns = _lan_discovery.get_endpoint(pid) if pid else None
     if mdns is not None:
-        return mdns
+        candidates.append(mdns)
     for source in ('static_endpoints', 'endpoints'):
         for raw in (peer_entry.get(source) or []):
             try:
                 host, port = raw.rsplit(':', 1)
-                return (host, int(port))
+                candidates.append((host, int(port)))
             except (ValueError, TypeError):
                 continue
-    return None
+    if not candidates:
+        return None
+    for host, port in candidates:
+        if not _endpoint_recently_dead(pid, host, port):
+            return (host, port)
+    print(f'[lan-push] {str(pid)[:8]!r}: every known endpoint failed '
+          f'within the last {int(_ENDPOINT_DEAD_COOLDOWN_S)}s '
+          f'({len(candidates)} tried) — retrying the first anyway',
+          file=sys.stderr, flush=True)
+    return candidates[0]
 
 
 def _build_ssl_context(expected_fp):
@@ -258,6 +369,35 @@ def _push_to_peer(project, peer_entry):
     from dulwich import porcelain
     pid = peer_entry.get('peer_id', '')
     expected_fp = peer_entry.get('fp', '')
+    # LAN TOGGLE GATE (0.55.68). ``lan.allow_sync`` off must mean off in
+    # BOTH directions. Until now it stopped the listener and nothing
+    # else: this module never consulted the setting at all (zero
+    # references), so every outbound trigger — sweep, fan-out, reverse
+    # delivery, arrival, burst — kept dialing peers with LAN switched
+    # off. Field 2026-07-28, desktop:
+    #
+    #   19:23:57  [lan-listener] stopped          ← toggled off
+    #   19:24:03  [lan-push] dialing …
+    #   19:24:21  [lan-push] dialing …   (and on, for minutes)
+    #
+    # Same defect shape as ``work_offline`` before 0.55.42: the toggle
+    # was enforced where it was cheap to enforce, not where the network
+    # is actually touched. A user turning LAN off is asking us to leave
+    # the radio alone; half-honouring that is worse than not offering
+    # the switch, because the battery cost continues invisibly.
+    #
+    # Placed at this seam for the same reason as the in-flight and
+    # one-sided-share guards: every trigger funnels through here.
+    try:
+        from . import settings as _settings
+        if not _settings.lan_allow_sync():
+            print(f'[lan-push] {str(pid or "")[:8]!r}: LAN sync is off — '
+                  f'not dialing (the toggle stops outbound too, not just '
+                  f'the listener)', file=sys.stderr, flush=True)
+            return False
+    except Exception as ex:
+        print(f'[lan-push] lan_allow_sync check raised: {ex!r} — '
+              f'proceeding', file=sys.stderr, flush=True)
     _pkey = (str(pid or ''), str(getattr(project, 'langcode', '') or ''))
     # ONE-SIDED SHARE GATE (0.55.61). Moved here from ``sweep_peer``,
     # which was the ONLY trigger consulting the hello manifest — reverse
@@ -580,12 +720,19 @@ def _push_to_peer_inner(project, peer_entry, pid, expected_fp):
             else:
                 cause = 'unspecified connection failure'
             print(f'[lan-push] {pid[:8]!r} at {host}:{port} '
-                  f'refused / unreachable: {cause} — invalidated '
-                  f'mDNS cache for re-resolve',
+                  f'refused / unreachable: {cause}{_route_hint(host)} '
+                  f'— invalidated mDNS cache for re-resolve',
                   file=sys.stderr, flush=True)
             # Fast-fail gate (0.50.49): record the observation so
             # subsequent push / sweep / signalling calls within
             # the cooldown skip without re-paying the retry storm.
+            #
+            # Endpoint AND peer (0.55.83). The endpoint marker lets
+            # ``_resolve_endpoint`` walk past this address to another one
+            # in the ladder; the peer marker is the coarse gate that
+            # stops a fan-out storm. Marking only the peer condemned a
+            # device that was reachable at a different address.
+            _record_endpoint_dead(pid, host, port)
             _record_unreachable(pid)
             # Track consecutive failures; after the threshold, do
             # what manually toggling LAN off+on would do — restart
@@ -988,6 +1135,96 @@ def _record_probe(url, pid, outcome, detail=''):
         pass
 
 
+_merge_fail = {}                 # {(pid, langcode): {n, next_at, head}}
+_merge_fail_lock = threading.Lock()
+_MERGE_BACKOFF_BASE_S = 60.0
+_MERGE_BACKOFF_MAX_S = 900.0
+
+
+def _merge_attempt_due(pid, langcode):
+    """Is a divergence-merge attempt against this peer+project due?
+
+    **Repeated doomed merges had no backoff at all (0.55.62).** Field
+    2026-07-28, one peer over 15 minutes: six full merge attempts, each
+    burning a ~90 s fetch, every one ending
+
+        [lan-merge] fetch from '80570dd9' failed:
+            GitProtocolError('EOF occurred in violation of protocol')
+        … then: unexpected http resp 500 for …/nml.git/git-upload-pack
+
+    `lan_backoff` governs the post-commit burst, but reverse delivery and
+    mDNS arrival call straight into the push path, so nothing throttled
+    the retry. Two radios, two CPUs, two batteries, every two minutes,
+    for a fetch that cannot succeed while the far end can't serve.
+
+    Same shape as the reset-failure curve: 60 s doubling to 15 min,
+    cleared by any success. A peer that comes back healthy is picked up on
+    the next tick after its window, not minutes later."""
+    key = (str(pid or ''), str(langcode or ''))
+    with _merge_fail_lock:
+        st = _merge_fail.get(key)
+        if not st:
+            return True
+        remain = st.get('next_at', 0.0) - _time_mod.time()
+        if remain <= 0:
+            return True
+    print(f'[lan-merge] {key[0][:8]!r} {key[1]!r}: skipping — '
+          f'{st.get("n", 0)} consecutive failure(s), next attempt in '
+          f'{int(remain)}s', file=sys.stderr, flush=True)
+    return False
+
+
+def _note_merge_attempt_head(pid, langcode, peer_head):
+    """Record the peer head this attempt is aiming at, and say so when it
+    MOVED since the last attempt (0.55.62).
+
+    A moving target is its own failure mode and was invisible: I only
+    caught it by hand-diffing six log lines. If the peer commits faster
+    than we can fetch-and-merge, no amount of retrying converges — the
+    remedy is on that device, not here."""
+    key = (str(pid or ''), str(langcode or ''))
+    head = str(peer_head or '')[:12]
+    with _merge_fail_lock:
+        st = _merge_fail.get(key) or {}
+        prev = str(st.get('head', '') or '')
+        if prev and head and prev != head:
+            st['head'] = head
+            _merge_fail[key] = st
+            moved = prev
+        else:
+            st['head'] = head
+            _merge_fail[key] = st
+            moved = ''
+    if moved:
+        print(f'[lan-merge] {key[0][:8]!r} {key[1]!r}: peer head MOVED '
+              f'{moved} → {head} since our last attempt — they are '
+              f'committing faster than we can absorb; retrying alone '
+              f'will not converge', file=sys.stderr, flush=True)
+
+
+def _note_merge_failure(pid, langcode, phase):
+    """Advance the merge-failure curve for this peer+project."""
+    key = (str(pid or ''), str(langcode or ''))
+    with _merge_fail_lock:
+        st = _merge_fail.get(key) or {}
+        n = int(st.get('n', 0)) + 1
+        delay = min(_MERGE_BACKOFF_BASE_S * (2 ** (n - 1)),
+                    _MERGE_BACKOFF_MAX_S)
+        st['n'] = n
+        st['next_at'] = _time_mod.time() + delay
+        _merge_fail[key] = st
+    print(f'[lan-merge] {key[0][:8]!r} {key[1]!r}: {phase} failed '
+          f'({n} consecutive) — next attempt in {int(delay)}s',
+          file=sys.stderr, flush=True)
+
+
+def clear_merge_failure(pid, langcode):
+    """Called on a successful merge+push: drop the curve entirely."""
+    key = (str(pid or ''), str(langcode or ''))
+    with _merge_fail_lock:
+        _merge_fail.pop(key, None)
+
+
 def _merge_then_push(project, url, pm, pid, host, port):
     """Divergence-recovery path for the LAN fan-out. Fetches the
     peer's commits over our pinned-TLS pool, runs the daemon's
@@ -1037,20 +1274,34 @@ def _merge_then_push(project, url, pm, pid, host, port):
     # about what a SHA means, and nothing observes these objects until a
     # ref points at them — which still happens under the lock in phase
     # 2. Refs, index, working tree and HEAD are untouched here.
+    _lang = str(getattr(project, 'langcode', '') or '')
+    if not _merge_attempt_due(pid, _lang):
+        return False
     peer_head = _fetch_peer_objects_unlocked(project, url, pm, pid)
     if peer_head is None:
+        _note_merge_failure(pid, _lang, 'fetch')
         return False
+    _note_merge_attempt_head(pid, _lang, peer_head)
     # PHASE 2 — everything that mutates local state, under the lock.
     # Now bounded by local work only, so the 5 s timeout means what it
     # says instead of being a hostage to the network.
     try:
         with project_lock(project.working_dir, timeout=5.0):
-            return _merge_then_push_locked(
+            ok = _merge_then_push_locked(
                 project, url, pm, pid, host, port,
                 peer_head=peer_head)
+        if ok:
+            clear_merge_failure(pid, _lang)
+        else:
+            _note_merge_failure(pid, _lang, 'merge')
+        return ok
     except LockTimeout:
+        # NOT a failure of this peer or project — our own lock was busy.
+        # Deliberately does NOT advance the curve: penalising a peer for
+        # our local contention would push a healthy link out to 15 min.
         print(f'[lan-merge] {pid[:8]!r}: project busy — deferring '
-              f'merge; next drain pass will retry',
+              f'merge; next drain pass will retry (backoff curve '
+              f'untouched — local contention, not their fault)',
               file=sys.stderr, flush=True)
         return False
 
@@ -1582,7 +1833,7 @@ def _merge_then_push_locked(project, url, pm, pid, host, port,
 
 
 def hello_to_peer(host, port, expected_fp, device_name='',
-                  langcode='', out=None):
+                  langcode='', out=None, peer_id_hint=''):
     """Initiate a TLS hello handshake to *host*:*port*, pinning
     *expected_fp*, and POST our identity to ``/v1/lan/hello`` so the
     remote daemon auto-reverse-records us.
@@ -1681,6 +1932,30 @@ def hello_to_peer(host, port, expected_fp, device_name='',
             retries=False,
         )
     except Exception as ex:
+        # FEED THE UNREACHABLE GATE (0.55.83). ``hello_to_peer`` builds
+        # its own PoolManager rather than going through
+        # ``_https_post_to_peer``, so it never recorded reachability —
+        # and the very next step in the same sweep re-paid the full 5 s
+        # connect timeout against an address hello had just proven dead.
+        # Field 2026-07-28: hello failed at 20:27:09.127, the share-offer
+        # to the SAME endpoint started 145 ms later and timed out again,
+        # then three dials followed. ~25 s establishing what the first
+        # line already knew.
+        #
+        # Only connect-level failures count. A 4xx, a TLS pin mismatch or
+        # a body rejection proves the peer IS reachable; recording those
+        # would suppress pushes that would have worked (the same
+        # conflation fixed in ``_classify_peek_failure`` in 0.55.60).
+        _t = f'{ex!r} {ex}'.lower()
+        if any(k in _t for k in ('timed out', 'timeout', 'no route',
+                                 'errno 113', 'connection refused',
+                                 'errno 111', 'unreachable',
+                                 'errno 101')):
+            try:
+                if peer_id_hint:
+                    _record_unreachable(peer_id_hint)
+            except Exception:
+                pass
         print(f'[lan-hello] POST to {host}:{port} failed: {ex!r}',
               file=sys.stderr, flush=True)
         return False
@@ -2207,9 +2482,14 @@ def sweep_peer(peer_id, exclude_langcode=''):
                 print(f'[lan-sweep] {peer_id[:8]!r}: pairing not '
                       f'confirmed — saying hello to complete it',
                       file=sys.stderr, flush=True)
+                # Pass the peer id so a connect-level failure records
+                # unreachability (0.55.83). Only the AUTOMATIC sweep does
+                # this; the two pair-accept call sites in server.py are
+                # user gestures walking a candidate address list, and
+                # shouldn't be gating themselves.
                 if hello_to_peer(host, int(port), entry.get('fp', ''),
                                  _store_mod.get_device_name(),
-                                 langcode=''):
+                                 langcode='', peer_id_hint=peer_id):
                     _peers.set_pair_confirmed(peer_id, True)
                     entry = _peers.get_peer(peer_id) or entry
                     print(f'[lan-sweep] {peer_id[:8]!r}: pairing '

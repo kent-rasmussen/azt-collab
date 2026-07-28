@@ -207,6 +207,25 @@ class ProjectStatus:
     # "remote has leftover branches" indicator in a sync-detail
     # screen; it's not a sync-blocking condition. Since 0.50.15.
     foreign_topic_orphan_count: int = 0
+    # Live position inside a chunked push, or None when nothing is in
+    # flight (0.55.83): ``{'banked': int, 'total': int, 'ref': str,
+    # 'phase': str, 'at': float}``.
+    #
+    # NOT a duplicate of ``wan_unshared``, which already counts down as
+    # chunks land. It answers the question that count cannot: **is a
+    # chunk in flight right now?** A single oversize chunk can run for
+    # hours with ``wan_unshared`` legitimately frozen — field 2026-07-28,
+    # an 8.9 GB merge, 26+ minutes, no signal of any kind — and a user
+    # who can't distinguish "working" from "stuck" interrupts it. Every
+    # interruption of a chunked push discards the chunk in flight, so a
+    # missing liveness signal actively destroys progress.
+    #
+    # ``None`` also when the last report is stale (daemon restarted or
+    # the push died), so a reader never shows a frozen progress line as
+    # though work were continuing. Render as a supplement to the
+    # ``wan_unshared`` figure, never as a replacement: "816 to go —
+    # uploading 173 of 816".
+    push_progress: dict | None = None
 
     @classmethod
     def from_dict(cls, d):
@@ -251,4 +270,10 @@ class ProjectStatus:
                            else None),
             foreign_topic_orphan_count=int(
                 d.get('foreign_topic_orphan_count', 0) or 0),
+            # Absent on pre-0.55.83 daemons → None, i.e. "no liveness
+            # information", which renders as nothing rather than as a
+            # stalled push.
+            push_progress=(d.get('push_progress')
+                           if isinstance(d.get('push_progress'), dict)
+                           else None),
         )

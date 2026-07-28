@@ -94,13 +94,39 @@ def _stall_report():
         ages = _sched.heartbeat_ages() or {}
     except Exception:
         ages = {}
+    try:
+        expect = _sched.heartbeat_expectations() or {}
+    except Exception:
+        expect = {}
+    warn_s = float(_cfg('watchdog.warn_s', 120))
     for name, age in sorted(ages.items()):
-        # Per-loop expectation: iface-watch ~3 s, watcher up to ~60 s
-        # with backoff. Use a single generous bar rather than
-        # per-loop tuning — we are looking for minutes, not jitter.
-        if age > _cfg('watchdog.warn_s', 120):
+        # Judge each loop against ITS OWN cadence (0.55.66). The old note
+        # here read "watcher up to ~60 s with backoff", so a single 120 s
+        # bar looked generous — but the connectivity-probe backoff
+        # stretches that interval well past 120 s on an idle machine, and
+        # a loop sleeping exactly as designed got reported as stalled:
+        #
+        #   STALL DETECTED: loop 'watcher' last ticked 145s ago
+        #   threads=5 fds=16 … stall cleared — loops … moving again
+        #
+        # four times in twenty minutes, every thread parked in wait(),
+        # nothing held. A watchdog that cries wolf on healthy idling
+        # trains you to skip the line that is one day real.
+        #
+        # 2.5× the loop's published interval: late enough to be a genuine
+        # miss rather than scheduling jitter, and never below the fixed
+        # bar, so a loop that publishes nothing keeps the old behaviour.
+        bar = warn_s
+        try:
+            exp = float(expect.get(name) or 0)
+            if exp > 0:
+                bar = max(warn_s, exp * 2.5)
+        except Exception:
+            bar = warn_s
+        if age > bar:
             worst = max(worst, float(age))
-            lines.append(f'loop {name!r} last ticked {age:.0f}s ago')
+            lines.append(f'loop {name!r} last ticked {age:.0f}s ago '
+                         f'(expected every ~{expect.get(name, "?")}s)')
     try:
         from .locks import held_snapshot
         held = held_snapshot()
@@ -228,6 +254,41 @@ def _loop():
             continue
         if worst < restart_s:
             continue
+        # NEVER RESTART OVER A PUSH THAT IS ACTUALLY RUNNING (0.55.73).
+        #
+        # Field 2026-07-28, ten minutes into the 816-commit 'nml' push:
+        #
+        #   [watchdog] stall persisted 625s — restarting the daemon
+        #     (project lock … held 625s by 'Thread-54 …';
+        #      project lock … held 313s by 'Thread-356 …')
+        #
+        # Both locks were held by push threads doing real work. The
+        # watchdog killed a healthy transfer at the ten-minute mark —
+        # and a large first push CANNOT finish inside ten minutes, so
+        # every attempt died here, got marked interrupted, and re-entered
+        # the backoff curve. That is a self-inflicted reason a big
+        # history never converges, and it would look exactly like a
+        # network problem from outside.
+        #
+        # ``sync_flight`` already exists to mean "a push is in flight,
+        # do not kill this process" — Android's idle-stop honours it.
+        # The watchdog must honour it too: a long-held lock with a
+        # transfer in flight is the system working, not wedged. Loop
+        # heartbeats are unaffected; if a LOOP is genuinely stuck the
+        # restart still fires once no push is running.
+        try:
+            from . import sync_flight as _sf
+            if _sf.in_flight():
+                print(f'[watchdog] stall persisted {worst:.0f}s but a '
+                      f'sync is IN FLIGHT — not restarting. A large '
+                      f'push legitimately holds the project lock for '
+                      f'minutes; killing it here is how a big history '
+                      f'never converges', file=sys.stderr, flush=True)
+                continue
+        except Exception as ex:
+            print(f'[watchdog] sync_flight check raised: {ex!r} — '
+                  f'proceeding with the restart decision',
+                  file=sys.stderr, flush=True)
         # Rate limit: never turn a slow machine into a restart loop.
         # The stall must also outlive one full cycle of our own
         # checks, which the threshold already guarantees.
