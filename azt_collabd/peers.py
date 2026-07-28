@@ -116,6 +116,17 @@ def _normalize_entry(entry):
         for k, v in raw_lcl.items():
             if isinstance(k, str) and isinstance(v, str) and v:
                 last_covered_local[k] = v
+    # What THEY told us THEY share with US (0.55.50), learned from the
+    # hello manifest exchange. Distinct from ``shared_projects``, which
+    # is what WE grant THEM. Empty means "not yet told" — never "they
+    # share nothing", because the two are indistinguishable on the wire
+    # and treating unknown as refusal would silence working pairs the
+    # moment they upgrade.
+    raw_theirs = entry.get('their_shared_projects')
+    their_shared_projects = None
+    if isinstance(raw_theirs, list):
+        their_shared_projects = sorted(
+            {str(x) for x in raw_theirs if isinstance(x, str) and x})
     # Why the last reach ATTEMPT didn't become an observation (0.55.20).
     # Kept strictly separate from ``project_seen_at``: an attempt is not
     # an observation, and must never advance the board's as-of stamp.
@@ -217,6 +228,11 @@ def _normalize_entry(entry):
         # 0.55.20, which is the ambiguity Kent could not diagnose
         # around.
         'probe': probe,
+        # ``None`` = they have never told us (pre-0.55.50 peer, or no
+        # hello yet). A LIST — including an empty one — is an actual
+        # answer. Callers MUST distinguish: ``None`` means proceed as
+        # before; ``[]`` means they consent to nothing.
+        'their_shared_projects': their_shared_projects,
     }
 
 
@@ -640,6 +656,49 @@ def set_peer_last_seen_main(peer_id, langcode, sha):
         _save_raw(data)
     _invalidate_sync_board()  # timestamp (and possibly state) moved
     return True
+
+
+def set_their_shared_projects(peer_id, langcodes):
+    """Record what *peer_id* told us THEY share with US (0.55.50).
+
+    Learned from the hello manifest exchange — the one authenticated
+    round trip both peers already make. Distinct from
+    ``shared_projects`` (what WE grant THEM); this is the other half of
+    the agreement, and having it is what lets a peer stop dialing for a
+    project the other side has not consented to instead of discovering
+    it as a reasonless ``NotGitRepository`` hours later.
+
+    An empty list is a real answer ("I share nothing with you") and is
+    stored as such. Absence of the key means "never told"; the two must
+    stay distinguishable — see ``_normalize_entry``."""
+    if not peer_id or langcodes is None:
+        return False
+    clean = sorted({str(x) for x in langcodes if isinstance(x, str) and x})
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if peer_id not in peers:
+            return False
+        entry = dict(peers[peer_id] or {})
+        before = entry.get('their_shared_projects')
+        if isinstance(before, list) and sorted(before) == clean:
+            return True                     # no change; skip the write
+        entry['their_shared_projects'] = clean
+        peers[peer_id] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    print(f'[peers] {peer_id[:8]!r} shares {clean!r} with us '
+          f'(was {before!r})', file=sys.stderr, flush=True)
+    _invalidate_sync_board()
+    return True
+
+
+def their_shared_projects(peer_id):
+    """What *peer_id* shares with us, or ``None`` if never told."""
+    entry = get_peer(peer_id)
+    if entry is None:
+        return None
+    return entry.get('their_shared_projects')
 
 
 def set_peer_probe_result(peer_id, langcode, outcome, detail=''):

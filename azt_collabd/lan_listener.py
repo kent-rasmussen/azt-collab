@@ -108,6 +108,99 @@ _pending_qr_offers = {}   # langcode (str) → last-heartbeat unix ts
 # back. Ungated (0.55.10–0.55.12) that is a mutual amplifier: ~330
 # threads in ~10 s and a dead ``:provider`` process, every delivery a
 # no-op. One look per contact burst is all convergence needs.
+# Per-request ACL context (0.55.47). ``open_repository`` is a backend
+# method with no access to the WSGI ``environ``, so the middleware —
+# which has it — stashes the identified caller here. Safe because the
+# listener is ``ThreadingMixIn``: one thread per request.
+_acl_ctx = threading.local()
+
+
+def _identify_peer_by_addr(environ):
+    """Best-effort caller identity for the git routes: match
+    ``REMOTE_ADDR`` against paired peers' known endpoints. Returns a
+    peer_id or ''.
+
+    Same heuristic ``_reverse_deliver_by_addr`` uses, and subject to the
+    same limits — spoofable on a hostile LAN, blind to a peer on an
+    address we haven't recorded. It is nonetheless the only identity the
+    git smart-protocol routes offer (no body, TLS is CERT_NONE), and
+    it's strictly better than authorising every caller identically."""
+    try:
+        host = str(environ.get('REMOTE_ADDR', '') or '').strip()
+        if not host:
+            return ''
+        for peer in (_peers.list_peers() or []):
+            for ep in (list(peer.get('endpoints') or [])
+                       + list(peer.get('static_endpoints') or [])):
+                if str(ep).rsplit(':', 1)[0] == host:
+                    return peer.get('peer_id', '') or ''
+    except Exception:
+        pass
+    return ''
+
+
+def _project_presence(langcode):
+    """``'present'`` | ``'ghost'`` | ``'materializing'`` |
+    ``'unregistered'`` (0.55.47).
+
+    Only ``'ghost'`` — REGISTERED but its directory is gone — is safe to
+    self-clean. The other two are deliberately left alone:
+
+    - ``'materializing'``: directory exists, no ``.git`` yet. Plausibly a
+      clone in flight, which is the exception Kent carved out; pruning
+      would cancel a share the user just accepted.
+    - ``'unregistered'``: we never had it. Could be a share we accepted
+      whose clone hasn't started, so refuse but don't touch grants."""
+    try:
+        p = _projects.get(langcode)
+    except Exception:
+        return 'materializing'      # can't tell → never prune
+    if p is None:
+        return 'unregistered'
+    wd = (getattr(p, 'working_dir', '') or '').strip()
+    if not wd or not os.path.isdir(wd):
+        return 'ghost'
+    if not os.path.isdir(os.path.join(wd, '.git')):
+        return 'materializing'
+    return 'present'
+
+
+def _prune_ghost_shares(langcode):
+    """Drop *langcode* from every paired peer's ``shared_projects``.
+
+    Called when a request arrives for a project that is registered but
+    whose directory is gone. The grant cannot be honoured by anything, so
+    keeping it only guarantees the peer asks again forever — the field
+    symptom was ``GET /en.git/info/refs`` served-then-failed on repeat
+    (Kent 2026-07-28: *"if we don't have the project, we should clear
+    it"*).
+
+    Local only, by design: Kent explicitly does NOT want unshares
+    propagated (*"we don't need to keep everyone up to date on our
+    projects"*). The peer stops getting it served; whether it keeps
+    asking is its own business."""
+    pruned = []
+    try:
+        for entry in _peers.list_peers() or []:
+            pid = entry.get('peer_id', '') or ''
+            if pid and langcode in (entry.get('shared_projects') or []):
+                try:
+                    _peers.remove_shared_project(pid, langcode)
+                    pruned.append(pid[:8])
+                except Exception as ex:
+                    print(f'[lan-listener] prune {langcode!r} from '
+                          f'{pid[:8]!r} raised: {ex!r}',
+                          file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-listener] ghost-share prune raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return
+    print(f'[data-quality] pruned-ghost-shares langcode={langcode!r} '
+          f'peers={pruned!r} — registered but its directory is gone, so '
+          f'the grant could never be served',
+          file=sys.stderr, flush=True)
+
+
 _REVERSE_COOLDOWN_S = 60.0
 # Per-PEER concurrency, not a global counter (0.55.19). A flat cap of 2
 # was starving the mechanism it was meant to protect: reverse-delivery
@@ -358,12 +451,51 @@ class _DynamicBackend:
         print(f'[lan-listener] open_repository: raw={raw!r} → '
               f'langcode={langcode!r}',
               file=sys.stderr, flush=True)
-        # Gate: project must appear in at least one paired peer's
-        # shared_projects allowlist. This IS the access control on
-        # the listener (TLS layer is CERT_NONE since stdlib ssl
-        # can't pin self-signed client certs). Future-harden with
-        # signed-message body auth to gate per-peer rather than
-        # union-of-all-peers.
+        # GATE 1 — DO WE EVEN HAVE IT? (0.55.47)
+        #
+        # Kent 2026-07-28: *"we shouldn't be sharing what we've
+        # deleted. No idea how it got there, but if we don't have the
+        # project, we should clear it (except if it's waiting on a
+        # clone)."* Field: this phone served ``GET /en.git/info/refs``
+        # repeatedly for a project whose working_dir was gone —
+        # authorised by a stale grant in some peer's share list, then
+        # failing deeper as NOT_A_REPO. Nothing pruned the grant, so it
+        # recurred forever.
+        #
+        # Presence is checked BEFORE authorisation on purpose: a grant
+        # for something we don't have is meaningless, and self-clearing
+        # it here is the only place that sees the evidence.
+        _presence = _project_presence(langcode)
+        if _presence != 'present':
+            if _presence == 'unregistered':
+                print(f'[lan-listener] reject {langcode!r}: not '
+                      f'registered on this device — refusing, grants '
+                      f'left intact (may be an accepted share whose '
+                      f'clone has not started)',
+                      file=sys.stderr, flush=True)
+                raise NotGitRepository(
+                    f'project {langcode!r} not registered')
+            if _presence == 'ghost':
+                # Registered-or-granted but the directory is GONE.
+                # Nothing can make this servable; drop the grants so
+                # peers stop asking.
+                _prune_ghost_shares(langcode)
+                raise NotGitRepository(
+                    f'project {langcode!r} is not on this device '
+                    f'(stale share grants pruned)')
+            # 'materializing' — directory exists but no .git yet, i.e.
+            # plausibly a clone in flight. Refuse WITHOUT pruning: this
+            # is exactly the exception Kent carved out, and a prune here
+            # would cancel a share the user just accepted.
+            print(f'[lan-listener] defer {langcode!r}: directory '
+                  f'present but no .git yet (clone in flight?) — '
+                  f'refusing this request, grants left intact',
+                  file=sys.stderr, flush=True)
+            raise NotGitRepository(
+                f'project {langcode!r} not yet materialized')
+        # GATE 2 — IS IT SHARED WITH *THIS* PEER? This IS the access
+        # control on the listener (TLS is CERT_NONE since stdlib ssl
+        # can't pin self-signed client certs).
         try:
             peers_list = _peers.list_peers(strict=True)
         except Exception as ex:
@@ -378,16 +510,102 @@ class _DynamicBackend:
                   file=sys.stderr, flush=True)
             raise NotGitRepository(
                 'peer registry unreadable (transient)') from ex
-        shared_anywhere = set()
-        for peer in peers_list:
-            shared_anywhere.update(peer.get('shared_projects') or [])
-        if langcode not in shared_anywhere:
-            print(f'[lan-listener] reject {langcode!r}: not in any '
-                  f'peer\'s shared_projects '
-                  f'(shared_anywhere={sorted(shared_anywhere)!r})',
-                  file=sys.stderr, flush=True)
-            raise NotGitRepository(
-                f'project {langcode!r} is not shared with any peer')
+        # PER-PEER when we can identify the caller, union when we can't
+        # (0.55.47). The git smart-protocol routes carry no identity —
+        # no body, and TLS is CERT_NONE — which is *why* this was a
+        # union of every paired peer's list. The consequence, confirmed
+        # in the field: sharing one project with one peer made it
+        # fetchable by EVERY paired peer, and the peer screen showed
+        # nothing to warn you. Kent's phone served 'nml' to the desktop
+        # 22 times in 15 minutes while its own screen read "no projects
+        # shared" for that desktop.
+        #
+        # Best available identity is the source address, matched against
+        # paired peers' known endpoints — the same heuristic reverse
+        # delivery uses, stashed by ``_peer_acl_middleware``. Spoofable
+        # on a hostile LAN; strictly better than no check at all.
+        #
+        # Unidentified callers FALL BACK to the union rather than being
+        # refused. That is deliberate: a peer on a new subnet, or behind
+        # NAT, has an address we don't know yet, and refusing it would
+        # break working pairs the moment this ships. The fallback is
+        # logged as a data-quality line so the frequency is visible —
+        # that log is the audit needed before making per-peer strict.
+        requester = getattr(_acl_ctx, 'peer_id', '') or ''
+        remote = getattr(_acl_ctx, 'remote', '') or ''
+        accepting = bool(getattr(_acl_ctx, 'accepting', False))
+        try:
+            from . import settings as _settings_mod
+            strict = bool(_settings_mod.get('lan.strict_peer_acl', False))
+        except Exception:
+            strict = False
+        # BOTH DIRECTIONS are gated by the grant (0.55.49). 0.55.48
+        # exempted inbound on the reasoning that a grant says what we
+        # hand out, not whose data we take. Kent corrected that, and he
+        # is right: **a grant is per-project consent to collaborate with
+        # that peer.** Accepting an unsolicited push means taking
+        # someone's commits into our project, which needs the same
+        # agreement as serving ours out. Treating a non-consented
+        # delivery as something to preserve was routing around a
+        # configuration error instead of surfacing it.
+        #
+        # Exempting inbound was also useless in practice:
+        # ``_push_to_peer`` proceeds with the push when its peek fails
+        # ("Couldn't ls-remote; proceed with the push attempt anyway"),
+        # so refusing only the fetch leaves the push knocking anyway.
+        # Gate both or gate neither.
+        if requester and strict:
+            granted = set()
+            for peer in peers_list:
+                if (peer.get('peer_id') or '') == requester:
+                    granted = set(peer.get('shared_projects') or [])
+                    break
+            if langcode not in granted:
+                print(f'[lan-listener] reject {langcode!r} '
+                      f'({"inbound push" if accepting else "fetch"}) '
+                      f'from {requester[:8]!r}: not shared with them '
+                      f'(their grants: {sorted(granted)!r}) — per-peer '
+                      f'ACL', file=sys.stderr, flush=True)
+                raise NotGitRepository(
+                    f'project {langcode!r} is not shared with you')
+        else:
+            shared_anywhere = set()
+            for peer in peers_list:
+                shared_anywhere.update(peer.get('shared_projects') or [])
+            if langcode not in shared_anywhere:
+                print(f'[lan-listener] reject {langcode!r}: not in any '
+                      f'peer\'s shared_projects '
+                      f'(shared_anywhere={sorted(shared_anywhere)!r})',
+                      file=sys.stderr, flush=True)
+                raise NotGitRepository(
+                    f'project {langcode!r} is not shared with any peer')
+            # THE AUDIT (0.55.48). Two different reasons to be here, and
+            # only one of them is about identity — say which, because
+            # this log is what decides whether `lan.strict_peer_acl` is
+            # safe to turn on.
+            if requester:
+                granted = set()
+                for peer in peers_list:
+                    if (peer.get('peer_id') or '') == requester:
+                        granted = set(peer.get('shared_projects') or [])
+                        break
+                if langcode not in granted:
+                    print(f'[data-quality] acl-would-refuse langcode='
+                          f'{langcode!r} peer={requester[:8]!r} '
+                          f'dir={"inbound-push" if accepting else "fetch"} '
+                          f'from={remote or "?"} (their grants: '
+                          f'{sorted(granted)!r}) — allowed under the '
+                          f'union; STRICT MODE WOULD REFUSE THIS. Grant '
+                          f'the project to that peer before enabling '
+                          f'lan.strict_peer_acl',
+                          file=sys.stderr, flush=True)
+            else:
+                print(f'[data-quality] acl-fallback-union langcode='
+                      f'{langcode!r} from={remote or "?"} — caller not '
+                      f'identifiable by address, so per-peer enforcement '
+                      f'is impossible for this request. Frequent hits '
+                      f'mean strict mode would refuse real peers',
+                      file=sys.stderr, flush=True)
         project = _projects.get(langcode)
         if project is None or not project.working_dir:
             print(f'[lan-listener] reject {langcode!r}: not '
@@ -605,7 +823,38 @@ def _handle_hello_bodyauth(environ, start_response):
                   f'recent QR offer for it; pair recorded, '
                   f'auto-share refused — telling the scanner',
                   file=sys.stderr, flush=True)
-    resp_body = {'ok': True, 'peer_id': actual_peer_id}
+    # SHARE MANIFEST EXCHANGE (0.55.50). Until now hello established
+    # pairing and said nothing about which projects each side is willing
+    # to collaborate on, so two peers could greet successfully and only
+    # discover a per-project disagreement much later — implicitly, as a
+    # reasonless ``NotGitRepository`` from a git route. Kent: *"can we
+    # greet each other as peers, then only later discover that we don't
+    # share x project?"* Yes, and that was the bug: the desktop dialed
+    # the phone for 'nml' for hours without ever learning the phone
+    # would not collaborate on it.
+    #
+    # Both directions travel on this one authenticated exchange:
+    #   - inbound  ``shared_with_you``: what the CALLER grants US.
+    #   - outbound ``shared_with_you``: what WE grant the caller.
+    # Each side stores the other's list as ``their_shared_projects`` and
+    # uses it to stop dialing for projects the peer hasn't consented to.
+    try:
+        claimed = payload.get('shared_with_you')
+        if isinstance(claimed, list):
+            _peers.set_their_shared_projects(
+                actual_peer_id,
+                [str(x) for x in claimed if isinstance(x, str)])
+    except Exception as ex:
+        print(f'[lan-listener] hello: recording caller manifest '
+              f'raised: {ex!r}', file=sys.stderr, flush=True)
+    ours_for_them = []
+    try:
+        _entry = _peers.get_peer(actual_peer_id) or {}
+        ours_for_them = sorted(_entry.get('shared_projects') or [])
+    except Exception:
+        ours_for_them = []
+    resp_body = {'ok': True, 'peer_id': actual_peer_id,
+                 'shared_with_you': ours_for_them}
     if share_refused:
         # The QR's keepalive window (30 s) had lapsed, or its screen
         # was dismissed. Deliberately specific: the fix is "show the
@@ -1640,6 +1889,25 @@ def _peer_acl_middleware(app):
         print(f'[lan-listener] {method} {path_info} from '
               f'{environ.get("REMOTE_ADDR", "?")}',
               file=sys.stderr, flush=True)
+        # Stash the caller for ``open_repository``'s per-peer ACL
+        # (0.55.47) — it's a backend method with no ``environ``.
+        # Thread-local is sound here: ThreadingMixIn gives one thread
+        # per request. Set unconditionally so a previous request's
+        # identity on a reused thread can never leak into this one.
+        _acl_ctx.peer_id = _identify_peer_by_addr(environ)
+        _acl_ctx.remote = environ.get('REMOTE_ADDR', '') or ''
+        # Which DIRECTION is this? ``git-upload-pack`` (and the
+        # ``info/refs?service=git-upload-pack`` probe) is the peer
+        # FETCHING FROM us — that's serving, and our grant governs it.
+        # ``git-receive-pack`` is the peer PUSHING TO us — that's
+        # accepting, and our grant has nothing to say about it. The old
+        # union ACL conflated the two; strict per-peer enforcement
+        # applied to a receive would refuse a delivering peer and break
+        # inbound sync, which is the opposite of the intent (0.55.48).
+        _p = path_info or ''
+        _q = environ.get('QUERY_STRING', '') or ''
+        _acl_ctx.accepting = ('git-receive-pack' in _p
+                              or 'git-receive-pack' in _q)
         return app(environ, start_response)
     return wrapped
 
@@ -2005,11 +2273,288 @@ def _note_reset_hard_failure(langcode, ex):
               f'{wait:.0f}s. This does not self-heal: the object has to '
               f'be recovered from a peer that still has it',
               file=sys.stderr, flush=True)
-        _log_missing_object_classification(langcode, missing)
+        info = _log_missing_object_classification(langcode, missing)
+        # REPAIR LADDER (0.55.57), cheapest and most exact first.
+        #
+        # 1. Rebuild a missing TREE from the working directory. Trees are
+        #    content-addressed, so this either reproduces the exact sha
+        #    or writes nothing. Free, local, and the only option that
+        #    works when NO peer still holds the object — which is the
+        #    situation here: `dcf320a895…` is missing on more than one
+        #    device.
+        # 2. Roll the ref back off an incomplete tip (0.55.56) so the
+        #    sender re-delivers. Only helps when the gap is recent;
+        #    `heal-failed: no complete commit within 200` says it isn't.
+        try:
+            if info and info.get('kind') == 'tree':
+                for _p in (info.get('paths') or [])[:1]:
+                    if _rebuild_missing_tree_from_worktree(
+                            langcode, missing, _p):
+                        clear_reset_hard_failure(langcode)
+                        print(f'[heal] {langcode!r}: object restored — '
+                              f'the next drain pass will retry the '
+                              f'working-tree reset',
+                              file=sys.stderr, flush=True)
+                        return
+        except Exception as ex:
+            print(f'[heal] {langcode!r} tree rebuild raised: {ex!r}',
+                  file=sys.stderr, flush=True)
+        try:
+            if _heal_incomplete_tip(langcode):
+                clear_reset_hard_failure(langcode)
+                _remove_pending_reset(langcode)
+        except Exception as ex:
+            print(f'[heal] {langcode!r} raised: {ex!r}',
+                  file=sys.stderr, flush=True)
     else:
         print(f'[data-quality] reset-blocked langcode={langcode!r} '
               f'failures={count} detail={detail} — retrying in '
               f'{wait:.0f}s', file=sys.stderr, flush=True)
+
+
+def _rebuild_missing_tree_from_worktree(langcode, want_sha, rel_path):
+    """Reconstruct a missing TREE object from the working directory
+    (0.55.57).
+
+    Git objects are content-addressed, so this either reproduces exactly
+    *want_sha* — closing the gap with no network — or it doesn't, and we
+    add nothing. There is no way for it to write a wrong object.
+
+    Kent's objection to this on 2026-07-28 was correct at the time: the
+    post-receive reset never ran, so the working tree holds the OLD
+    content, which wouldn't match a newly-arrived tree. What changed is
+    the evidence — `heal-failed: no complete commit within 200` with
+    `commits_walked=448` means this tree has been referenced across
+    hundreds of commits. It did not newly arrive; it **vanished from the
+    store**, retroactively breaking everything that referenced it. And a
+    tree unchanged for 400+ commits is one whose on-disk content is very
+    likely still exactly right.
+
+    It also matters that the same object is missing on more than one
+    device: a scratch-clone repair needs SOME peer to still hold it, and
+    if none does, local reconstruction is the only route left.
+
+    Returns True only if *want_sha* was produced and stored."""
+    import os as _os
+    import stat as _stat
+    from dulwich.repo import Repo
+    from dulwich.objects import Blob, Tree
+    from . import projects as _projects_mod
+    project = _projects_mod.get(langcode)
+    if project is None or not project.working_dir:
+        return False
+    want = (want_sha.encode('ascii') if isinstance(want_sha, str)
+            else want_sha)
+    root = _os.path.join(project.working_dir, rel_path)
+    if not _os.path.isdir(root):
+        print(f'[heal] {langcode!r}: {rel_path!r} is not a directory on '
+              f'disk — cannot rebuild its tree',
+              file=sys.stderr, flush=True)
+        return False
+    repo = None
+    try:
+        repo = Repo(project.working_dir)
+    except Exception as ex:
+        print(f'[heal] {langcode!r}: open repo failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+    staged = []          # objects to add only if the root sha matches
+
+    def _build(path):
+        """Return the Tree object for *path*, collecting new objects."""
+        tree = Tree()
+        for name in sorted(_os.listdir(path)):
+            full = _os.path.join(path, name)
+            nb = name.encode('utf-8')
+            st = _os.lstat(full)
+            if _stat.S_ISDIR(st.st_mode):
+                sub = _build(full)
+                tree.add(nb, 0o040000, sub.id)
+            elif _stat.S_ISLNK(st.st_mode):
+                blob = Blob.from_string(
+                    _os.readlink(full).encode('utf-8'))
+                staged.append(blob)
+                tree.add(nb, 0o120000, blob.id)
+            else:
+                with open(full, 'rb') as f:
+                    blob = Blob.from_string(f.read())
+                staged.append(blob)
+                mode = (0o100755 if st.st_mode & _stat.S_IXUSR
+                        else 0o100644)
+                tree.add(nb, mode, blob.id)
+        staged.append(tree)
+        return tree
+
+    try:
+        try:
+            built = _build(root)
+        except Exception as ex:
+            print(f'[heal] {langcode!r}: rebuilding {rel_path!r} raised: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+            return False
+        if built.id != want:
+            print(f'[data-quality] tree-rebuild-mismatch '
+                  f'langcode={langcode!r} path={rel_path!r} '
+                  f'want={want.decode()} got={built.id.decode()} — the '
+                  f'working copy differs from what that tree recorded, '
+                  f'so the content is genuinely gone. Nothing written; '
+                  f'needs the scratch-clone repair from a peer that '
+                  f'still holds it', file=sys.stderr, flush=True)
+            return False
+        added = 0
+        for obj in staged:
+            try:
+                if obj.id not in repo.object_store:
+                    repo.object_store.add_object(obj)
+                    added += 1
+            except Exception as ex:
+                print(f'[heal] {langcode!r}: storing {obj.id!r} raised: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+                return False
+        print(f'[data-quality] tree-rebuilt langcode={langcode!r} '
+              f'path={rel_path!r} sha={want.decode()} '
+              f'objects_added={added} — reconstructed byte-identically '
+              f'from the working tree; the object store had lost it '
+              f'while the files were intact',
+              file=sys.stderr, flush=True)
+        return True
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
+
+
+def _heal_incomplete_tip(langcode, max_commits=200):
+    """Roll a ref back off commits whose objects never fully arrived, so
+    the sender re-delivers them (0.55.56).
+
+    Kent 2026-07-28: *"looks like something we should be doing anyway:
+    heal bad transfers."* Right — this is a mechanism, not a repair for
+    one project. An interrupted receive can leave refs advanced onto
+    commits whose objects are only partly present, and such a tip is
+    **unusable in both directions**:
+
+    - the working-tree reset dies (`KeyError(b'dcf320a895…')`), so nothing
+      is ever absorbed;
+    - upload-pack refuses every fetch — `GitProtocolError: Client wants
+      invalid object b'7315ccfa…'` — which is the `HTTP 500` every peer
+      saw, deterministically, whatever the load.
+
+    Probable origin here: the chunk-cap failures (fixed 0.55.21) aborting
+    `add_thin_pack` mid-completion. Thin packs are completed by the
+    RECEIVER, so an interrupted completion is exactly how refs end up
+    ahead of the objects.
+
+    Walks back from the tip for the newest commit whose tree enumerates
+    cleanly and CASes the ref to it. Nothing is lost that was ever usable,
+    and the peer still holds what it sent.
+
+    **Refuses if any discarded commit is locally authored.** A local
+    commit's objects are present by construction, so a broken range
+    should contain none — but if it does, this would be data loss and a
+    human has to decide. Bounded at *max_commits*; a gap deeper than that
+    needs the scratch-clone repair instead."""
+    from dulwich.repo import Repo
+    from . import projects as _projects_mod
+    from . import store as _store_mod
+    project = _projects_mod.get(langcode)
+    if project is None or not project.working_dir:
+        return False
+    try:
+        me = (_store_mod.get_contributor() or '').strip()
+    except Exception:
+        me = ''
+    repo = None
+    try:
+        repo = Repo(project.working_dir)
+    except Exception as ex:
+        print(f'[heal] {langcode!r}: open repo failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return False
+    try:
+        try:
+            tip = repo.refs[b'HEAD']
+        except Exception:
+            return False
+        discarded, target, sha = [], None, tip
+        for _ in range(max_commits):
+            try:
+                commit = repo[sha]
+            except Exception:
+                break                   # commit itself absent — keep going back
+            complete = True
+            try:
+                for _e in repo.object_store.iter_tree_contents(commit.tree):
+                    if _e.sha not in repo.object_store:
+                        complete = False
+                        break
+            except Exception:
+                complete = False        # tree itself unreadable
+            if complete:
+                target = sha
+                break
+            discarded.append((sha, commit))
+            parents = list(commit.parents or [])
+            if not parents:
+                break
+            sha = parents[0]
+        if target is None:
+            print(f'[data-quality] heal-failed langcode={langcode!r}: no '
+                  f'complete commit within {max_commits} — needs the '
+                  f'scratch-clone repair, not a rollback',
+                  file=sys.stderr, flush=True)
+            return False
+        if not discarded:
+            return False                # tip was fine; nothing to heal
+        if me:
+            for _sha, _c in discarded:
+                try:
+                    author = (_c.author or b'').decode('utf-8', 'replace')
+                except Exception:
+                    author = ''
+                if me and me in author:
+                    print(f'[data-quality] heal-REFUSED '
+                          f'langcode={langcode!r}: '
+                          f'{_sha[:12].decode()} is locally authored '
+                          f'({author!r}) and its objects are incomplete. '
+                          f'Rolling back would lose local work — a human '
+                          f'must decide. Not touching refs',
+                          file=sys.stderr, flush=True)
+                    return False
+        ff_ref = b'refs/heads/main'
+        try:
+            from dulwich import porcelain as _porc
+            active = _porc.active_branch(repo)
+            if active:
+                ff_ref = b'refs/heads/' + active
+        except Exception:
+            pass
+        moved = False
+        try:
+            moved = bool(repo.refs.set_if_equals(ff_ref, tip, target))
+            if moved and repo.refs[b'HEAD'] != target:
+                repo.refs.set_if_equals(b'HEAD', tip, target)
+        except Exception as ex:
+            print(f'[heal] {langcode!r}: ref rollback failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+            return False
+        if not moved:
+            return False
+        print(f'[data-quality] healed-incomplete-tip '
+              f'langcode={langcode!r} from={tip[:12].decode()} '
+              f'to={target[:12].decode()} discarded='
+              f'{[s[:12].decode() for s, _ in discarded]!r} — those '
+              f'commits arrived without all their objects (interrupted '
+              f'transfer). The sender still holds them and will '
+              f're-deliver',
+              file=sys.stderr, flush=True)
+        return True
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
 
 
 def _log_missing_object_classification(langcode, sha_hex):
@@ -2037,9 +2582,11 @@ def _log_missing_object_classification(langcode, sha_hex):
               f'commits_walked={info.get("walked", 0)} '
               f'capped={info.get("capped", False)}',
               file=sys.stderr, flush=True)
+        return info
     except Exception as ex:
         print(f'[data-quality] missing-object-identity failed for '
               f'{langcode!r}: {ex!r}', file=sys.stderr, flush=True)
+    return None
 
 
 def _reset_backoff_active(langcode):
@@ -2074,14 +2621,30 @@ def drain_pending_resets():
         if _reset_backoff_active(langcode):
             continue
         try:
-            _reset_working_tree_after_receive(langcode)
+            # WAIT for the lock here (0.55.53). The 5 s default exists
+            # because the first attempt runs inside a WSGI worker, where
+            # blocking would stall the peer's HTTP request. This retry
+            # runs on the scheduler's watcher thread — nothing is
+            # waiting on it — so a short timeout buys nothing and costs
+            # everything: on a busy tablet every pass timed out and the
+            # working tree never reconciled.
+            #
+            # Field 2026-07-28, tablet 841d43a8: `lock busy (5s
+            # timeout)` nine times in twelve minutes while `nml`'s
+            # project_lock was continuously contended. Each incoming
+            # push advanced its refs and the reset never completed, so
+            # the device accumulated ~25 head positions it could not
+            # consolidate — which is why every one of them looked
+            # non-ancestor to the desktop.
+            _reset_working_tree_after_receive(langcode,
+                                             lock_timeout_s=120)
         except Exception as ex:
             print(f'[lan-listener] drain_pending_resets '
                   f'{langcode!r}: {ex!r}',
                   file=sys.stderr, flush=True)
 
 
-def _reset_working_tree_after_receive(langcode):
+def _reset_working_tree_after_receive(langcode, lock_timeout_s=5):
     """After an incoming receive-pack advances HEAD via a push
     from a peer, sync this peer's working tree + index to the
     new HEAD. Without this, dulwich's receive-pack updates refs
@@ -2162,7 +2725,8 @@ def _reset_working_tree_after_receive(langcode):
             # Fall through — better to do the reset than skip
             # silently when the guard itself broke.
     try:
-        with project_lock(project.working_dir, timeout=5):
+        with project_lock(project.working_dir,
+                          timeout=lock_timeout_s):
             repo = Repo(project.working_dir)
             try:
                 # 0.45.39 Phase-2 guard: defer if the working tree
@@ -2397,10 +2961,17 @@ def _reset_working_tree_after_receive(langcode):
         # merge. See repo._commit_repo_locked for the absorbing
         # half of this fix.
         _add_pending_reset(langcode)
-        print(f'[lan-listener] post-receive reset {langcode!r}: '
-              f'lock busy (5s timeout) — queued for retry on next '
-              f'scheduler tick + absorb on next commit_project',
-              file=sys.stderr, flush=True)
+        # Report the ACTUAL timeout and WHICH path timed out (0.55.54).
+        # This hardcoded "5s" in its text, so after 0.55.53 gave the
+        # drain retry a 120 s wait the line still claimed 5 s — and the
+        # two callers were indistinguishable. Kent was reading exactly
+        # this line to judge whether 0.55.53 was live.
+        _which = ('drain retry' if lock_timeout_s > 5
+                  else 'first attempt, in the WSGI worker')
+        print(f'[lan-listener] post-receive reset {langcode!r}: lock '
+              f'busy after {lock_timeout_s}s ({_which}) — queued for '
+              f'retry on next scheduler tick + absorb on next '
+              f'commit_project', file=sys.stderr, flush=True)
     except Exception as ex:
         print(f'[lan-listener] post-receive reset {langcode!r} '
               f'failed: {ex!r}',

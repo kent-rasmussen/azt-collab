@@ -9,6 +9,582 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.61 — the one-sided-share gate covers every trigger
+
+`sweep_peer` was the **only** caller consulting the hello manifest before
+dialing. Reverse delivery, mDNS arrival and `lan_burst_now` all call
+`_push_to_peer` directly, so they dialed straight into a known one-sided
+share and ate a bare `NotGitRepository` — which is why 0.55.50's "stop
+dialing" fix kept looking incomplete in the field.
+
+The gate now lives in `_push_to_peer`, the seam every trigger funnels
+through — the same reason the in-flight guard went there in 0.55.55.
+
+Refusing to **push** (not only fetch) is deliberate and matches the
+per-peer ACL: their listener requires the project be shared with us in both
+directions, so a push into a project they don't share with us is refused on
+arrival. Dialing is futile, not merely impolite.
+
+`sweep_peer`'s check stays — it skips *before* the call so the sweep can
+record a per-project result and emit one aggregate line, instead of one
+refusal per project per sweep.
+
+Extracted `_their_shared_projects(pid, peer_entry=None)` so the gate, the
+sweep and `_classify_peek_failure` read the manifest one way. It preserves
+the distinction that matters: a list — **including an empty one** — is an
+answer; `None` means they never told us, and gates nothing.
+
+## 0.55.60 — `NotGitRepository` was seven answers; say which
+
+Kent: *"are we still reporting NGR for 'not sharing that with you'?"* We
+were. `lan_listener.open_repository` raises that one exception for **seven**
+conditions:
+
+| Reason | Retryable? |
+|---|---|
+| not registered here | no |
+| ghost — directory gone | no |
+| **materializing — clone in flight** | **yes, soon** |
+| **peer registry unreadable (transient)** | **yes, soon** |
+| not shared with *this* peer | no — needs a grant |
+| not in any peer's `shared_projects` | no — needs a grant |
+| repo failed to open | maybe |
+
+The dialer called all seven `not_served`, asserting a cause it hadn't
+established — "won't share with you", "still cloning" and "my registry
+hiccuped" were one signal.
+
+The reason can't cross the wire: our listener raises it with a useful
+message, but dulwich's *client* mints its own exception from the HTTP
+failure — which is why the field log reads `NotGitRepository()` with empty
+args.
+
+So `_classify_peek_failure` disambiguates out-of-band from the hello share
+manifest (0.55.50), the same `their_shared_projects` field `sweep_peer`
+already uses for its one-sided-share skip:
+
+- manifest says they DON'T share it → **`unshared`**. A user must grant it;
+  dialing again changes nothing.
+- manifest says they DO → **`absent`**. They mean to serve it but can't
+  yet. Worth retrying.
+- no manifest → **`not_served`**, the honest "refused, reason unknown".
+
+Peek failures now also name the project, and each outcome carries its
+remedy inline instead of leaving the operator to infer one.
+
+*Caught while writing this:* my first version called
+`_peers.get_their_shared_projects()`, which doesn't exist — only the
+setter does. The surrounding `except Exception` would have swallowed the
+`AttributeError` and returned `not_served` every time, silently defeating
+the change. Now reads the entry off `list_peers()` like `sweep_peer` does.
+
+## 0.55.59 — silence Kivy's icon-copy traceback (cosmetic)
+
+```
+[ERROR  ] Error when copying logo directory
+shutil.Error: [(… kivy/data/logo/kivy-icon-128.png,
+    …/files/app/.kivy/icon/kivy-icon-128.png,
+    "[Errno 13] Permission denied: …/.kivy/icon")]
+```
+
+I read this as fatal — "the process dies before any of our code runs."
+**Wrong.** Kivy catches it; the same boot went on to
+`Start application main loop` and the Activity came up normally. This is
+noise, not breakage: a ten-line traceback on every launch that reads like
+a real fault when you're scanning for one.
+
+Scoped to `$KIVY_HOME/icon` only. `.kivy` also holds `logs/`, which is
+writable on the same boot and is where Kivy's own log lands — a guard that
+renamed all of `.kivy` (my first version did) would discard those to fix
+cosmetics. Renamed, not deleted, so the bad state stays inspectable.
+
+Duplicated in `main.py` and `service.py` rather than shared: importing
+`service.py` from `main.py` would run its module body and start a second
+daemon.
+
+## 0.55.58 — the drain stops announcing pushes it isn't making
+
+```
+13:11:44  WAN drain skipped: 'en' wan_backoff next=2026-07-29T10:10:09+00:00
+              (in 21h58m, 178 consecutive failure(s))
+13:11:59  WAN drain: pushing to github ['en']
+13:12:14  WAN drain: pushing to github ['en']
+13:12:29  WAN drain: pushing to github ['en']        … every 15 s, forever
+```
+
+Nothing was being pushed. That line fires **before** the per-project
+`wan_backoff.is_due` check, and the skip line is rate-limited to once per
+changed due-time — so a project parked 22 hours out announced a push every
+tick. My 0.55.44 rename made it worse by replacing the vague "drain
+pushes" with a claim ("pushing to github") the code hadn't earned yet.
+
+- The candidates line is **gone**; the attempt is announced inside the
+  loop, after the due-check and after credentials are in hand:
+  `WAN drain: pushing 'nml' to github`.
+- **Ghost projects are excluded.** `en`'s `working_dir` doesn't exist, so
+  it can never push — yet it stayed flagged `pending_push` and was
+  re-enumerated every 15 s to 178 consecutive failures. Now dropped with
+  one `[data-quality] drain-ghost` line, the same ghost class the listener
+  learned to refuse in 0.55.47 and the drain never did.
+
+Fourth log-that-lies today, and this one I introduced while fixing the
+third. The recurring shape: a message placed before the check that decides
+whether the message is true.
+
+## 0.55.57 — rebuild the missing tree from the working directory
+
+0.55.56's heal reported honestly and, in doing so, disproved my account of
+the cause:
+
+```
+[data-quality] missing-object-identity … kind='tree' paths=['.azt'] commits_walked=448
+[data-quality] heal-failed langcode='nml': no complete commit within 200 —
+    needs the scratch-clone repair, not a rollback
+```
+
+**No complete commit within 200, having walked 448.** So `.azt`'s tree has
+been referenced across hundreds of commits: it did not newly arrive and
+fail to land — it **vanished from the store**, retroactively breaking
+everything that referenced it. Rolling back cannot help, because going
+further back keeps hitting the same tree. My interrupted-thin-pack story
+was wrong.
+
+That evidence revives the option Kent had correctly ruled out. His
+objection — the reset never ran, so the working tree holds the OLD content
+— held while the tree was assumed to be newly arrived. A tree unchanged
+across 400+ commits is one whose on-disk content is very likely still
+exactly right. And the same object is missing on **more than one device**,
+so a scratch-clone repair may find no peer that still holds it, leaving
+local reconstruction the only route.
+
+`_rebuild_missing_tree_from_worktree` walks the directory, hashes blobs and
+sub-trees, and compares the resulting root sha with the wanted one:
+
+- match ⇒ store the objects, clear the backoff, let the next drain pass
+  retry the reset;
+- mismatch ⇒ `tree-rebuild-mismatch` naming want vs got, **write nothing**,
+  and say the content is genuinely gone.
+
+Because trees are content-addressed, there is no path by which this writes
+a wrong object — it reproduces the exact sha or it does nothing.
+
+The failure path is now a ladder, cheapest and most exact first: rebuild
+the tree locally (0.55.57), then roll back an incomplete tip (0.55.56),
+then report that a scratch-clone from a peer is required.
+
+## 0.55.56 — heal bad transfers: roll a ref off objects that never arrived
+
+Kent: *"D looks like something we should be doing anyway: heal bad
+transfers."* Right — a mechanism, not a repair for one project.
+
+An interrupted receive can leave refs advanced onto commits whose objects
+are only partly present, and such a tip is **unusable in both
+directions**:
+
+- the working-tree reset dies — `KeyError(b'dcf320a895…')`, nine times
+  running on one device, so nothing is ever absorbed;
+- **upload-pack refuses every fetch** — `GitProtocolError: Client wants
+  invalid object b'7315ccfa…'`. That is the `HTTP 500 for
+  …/git-upload-pack` every peer has been hitting, deterministically,
+  regardless of load. It was never only a concurrency problem.
+
+Probable origin: the chunk-cap failures (fixed 0.55.21) aborting
+`add_thin_pack` mid-completion. Thin packs are completed by the
+**receiver**, so an interrupted completion is precisely how refs end up
+ahead of their objects — and it explains why `nml` and not `baf`.
+
+`_heal_incomplete_tip` walks back for the newest commit whose tree
+enumerates cleanly and CASes the ref to it. Nothing usable is lost — the
+discarded commits could not be read or served — and the sender still holds
+them, so normal sync re-delivers, now over a fixed chunk path.
+
+**Refuses if any discarded commit is locally authored.** A local commit's
+objects are present by construction, so a broken range should contain
+none; if it does, rolling back would be real data loss and a human
+decides. Bounded at 200 commits — deeper than that wants the
+scratch-clone repair instead, and it says so rather than failing quietly.
+
+Wired to the backed-off hard-failure path, so it attempts at most once per
+60 s → 15 min, and clears its own backoff plus the pending-reset entry on
+success so the re-delivered tip gets a prompt reset.
+
+## 0.55.55 — one push attempt per peer+project
+
+Watchdog dump, tablet 2026-07-28 12:56: **fds=1607** (up from ~280), with
+six threads — `lan-reverse-deliver` ×3, `lan-arrival-sweep` ×2,
+`lan-bind-sweep` — all inside `_peer_is_ancestor_of_local` → dulwich walk
+→ `_lookup_in_packs` simultaneously.
+
+No fd leak: that function closes its repo. But every `Repo()` opens every
+pack file, so N concurrent walks multiply the fd peak N-fold and duplicate
+the CPU N times to compute one answer. 0.55.52 guarded the fetch; the work
+*before* it was still duplicated, and on a tablet it is not cheap.
+
+`_push_to_peer` now admits one attempt per **(peer, project)**, keyed
+separately from `_fetch_inflight` so the nested fetch guard cannot see the
+push entry and skip itself. Losers log `push already in flight — skipping
+this trigger` and return.
+
+## 0.55.54 — the lock-busy line reports the real timeout
+
+The `post-receive reset … lock busy (5s timeout)` message hardcoded "5s"
+in its text. After 0.55.53 gave the drain retry a 120 s wait, the line
+would still have claimed 5 s — and nothing distinguished the WSGI first
+attempt from the drain retry, which are now deliberately different.
+
+Kent was reading exactly this line to judge whether 0.55.53 was live, so
+the lie was load-bearing.
+
+```
+post-receive reset 'nml': lock busy after 5s (first attempt, in the WSGI
+    worker) — queued for retry on next scheduler tick …
+post-receive reset 'nml': lock busy after 120s (drain retry) — …
+```
+
+The second form appearing at all would mean the lock is held for over two
+minutes, which is a finding rather than noise. The first is expected and
+benign: it's the WSGI worker declining to block a peer's HTTP request.
+
+Third instance today of a log asserting something it couldn't know — after
+the drain labels (0.55.44) and the push outcome lines (0.55.51). The
+pattern is a message whose text embeds a value that later became a
+parameter.
+
+## 0.55.53 — the reset retry waits for the lock instead of giving up
+
+0.55.52 confirmed working on the tablet — `fetch already in flight —
+skipping this pass`, with 0.55.51's project labels — and with the pile-up
+gone the real bottleneck is legible:
+
+```
+[lan-merge] '8f19208f': project busy — deferring merge          ×9 in 12 min
+[lan-listener] post-receive reset 'nml': lock busy (5s timeout)  ×9 in 12 min
+[watchdog] … dulwich/object_store.py:2460 in get_commit_graph
+[watchdog] … dulwich/object_store.py:3052 in _split_commits_and_tags
+```
+
+`nml`'s `project_lock` is contended essentially continuously, and long
+stretches are spent in dulwich object enumeration.
+
+**This also corrects my reading of the head churn.** I had guessed the
+tablet was minting merge commits. It wasn't: **each incoming push advances
+its refs while the working-tree reset keeps failing**, so the ~25 head
+positions were other peers' deliveries landing on a device that could
+never consolidate them. That is why every head looked non-ancestor to the
+desktop — it wasn't seeing merges, it was seeing an unabsorbed pile.
+
+The 5 s lock timeout is right for the FIRST attempt, which runs inside a
+WSGI worker where blocking would stall the peer's HTTP request. It is
+wrong for the retry: `drain_pending_resets` runs on the scheduler's
+watcher thread with nothing waiting on it, so a short timeout buys nothing
+and costs everything — every pass timed out and the tree never
+reconciled.
+
+`_reset_working_tree_after_receive` takes a `lock_timeout_s` (default 5,
+unchanged for the WSGI path); the drain passes **120 s**.
+
+Note the interaction with the watchdog: a 120 s hold on the watcher thread
+approaches `watchdog.warn_s`, so a slow reset may now produce a stall
+dump. That is the correct trade — the dump names the holder, whereas a
+timeout produced a silent no-op nine times running.
+
+## 0.55.52 — one fetch per peer+project; 0.55.24 removed the serialisation
+
+The outcome lines Kent finally grepped show **every** merge failing at the
+fetch, and the timestamps show why:
+
+```
+12:20:08.476  fetch from '841d43a8' failed: ConnectionResetError(104)
+12:20:08.489  fetch from '841d43a8' failed: ConnectionResetError(104)
+12:20:08.489  fetch from '841d43a8' failed: ConnectionResetError(104)   ×2
+12:20:08.490  fetch from '841d43a8' failed: ConnectionResetError(104)
+12:30:30.6xx  ×6 inside 400 ms
+```
+
+Five concurrent `git-upload-pack` requests to one tablet inside a single
+millisecond; six more inside 400 ms later. It answered with read timeouts,
+`HTTP 500`, `HangupException` and `ConnectionResetError(104)` — a tablet
+cannot serve six simultaneous packs of `nml`'s history. So no merge ever
+completed: the desktop's head sat at `7332a7fd8803` for **63 minutes**
+while the tablet's moved through **23 distinct heads**.
+
+**Regression from 0.55.24, mine.** Hoisting the fetch out of
+`project_lock` was right for the 147 s stall, but the lock had been doing a
+second job by accident: **serialising these fetches.** One merge at a time
+meant one pack request at a time. Without it, every trigger — sweep,
+fan-out, reverse delivery, burst, scheduler — fetches simultaneously.
+
+The lock must not come back, so the serialisation gets its own guard:
+`_fetch_inflight`, keyed per **(peer, project)**, held across the network
+call only, no `project_lock` involved. A loser logs
+`fetch already in flight — skipping this pass` and retries next pass —
+cheaper than a request the peer will drop anyway.
+
+Worth generalising: when removing a lock, ask what else it was
+incidentally serialising. The stall fix was correct and still introduced
+this, because the lock's *documented* purpose (local mutation) wasn't its
+only effect.
+
+## 0.55.51 — push outcome lines name their project
+
+Kent, reading two adjacent lines eight seconds apart:
+
+```
+[lan-push] '841d43a8' already at '234f3e924d29' — no-op
+[lan-push] '841d43a8': peer at '31c00d34e2aa' is NOT ancestor of local '7332a7fd8803' …
+```
+
+They look contradictory and aren't — they're **different projects**
+(`baf` and `nml`). The `dialing` line names the project; none of the
+outcome lines did, so a grep on an outcome pattern loses project identity
+entirely and the reader has to reconstruct it from SHAs.
+
+That cost real accuracy: asked how I knew which project was which, I had
+to admit that `234f3e924d29 = baf` was evidenced (from earlier
+`dialing … for 'baf'` pairings) while `7332a7fd8803 = nml` was inference
+by elimination, presented as a reading. Kent's later excerpt — with the
+`dialing` lines included — is what actually proved it. **A log that forces
+inference invites overstatement.**
+
+`{project.langcode!r}` added to the outcome lines in `_push_to_peer`:
+`already at … no-op`, `is NOT ancestor of local …`, and the
+`push errored` post-check. So:
+
+```
+[lan-push] '841d43a8' 'baf' already at '234f3e924d29' — no-op
+[lan-push] '841d43a8' 'nml': peer at '31c00d34e2aa' is NOT ancestor …
+```
+
+## 0.55.50 — hello exchanges the share manifest; one-sided shares stop dialing
+
+Kent: *"can we greet each other as peers, then only later discover that we
+don't share x project?"* Yes — and that was the whole bug. Pairing said
+nothing about which projects each side would collaborate on, so the
+disagreement surfaced only implicitly, as a reasonless
+`NotGitRepository` from a git route, hours later. The desktop peeked the
+phone for `nml` 22 times in 15 minutes while the phone granted it nothing.
+
+**Both halves now travel on the one authenticated round trip that already
+exists.** `hello` gains `shared_with_you` in each direction:
+
+- request → what the CALLER grants the responder;
+- response → what the RESPONDER grants the caller.
+
+Each side stores the other's list as `their_shared_projects` in
+`peers.json`, distinct from `shared_projects` (what *we* grant *them*).
+
+**`None` and `[]` are kept rigorously distinct.** `None` means "never
+told" — a pre-0.55.50 peer, or no hello yet — and behaves exactly as
+before. `[]` is a real answer: they consent to nothing. Collapsing the two
+would have silenced every working pair the moment they upgraded, which is
+the same class of mistake as the silent-empty credentials fallback earlier
+today.
+
+**`sweep_peer` now stops dialing** for any project the peer hasn't
+consented to, and says why in terms that name the fix:
+
+```
+[lan-sweep] '3a0285ec': skipping 'nml' — ONE-SIDED SHARE. We share it
+    with them; they do not share it with us (their grants: ['baf']).
+    Not dialing. Ask them to share 'nml', or stop sharing it with them
+```
+
+That log is deliberately where the surfacing lives — Kent: *"this is
+actually where I want it."*
+
+`lan.strict_peer_acl` stays **off**; `acl-would-refuse` remains the audit
+for turning it on.
+
+## 0.55.49 — a grant is consent, so it gates both directions
+
+Reverses 0.55.48's direction split. Kent: *"per-peer ACL means that fetch
+AND push would be refused, which is correct."* He's right, and my
+reasoning was backwards.
+
+**A grant is per-project consent to collaborate with that peer** — not
+merely a serving permission. Accepting an unsolicited push means taking
+someone's commits into our project, which needs the same agreement as
+handing ours out. I had treated "this would break inbound delivery" as a
+cost to avoid; in a non-consented pair that refusal is the **correct
+outcome**, and the asymmetry is a configuration error to surface rather
+than route around.
+
+It was also useless in practice: `_push_to_peer` pushes anyway when its
+peek fails (*"Couldn't ls-remote; proceed with the push attempt anyway"*),
+so gating only the fetch leaves the push knocking. Gate both or gate
+neither.
+
+Direction is still detected, but only to make the logs specific —
+`reject 'nml' (inbound push) from '8f19208f'` and
+`acl-would-refuse … dir=inbound-push` — so the audit distinguishes a peer
+that wants our data from one trying to give us theirs.
+
+`lan.strict_peer_acl` remains **default off** pending an `acl-would-refuse`
+sweep.
+
+**Still the real gap: `hello` carries no share manifest.** Peers greet
+successfully and only discover per-project disagreement later, implicitly,
+via git-route refusals that carry no reason — so neither side can tell
+"not shared with you" from "don't have it" from "transient". Kent: *"can we
+greet each other as peers, then only later discover that we don't share x
+project?"* Yes, and that's the bug. Making the agreement explicit at hello
+time — and having the asker stop dialing and surface it — is the next
+change-set.
+
+## 0.55.48 — serving and accepting are different questions
+
+Working out how to make the ACL strict surfaced a conflation that would
+have made strict mode actively harmful.
+
+**A share grant says what we will HAND OUT. It says nothing about whose
+data we will TAKE.** `open_repository` gated both directions identically,
+so strict per-peer enforcement would have refused a peer *pushing to us* —
+breaking inbound delivery, the opposite of the intent. And that is not
+hypothetical: the desktop dials the phone for `nml` because **the
+desktop** grants `nml` to the phone (`sweep_peer` iterates *our* grants),
+so its peek is the pre-flight of a delivery. Strict mode would have killed
+exactly the traffic Kent wants.
+
+- **Direction is now detected** in the middleware (`git-receive-pack` in
+  path or query ⇒ inbound) and stashed alongside the caller identity.
+- **Inbound is not gated by our grants.** Pairing plus having the project
+  is the gate; the well-guarded post-receive reset decides what reaches
+  the working tree.
+- **Outbound (`upload-pack`) is per-peer when `lan.strict_peer_acl` is
+  on** — **default off**, because there is direct field evidence of at
+  least one pair currently relying on the union, and flipping it
+  mid-session would silently orphan them.
+
+**The audit that unblocks turning it on.** The permissive path now
+distinguishes its two reasons rather than logging one vague line:
+
+- `[data-quality] acl-would-refuse langcode='nml' peer='8f19208f' (their
+  grants: []) — served under the union; STRICT MODE WOULD REFUSE THIS.
+  Grant the project to that peer before enabling lan.strict_peer_acl`
+- `[data-quality] acl-fallback-union … caller not identifiable by
+  address, so per-peer enforcement is impossible for this request`
+
+The first names the pairs to fix; the second names requests where identity
+is unavailable at all. Empty of both ⇒ strict is safe to enable.
+
+## 0.55.47 — per-peer ACL, and stop serving projects we don't have
+
+Two gates where there was one, in the order Kent set: *"if we don't have
+the project, we should clear it"* first, then *"is it shared with this
+peer"*.
+
+**Gate 1 — presence.** The phone served `GET /en.git/info/refs` on repeat
+for a project whose `working_dir` was gone: a stale grant in some peer's
+share list authorised it, the filesystem then refused, and nothing pruned
+the grant, so it recurred forever. Presence is now checked **before**
+authorisation, because a grant for something we don't have is meaningless
+and this is the only place that sees the evidence.
+
+Four states, and only one is self-cleaned:
+
+| state | action |
+|---|---|
+| `present` (dir + `.git`) | serve |
+| `ghost` (registered, dir **gone**) | refuse **and prune the grants** |
+| `materializing` (dir, no `.git` yet) | refuse, grants intact — Kent's clone-in-flight exception |
+| `unregistered` | refuse, grants intact — may be an accepted share whose clone hasn't started |
+
+Pruning is **local only**, per Kent: *"we don't need to keep everyone up
+to date on our projects."* We stop serving it; whether the peer keeps
+asking is its own business.
+
+**Gate 2 — per-peer instead of union.** Confirmed in the field: the phone
+served `nml` to the desktop **22 times in 15 minutes** while its own peer
+screen read "no projects shared" for that desktop. Both displays were
+honest — the ACL simply never consulted the requester, so sharing one
+project with one peer made it fetchable by *every* paired peer, with
+nothing on screen to warn you.
+
+The git routes carry no identity (no body, TLS is `CERT_NONE`), which is
+why it was a union. Best available identity is the source address matched
+against known endpoints — the same heuristic reverse delivery uses,
+stashed into a thread-local by `_peer_acl_middleware` since
+`open_repository` has no `environ`. Spoofable on a hostile LAN; strictly
+better than authorising every caller identically.
+
+**Unidentified callers fall back to the union rather than being refused.**
+Deliberate: a peer on a new subnet or behind NAT has an address we don't
+know yet, and refusing it would break working pairs the moment this ships.
+Each fallback logs `[data-quality] acl-fallback-union` — and that log is
+the audit needed before making per-peer strict.
+
+## 0.55.46 — stop warning that the name is missing while it's loading
+
+Kent, twice: *"I lost my name again."* Both times the log said otherwise —
+`contributor rendered: set 10 chars, widget now holds 10 chars` — and the
+second time he confirmed it: *"Ah, it did arrive, finally. So maybe the
+regression from just now is only a timing thing."* It was.
+
+`_focus_contributor_if_unset()` ran from `on_enter`, but since 0.55.25 the
+contributor arrives **asynchronously**. So the guard tested a field that
+was empty only because the RPC hadn't landed: it stole focus, raised the
+keyboard, and printed red *"Required: your name is used to label your work
+… Sync refuses until this is set"* — and then the name appeared underneath
+it, with nothing to clear the warning, since only
+`_save_contributor_done` ever did.
+
+- **The test moved to `_apply_credentials_state`**, after the daemon has
+  actually said whether a name is set. No more prompting about a value in
+  flight.
+- **A rendered non-empty name clears the stale warning and releases
+  focus**, so the keyboard drops instead of hovering over a filled field.
+- Docstring now states the precondition: call only once the daemon has
+  answered, never from `on_enter`.
+
+Worth recording why this rated a fix rather than a backlog line: the bug
+produced no data loss at all, but it *claimed* to, and that claim cost
+several hours of hunting a phantom — including 0.55.33's config-hardening,
+written to explain a loss that never happened. **A false alarm about data
+loss is more expensive than a missing prompt.**
+
+## 0.55.45 — a device that is behind can now catch itself up
+
+Kent grepped this pair repeating every few minutes for 35+ minutes, SHAs
+never moving:
+
+```
+[lan-push] '3a0285ec': peer at '42d897225465' is NOT ancestor of local
+           '5358186ca759' — would be force-overwrite; routing through merge
+[lan-merge] '3a0285ec': peer 42d897225465 contains local 5358186ca759
+            — we are behind; no merge, peer receive-pack will catch us up
+```
+
+Both lines are consistent — the peer's head isn't an ancestor of ours
+*because it's a descendant*. We were strictly behind, declined to act, and
+logged "convergence is reached; report success". It was not reached: the
+event we deferred to was not arriving.
+
+**The underlying gap: LAN sync is push-only, so a device that discovers it
+is behind has no way to catch itself up.** It can only wait to be pushed
+to, and when the reverse direction doesn't work — the one-way reachability
+that dominates this rig — it waits indefinitely while its board reads "to
+merge".
+
+And the deferral was unnecessary. Since 0.55.24 the fetch happens *before*
+the ancestry check, so **the peer's objects are already in our store**.
+Nothing needs downloading and nothing needs merging: it is a
+fast-forward, with no conflict surface.
+
+- **We now take the FF ourselves**, then sync the working tree through
+  `_reset_working_tree_after_receive` — the *same* guarded function the
+  receive path uses, which answers the original "less-guarded path"
+  objection rather than working around it.
+- **Safe because the branch is inside `if not snapshot:`** — the working
+  tree is clean, so the reset destroys no uncommitted work. That
+  precondition is what makes this sound here and would not have made a
+  general merge sound.
+- **`set_if_equals`, not a blind write.** If a concurrent commit advanced
+  us between the ancestry check and the update, the CAS fails and we log
+  "our ref moved under us — no FF this pass" rather than clobbering it.
+  Detached HEAD is handled with the same discipline.
+- Coverage is recorded at the new head, and a failed post-FF reset leaves
+  the refs advanced with the reset queue to absorb it.
+
 ## 0.55.44 — every drain log line now names its network
 
 Kent 2026-07-28: *"it would help me for log lines like 'drain suppressed'

@@ -1293,8 +1293,38 @@ def _drain_pending_push(ignore_backoff=False):
     except Exception as ex:
         print(f'[scheduler] work_offline check raised: {ex!r} — '
               f'proceeding with WAN drain', file=sys.stderr, flush=True)
-    print(f'[scheduler] WAN drain: pushing to github {candidates!r}',
-          file=sys.stderr, flush=True)
+    # Drop projects whose working tree is GONE (0.55.58). A registry
+    # entry with no directory can never push, but it stays flagged
+    # ``pending_push`` forever and is reconsidered every tick — field
+    # 2026-07-28: 'en' at **178 consecutive failures**, parked 22 h out,
+    # still enumerated every 15 s. Same ghost class the listener learned
+    # to refuse in 0.55.47; the drain never did.
+    alive = []
+    for _lang in candidates:
+        try:
+            _p = projects.get(_lang)
+            _wd = (getattr(_p, 'working_dir', '') or '') if _p else ''
+        except Exception:
+            _wd = ''
+        if _wd and os.path.isdir(_wd):
+            alive.append(_lang)
+            continue
+        if _lang not in _ghost_drain_logged:
+            _ghost_drain_logged.add(_lang)
+            print(f'[data-quality] drain-ghost langcode={_lang!r} — '
+                  f'flagged pending_push but its working tree is gone, '
+                  f'so it can never push. Excluding from the WAN drain; '
+                  f'"Remove from device" will clear the entry',
+                  file=sys.stderr, flush=True)
+    candidates = alive
+    if not candidates:
+        return
+    # NOTE: no "pushing" line here (0.55.58). This point is BEFORE the
+    # per-project ``wan_backoff.is_due`` check, so announcing a push here
+    # was a claim the code hadn't earned — with the skip line
+    # rate-limited, a project parked for 22 h produced
+    # "WAN drain: pushing to github ['en']" every 15 s forever. The
+    # attempt is announced inside the loop, once it is actually happening.
     for langcode in candidates:
         p = projects.get(langcode)
         if p is None:
@@ -1327,6 +1357,11 @@ def _drain_pending_push(ignore_backoff=False):
             # user gesture routes AUTH_REQUIRED. Don't advance the
             # backoff curve: nothing failed network-wise.
             continue
+        # NOW it's true (0.55.58): due (or escalating), credentials in
+        # hand, about to hit the network.
+        print(f'[scheduler] WAN drain: pushing {langcode!r} to github'
+              + (' (run-to-completion)' if escalate else ''),
+              file=sys.stderr, flush=True)
         if escalate:
             _run_to_completion(langcode, p, git_user, token)
             continue
@@ -1435,6 +1470,9 @@ _ACCESS_REPROBE_CODES = (
 # the expensive push — but not every 30 s tick. Once every 5 min per
 # blocked project is plenty to self-heal within minutes of an out-of-band
 # grant, at negligible cost.
+# Langcodes already reported as drain ghosts (0.55.58) — log once, not
+# every tick.
+_ghost_drain_logged = set()
 _ACCESS_REPROBE_MIN_INTERVAL_S = 300.0
 _access_reprobe_last = {}   # langcode -> monotonic time of last probe
 # Rate limit for the work_offline suppression notice (0.55.44). The

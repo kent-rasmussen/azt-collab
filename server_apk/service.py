@@ -34,6 +34,54 @@ import sys
 import time
 
 
+def _ensure_kivy_icon_dir_writable():
+    """Move an unwritable ``$KIVY_HOME/icon`` aside before Kivy is
+    imported (0.55.59). **Cosmetic — not a crash fix.**
+
+    ``kivy/__init__.py`` copies its icon set into ``KIVY_HOME`` at import
+    time. Field 2026-07-28, after a day of repeated APK extracts:
+
+        [ERROR  ] Error when copying logo directory
+        shutil.Error: [(… kivy/data/logo/kivy-icon-128.png,
+            …/files/app/.kivy/icon/kivy-icon-128.png,
+            "[Errno 13] Permission denied: …/.kivy/icon")]
+
+    **Kivy catches this and carries on** — the same boot reached
+    ``Start application main loop`` normally. I first read the traceback
+    as fatal; it isn't. All this does is remove a ten-line traceback that
+    otherwise appears on every launch and looks like a real fault when
+    you're scanning a log for one.
+
+    Scoped to the ``icon`` subdirectory ONLY. ``.kivy`` also holds
+    ``logs/``, which is writable and is where Kivy's own log lands — a
+    guard that renamed all of ``.kivy`` would throw those away to fix
+    cosmetics. Renamed rather than deleted so the bad state stays
+    inspectable if this recurs.
+
+    Must stay at the top of this module, with no Kivy-touching import
+    above it."""
+    try:
+        home = (os.environ.get('KIVY_HOME')
+                or os.path.join(os.getcwd(), '.kivy'))
+        icon_dir = os.path.join(home, 'icon')
+        if not os.path.exists(icon_dir):
+            return                      # Kivy will create it
+        if os.access(icon_dir, os.W_OK | os.X_OK):
+            return                      # fine
+        aside = f'{icon_dir}.broken.{int(time.time())}'
+        os.rename(icon_dir, aside)
+        print(f'[server_apk] {icon_dir!r} was not writable — moved to '
+              f'{aside!r} so Kivy can rebuild it (icon cache only; '
+              f'logs/ untouched)', flush=True)
+    except Exception as ex:
+        # Never let a cosmetic guard be what kills startup.
+        print(f'[server_apk] kivy icon-dir check skipped: {ex!r}',
+              flush=True)
+
+
+_ensure_kivy_icon_dir_writable()
+
+
 # ── File-based boot diagnostic ──────────────────────────────────────────────
 #
 # logcat is unreachable from this point in service.py module load:

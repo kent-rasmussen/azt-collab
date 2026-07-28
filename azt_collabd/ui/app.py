@@ -1183,7 +1183,15 @@ class SettingsScreen(Screen):
             self._start_cawl_cache_poll()
             self._start_peer_sync_poll()
             self._set_tether_button_label()
-            self._focus_contributor_if_unset()
+            # NOT here any more (0.55.46). ``refresh()`` fetches the
+            # contributor asynchronously since 0.55.25, so testing
+            # emptiness on screen entry tests a field that is empty only
+            # because the answer hasn't landed — it grabbed focus, raised
+            # the keyboard and printed a red "Required:" warning over a
+            # name that appeared a moment later. Kent read that as having
+            # lost his name, twice. The test now runs from
+            # ``_apply_credentials_state``, once the daemon has actually
+            # said whether it is set.
         Clock.schedule_once(_ready, 0)
 
     def on_leave(self):
@@ -2095,6 +2103,27 @@ class SettingsScreen(Screen):
                   f'{len(contrib_input.text or "")} chars, '
                   f'focus={contrib_input.focus}',
                   file=sys.stderr, flush=True)
+            # Now that the daemon has answered, run — or undo — the
+            # "you must set a name" prompt (0.55.46).
+            if _incoming.strip():
+                # A name IS set. Clear any stale warning and release the
+                # focus the old on_enter guard may have taken, so the
+                # keyboard drops instead of hovering over a filled
+                # field. Only `_save_contributor_done` used to clear
+                # this message, so a warning raised before the value
+                # arrived stayed up indefinitely.
+                _msg = self.ids.get('contributor_msg')
+                if _msg is not None and (_msg.text or '').strip():
+                    _msg.text = ''
+                    print('[settings] cleared stale "name required" '
+                          'warning — a name is set',
+                          file=sys.stderr, flush=True)
+                if contrib_input.focus:
+                    contrib_input.focus = False
+            else:
+                # Genuinely unset per the daemon — NOW it's honest to
+                # prompt.
+                self._focus_contributor_if_unset()
         else:
             print(f'[settings] contributor render SKIPPED: user is '
                   f'editing (focus={contrib_input.focus}, '
@@ -3575,12 +3604,21 @@ class SettingsScreen(Screen):
         return project
 
     def _focus_contributor_if_unset(self):
-        """On screen entry, if the contributor name is empty, focus
-        the input and surface an inline reason. Avoids the peer-side
-        ``S.CONTRIBUTOR_UNSET`` toast getting blown away by the
-        screen transition before the user can read it — the field
-        coming up with the keyboard active makes the missing-value
-        story obvious without an overlay.
+        """If the contributor name is empty, focus the input and surface
+        an inline reason. Avoids the peer-side ``S.CONTRIBUTOR_UNSET``
+        toast getting blown away by the screen transition before the
+        user can read it — the field coming up with the keyboard active
+        makes the missing-value story obvious without an overlay.
+
+        **Call only AFTER the daemon has answered** (0.55.46) — i.e.
+        from ``_apply_credentials_state``, never from ``on_enter``.
+        Since 0.55.25 the contributor arrives asynchronously, so an
+        on-entry check tests a field that is empty merely because the
+        RPC hasn't landed: it raised a red "Required:" warning over a
+        name that appeared moments later, and only
+        ``_save_contributor_done`` ever cleared it. Kent read that as
+        lost credentials on two separate occasions — an alarm about data
+        loss is far more expensive than a missing prompt.
 
         Defensive: silent on missing widget (UI not yet built), and
         only takes focus if the field is empty AND not already

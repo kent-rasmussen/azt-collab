@@ -185,6 +185,45 @@ symptom-hider and raising it would hide more.
 Open question if it recurs after that: make the hold *adaptive*
 (release on first successful paint) rather than tuning 45 s.
 
+### 3. PAPERCUT: empty-name guard fires before the name arrives (2026-07-28)
+
+Kent, with a screenshot of the **desktop** settings window — so this is
+the shared `ui/app.py` path, not Android-only:
+
+> *"papercut on open, the guard on empty name comes up (red scary text,
+> keyboard and all), THEN the name is filled in, with the scary text still
+> there, waiting for the user to press enter. This is a regression; the
+> field should be populated BEFORE the test."*
+
+End state in the screenshot: `contributor_input` correctly reads
+`Kent Rasmussen (desktop A+Z-T Collab)` with the red *"Required: your name
+is used to label your work… Sync refuses until this is set."* still
+beneath it. The warning is stale the moment the field fills.
+
+**Cause — a 0.55.25 regression, mine.** Moving `get_credentials_status()`
+off the UI thread made the contributor arrive **asynchronously**
+(`_fetch_creds_and_online` → `_apply_credentials_state`), while
+`_focus_contributor_if_empty` still runs **synchronously** on screen
+entry. The guard therefore evaluates a field that is empty only because
+the answer hasn't landed yet: it takes focus, raises the keyboard, prints
+the warning — then the RPC lands and fills the field, and nothing clears
+the warning.
+
+Two fixes, both small:
+
+1. **Don't test until the daemon has answered** — defer
+   `_focus_contributor_if_empty` until the first
+   `_apply_credentials_state` with `unreachable=False`. Correct ordering,
+   and it also stops the keyboard popping on a field that was never empty.
+2. **Clear the warning when the field populates** — in
+   `_apply_credentials_state`, blank `contributor_msg` and drop focus
+   whenever a non-empty contributor is rendered. Cheaper, but still
+   flashes red on every open.
+
+Prefer (1) with (2) as belt-and-braces: (1) alone still leaves the message
+up if the daemon genuinely answers "unset" and the user then types a name,
+since only `_save_contributor_done` currently clears it.
+
 ### 2. Swipe-up during load activates "Connect to GitHub"
 
 The primary-action button is bound on **`touch_down`**, on purpose —

@@ -36,6 +36,28 @@ runs ``reconcile_on_startup()`` to mark in-flight scheduler jobs as
 
 import os
 import sys
+import time
+
+# Cosmetic: keep Kivy's import-time icon copy from printing a ten-line
+# traceback on every launch (0.55.59). Mirrors
+# `service.py:_ensure_kivy_icon_dir_writable` — duplicated rather than
+# imported because importing service.py would run its whole module body,
+# starting a second daemon. Read that docstring for the field evidence
+# and for why this is NOT a crash fix: Kivy catches the error and boots
+# fine. Must stay above any Kivy-touching import.
+try:
+    _kh = (os.environ.get('KIVY_HOME')
+           or os.path.join(os.getcwd(), '.kivy'))
+    _ki = os.path.join(_kh, 'icon')
+    if os.path.exists(_ki) and not os.access(_ki, os.W_OK | os.X_OK):
+        _aside = f'{_ki}.broken.{int(time.time())}'
+        os.rename(_ki, _aside)
+        print(f'[server_apk] {_ki!r} was not writable — moved to '
+              f'{_aside!r} so Kivy can rebuild it (icon cache only)',
+              flush=True)
+except Exception as _ex:
+    print(f'[server_apk] kivy icon-dir check skipped: {_ex!r}',
+          flush=True)
 
 # When packaged with buildozer the resulting APK bundles azt_collabd
 # and azt_collab_client as top-level packages (symlinked in from the

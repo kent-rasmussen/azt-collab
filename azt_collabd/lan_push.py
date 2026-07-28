@@ -201,13 +201,104 @@ def _pinned_pool_manager(ctx, expected_fp, connect, read):
     )
 
 
+_push_inflight = set()           # {(peer_id, langcode)} being pushed
+_push_inflight_lock = threading.Lock()
+
+
+def _their_shared_projects(pid, peer_entry=None):
+    """What the peer told us THEY share with us, from the hello manifest
+    (0.55.50).
+
+    Returns a list — **including an empty one, which is an answer** — or
+    ``None`` when they have never told us (pre-0.55.50 peer, or no hello
+    yet). Callers must distinguish those: ``None`` means "no information",
+    not "shares nothing".
+
+    Prefers the entry already in hand; falls back to a registry lookup.
+    There is no getter in ``peers`` — only ``set_their_shared_projects``
+    — so this reads the field the way ``sweep_peer`` does rather than
+    inventing an accessor."""
+    if isinstance(peer_entry, dict):
+        v = peer_entry.get('their_shared_projects')
+        if isinstance(v, list):
+            return v
+    if not pid:
+        return None
+    try:
+        for e in (_peers.list_peers() or []):
+            if str(e.get('peer_id', '')) == str(pid):
+                v = e.get('their_shared_projects')
+                return v if isinstance(v, list) else None
+    except Exception:
+        return None
+    return None
+
+
 def _push_to_peer(project, peer_entry):
     """Single push attempt against one paired peer. Returns
     ``True`` on success, ``False`` on any failure. Logs detail
-    rather than raising."""
+    rather than raising.
+
+    **One attempt per (peer, project) at a time (0.55.55).** Several
+    triggers fire independently — mDNS arrival sweep, listener-bind
+    sweep, reverse delivery, fan-out, the burst — and nothing stopped
+    them running the same push concurrently. 0.55.52 guarded the fetch;
+    the work BEFORE it was still duplicated, and that work is not cheap.
+
+    Watchdog dump, tablet, 2026-07-28 12:56: six threads
+    (`lan-reverse-deliver` ×3, `lan-arrival-sweep` ×2,
+    `lan-bind-sweep`) all inside `_peer_is_ancestor_of_local` →
+    dulwich walk → `_lookup_in_packs` at once, with **fds=1607** (up
+    from ~280). No fd leak — that function closes its repo — but each
+    ``Repo()`` opens every pack file, so N concurrent walks multiply the
+    fd peak N-fold and duplicate the CPU exactly N times for one answer.
+
+    Keyed separately from ``_fetch_inflight`` so the nested fetch guard
+    inside ``_merge_then_push`` can't see this entry and skip itself."""
     from dulwich import porcelain
     pid = peer_entry.get('peer_id', '')
     expected_fp = peer_entry.get('fp', '')
+    _pkey = (str(pid or ''), str(getattr(project, 'langcode', '') or ''))
+    # ONE-SIDED SHARE GATE (0.55.61). Moved here from ``sweep_peer``,
+    # which was the ONLY trigger consulting the hello manifest — reverse
+    # delivery, mDNS arrival and ``lan_burst_now`` all call this function
+    # directly, so they dialed straight into a known one-sided share and
+    # ate a bare ``NotGitRepository``. Every trigger funnels through
+    # here, same reason the in-flight guard lives at this seam.
+    #
+    # Refusing to PUSH (not just fetch) is deliberate and matches the
+    # per-peer ACL: their listener requires the project be shared with us
+    # in BOTH directions, so a push into a project they don't share with
+    # us is refused on arrival. Dialing is futile, not merely impolite.
+    if _pkey[1]:
+        _theirs = _their_shared_projects(pid, peer_entry)
+        if isinstance(_theirs, list) and _pkey[1] not in _theirs:
+            print(f'[lan-push] {pid[:8]!r} {_pkey[1]!r}: ONE-SIDED '
+                  f'SHARE — we share it with them, they do not share it '
+                  f'with us (their grants: {sorted(_theirs)!r}). Not '
+                  f'dialing; their ACL would refuse this anyway. Ask '
+                  f'them to share {_pkey[1]!r}, or stop sharing it '
+                  f'with them', file=sys.stderr, flush=True)
+            return False
+    with _push_inflight_lock:
+        if _pkey in _push_inflight:
+            print(f'[lan-push] {pid[:8]!r} {_pkey[1]!r}: push already '
+                  f'in flight — skipping this trigger (duplicate work '
+                  f'for one answer)', file=sys.stderr, flush=True)
+            return False
+        _push_inflight.add(_pkey)
+    try:
+        return _push_to_peer_inner(project, peer_entry, pid, expected_fp)
+    finally:
+        with _push_inflight_lock:
+            _push_inflight.discard(_pkey)
+
+
+def _push_to_peer_inner(project, peer_entry, pid, expected_fp):
+    """Body of ``_push_to_peer``; see it for the contract and for why
+    the in-flight guard exists. Split so the guard has one release
+    point."""
+    from dulwich import porcelain
     # Fast-fail gate (0.50.49): skip the connect attempt entirely
     # if this peer was unreachable within the cooldown window.
     # Saves ~7s per attempt (3 urllib3 retries × 2.3s connect
@@ -282,7 +373,12 @@ def _push_to_peer(project, peer_entry):
         # a clear error if the push fails.
         pass
     elif local_head and pre_peer_head == local_head:
-        print(f'[lan-push] {pid[:8]!r} already at '
+        # Name the PROJECT (0.55.51). ``dialing`` says which project;
+        # the outcome lines did not, so a grep could not tell you which
+        # of a peer's projects an outcome belonged to. Kent read a
+        # diverged 'nml' and an in-sync 'baf' — same peer, 8 s apart —
+        # as a contradiction, because both lines showed only SHAs.
+        print(f'[lan-push] {pid[:8]!r} {project.langcode!r} already at '
               f'{local_head[:12]!r} — no-op',
               file=sys.stderr, flush=True)
         # The no-op confirms the peer has our SHA. Both the
@@ -347,8 +443,8 @@ def _push_to_peer(project, peer_entry):
     # level success that we shouldn't have asked for.
     if pre_peer_head and pre_peer_head != local_head:
         if not _peer_is_ancestor_of_local(project, pre_peer_head):
-            print(f'[lan-push] {pid[:8]!r}: peer at '
-                  f'{pre_peer_head[:12]!r} is NOT ancestor of '
+            print(f'[lan-push] {pid[:8]!r} {project.langcode!r}: peer '
+                  f'at {pre_peer_head[:12]!r} is NOT ancestor of '
                   f'local {local_head[:12]!r} — would be force-'
                   f'overwrite; routing through merge instead',
                   file=sys.stderr, flush=True)
@@ -415,7 +511,8 @@ def _push_to_peer(project, peer_entry):
             except Exception:
                 post_head = None
             if post_head and post_head == local_head:
-                print(f'[lan-push] {pid[:8]!r}: push errored ({cls}) '
+                print(f'[lan-push] {pid[:8]!r} {project.langcode!r}: '
+                      f'push errored ({cls}) '
                       f'but peer main is AT our head '
                       f'{local_head[:12]!r} — delivered, response '
                       f'lost; recording success',
@@ -787,14 +884,34 @@ def _peek_peer_main(url, pm, pid):
             return main.decode('ascii')
         return main
     except Exception as ex:
-        outcome = _classify_peek_failure(ex)
+        # Derive the langcode from the URL path ('/nml.git' → 'nml') so
+        # the classifier can consult the share manifest without a
+        # signature change at every call site (same trick
+        # ``_record_probe`` uses).
+        _lang = ''
+        try:
+            _tail = str(url or '').rstrip('/').rsplit('/', 1)[-1]
+            _lang = _tail[:-4] if _tail.endswith('.git') else _tail
+        except Exception:
+            _lang = ''
+        outcome = _classify_peek_failure(ex, pid=pid, langcode=_lang)
         _record_probe(url, pid, outcome, repr(ex))
+        _why = {
+            'unshared': " — they don't list it as shared with us; a "
+                        "user must grant it, retrying won't help",
+            'absent': ' — they DO list it as shared but cannot serve it '
+                      'yet (clone in flight, or a transient registry '
+                      'read); worth retrying',
+            'not_served': ' — refused, reason unknown (no share '
+                          'manifest from them yet)',
+        }.get(outcome, '')
         print(f'[lan-push] ls-remote peek failed for {pid[:8]!r} '
-              f'[{outcome}]: {ex!r}', file=sys.stderr, flush=True)
+              f'{_lang!r} [{outcome}]: {ex!r}{_why}',
+              file=sys.stderr, flush=True)
         return None
 
 
-def _classify_peek_failure(ex):
+def _classify_peek_failure(ex, pid='', langcode=''):
     """Bucket a failed peek so the board can distinguish a CONNECTIVITY
     problem from a RECIPROCATION one (0.55.20).
 
@@ -807,12 +924,43 @@ def _classify_peek_failure(ex):
     - ``timeout`` / ``no_route`` / ``refused`` — we never got an answer:
       connectivity. (``refused`` is host-up-listener-down, which is
       worth separating: the network is fine.)
-    - ``not_served`` — they ANSWERED and would not serve this project.
-      Nothing to do with the network.
-    - ``error`` — anything else; the detail string carries it."""
+    - ``unshared`` / ``absent`` / ``not_served`` — they ANSWERED and
+      would not serve this project; see below for how the three are
+      told apart.
+    - ``error`` — anything else; the detail string carries it.
+
+    **`NotGitRepository` is seven different answers (0.55.60).** Kent:
+    *"are we still reporting NGR for 'not sharing that with you'?"* We
+    were. `lan_listener.open_repository` raises that one exception for:
+    not registered, ghost directory, clone-in-flight, **peer registry
+    temporarily unreadable**, not-shared-with-this-peer, not-shared-with-
+    anyone, and repo-failed-to-open. Two of those are retryable within
+    seconds; two need a user to grant a share and will never succeed on
+    their own. Calling them all ``not_served`` asserted a cause we hadn't
+    established.
+
+    The reason cannot come over the wire: our listener raises it with a
+    useful message, but dulwich's *client* mints its own exception from
+    the HTTP failure, which is why the field log shows a bare
+    ``NotGitRepository()`` with empty args.
+
+    So disambiguate out-of-band with the hello share manifest (0.55.50),
+    which already records what each peer says it shares:
+
+    - manifest says they DON'T share it → ``unshared``. A user has to
+      grant it; dialing again changes nothing.
+    - manifest says they DO share it → ``absent``. They mean to serve it
+      but can't yet — mid-clone, or a transient registry read. Worth
+      retrying.
+    - no manifest yet → ``not_served``, the honest "they refused and we
+      don't know why.\""""
     name = type(ex).__name__
     text = f'{ex!r} {ex}'.lower()
     if 'notgitrepository' in name.lower():
+        if pid and langcode:
+            theirs = _their_shared_projects(pid)
+            if isinstance(theirs, list):
+                return ('absent' if langcode in theirs else 'unshared')
         return 'not_served'
     if 'timed out' in text or 'timeout' in text:
         return 'timeout'
@@ -907,6 +1055,10 @@ def _merge_then_push(project, url, pm, pid, host, port):
         return False
 
 
+_fetch_inflight = set()          # {(peer_id, langcode)} being fetched
+_fetch_inflight_lock = threading.Lock()
+
+
 def _fetch_peer_objects_unlocked(project, url, pm, pid):
     """Populate our object store from *pid*'s refs, holding NO lock.
 
@@ -918,7 +1070,48 @@ def _fetch_peer_objects_unlocked(project, url, pm, pid):
 
     Prefers ``HEAD`` over ``refs/heads/main`` for the same reason
     ``_peek_peer_main`` does: after a force-overwrite the peer's real
-    state lives at HEAD."""
+    state lives at HEAD.
+
+    **One fetch per (peer, project) at a time (0.55.52).** Until 0.55.24
+    this ran under ``project_lock``, which — besides protecting local
+    state — had the accidental effect of SERIALISING these fetches: one
+    merge at a time meant one pack request at a time. Hoisting the fetch
+    out of the lock fixed the freeze and removed that serialisation, so
+    every trigger (sweep, fan-out, reverse delivery, burst, scheduler)
+    began fetching simultaneously.
+
+    Field 2026-07-28: five concurrent `git-upload-pack` requests to one
+    tablet inside the same millisecond, again six inside 400 ms. It
+    answered with read timeouts, `HTTP 500`, hangups and
+    `ConnectionResetError(104)` — a tablet cannot serve six simultaneous
+    packs of a large history. Every merge failed at the fetch, so the
+    desktop's head sat unchanged for 63 minutes while the tablet's moved
+    23 times.
+
+    The lock must NOT come back (that was the 147 s stall), so the
+    serialisation gets its own guard: no lock held, network-only,
+    keyed per peer+project. A loser returns None and the caller retries
+    on its next pass — cheaper than a request the peer will drop."""
+    from dulwich.repo import Repo
+    key = (str(pid or ''), str(getattr(project, 'langcode', '') or ''))
+    with _fetch_inflight_lock:
+        if key in _fetch_inflight:
+            print(f'[lan-merge] {pid[:8]!r} '
+                  f'{key[1]!r}: fetch already in flight — skipping this '
+                  f'pass (avoids piling concurrent upload-packs on one '
+                  f'peer)', file=sys.stderr, flush=True)
+            return None
+        _fetch_inflight.add(key)
+    try:
+        return _fetch_peer_objects_inner(project, url, pm, pid)
+    finally:
+        with _fetch_inflight_lock:
+            _fetch_inflight.discard(key)
+
+
+def _fetch_peer_objects_inner(project, url, pm, pid):
+    """Body of ``_fetch_peer_objects_unlocked``; see it for contract.
+    Split so the in-flight guard has a single release point."""
     from dulwich.repo import Repo
     repo = None
     try:
@@ -1145,35 +1338,105 @@ def _merge_then_push_locked(project, url, pm, pid, host, port,
             except Exception:
                 local_in_peer = False
             if local_in_peer:
-                # Peer is strictly ahead and contains all our work.
-                # Do NOT merge and do NOT push a stale head. We are
-                # behind; the peer's own fan-out will deliver its
-                # head to us through the normal receive-pack path,
-                # which advances our working tree via the
-                # well-guarded ``_reset_working_tree_after_receive``.
-                # Advancing ourselves here would mean a hard reset in
-                # this less-guarded path — avoid it. Convergence is
-                # reached; report success.
-                print(f'[lan-merge] {pid[:8]!r}: peer '
-                      f'{peer_head[:12]!r} contains local '
-                      f'{local_head[:12]!r} — we are behind; no '
-                      f'merge, peer receive-pack will catch us up',
-                      file=sys.stderr, flush=True)
-                # Ancestry just PROVED the peer contains our head —
-                # record covered-local coverage for the walkers'
-                # unknown-peer-head fallback.
+                # Peer is strictly ahead and contains all our work:
+                # this is a FAST-FORWARD, and we take it ourselves
+                # (0.55.45).
+                #
+                # Until now we declined and waited for the peer's own
+                # fan-out to push its head to us, on the grounds that
+                # advancing here would mean a hard reset down a
+                # "less-guarded" path. Two things make that wrong:
+                #
+                # 1. **LAN sync is push-only, so a device that is
+                #    behind has no way to catch itself up.** It can
+                #    only wait to be pushed to — and when the reverse
+                #    direction doesn't work (the one-way reachability
+                #    that dominates this rig), it waits forever while
+                #    its board reads "to merge". Field 2026-07-28: the
+                #    desktop sat at 5358186c while two peers held
+                #    42d89722, rediscovering it every few minutes for
+                #    35+ minutes, logging "convergence is reached" each
+                #    time. It was not reached.
+                # 2. **We already hold their objects.** Since 0.55.24
+                #    the fetch happens before this check, so peer_head
+                #    is in our store. Nothing needs downloading and
+                #    nothing needs merging — a fast-forward has no
+                #    conflict surface at all.
+                #
+                # The "less-guarded" objection is answered by reusing
+                # the SAME function the receive path uses:
+                # ``_reset_working_tree_after_receive`` (its truncation
+                # guards, atomic-pending check, and notify). And this
+                # whole branch is inside ``if not snapshot:`` — the
+                # working tree is CLEAN — so the reset destroys no
+                # uncommitted work. That is what makes it safe here and
+                # would not have been safe in the general merge case.
+                old_head = local_head
+                ff_ref = b'refs/heads/main'
                 try:
-                    _peers.set_peer_covered_local(
-                        pid, project.langcode,
-                        local_head.decode('ascii', 'replace')
-                        if isinstance(local_head, bytes)
-                        else str(local_head))
+                    active = porcelain.active_branch(repo)
+                    if active:
+                        ff_ref = b'refs/heads/' + active
                 except Exception:
-                    pass
+                    pass    # detached HEAD → handled below
+                moved = False
+                try:
+                    # CAS, not a blind write: if a concurrent commit
+                    # advanced us between the ancestry check and here,
+                    # this fails and we leave it to the next pass
+                    # rather than clobbering that commit.
+                    moved = bool(repo.refs.set_if_equals(
+                        ff_ref, old_head, peer_head))
+                    if moved and repo.refs[b'HEAD'] != peer_head:
+                        # Detached HEAD: moving the branch didn't move
+                        # us. Move HEAD too, same CAS discipline.
+                        repo.refs.set_if_equals(
+                            b'HEAD', old_head, peer_head)
+                except Exception as ex:
+                    print(f'[lan-merge] {pid[:8]!r}: FF ref update '
+                          f'failed: {ex!r} — staying behind; next pass '
+                          f'retries', file=sys.stderr, flush=True)
+                    moved = False
                 try:
                     repo.close()
                 except Exception:
                     pass
+                if not moved:
+                    print(f'[lan-merge] {pid[:8]!r}: peer '
+                          f'{peer_head[:12]!r} contains local '
+                          f'{old_head[:12]!r} but our ref moved under '
+                          f'us — no FF this pass',
+                          file=sys.stderr, flush=True)
+                    return True
+                print(f'[lan-merge] {pid[:8]!r}: peer '
+                      f'{peer_head[:12]!r} contains local '
+                      f'{old_head[:12]!r} — we were behind; '
+                      f'fast-forwarded ourselves to '
+                      f'{peer_head[:12]!r} (no merge, clean tree)',
+                      file=sys.stderr, flush=True)
+                # Working tree + index still reflect the old head;
+                # sync them through the guarded receive-path reset.
+                # Function-local import: lan_listener imports this
+                # module, so a top-level import would be circular.
+                try:
+                    from . import lan_listener as _lan_listener
+                    _lan_listener._reset_working_tree_after_receive(
+                        project.langcode)
+                except Exception as ex:
+                    print(f'[lan-merge] {pid[:8]!r}: post-FF working '
+                          f'tree reset raised: {ex!r} — refs advanced; '
+                          f'the reset queue / next commit_project will '
+                          f'absorb it', file=sys.stderr, flush=True)
+                # We are now AT the peer's head: they hold everything
+                # we hold, and we hold everything they hold.
+                for _sha in (peer_head,):
+                    try:
+                        _peers.set_peer_covered_local(
+                            pid, project.langcode,
+                            _sha.decode('ascii', 'replace')
+                            if isinstance(_sha, bytes) else str(_sha))
+                    except Exception:
+                        pass
                 return True
             # Divergent history but IDENTICAL trees — neither head is
             # an ancestor of the other, yet their content matches. The
@@ -1384,12 +1647,30 @@ def hello_to_peer(host, port, expected_fp, device_name='',
     # actually dial — the previous guess left multi-homed hosts telling
     # a tethered phone to reach them on wifi.
     our_endpoint = _our_endpoint_for(host)
+    # Our half of the share manifest (0.55.50): the projects we grant
+    # THIS peer. Sending it here — on the one authenticated round trip
+    # both sides already make — is what stops a pair greeting
+    # successfully and only discovering a per-project disagreement much
+    # later, as a reasonless NotGitRepository from a git route.
+    #
+    # ``expected_fp`` identifies who we're talking to, but the peer_id is
+    # what keyed our grants, so resolve it by fingerprint.
+    ours_for_them = []
+    try:
+        for _p in (_peers.list_peers() or []):
+            if (_p.get('fp') or '') == expected_fp:
+                ours_for_them = sorted(_p.get('shared_projects') or [])
+                break
+    except Exception as ex:
+        print(f'[lan-hello] building our manifest raised: {ex!r}',
+              file=sys.stderr, flush=True)
     body = json.dumps({
         'peer_id': ident['peer_id'],
         'fp': ident['fp'],
         'device_name': device_name,
         'langcode': langcode,
         'endpoint': our_endpoint,
+        'shared_with_you': ours_for_them,
     }).encode('utf-8')
     url = f'https://{host}:{int(port)}/v1/lan/hello'
     try:
@@ -1415,23 +1696,37 @@ def hello_to_peer(host, port, expected_fp, device_name='',
     # fails with ``NotGitRepository``, so hand it to the caller
     # through *out* rather than leaving it in the peer's log — the
     # bool return is unchanged, since the hello itself succeeded.
-    if out is not None:
-        try:
-            import json as _json_mod
-            decoded = _json_mod.loads((resp.data or b'').decode(
-                'utf-8', 'replace') or '{}')
-            if isinstance(decoded, dict):
-                refused = str(decoded.get('share_refused', '') or '')
-                if refused:
-                    out['share_refused'] = refused
-                    out['share_refused_reason'] = str(
-                        decoded.get('share_refused_reason', '') or '')
-                    print(f'[lan-hello] {host}:{port} did NOT share '
-                          f'{refused!r} — its QR offer had lapsed',
-                          file=sys.stderr, flush=True)
-        except Exception as ex:
-            print(f'[lan-hello] response decode raised: {ex!r}',
-                  file=sys.stderr, flush=True)
+    # Decode unconditionally now (0.55.50): the reply carries THEIR half
+    # of the manifest, which must be recorded whether or not the caller
+    # passed *out*.
+    try:
+        import json as _json_mod
+        decoded = _json_mod.loads((resp.data or b'').decode(
+            'utf-8', 'replace') or '{}')
+    except Exception as ex:
+        decoded = {}
+        print(f'[lan-hello] response decode raised: {ex!r}',
+              file=sys.stderr, flush=True)
+    if isinstance(decoded, dict):
+        theirs = decoded.get('shared_with_you')
+        their_pid = str(decoded.get('peer_id', '') or '')
+        if isinstance(theirs, list) and their_pid:
+            try:
+                _peers.set_their_shared_projects(
+                    their_pid,
+                    [str(x) for x in theirs if isinstance(x, str)])
+            except Exception as ex:
+                print(f'[lan-hello] recording their manifest raised: '
+                      f'{ex!r}', file=sys.stderr, flush=True)
+        if out is not None:
+            refused = str(decoded.get('share_refused', '') or '')
+            if refused:
+                out['share_refused'] = refused
+                out['share_refused_reason'] = str(
+                    decoded.get('share_refused_reason', '') or '')
+                print(f'[lan-hello] {host}:{port} did NOT share '
+                      f'{refused!r} — its QR offer had lapsed',
+                      file=sys.stderr, flush=True)
     print(f'[lan-hello] auto-reverse-recorded on {host}:{port}',
           file=sys.stderr, flush=True)
     return True
@@ -1950,9 +2245,34 @@ def sweep_peer(peer_id, exclude_langcode=''):
         print(f'[lan-sweep] {peer_id[:8]!r} share heal raised: {ex!r}',
               file=sys.stderr, flush=True)
     shared = entry.get('shared_projects') or []
+    # What THEY consented to, learned from the hello manifest (0.55.50).
+    # ``None`` = never told (pre-0.55.50 peer, or no hello yet) → behave
+    # exactly as before. A list, INCLUDING an empty one, is an answer.
+    theirs = _their_shared_projects(peer_id, entry)
     out = {}
     for langcode in shared:
         if langcode == exclude_langcode:
+            continue
+        # STOP DIALING for a project the peer hasn't consented to
+        # (0.55.50). A grant is mutual consent to collaborate: if they
+        # don't share it with us, our pushes are refused and our peeks
+        # tell us nothing — and before the manifest existed we had no
+        # way to know, so we dialed forever. Field 2026-07-28: the
+        # desktop peeked the phone for 'nml' 22 times in 15 minutes
+        # while the phone granted it nothing.
+        #
+        # Kept after 0.55.61 moved the authoritative gate into
+        # ``_push_to_peer``: this one skips before the call so the sweep
+        # can record the per-project result and log one aggregate line,
+        # rather than every sweep emitting a refusal per project.
+        if isinstance(theirs, list) and langcode not in theirs:
+            print(f'[lan-sweep] {peer_id[:8]!r}: skipping {langcode!r} '
+                  f'— ONE-SIDED SHARE. We share it with them; they do '
+                  f'not share it with us (their grants: {theirs!r}). '
+                  f'Not dialing. Ask them to share {langcode!r}, or '
+                  f'stop sharing it with them',
+                  file=sys.stderr, flush=True)
+            out[langcode] = False
             continue
         # Stop after the FIRST project that proves the peer is
         # unreachable: every remaining project would pay the same
