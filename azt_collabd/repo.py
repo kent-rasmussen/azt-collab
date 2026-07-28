@@ -2350,6 +2350,332 @@ def diagnose_and_repair_registry_on_startup():
           f'candidates={len(candidates)} '
           f'repaired={len(repaired)} failed={len(failed)}',
           file=sys.stderr, flush=True)
+    _prune_dangling_refs_on_startup()
+
+
+def _prune_dangling_refs_on_startup():
+    """Drop refs whose target object is absent from the store (0.55.26).
+
+    Field 2026-07-27, phone ``3a0285ec``, once per served ``info/refs``:
+
+        [WARNING] ref refs/tags/main-before-itservices-merge points at
+                  non-present sha 1db02cfa4960…
+
+    A "before-merge" safety tag whose target object is gone protects
+    nothing — there is no state to recover from it — so pruning destroys
+    no recoverable data and ends a warning that fires on every fetch.
+
+    **Tags and remote-tracking refs only.** A dangling ``refs/heads/*``
+    or ``HEAD`` is a different and worse condition: that is the branch,
+    and deleting it would turn a damaged repo into an empty one. Those
+    are logged as ``[data-quality]`` for a human, never removed.
+
+    Uses ``remove_if_equals`` so a ref that moved between the check and
+    the delete is left alone, and holds ``project_lock`` briefly since it
+    mutates refs — skipping any project that is busy, because this is
+    hygiene and the next boot will get it.
+
+    Note this treats a SYMPTOM. Two distinct absent objects on that
+    device (the tag's, plus ``dcf320a895…`` surfacing as
+    ``[snapshot] status raised KeyError`` and a skipped pre-merge commit)
+    say the store is missing more than one thing; why objects go missing
+    is a separate question this does not answer."""
+    from dulwich.repo import Repo
+    from . import projects as _projects_mod
+    pruned = kept = 0
+    findings = {}
+    for p in _list_projects_safely(_projects_mod):
+        wd = (getattr(p, 'working_dir', '') or '').strip()
+        if not wd or not os.path.isdir(os.path.join(wd, '.git')):
+            continue
+        try:
+            with project_lock(wd, timeout=2.0):
+                repo = Repo(wd)
+                try:
+                    store = repo.object_store
+                    for ref, sha in list(repo.get_refs().items()):
+                        if not sha or ref.endswith(b'^{}'):
+                            continue
+                        try:
+                            if sha in store:
+                                continue
+                        except Exception:
+                            continue
+                        name = ref.decode('utf-8', 'replace')
+                        if ref.startswith(b'refs/tags/') \
+                                or ref.startswith(b'refs/remotes/'):
+                            try:
+                                repo.refs.remove_if_equals(ref, sha)
+                                pruned += 1
+                                print(f'[diag-repair] pruned dangling '
+                                      f'ref {name!r} → absent '
+                                      f'{sha[:12].decode()} in {wd!r}',
+                                      file=sys.stderr, flush=True)
+                            except Exception as ex:
+                                print(f'[diag-repair] could not prune '
+                                      f'{name!r}: {ex!r}',
+                                      file=sys.stderr, flush=True)
+                        else:
+                            kept += 1
+                            print(f'[data-quality] dangling-branch-ref '
+                                  f'ref={name!r} '
+                                  f'absent={sha[:12].decode()} '
+                                  f'dir={wd!r} — NOT removed: this is a '
+                                  f'branch, so the object store is '
+                                  f'missing history a ref still names',
+                                  file=sys.stderr, flush=True)
+                    findings[str(getattr(p, 'langcode', '') or wd)] = \
+                        _integrity_probe(repo, store)
+                finally:
+                    try:
+                        repo.close()
+                    except Exception:
+                        pass
+        except LockTimeout:
+            print(f'[diag-repair] ref prune skipped for {wd!r}: '
+                  f'project busy', file=sys.stderr, flush=True)
+        except Exception as ex:
+            print(f'[diag-repair] ref prune raised for {wd!r}: {ex!r}',
+                  file=sys.stderr, flush=True)
+    print(f'[diag-repair] dangling refs pruned={pruned} '
+          f'branch-level-kept={kept}', file=sys.stderr, flush=True)
+    _record_integrity(findings)
+
+
+def classify_missing_object(working_dir, sha_hex, commit_cap=500,
+                            entry_cap=20000):
+    """Work out WHAT an absent object is, by finding what points at it.
+
+    We cannot load the object — that's the problem — so its identity has
+    to be inferred from its referrers. That inference is what decides
+    severity and whether recovery is even possible:
+
+    - **referenced by a ref** → dangling ref (0.55.26 prunes tags /
+      remotes; a branch is reported, never removed).
+    - **a commit's parent** → a HISTORY gap. Walks break, and any peer
+      whose history includes that commit can supply it.
+    - **a commit's root tree** → the commit is present but its content
+      isn't; same recovery source.
+    - **an entry in a reachable tree** → one file's tree-or-blob. The
+      path is reported, which tells you which file's content is missing
+      and makes it obvious whether it matters.
+
+    Bounded on purpose (``commit_cap`` parents, ``entry_cap`` tree
+    entries): this runs on a device already under strain, and a partial
+    answer naming one referrer is worth as much as an exhaustive one.
+
+    Returns a dict; never raises."""
+    from dulwich.repo import Repo
+    want = sha_hex.encode('ascii') if isinstance(sha_hex, str) else sha_hex
+    out = {'object': want.decode('ascii', 'replace'), 'kind': 'unknown',
+           'referrers': [], 'paths': [], 'walked': 0, 'capped': False}
+    repo = None
+    try:
+        repo = Repo(working_dir)
+    except Exception as ex:
+        out['kind'] = f'repo-unopenable: {ex!r}'
+        return out
+    try:
+        try:
+            for ref, sha in list(repo.get_refs().items()):
+                if sha == want:
+                    out['kind'] = 'ref-target'
+                    out['referrers'].append(
+                        'ref ' + ref.decode('utf-8', 'replace'))
+        except Exception:
+            pass
+        # Commit-level: is it a parent, or a root tree?
+        try:
+            head = repo.refs[b'HEAD']
+        except Exception:
+            head = None
+        seen, queue = set(), ([head] if head else [])
+        tree_roots = []
+        while queue and out['walked'] < commit_cap:
+            sha = queue.pop(0)
+            if not sha or sha in seen:
+                continue
+            seen.add(sha)
+            out['walked'] += 1
+            try:
+                commit = repo[sha]
+            except Exception:
+                continue
+            try:
+                if want in (commit.parents or []):
+                    out['kind'] = 'commit (history gap)'
+                    out['referrers'].append(
+                        'parent-of ' + sha.decode('ascii', 'replace'))
+                if getattr(commit, 'tree', None) == want:
+                    out['kind'] = 'root-tree'
+                    out['referrers'].append(
+                        'tree-of ' + sha.decode('ascii', 'replace'))
+                queue.extend(commit.parents or [])
+                if getattr(commit, 'tree', None):
+                    tree_roots.append(commit.tree)
+            except Exception:
+                pass
+        if len(queue) and out['walked'] >= commit_cap:
+            out['capped'] = True
+        # Content-level: scan the newest reachable tree for an entry
+        # pointing at it. One tree is enough to name the path; older
+        # commits would only repeat it.
+        entries = 0
+        for root in tree_roots[:1]:
+            stack = [(root, '')]
+            while stack and entries < entry_cap:
+                tsha, prefix = stack.pop()
+                try:
+                    tree = repo[tsha]
+                except Exception:
+                    continue
+                try:
+                    items = list(tree.items())
+                except Exception:
+                    continue
+                for item in items:
+                    entries += 1
+                    name = getattr(item, 'path', b'') or b''
+                    isha = getattr(item, 'sha', b'') or b''
+                    mode = getattr(item, 'mode', 0) or 0
+                    full = (prefix + '/' if prefix else '') + \
+                        name.decode('utf-8', 'replace')
+                    if isha == want:
+                        out['kind'] = ('tree' if mode & 0o040000
+                                       else 'blob')
+                        out['paths'].append(full)
+                    elif mode & 0o040000:
+                        stack.append((isha, full))
+            if entries >= entry_cap:
+                out['capped'] = True
+        return out
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
+
+
+def _integrity_probe(repo, store):
+    """Cheap missing-object census for one open repo (0.55.27).
+
+    Two measurements, both bounded:
+
+    - ``bad_refs`` — refs whose target object is absent. O(refs), and the
+      caller has just walked them anyway.
+    - ``bad_commits`` / ``walked`` — a parent-only walk from HEAD over at
+      most ``integrity.head_walk_commits`` commits (default 200),
+      counting commit objects that cannot be loaded.
+
+    Parents only, never trees: loading trees is what makes the existing
+    3822-commit walks slow on these devices, and a missing commit is the
+    signal we're after. Deliberately a SAMPLE — the point is a number
+    comparable across boots, not a full fsck. It answers "is the set of
+    missing objects growing?", which is the question that decides whether
+    anything further is worth building."""
+    out = {'bad_refs': 0, 'bad_commits': 0, 'walked': 0, 'head': ''}
+    try:
+        for ref, sha in list(repo.get_refs().items()):
+            if not sha or ref.endswith(b'^{}'):
+                continue
+            try:
+                if sha not in store:
+                    out['bad_refs'] += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        limit = int(_settings.get('integrity.head_walk_commits', 200)
+                    or 200)
+    except Exception:
+        limit = 200
+    try:
+        head = repo.refs[b'HEAD']
+    except Exception:
+        return out
+    out['head'] = head[:12].decode('ascii', 'replace') \
+        if isinstance(head, bytes) else str(head)[:12]
+    seen, queue = set(), [head]
+    while queue and out['walked'] < limit:
+        sha = queue.pop(0)
+        if not sha or sha in seen:
+            continue
+        seen.add(sha)
+        out['walked'] += 1
+        try:
+            commit = repo[sha]
+        except Exception:
+            out['bad_commits'] += 1
+            continue
+        try:
+            queue.extend(commit.parents or [])
+        except Exception:
+            pass
+    return out
+
+
+def _record_integrity(findings):
+    """Persist this boot's census and log growth since the last one.
+
+    Growth is the whole point: a one-off (recovery residue on a single
+    device) stays flat and can be ignored; a count that climbs boot over
+    boot means objects are still going missing and the cause needs
+    finding. Written to ``$AZT_HOME/integrity.json``, tempfile +
+    ``os.replace`` so a crash mid-write can't corrupt the baseline."""
+    if not findings:
+        return
+    import json
+    import tempfile
+    try:
+        home = _azt_home()
+    except Exception:
+        return
+    path = os.path.join(home, 'integrity.json')
+    prev = {}
+    try:
+        with open(path, 'rb') as f:
+            prev = json.loads(f.read().decode('utf-8')) or {}
+    except Exception:
+        prev = {}
+    prev_p = prev.get('projects') or {}
+    boots = int(prev.get('boots', 0) or 0) + 1
+    for lang, cur in sorted(findings.items()):
+        old = prev_p.get(lang) or {}
+        d_refs = cur['bad_refs'] - int(old.get('bad_refs', 0) or 0)
+        d_commits = (cur['bad_commits']
+                     - int(old.get('bad_commits', 0) or 0))
+        if cur['bad_refs'] or cur['bad_commits']:
+            print(f'[data-quality] integrity langcode={lang!r} '
+                  f'bad_refs={cur["bad_refs"]} '
+                  f'bad_commits={cur["bad_commits"]}/'
+                  f'{cur["walked"]} walked head={cur["head"]} '
+                  f'(since last boot: refs{d_refs:+d} '
+                  f'commits{d_commits:+d})',
+                  file=sys.stderr, flush=True)
+        if old and (d_refs > 0 or d_commits > 0):
+            print(f'[data-quality] integrity-GROWING langcode={lang!r} '
+                  f'refs{d_refs:+d} commits{d_commits:+d} over '
+                  f'{boots} boot(s) — objects are still going missing; '
+                  f'this is not stale recovery residue',
+                  file=sys.stderr, flush=True)
+    payload = json.dumps({'boots': boots, 'projects': findings},
+                         indent=2, sort_keys=True).encode('utf-8')
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='.integrity.', suffix='.tmp',
+                                  dir=home)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(payload)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except Exception as ex:
+        print(f'[diag-repair] integrity.json write failed: {ex!r}',
+              file=sys.stderr, flush=True)
 
 
 def _list_projects_safely(projects_mod):
@@ -3142,6 +3468,7 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
     # phone showing "up to date" with a fresh stamp beside a tablet
     # showing "392 to send" — the phone had confirmed its own delivery
     # and never peeked the tablet's main.
+    _probe = (peer_entry.get('probe') or {}).get(langcode) or {}
     incoming = False
     incoming_held = False
     incoming_known = bool(main_hex)
@@ -3184,12 +3511,29 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         # post-0.54.70 observation.
         'observed_at': (peer_entry.get('project_seen_at')
                         or {}).get(langcode, '') or '',
+        # Why the last reach ATTEMPT didn't become an observation
+        # (0.55.20). 'ok' when the last peek succeeded. Anything else
+        # tells the user WHICH problem they have: timeout / no_route /
+        # refused are connectivity, not_served means the peer answered
+        # and declined to serve this project. Never advances
+        # ``observed_at`` — an attempt is not an observation.
+        'probe_outcome': (_probe or {}).get('outcome', '') or '',
+        'probe_at': (_probe or {}).get('at', '') or '',
     }
 
 
 _peer_sync_cache = {'rows': [], 'computed_at': 0.0, 'dirty': True}
 _PEER_SYNC_MIN_RECOMPUTE_S = 5.0    # don't re-walk more often than this
 _PEER_SYNC_MAX_STALE_S = 30.0       # re-walk at least this often (safety)
+# Single-flight gate (0.55.19). The cache alone does not stop CONCURRENT
+# recomputes: several ContentProvider dispatch threads can each find the
+# rows stale at the same instant and each start the full git walk.
+# Watchdog stack dump 2026-07-27 14:30 caught FIVE threads simultaneously
+# in _compute_peer_sync_rows → _is_ancestor → dulwich unpack_object, all
+# on one Android CPU, while the watcher loop it was starving sat 120 s
+# behind. Held non-blocking on purpose: a poller that loses the race
+# serves the slightly-stale rows rather than queueing behind a walk.
+_peer_sync_lock = threading.Lock()
 
 
 def invalidate_peer_sync():
@@ -3212,14 +3556,28 @@ def lan_peer_sync_rows(count_limit=100000):
     that ANR'd the daemon; and it matches the 'changes arrive with the
     changes' model — the walk is event-driven, not clock-driven)."""
     import time
-    now = time.time()
     st = _peer_sync_cache
-    age = now - st['computed_at']
-    if (st['dirty'] and age >= _PEER_SYNC_MIN_RECOMPUTE_S) \
-            or age >= _PEER_SYNC_MAX_STALE_S:
-        st['rows'] = _compute_peer_sync_rows(count_limit)
-        st['computed_at'] = now
-        st['dirty'] = False
+
+    def _due(at_time):
+        age = at_time - st['computed_at']
+        return ((st['dirty'] and age >= _PEER_SYNC_MIN_RECOMPUTE_S)
+                or age >= _PEER_SYNC_MAX_STALE_S)
+
+    if not _due(time.time()):
+        return list(st['rows'])
+    # Single-flight: whoever gets the lock walks; everyone else serves
+    # the cached rows immediately. Non-blocking so a UI poll can never
+    # queue behind a git walk (0.55.19).
+    if not _peer_sync_lock.acquire(blocking=False):
+        return list(st['rows'])
+    try:
+        now = time.time()
+        if _due(now):        # re-check: the winner may have just landed
+            st['rows'] = _compute_peer_sync_rows(count_limit)
+            st['computed_at'] = now
+            st['dirty'] = False
+    finally:
+        _peer_sync_lock.release()
     return list(st['rows'])
 
 

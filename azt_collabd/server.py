@@ -383,7 +383,34 @@ def _health_liveness():
 
 
 def _h_online(_body):
-    return 200, {"ok": True, "online": _has_internet()}
+    """Serve the watcher's CACHED connectivity observation (0.55.23).
+
+    Was a live ``_has_internet()`` probe on every call — which
+    ``is_online_cached``'s own docstring prices at "3–6 s TCP-timeout
+    cost on offline networks". Running with no upstream is a SUPPORTED
+    operating state for this suite, not a degraded one (Kent 2026-07-27:
+    *"we should work with or without this just fine"*), so the offline
+    answer has to be the cheap one. It was the expensive one, on every
+    poll, forever — and since the settings screen asks on the UI thread,
+    that landed directly on the frame.
+
+    The cache is what the scheduler's own push-gating already trusts, and
+    it's refreshed every ``sync.connectivity_poll_s`` (default 30 s). A
+    connectivity verdict up to 30 s old is strictly better than one that
+    costs 6 s to obtain and is stale the moment it arrives.
+
+    Falls back to one live probe only when the watcher has never
+    populated the cache (``None``) — first call after a cold start."""
+    cached = None
+    try:
+        from . import scheduler as _sched
+        cached = _sched.is_online_cached()
+    except Exception:
+        cached = None
+    if cached is None:
+        return 200, {"ok": True, "online": _has_internet(),
+                     "source": "probe"}
+    return 200, {"ok": True, "online": bool(cached), "source": "cache"}
 
 
 def _h_credentials_status(_body):
@@ -5096,6 +5123,23 @@ def _build_diagnostic_snapshot():
             f'config.lan.allow_sync: {_settings.lan_allow_sync()}')
     except Exception as ex:
         lines.append(f'config.lan.allow_sync: <error: {ex!r}>')
+
+    # Contributor VALUE, not just presence (0.55.32 reported length only;
+    # 0.55.34 prints it). Kent 2026-07-27: *"each do, each with their own
+    # number of characters (obfuscation?)"* — the length-only form cost a
+    # round-trip and answered nothing, because the question was whether
+    # the stored value is the user's actual name or junk. There is no
+    # confidentiality to protect: the contributor is broadcast in the
+    # clear in every mDNS TXT record and stamped on every git commit, so
+    # masking it in a LOCAL diagnostic was theatre.
+    try:
+        _contrib = store.get_contributor() or ''
+        lines.append(
+            f'config.collab.contributor: '
+            f'{_contrib!r}' if _contrib.strip() else
+            'config.collab.contributor: <UNSET>')
+    except Exception as ex:
+        lines.append(f'config.collab.contributor: <error: {ex!r}>')
 
     try:
         info = _peer_id.ensure()

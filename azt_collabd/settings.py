@@ -34,9 +34,11 @@ Env-var overrides take precedence at startup:
     AZT_SYNC_PUSH_BUDGET_S
 """
 
+import contextlib
 import json
 import os
 import threading
+import time as _time
 
 from .paths import azt_home
 
@@ -135,22 +137,35 @@ def _save_raw(data):
     interrupted write (APK update kill, OOM) never leaves a truncated
     config.json that the next boot reads as ``{}`` and resolves every
     key to its default."""
+    with _lock:
+        _save_raw_locked(data)
+
+
+def _save_raw_locked(data):
+    """``_save_raw`` body, assuming ``_lock`` is already held.
+
+    Split out for ``update()`` (0.55.33), which must hold the lock across
+    read + mutate + write; calling ``_save_raw`` from inside that span
+    would deadlock on a non-reentrant ``Lock``.
+
+    Per-pid temp name: two processes never share a temp path, and within
+    a process the lock serializes, so a partially-written temp can never
+    be published by another writer."""
     p = _path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
     tmp = f'{p}.tmp.{os.getpid()}'
-    with _lock:
-        with open(tmp, 'w') as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                # Some filesystems (notably tmpfs on older Android)
-                # reject fsync. Atomic-replace still works there;
-                # we just lose the durability guarantee on power
-                # loss, which is the smaller of the two risks.
-                pass
-        os.replace(tmp, p)
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Some filesystems (notably tmpfs on older Android)
+            # reject fsync. Atomic-replace still works there;
+            # we just lose the durability guarantee on power
+            # loss, which is the smaller of the two risks.
+            pass
+    os.replace(tmp, p)
 
 
 def get(key, default=None):
@@ -174,19 +189,116 @@ def get(key, default=None):
     return _DEFAULTS.get(key, default)
 
 
+def update(mutate, what='update'):
+    """**The** serialized read-modify-write for config.json (0.55.33).
+
+    Holds ``_lock`` across read + mutate + write. That span is the whole
+    point: ``_save_raw`` already took the lock for the write alone, but
+    every caller did its READ outside it, so two setters could each read
+    the file, each change their own key, and each write the whole dict —
+    the second one silently dropping the first one's change. A plain lost
+    update; no corruption required.
+
+    Field 2026-07-27: Kent's contributor name vanished on five devices
+    and would not stay saved. He'd type it (``store.set_contributor``
+    → read, set, write) while ``iface-watch`` applied the LAN toggle
+    (``settings.set_lan_allow_sync`` → read, set, write) from a snapshot
+    taken before his save. Whichever wrote last won, and the loser's key
+    was gone. It also explains why ``lan.allow_sync`` always looked fine:
+    the toggle rewrites its own key constantly, while nothing rewrites a
+    person's name.
+
+    ``store.py`` writes the same file (``collab.contributor``,
+    ``device_name``, CAWL prefs) and had its own separate lock, which is
+    no lock at all for this purpose — two locks guarding one file
+    serialize nothing. It now delegates here, so there is exactly one
+    mutex and one write path.
+
+    Refuses on an unreadable config rather than rebuilding it from
+    defaults, preserving the pre-existing ``_LoadFailed`` contract.
+    Returns True if written."""
+    with _lock, _config_file_lock():
+        data = _load_raw()
+        if isinstance(data, _LoadFailed):
+            print(f'[collab.settings] refusing {what}: config.json is '
+                  f'unreadable ({data.error!r}). Repair or remove it '
+                  f'and retry.', flush=True)
+            return False
+        mutate(data)
+        _save_raw_locked(data)
+        return True
+
+
+@contextlib.contextmanager
+def _config_file_lock(timeout=5.0):
+    """``flock`` around config.json's read-modify-write — CROSS-PROCESS
+    (0.55.33).
+
+    A ``threading.Lock`` is not enough here, and that isn't theoretical.
+    Kent 2026-07-27: *"four android devices lost this field at the same
+    time, immediately after an update."* Four devices simultaneously is
+    not a race being lost by chance; it is something an update does every
+    time.
+
+    On startup **two processes** write this file: the picker Activity's
+    jnius prewarm (``server_apk/main.py`` step 2a calls
+    ``store.get_device_name()``, which its own comment notes "caches
+    device_name in config.json") and ``:provider``'s own boot. Each does
+    read-modify-write. A thread lock in one process is invisible to the
+    other, so the second writer publishes a dict built from a snapshot
+    taken before the first writer's change — and the first writer's key
+    is gone. An update restarts both processes together, on every device,
+    which is precisely the observed signature. It also explains the
+    survivors: ``device_name`` and ``lan.allow_sync`` get rewritten
+    constantly, while a person's name is written once and never again.
+
+    Best-effort by design: if ``fcntl`` is unavailable or the lock can't
+    be taken in *timeout*, proceed anyway. An unserialized write is the
+    status quo we're improving on — refusing to save the user's name
+    would be a worse failure than a rare lost update."""
+    lock_path = os.path.join(azt_home(), 'config.lock')
+    fh = None
+    try:
+        import fcntl
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fh = open(lock_path, 'a+')
+        deadline = _time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if _time.time() >= deadline:
+                    print(f'[collab.settings] config.lock busy for '
+                          f'{timeout:.0f}s; writing unserialized',
+                          flush=True)
+                    break
+                _time.sleep(0.05)
+    except Exception:
+        fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            try:
+                import fcntl as _f
+                _f.flock(fh.fileno(), _f.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def set_(key, value):
     """Persist a value for *key* in config.json. Refuses to write
     when the existing config.json is unreadable, so a corrupt file
     isn't replaced with a one-key dict that silently reverts every
     other persisted setting."""
-    data = _load_raw()
-    if isinstance(data, _LoadFailed):
-        print(f'[collab.settings] refusing to set {key!r}: '
-              f'config.json is unreadable ({data.error!r}). '
-              f'Repair or remove it and retry.', flush=True)
-        return
-    data[key] = value
-    _save_raw(data)
+    def _mutate(data):
+        data[key] = value
+    update(_mutate, what=f'set {key!r}')
 
 
 def _coerce(key, value):

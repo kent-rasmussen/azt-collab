@@ -44,6 +44,69 @@ treatment:
   reopening it as a p4a dep-propagation problem. It also means
   `:provider` never gets bind-priority protection, so Android is free
   to freeze the daemon this UI is waiting on.
+
+  **Recurred 2026-07-27 13:39 after Kent's clean build → reopened, and
+  it is NOT dep-propagation.** Read the source:
+  `android/src/main/java/.../AZTServiceConnector.java` imports only
+  framework classes (`ComponentName`, `Context`, `Intent`,
+  `ServiceConnection`, `IBinder`, `Log`) — no AndroidX, nothing that
+  could fail to propagate from an AAR. A plain public class with no
+  external deps that throws CNF is simply **not in the calling APK's
+  dex**. The java is compiled per-APK via `android.add_src`, which
+  appears in `server_apk/buildozer.spec.tmpl:217` and is required of
+  every peer by `CLIENT_INTEGRATION.md` § 2 — so this is a build-config
+  fact about one specific APK, not a toolchain problem.
+
+  **Kent 2026-07-27: it was the SERVER UI.** So the app that failed is
+  the one whose spec definitely carries `android.add_src`
+  (`server_apk/buildozer.spec.tmpl:217`) — which makes "peer forgot the
+  spec line" a dead end and leaves two candidates:
+
+  1. **Not in the dex** despite line 217 — spec render, or the relative
+     path `../android/src/main/java` not resolving from where buildozer
+     expects.
+  2. **In the dex, wrong classloader.** `discover()` runs `ensureBound`
+     from whichever thread makes the first RPC — a worker — and
+     Python-spawned threads attach to the JVM with the
+     **bootclassloader**, which holds framework classes but not app
+     classes. This is the same trap §2a of `server_apk/main.py` already
+     prewarms against (SIGSEGV precedent, baf 2026-05-20). It fits every
+     observation: survives clean builds, hits only our own class, and
+     `PythonActivity` resolving four lines earlier in the same function
+     proves nothing because it is warmed on the main thread at startup
+     and served from jnius's cache.
+
+  Hypothesis 2 is the better fit and is now both fixed and tested by the
+  same change: **step 2a.3 resolves the class on the main thread during
+  Activity startup.** jnius caches per class, so a successful warm there
+  makes every later worker-thread lookup succeed — and the log
+  discriminates:
+
+  - `AZTServiceConnector prewarm ok — class is in this APK` and no more
+    `ensureBound failed` ⇒ it was the classloader; done.
+  - `prewarm ok` but `ensureBound` still fails ⇒ classloader theory
+    wrong in some other way; reopen.
+  - `prewarm FAILED on the main thread` ⇒ hypothesis 1; the class isn't
+    in the APK and the spec/render is at fault.
+
+  **Hypothesis 1 eliminated 2026-07-27** by dex inspection of every APK
+  on disk (`unzip -p "$a" 'classes*.dex' | grep -ac AZTServiceConnector`):
+  **2 hits in all of them** — recorder 1.62.2, viewer 0.18.2, and every
+  aztcollab from 0.54.35 through the field build 0.55.10. The two strings
+  are its class descriptor and its `TAG` literal, and no other java
+  references the class, so the definition is genuinely present. Peers are
+  correctly configured too.
+
+  **⇒ Cause is the classloader (hypothesis 2). Fixed in 0.55.14** by
+  step 2a.3. Remaining verification is one cold launch on ≥ 0.55.14:
+  expect `AZTServiceConnector prewarm ok — class is in this APK` and no
+  further `ensureBound failed`.
+
+  **Then re-time before doing more work on this item.** With the bind
+  finally holding, `:provider` gets bind-priority protection for the
+  first time, which removes freezer-suspension as a cause of the 44 s
+  silence. The startup numbers this item is built on may move on their
+  own.
 - **NSD resolve storm** at 17:05:08–09: the same two peers resolved 8+
   times per second, alternating. Each feeds `_record` and can trigger a
   sweep. Needs a dedupe/debounce at the resolve callback.

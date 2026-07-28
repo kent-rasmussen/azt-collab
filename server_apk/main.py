@@ -167,6 +167,11 @@ def main():
         from azt_collabd import store as _store
         from azt_collabd.paths import azt_home as _azt_home
         _azt_home()
+        # NOTE: read-only since 0.49.0 — device_name is DERIVED from
+        # contributor + OS label, not persisted. An older comment here
+        # said it "caches device_name in config.json", which was true
+        # pre-0.49.0 and misled a 2026-07-27 investigation into believing
+        # this process writes config at startup. It does not.
         _store.get_device_name()
     except Exception as ex:
         print(f'[server_apk] jnius prewarm skipped: {ex}', flush=True)
@@ -217,6 +222,37 @@ def main():
     except Exception as ex:
         print(f'[server_apk] NsdManager/WifiManager prewarm skipped: '
               f'{ex}', flush=True)
+    # 2a.3. Prewarm our OWN java class, ``AZTServiceConnector``
+    # (0.55.13). The client transport's ``discover()`` calls
+    # ``ensureBound`` from whichever thread makes the first RPC — a
+    # worker, in practice — and that has been logging
+    # ClassNotFoundException on this app's own class since 2026-07-23,
+    # through a clean build (2026-07-27 13:39, server UI). Two possible
+    # causes, and this one call separates them:
+    #
+    #   * If it succeeds here but ``discover()`` still fails on a
+    #     worker, the class IS in the dex and the fault was the
+    #     bootclassloader attach that the rest of this block exists to
+    #     defend against — and warming it here fixes it, because jnius
+    #     caches per class. (``PythonActivity`` resolving in
+    #     ``discover()`` never disproved this: it is warmed on the main
+    #     thread during startup, so it is served from cache.)
+    #   * If it fails HERE, on the main thread with the app
+    #     classloader, then the class genuinely isn't in the APK and the
+    #     build config is at fault despite
+    #     ``android.add_src = ../android/src/main/java`` in the spec.
+    #
+    # Either way the log now says which, instead of recurring silently.
+    try:
+        from jnius import autoclass
+        autoclass('org.atoznback.aztcollab.AZTServiceConnector')
+        print('[server_apk] AZTServiceConnector prewarm ok — class is '
+              'in this APK', flush=True)
+    except Exception as ex:
+        print(f'[server_apk] AZTServiceConnector prewarm FAILED on the '
+              f'main thread: {ex} — the class is not in this APK; '
+              f'check android.add_src in server_apk/buildozer.spec',
+              flush=True)
 
     # 2b. Crash-marker bookkeeping. Detect "previous process didn't
     #    run atexit" (SIGSEGV / SIGKILL / OOM-kill / kernel kill —

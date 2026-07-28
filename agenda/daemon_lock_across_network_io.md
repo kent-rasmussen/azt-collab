@@ -95,6 +95,80 @@ worth keeping:
   that subnet at all. Cheap to discover (~3 s) versus the timeout's
   ~15–30 s.
 
+### STATUS 2026-07-28: LAN half shipped, WAN half open
+
+- **LAN path — DONE (0.55.24).** `_merge_then_push` fetches in
+  `_fetch_peer_objects_unlocked` with no lock held; `project_lock` now
+  covers only merge + ref update + reset + push. This was the holder the
+  watchdog caught (147 s in `ssl.read`). Verify per the greps below.
+- **WAN path — NOT DONE, and it is the original repro.**
+  `repo.sync_repo` takes `project_lock(project_dir)` with **no timeout**
+  and calls `_push_step_locked` (github fetch + push) plus
+  `_push_extras_step` inside it. A dead github connection therefore holds
+  the project for the full network timeout while every local operation
+  queues — which is exactly the 2026-07-22 "AZT freezes on bad network"
+  evidence this item was opened for.
+
+  Split shape (same as LAN, one more stage): commit **locked** → fetch
+  **unlocked** → merge **locked** → push **unlocked**, against a head
+  captured under the lock → update tracking refs **locked** (cheap).
+  Check `push_repo` / the drain path for the same pattern.
+
+**Verifying the LAN half** — two devices, diverged project, one peer on a
+dead or slow link. Pass = no `post-receive reset … lock busy (5s
+timeout)` storm, no `[watchdog] STALL DETECTED … held Ns by thread
+'lan-reverse-deliver'`, and `[lan-merge]` still reaching a conclusion.
+`[watchdog] stall cleared` on 2026-07-27 shows recovery, not absence — a
+clean run with a deliberately unreachable peer is the real test.
+
+### PROVEN 2026-07-27 22:07 — the stack, at last
+
+```
+[watchdog] STALL DETECTED: project lock '60206912458536ae.lock'
+           held 147s by thread 'lan-reverse-deliver'
+  lan_listener.py:808   _work
+  lan_push.py:355       _push_to_peer
+  lan_push.py:871       _merge_then_push
+  lan_push.py:986       _merge_then_push_locked
+  dulwich/client.py:1671 fetch
+  …  _handle_upload_pack_tail → _read_side_band64k_data
+  …  urllib3/response.py:1005 _fp_read → ssl.py:1167 read
+```
+
+**`_merge_then_push_locked` holds `project_lock` across a network
+fetch** and sat in `ssl.read` for 147 s. No longer a hypothesis — this
+is the exact regression this item was opened for, with a stack. It is
+also the direct cause of the `post-receive reset 'nml': lock busy (5s
+timeout)` line repeating every 20–40 s for minutes on every device
+tonight: inbound data lands and can never be absorbed because an
+outbound merge is parked on the lock inside a socket read.
+
+Fix shape (unchanged from the design sketch, now confirmed as the right
+target): split the phases so the lock covers only local object/ref/
+working-tree mutation, never the fetch or the push. Fetch into the
+object store unlocked (objects are content-addressed, so a concurrent
+fetch is safe), then take the lock for merge + ref update + reset.
+
+**Second finding in the same dump — `_has_internet` blocks the watcher
+in DNS:**
+
+```
+  scheduler.py:981  _watcher_loop
+  net.py:399        _has_internet
+  socket.py:827     create_connection
+  socket.py:962     getaddrinfo        ← blocked here
+```
+
+With no upstream, `getaddrinfo` can block for many seconds on Android,
+and it is doing so **on the watcher thread** — the same loop that runs
+`_drain_pending_push` and `drain_pending_resets`. So the offline case
+stalls the very loop that retries the lock-busy resets. 0.55.23 stopped
+the *RPC* from paying this, but the poll still does. Per
+[[feedback_offline_is_a_supported_state]] the offline path must be the
+cheap one: probe a numeric IP (no DNS) and/or set an explicit short
+socket timeout. Small, independent of the lock work, and worth doing
+first.
+
 ### Wedge detector + self-recovery (BUILT 0.54.89–0.54.90)
 
 Shipped 0.54.89 on `/v1/health`: `threads`, `fds`, `locks_held`

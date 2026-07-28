@@ -19,6 +19,7 @@ daemon is auto-spawned on first call.
 
 import datetime
 import os
+import sys
 import threading
 import webbrowser
 
@@ -1453,6 +1454,19 @@ class SettingsScreen(Screen):
         as_of = self._fmt_as_of(row.get('observed_at', ''))
         if as_of:
             base += f' ({as_of})'
+        # Why the row stopped moving (0.55.20). A stale row used to look
+        # the same whether we couldn't reach the peer at all or reached
+        # it and were refused the project — different problems, different
+        # fixes, and no way to tell them apart from the board.
+        outcome = row.get('probe_outcome', '') or ''
+        note = {
+            'timeout': _tr('no answer'),
+            'no_route': _tr('no route'),
+            'refused': _tr('not listening'),
+            'not_served': _tr('not shared to us'),
+        }.get(outcome, '')
+        if note:
+            base += f' · {note}'
         return base
 
     def _render_peer_sync(self, rows, current_langcode):
@@ -1821,17 +1835,167 @@ class SettingsScreen(Screen):
         # was inconsistent across launches; the buttons reflected
         # the daemon answer only when *both* RPCs happened to
         # succeed in this single try.
+        self._rpc_then(self._fetch_creds_and_online,
+                       self._apply_credentials_state)
+
+    def _fetch_creds_and_online(self):
+        """Worker half of ``refresh()``'s credentials + online pair
+        (0.55.25). Returns a dict; never raises for either RPC.
+
+        These two ran on the UI thread until now. On Android that is
+        indefensible twice over: the daemon is a different process, so
+        any call blocks for as long as it is busy, and
+        ``transports/android_cp.py`` documents that ``timeout`` is
+        **advisory** — ``ContentResolver.call`` has no timeout facility,
+        so 0.55.22's 4 s / 8 s bounds do nothing there. There is no
+        caller-side way to bound a binder call; the only fix is to not
+        make it on the frame's thread. Field 2026-07-27: presplash held
+        98 s and 153 s, with the Activity silent in 36–77 s blocks
+        bracketed by settings refreshes.
+
+        It also restores the presplash watchdog. That is a
+        ``threading.Timer``, so it always fires — but ``release()``
+        marshals the removal through ``Clock.schedule_once``, which
+        cannot run on a blocked main thread. Both the 45 s bound and the
+        freeze were the same stuck thread.
+
+        The two calls stay INDEPENDENT: a transient ``is_online``
+        failure must not cost us the credentials answer. Collapsing them
+        into one ``try`` was a real bug — any exception skipped the
+        button update and left "Connect to GitHub" on screen even when
+        credentials were confirmed."""
         try:
-            status = get_credentials_status()
+            status, status_err = get_credentials_status(), None
         except Exception as ex:
-            label = self.ids.get('status_label')
-            if label is not None:
-                label.text = _tr('Error: {error}').format(error=ex)
-            status = {}
+            status, status_err = {}, ex
         try:
             online = is_online()
         except Exception:
             online = False
+        # Prefetch what the two row-refreshers need (0.55.40). Both call
+        # ``_pick_publish_candidate()`` (→ ``last_project`` and possibly
+        # ``list_projects``) and one then calls ``project_status`` — four
+        # or five RPCs, and they ran on the MAIN thread at the tail of
+        # ``_apply_credentials_state``. On Android those are binder calls
+        # with no usable timeout, so a daemon busy with boot work blocks
+        # the frame for as long as it takes.
+        #
+        # Field 2026-07-27, thread 1748: ``publish candidate`` at
+        # 23:24:39, then 44 s of total silence, then the next one — while
+        # ``:provider`` ground through a 1005-commit wan-unshared walk.
+        # 0.55.25 moved the credentials pair off this thread and left
+        # these behind.
+        project = pstatus = None
+        try:
+            project = self._pick_publish_candidate()
+        except Exception:
+            project = None
+        if project is not None:
+            try:
+                pstatus = project_status(project.langcode)
+            except Exception:
+                pstatus = None
+        return {'status': status, 'online': online,
+                'status_err': status_err,
+                'project': project, 'pstatus': pstatus,
+                'prefetched': True}
+
+    def _hold_credentials_ui_on_unreachable(self):
+        """Daemon didn't answer: say so in the status label and leave
+        every other credential widget exactly as it was (0.55.27).
+
+        Specifically does NOT touch the contributor input or the
+        GitHub/GitLab buttons. Blanking those is what made a transient
+        daemon stall look like lost credentials; the honest report is
+        "we couldn't ask", and the values on screen remain the last ones
+        the daemon actually confirmed."""
+        label = self.ids.get('status_label')
+        if label is not None:
+            label.text = _tr('Service busy — status not updated')
+
+    def _apply_credentials_state(self, payload, err):
+        """Main-thread half: every widget touch, the cold-start retry
+        ladder, and the presplash release. Runs via ``_rpc_then``, so
+        ``Clock`` has already put us on the Kivy thread."""
+        if payload is None:
+            # Worker itself failed (not either RPC — those are caught
+            # inside). Surface it and stop; the retry ladder below can't
+            # run without a status dict, and the next refresh retries.
+            label = self.ids.get('status_label')
+            if label is not None and err is not None:
+                label.text = _tr('Error: {error}').format(error=err)
+            return
+        status = payload.get('status') or {}
+        online = bool(payload.get('online'))
+        status_err = payload.get('status_err')
+        # Say what actually arrived (0.55.34). The daemon reported
+        # ``config.collab.contributor: set (10 chars)`` while this screen
+        # showed nothing, and there was no way to tell whether the value
+        # was lost in the RPC, in the wrapper, or in the render. Length
+        # only — never the name itself — so a shared log stays clean.
+        try:
+            _c = status.get('contributor', None)
+            print(f'[settings] creds applied: unreachable='
+                  f'{bool(status.get("unreachable"))} '
+                  f'contributor='
+                  f'{"absent" if _c is None else (str(len(_c)) + " chars" if _c else "empty")} '
+                  f'keys={sorted(status.keys())} '
+                  f'err={status_err!r}', file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        if not status.get('unreachable'):
+            # Daemon answered — the backfill ladder has done its job and
+            # must not keep firing refreshes for the rest of the session.
+            self._cred_backfill_count = 0
+        # "Couldn't ask" must not be painted as "nothing configured"
+        # (0.55.27). The fallback dict carries empty usernames and no
+        # contributor; rendering it wiped the user's own values off the
+        # screen — Kent: *"I seem to have lost my git username?"* Hold
+        # the last good text and let the retry ladder below re-poll.
+        # Same principle as the peer-table hold in 0.55.13.
+        if status.get('unreachable'):
+            self._hold_credentials_ui_on_unreachable()
+            if getattr(self, '_credentials_retry_count', 0) \
+                    < _CRED_RETRY_MAX:
+                self._credentials_retry_count = getattr(
+                    self, '_credentials_retry_count', 0) + 1
+                Clock.schedule_once(
+                    lambda _dt: self._retry_refresh_credentials(),
+                    _CRED_RETRY_INTERVAL_S)
+            else:
+                # Budget spent and still no answer: release the splash
+                # rather than let a down daemon outlast it (unchanged
+                # policy from the answered path below).
+                try:
+                    from azt_collab_client.ui import presplash_hold
+                    presplash_hold.release()
+                except Exception:
+                    pass
+                # …but KEEP TRYING for the values, on a slower ladder
+                # (0.55.29). These two budgets do different jobs and
+                # must not share a limit: the splash has to lift
+                # quickly, while a blank username has to get filled in
+                # whenever the daemon finally answers.
+                #
+                # Field 2026-07-27, every device: the username field came
+                # up empty (and therefore auto-focused, popping the
+                # keyboard — Kent: *"OH, that's so I can type in my
+                # username. That's correct. Just shouldn't be missing
+                # the username"*). 0.55.25 moved this RPC off the UI
+                # thread, so it now fires ~1 s after the screen appears
+                # instead of after 36–77 s of blocking work — early
+                # enough that ``:provider`` is often still importing,
+                # the transport burns its 3.1 s null-bundle budget, and
+                # the 4.8 s ladder expires before the daemon is up.
+                # Giving up there left the field blank until a manual
+                # refresh.
+                self._schedule_credentials_backfill()
+            return
+        if status_err is not None:
+            label = self.ids.get('status_label')
+            if label is not None:
+                label.text = _tr('Error: {error}').format(
+                    error=status_err)
         gh = status.get('github', {})
         gl = status.get('gitlab', {})
         # ``get_credentials_status`` returns a ServerUnavailable
@@ -1904,9 +2068,39 @@ class SettingsScreen(Screen):
         # Contributor field — only repopulate when the user isn't
         # actively editing it, so a refresh during typing doesn't
         # clobber in-progress input.
+        # Repopulate unless the user has actual in-progress input to
+        # protect. The focus guard alone LATCHED (0.55.28): stray focus
+        # on this field — the same misrouted-input problem that makes a
+        # scroll swipe jump to Connect-to-GitHub, and that pops the
+        # soft keyboard unbidden — meant every later refresh skipped the
+        # field, so it stayed blank and read as "lost my git username"
+        # (Kent 2026-07-27). An EMPTY focused field holds nothing worth
+        # protecting, so fill it; a non-empty focused one is still left
+        # alone, which preserves the original intent.
         contrib_input = self.ids.get('contributor_input')
-        if contrib_input is not None and not contrib_input.focus:
-            contrib_input.text = status.get('contributor', '') or ''
+        _incoming = status.get('contributor', '') or ''
+        if contrib_input is None:
+            # Silent until 0.55.37: a missing widget made this a no-op
+            # with nothing in the log, so a value that arrived correctly
+            # (confirmed: unreachable=False contributor=10 chars) could
+            # vanish between the RPC and the screen with no trace.
+            print('[settings] contributor NOT rendered: '
+                  'contributor_input widget not in ids',
+                  file=sys.stderr, flush=True)
+        elif (not contrib_input.focus
+                or not (contrib_input.text or '').strip()):
+            contrib_input.text = _incoming
+            print(f'[settings] contributor rendered: '
+                  f'set {len(_incoming)} chars, widget now holds '
+                  f'{len(contrib_input.text or "")} chars, '
+                  f'focus={contrib_input.focus}',
+                  file=sys.stderr, flush=True)
+        else:
+            print(f'[settings] contributor render SKIPPED: user is '
+                  f'editing (focus={contrib_input.focus}, '
+                  f'{len((contrib_input.text or "").strip())} chars '
+                  f'present); incoming {len(_incoming)} chars held back',
+                  file=sys.stderr, flush=True)
         yes = _tr('yes')
         no = _tr('no')
         lines = [
@@ -1925,12 +2119,56 @@ class SettingsScreen(Screen):
             f"  {_tr('Confirmed:')} {yes if gl.get('confirmed') else no}",
         ]
         self.ids.status_label.text = '\n'.join(lines)
-        self._refresh_publish_row(status)
-        self._refresh_project_actions_row(status)
+        # Hand both rows the prefetched project + status so neither makes
+        # an RPC on this thread (0.55.40).
+        self._refresh_publish_row(
+            status, project=payload.get('project'),
+            pstatus=payload.get('pstatus'),
+            prefetched=bool(payload.get('prefetched')))
+        self._refresh_project_actions_row(
+            status, project=payload.get('project'),
+            prefetched=bool(payload.get('prefetched')))
 
-    def _refresh_project_actions_row(self, status):
+    # Slow follow-up ladder for filling in credential VALUES after the
+    # (deliberately short) presplash budget has expired. ~60 s of cover
+    # for a slow cold start, then stop — a daemon still silent after a
+    # minute is a real fault, and the status label already says so.
+    #
+    # Placement matters (0.55.39): defining these in the MIDDLE of
+    # ``_apply_credentials_state`` — which is what 0.55.29 did — silently
+    # truncated that method, handing everything below the insertion point
+    # to this one instead. Python accepted it happily; the success path
+    # just stopped after the log line. Keep new members at the end of a
+    # method, never inside one.
+    _CRED_BACKFILL_INTERVAL_S = 3.0
+    _CRED_BACKFILL_MAX = 20
+
+    def _schedule_credentials_backfill(self):
+        n = getattr(self, '_cred_backfill_count', 0)
+        if n >= self._CRED_BACKFILL_MAX:
+            return
+        self._cred_backfill_count = n + 1
+
+        def _tick(_dt):
+            # Only while this screen is current — don't wake an
+            # off-screen settings page (same rule as
+            # ``_retry_refresh_credentials``).
+            if self.manager is None or self.manager.current != self.name:
+                return
+            self.refresh()
+        Clock.schedule_once(_tick, self._CRED_BACKFILL_INTERVAL_S)
+
+    def _refresh_project_actions_row(self, status, project=None,
+                                     prefetched=False):
         """Show / hide the "Current project" actions row (Grant
         collaborator, etc.) and seed its info label.
+
+        *project* / *prefetched* (0.55.40): when the caller has already
+        resolved the candidate off-thread, pass it in so this method
+        makes no RPC. ``prefetched=True`` with ``project=None`` means
+        "there genuinely is no candidate" — distinct from the default
+        (``prefetched=False``), which means "nobody looked, resolve it
+        here" and preserves every existing call site.
 
         Visibility rule: there's a ``last_project()`` that resolves
         to a registered project AND that project has a remote URL.
@@ -1965,7 +2203,8 @@ class SettingsScreen(Screen):
         if msg is not None:
             msg.text = ''
         self._detach_project_actions_children()
-        project = self._pick_publish_candidate()
+        if not prefetched:
+            project = self._pick_publish_candidate()
         if project is None:
             self.current_langcode_label = ''
             return
@@ -2377,12 +2616,44 @@ class SettingsScreen(Screen):
         decisions watcher, reached through different callers).
 
         *apply_* receives ``(result, error)`` — exactly one is set."""
+        def _apply_guarded(data, err):
+            """Never let *apply_* raise into Kivy's clock (0.55.38).
+
+            An ``apply_`` that raises part-way leaves the screen
+            HALF-UPDATED and says nothing: the callback dies inside
+            ``Clock``, so the widgets it had already set keep their new
+            values and the ones after the raise keep their old ones.
+            That is indistinguishable from "the daemon returned an empty
+            answer", which is what sent five versions of the missing
+            -contributor hunt after the RPC layer while the real fault
+            was mid-render.
+
+            Field 2026-07-27: ``[settings] creds applied`` (the FIRST
+            statement of ``_apply_credentials_state``) logged, while
+            ``[settings] publish candidate`` (from its LAST statement)
+            did not — in a run where every previous run logged it twice.
+            The method was starting and never finishing, and nothing
+            anywhere recorded why."""
+            try:
+                apply_(data, err)
+            except Exception as ex:
+                import traceback as _tb
+                print(f'[settings] apply callback raised: {ex!r} — the '
+                      f'screen is now HALF-UPDATED (widgets before the '
+                      f'raise are new, after it are stale)',
+                      file=sys.stderr, flush=True)
+                for line in _tb.format_exception(
+                        type(ex), ex, ex.__traceback__):
+                    for sub in line.rstrip().splitlines():
+                        print(f'[settings]   {sub}',
+                              file=sys.stderr, flush=True)
+
         def _work():
             try:
                 data, err = fetch(), None
             except Exception as ex:
                 data, err = None, ex
-            Clock.schedule_once(lambda _dt: apply_(data, err), 0)
+            Clock.schedule_once(lambda _dt: _apply_guarded(data, err), 0)
         threading.Thread(target=_work, daemon=True).start()
 
     def _refresh_lan_state(self):
@@ -3062,8 +3333,14 @@ class SettingsScreen(Screen):
         if msg is not None:
             msg.text = text or ''
 
-    def _refresh_publish_row(self, status):
+    def _refresh_publish_row(self, status, project=None, pstatus=None,
+                             prefetched=False):
         """Show / hide / enable the "Publish <langcode> data" row.
+
+        *project* / *pstatus* / *prefetched* (0.55.40): supplied by the
+        caller when both were resolved off-thread, so this method makes
+        no RPC. Defaults preserve the original self-resolving behaviour
+        for every other call site.
 
         Picks the candidate project in this priority order:
 
@@ -3097,7 +3374,8 @@ class SettingsScreen(Screen):
         if msg is not None:
             msg.text = ''
         self._detach_publish_children()
-        project = self._pick_publish_candidate()
+        if not prefetched:
+            project = self._pick_publish_candidate()
         if project is None:
             return
         # Authoritative remote_url comes from project_status, which
@@ -3109,10 +3387,13 @@ class SettingsScreen(Screen):
         # correctly. Trusting Project.remote_url alone would re-show
         # the publish button on those repos forever.
         live_remote_url = (project.remote_url or '').strip()
-        try:
-            ps = project_status(project.langcode)
-        except Exception:
-            ps = None
+        if prefetched:
+            ps = pstatus          # resolved off-thread; no RPC here
+        else:
+            try:
+                ps = project_status(project.langcode)
+            except Exception:
+                ps = None
         if ps is not None and (ps.remote_url or '').strip():
             live_remote_url = ps.remote_url.strip()
         if live_remote_url:

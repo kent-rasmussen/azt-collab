@@ -384,16 +384,68 @@ def resolver_state():
     return _RESOLVER_STATE.get('last', 'unknown')
 
 
+# Numeric connectivity probes — no DNS involved (0.55.24). Anycast
+# addresses picked for stability, not for what they serve: we only need
+# "can a TCP SYN leave this device and get answered". 1.1.1.1 is already
+# this module's DoH provider, and 8.8.8.8:53 is a second opinion on a
+# different port in case :443 is filtered.
+_PROBE_ENDPOINTS = (('1.1.1.1', 443), ('8.8.8.8', 53))
+_PROBE_TIMEOUT_S = 1.5
+
+
 def _has_internet():
-    """Quick check for internet connectivity. Returns True if either
-    sync host's HTTPS port is reachable, with the resolver path
-    (system DNS vs DoH fallback) already accounted for via the
-    monkey-patched ``socket.getaddrinfo``. Side effect: updates
-    ``_RESOLVER_STATE`` for ``resolver_state()`` callers."""
-    for host in ('github.com', 'gitlab.com'):
+    """Quick check for internet connectivity — **numeric probes first, so
+    the offline answer costs no DNS** (0.55.24).
+
+    Previously this looped over ``github.com`` / ``gitlab.com``.
+    ``create_connection``'s ``timeout`` bounds the CONNECT only;
+    ``getaddrinfo`` runs first and is unbounded, and this module's
+    resolver falls back to DoH — over the network that is, by
+    hypothesis, down. So the offline path paid two full resolver cycles
+    including a DoH attempt.
+
+    Watchdog stack, field 2026-07-27 22:07 — the watcher loop parked
+    exactly there:
+
+        scheduler.py:981  _watcher_loop
+        net.py:399        _has_internet
+        socket.py:827     create_connection
+        socket.py:962     getaddrinfo        ← blocked
+
+    That loop also runs ``_drain_pending_push`` and
+    ``drain_pending_resets``, so an offline device was stalling the very
+    loop that retries lock-busy resets. Running with no upstream is a
+    supported state for this suite (Kent 2026-07-27: *"we should work
+    with or without this just fine"*), which makes a slow offline answer
+    a defect, not a circumstance.
+
+    Worst case offline is now ~3 s of bounded connects and zero name
+    resolution. A false negative is the safe direction: it suppresses WAN
+    attempts rather than inviting them, the user's Sync button overrides
+    it, and the next poll re-checks.
+
+    ``sync.connectivity_probe_host`` (default empty) adds a hostname
+    attempt for the rare network that filters both probe IPs while
+    permitting github — off by default because enabling it reintroduces
+    the DNS cost on every offline poll."""
+    for ip, port in _PROBE_ENDPOINTS:
+        try:
+            socket.create_connection((ip, port),
+                                     timeout=_PROBE_TIMEOUT_S).close()
+            return True
+        except OSError:
+            continue
+    host = ''
+    try:
+        from . import settings as _settings
+        host = str(_settings.get('sync.connectivity_probe_host', '')
+                   or '').strip()
+    except Exception:
+        host = ''
+    if host:
         try:
             socket.create_connection((host, 443), timeout=3).close()
             return True
         except OSError:
-            continue
+            pass
     return False

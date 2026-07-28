@@ -9,6 +9,1033 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.44 — every drain log line now names its network
+
+Kent 2026-07-28: *"it would help me for log lines like 'drain suppressed'
+to be clear what is draining … at least 'WAN drain suppressed'."* Right —
+five different things are called "drain" here and only two touch the
+network, so an unqualified line makes the reader guess.
+
+| was | now |
+|---|---|
+| `drain pushes: ['baf']` | `WAN drain: pushing to github ['baf']` |
+| `drain suppressed: work_offline is on …` | `WAN drain suppressed: … LAN drain + LAN fan-out are unaffected` |
+| `drain skipped: 'nml' wan_backoff next=…` | `WAN drain skipped: …` |
+| `_drain_pending_push failed: …` | `WAN drain (github push) failed: …` |
+| `drain_pushes_now failed: …` | `WAN drain (user nudge) failed: …` |
+| `lan_listener.drain_pending_resets failed: …` | `LAN drain (post-receive resets, local work only) failed: …` |
+
+The last one is worth the extra words: that drain is LAN-*originated* but
+does no network I/O at all, so seeing it while work_offline is on is
+correct and not a leak.
+
+Also: `_drain_access_reprobe`'s work_offline return was **silent**
+(0.55.43). A silent return is indistinguishable from "never ran" — the
+defect class that cost several round-trips on 2026-07-27 — so it now logs
+`WAN access re-probe suppressed`, rate-limited to once per 10 minutes
+since it's consulted every watcher tick, and names the consequence
+(pending invites aren't auto-accepted until the toggle is off).
+
+## 0.55.43 — the second WAN caller work_offline missed
+
+Auditing what "drain" means turned up five of them, and only two touch
+the network:
+
+| function | network | lock | gated now |
+|---|---|---|---|
+| `_drain_pending_push` | github fetch+push | **holds `project_lock`** | 0.55.42 |
+| `drain_pushes_now` | as above (nudge wrapper) | as above | via it |
+| `_drain_access_reprobe` | github invite + `GET /repos` | none | **0.55.43** |
+| `drain_pending_resets` | none — local working-tree reset | `project_lock`, briefly | n/a |
+| `_drain_atomic_orphans` | none — local filesystem | n/a | n/a |
+| `_drain_stuck_commits` | none — commit half is local by design | n/a | n/a |
+
+So "drain" means "work through a queue", not "go to the network" — worth
+knowing before reading the logs, since `drain_pending_resets` is the
+`lock busy` retry loop and has nothing to do with WAN.
+
+`_drain_access_reprobe` was the gap: cheap, but real github traffic, and
+"online-gated by the caller" is not the same as honouring the user's
+setting. It takes no `project_lock`, so it was never part of the
+client-freeze symptom — the reason to gate it is honesty about the
+toggle, not lock contention.
+
+Accepted consequence: a collaborator invitation arriving while the toggle
+is on won't be auto-accepted until it's off. That is what "work offline"
+says.
+
+## 0.55.42 — "work offline" now actually stops the daemon going to the network
+
+The toggle was enforced in **one** place: the Sync-button RPC handler
+(`server._h_sync_project`). The automatic drain ignored it —
+`scheduler.py` mentions `work_offline` only in comments and docstrings,
+with no check anywhere, and `scheduler.py:936` says so outright: *"The
+watcher itself doesn't gate on work_offline / grace anymore."* Meanwhile
+`_drain_pending_push`'s own docstring and `repo.push_repo`'s both claimed
+it did.
+
+So a user who set "work offline" stopped their Sync button and nothing
+else. Field, 2026-07-27: `[scheduler] drain pushes: ['baf']` followed by
+`fetch failed with 401` — unprompted WAN traffic.
+
+It matters because the WAN push path still holds `project_lock` across
+the network (`repo.sync_repo` → `_push_step_locked`, bounded by
+`_FETCH_TIMEOUT_S=60` + `_PUSH_TIMEOUT_S=180`). On a wifi link that has
+internet but is slow or half-dead, an unprompted drain stalls every local
+operation on that project for minutes — Kent 2026-07-28: *"azt clients
+that have been freezing when wifi internet is on."*
+
+- **`_drain_pending_push` returns early when `work_offline` is on**,
+  logging what it suppressed and how many projects are waiting. Includes
+  the `ignore_backoff` nudge path, since the Sync RPC already refuses
+  before reaching here; turning the toggle off is how the user says "try
+  now".
+- **LAN sync is deliberately unaffected** — `lan_push` never consults the
+  flag and fan-out fires from `_run_commit` after each local commit, not
+  from the drain. Work-offline suppresses github convergence while
+  peer-to-peer sharing continues, which is exactly the operational mode
+  needed for a LAN-only workshop day.
+- Both stale docstrings corrected.
+
+The lock phase-split remains the real fix
+(`agenda/daemon_lock_across_network_io.md`, #11 — LAN half shipped
+0.55.24, WAN half open). This restores the user's ability to say "not
+now" and have it mean something.
+
+## 0.55.41 — reverse delivery now dials the address it claims to
+
+Kent spotted the log contradicting itself:
+
+```
+GET /nml.git/info/refs from 192.168.124.5
+reverse delivery: checking 'nml' for '8f19208f' on the address they just reached us from
+[lan-push] dialing '8f19208f' at 192.168.124.153:34501   ← different, and dead
+```
+
+`_reverse_deliver_by_addr` used `REMOTE_ADDR` only to **identify** the
+caller; the dial then took whatever `_candidate_endpoints` offered first,
+which was a stale address from a previous network — while the address
+that had just provably carried their request sat further down the same
+list. The message was aspirational.
+
+`_note_inbound_endpoint` performs exactly this promotion, but was wired
+only to the body-authenticated routes (`hello`, `share_offer`), never to
+the git routes reverse delivery fires from. Now the matched endpoint is
+promoted to the head before dialing, and the log names the address and
+distinguishes "via <addr> (their arrival address, promoted to head)" from
+"no arrival address; using stored order" — so it can't overstate again.
+
+## 0.55.40 — the last two main-thread RPCs leave the frame
+
+0.55.39 restored the contributor render — confirmed in the field:
+`contributor rendered: set 10 chars, widget now holds 10 chars`. What
+remained was a separate main-thread block, visible on thread 1748:
+
+```
+23:24:39.213  publish candidate
+              ← 44 s of silence
+23:25:23.432  publish candidate
+23:25:41.880  presplash released
+```
+
+`_refresh_publish_row` and `_refresh_project_actions_row` are the last two
+statements of `_apply_credentials_state`. Both call
+`_pick_publish_candidate()` (→ `last_project`, sometimes `list_projects`)
+and one then calls `project_status` — four or five RPCs, on the frame,
+each an unbounded binder call on Android, while `:provider` ground through
+a 1005-commit `wan-unshared` walk. 0.55.25 moved the credentials pair off
+this thread and left these behind.
+
+`_fetch_creds_and_online` now resolves the candidate and its
+`project_status` in the same worker, and both refreshers take them as
+arguments. The `prefetched` flag distinguishes "already resolved, and the
+answer is genuinely no candidate" from "nobody looked" — so every other
+call site keeps the original self-resolving behaviour untouched.
+
+Also confirmed working in that log: `[watchdog] stall cleared — loops and
+locks are moving again` (the 0.55.24 lock split), and `[lan-sweep]
+'8f19208f': skipped — seen unreachable within the last 60s`.
+
+## 0.55.39 — I truncated `_apply_credentials_state` in 0.55.29
+
+Found it, and it was mine. Not a runtime failure — a **structural** one.
+
+0.55.29 inserted `_CRED_BACKFILL_*` and `_schedule_credentials_backfill`
+in the *middle* of `_apply_credentials_state`. Python accepted it: the
+method simply ended at the insertion point, and everything below —
+`status_err` handling, the GitHub/GitLab buttons, the presplash release,
+the contributor render, `_refresh_publish_row`,
+`_refresh_project_actions_row` — silently became the tail of
+`_schedule_credentials_backfill`.
+
+So on the success path the method logged `creds applied`, skipped the
+`unreachable` block, and stopped. Every symptom follows exactly:
+
+- contributor never rendered (the blank field, from 0.55.29 onward);
+- `publish candidate` absent, though it fired twice in every earlier run;
+- **`[presplash-hold] watchdog: release() not called within 45s`** — the
+  release sits above the contributor block and never ran either. That
+  line is what proved it: no exception, yet code before *and* after the
+  render was skipped, which is truncation rather than failure.
+
+Restored: the method is whole again, and the backfill members moved below
+it with a note that new members go at the END of a method, never inside
+one.
+
+Two lessons worth keeping. **The bug was in the fix**, not the system —
+0.55.30, .32, .33, .34, .37 and .38 all hunted a fault that 0.55.29 had
+introduced, and 0.55.33's config-hardening was written to explain data
+loss that never happened. And the 45 s watchdog line, which I had filed
+as an unrelated startup defect, was the decisive clue all along: I read it
+as "slow load" instead of "that code did not run."
+
+## 0.55.38 — an apply callback that raises no longer vanishes
+
+The 23:03 log, read for what's *missing*:
+
+```
+23:03:10.870  [settings] creds applied: unreachable=False contributor=10 chars
+              (…no [settings] publish candidate afterwards…)
+```
+
+`[settings] creds applied` is the **first** statement of
+`_apply_credentials_state`; `_refresh_publish_row` — which logs
+`publish candidate` — is its **last**, and fired twice in every earlier
+run. So the method starts and never finishes: something raises in the
+middle.
+
+`_rpc_then` handed the callback straight to `Clock.schedule_once` with
+nothing catching it, so the exception died inside Kivy's clock. The
+consequence is worse than a lost log line: widgets set *before* the raise
+keep their new values while those *after* it keep their old ones, leaving
+the screen **half-updated** — which is indistinguishable from "the daemon
+returned an empty answer". That appearance is what sent five versions of
+this hunt after the RPC layer while the fault was mid-render the whole
+time.
+
+Guarded at the seam rather than in one method, so every `apply_` in the
+class is covered: the exception is logged with its full traceback and an
+explicit warning that the screen is now half-updated.
+
+That's the fourth instance tonight of the same defect class — a silent
+`except` swallowing `_is_peer_disconnect` (0.55.21), a missing
+`import sys` inside a `try` (0.55.34), three quiet render branches
+(0.55.37), and now an unguarded clock callback. Each cost a round-trip to
+Kent's rig. Treat "this path can fail without saying so" as a defect on
+sight.
+
+## 0.55.37 — the render is where the contributor is lost
+
+0.55.34's diagnostic did its job:
+
+```
+[settings] creds applied: unreachable=False contributor=10 chars
+           keys=['contributor','github','gitlab','host'] err=None
+```
+
+The value arrives intact. So the RPC, the client wrapper, and the
+`unreachable` fallbacks (0.55.27 / 0.55.34) are all correct, and the loss
+is downstream of everything I had been fixing — in the render.
+
+Exactly one line in the file writes that widget, and all three of its
+outcomes were silent. Now each says which happened:
+
+- **`contributor_input` missing from `ids`** → the assignment was a no-op
+  with nothing logged. A value confirmed to have arrived could disappear
+  between RPC and screen leaving no trace at all.
+- **rendered** → reports chars set, chars the widget then holds, and focus
+  state (so a widget that accepts an assignment and reports back empty is
+  distinguishable from one never written).
+- **skipped because the user is editing** → reports the held-back length,
+  so the deliberate no-clobber guard can't be mistaken for a bug.
+
+Five versions of this hunt were spent on layers that were already
+working. The lesson is the same one as 0.55.19's silent-`except` and
+0.55.34's missing `import sys`: a branch that does nothing quietly is
+indistinguishable from a branch that never ran, and no amount of
+reasoning substitutes for making it say so.
+
+## 0.55.36 — the mDNS-name rationale, in Kent's terms not mine
+
+Docs only; supersedes the rationale recorded in 0.55.35. I had justified
+leaving the contributor in the mDNS instance name on pairing-UX grounds.
+Kent's actual reasoning is better and I'd missed the load-bearing part:
+
+> *"We're going to assume basic trust for now. If people need to obfuscate
+> their names, that field is available. And ultimately we can do other
+> stuff later."*
+
+`contributor` is **user-editable**, so obfuscation is already
+self-service — anyone needing a pseudonym on the network types one. The
+rejected identity-split would have built in code what a user can already
+do by typing. Pairing UX is real but secondary.
+
+Worth generalising: before proposing a privacy or hardening mechanism,
+check whether an existing user-editable field already hands the user that
+control.
+
+## 0.55.35 — record the mDNS-name decision where it can't be re-litigated
+
+Documentation only. Noticed while justifying why masking the contributor
+in a local diagnostic was pointless: the mDNS **service instance name** is
+`<contributor> — <os device label>`, so the user's name is multicast to
+every host on the subnet, unauthenticated and without pairing, whenever
+`lan.allow_sync` is on — hotel and conference wifi included, not just a
+private desk.
+
+**Kent's decision: leave it.** The string must be human-distinguishable
+before pairing or the device-chooser shows hex peer-ids, and on Android it
+feeds a *system* picker dialog (`FLAG_SHOW_PICKER`) that an opaque
+identifier would make useless. Same exposure class as AirDrop and
+Chromecast names.
+
+Written into `lan_discovery`'s module docstring — at the site, with the
+rejected alternative preserved (advertise the device label alone, deliver
+the contributor over the authenticated `hello` after pairing) in case a
+future deployment needs it. This is independent of tonight's bugs.
+
+## 0.55.34 — the data was never lost; the wrapper had one more silent empty
+
+0.55.33's diagnostic settled it: `config.collab.contributor: set (10
+chars)` on the phone while the settings field showed nothing — and Kent
+reports every device says `set`, each with its own length. Those lengths
+match the names already visible in the mDNS records ("Kent Phone" = 10,
+"kent tablet" = 11, "itservices-hue" = 14). **So nothing was ever lost on
+disk on any device. It is a display bug, everywhere.**
+
+Which means my account in 0.55.33 — fsync-less write, APK-update kill,
+rebuild-from-`{}` — was wrong. It explained `last_langcode` reading
+`<unset>`, so something in that family may still be real, but it is not
+what emptied the contributor field. The 0.55.33 hardening stands on its
+own merits; it was not the fix for this.
+
+The actual bug is one branch over from where 0.55.27 patched:
+
+```python
+if resp.get('ok'):
+    return {k: v for k, v in resp.items() if k != 'ok'}
+return {}          # ← silent empty, NOT marked unreachable
+```
+
+0.55.27 marked the two *exception* fallbacks and left the `not ok` branch
+returning a bare `{}`. That reaches the UI as a **successful** answer
+containing no contributor and no username, so the UI painted blanks over
+real values — the same daemon-contract violation, one line away. Now it
+returns the `unreachable`-marked shape with the daemon's error string.
+
+- **`[settings] creds applied: unreachable=… contributor=… keys=… err=…`**
+  so the next boot says whether a value was lost in the RPC, the wrapper,
+  or the render, instead of us inferring from a blank field.
+- **`import sys` added to `ui/app.py`** — it was missing, so that new log
+  line would have raised `NameError` straight into its own `except` and
+  printed nothing. A diagnostic that silently does nothing is worse than
+  none.
+- **The diagnostic now prints the contributor value**, not its length.
+  Kent: *"each with their own number of characters (obfuscation?)"* — the
+  masking cost a round-trip and answered nothing, since the question was
+  whether the stored value is the real name. It is broadcast in the clear
+  in every mDNS TXT record and stamped on every commit, so masking it in
+  a local diagnostic was theatre.
+
+## 0.55.33 — one lock, one write path for config.json
+
+**Scope, stated honestly: this fixes "the name won't stay saved". It does
+NOT explain why four devices lost it simultaneously at one update.** Kent
+was right to reject that framing — a write race fires on every launch, and
+his name survived many launches this evening, so it cannot account for a
+single simultaneous loss. Two separate problems; only the second is fixed
+here.
+
+`store.py` and `settings.py` both write `config.json`, each doing
+read-modify-write, and each with **its own lock** — two mutexes guarding
+one file serialize nothing. Worse, both did the READ outside the lock, so
+even within one module two setters could each load the file, change their
+own key, and write the whole dict, the second silently dropping the
+first's change. A plain lost update; no corruption required.
+
+And the writers are in **different processes**: the picker Activity's
+prewarm (`server_apk/main.py` step 2a → `store.get_device_name()`, which
+"caches device_name in config.json") and `:provider`'s boot. A
+`threading.Lock` is invisible across processes.
+
+- **`settings.update(mutate)`** is now the single serialized
+  read-modify-write, holding the thread lock **and an `flock`** on
+  `$AZT_HOME/config.lock` across read + mutate + write. Best-effort on the
+  flock: if `fcntl` is unavailable or the lock is busy past 5 s it writes
+  anyway, because refusing to save a user's name is a worse failure than a
+  rare lost update.
+- **`_save_raw_locked`** splits the write body out, since `update` holds
+  the non-reentrant lock and calling `_save_raw` inside it would deadlock.
+- **`store._update_config` delegates to it**, and every `store` setter
+  (contributor, last_popped_tag, last_langcode, cawl prefs) now goes
+  through it.
+- **`store._load_config_file(strict=…)`**: unparseable is no longer
+  silently `{}` for writers — that turned one unreadable moment into a
+  rewrite-from-nothing. Mirrors the `peers.json` strict/non-strict split
+  added after the 2026-07-10 incident.
+- **`store._save_config_file`** uses a unique `mkstemp` name plus `fsync`;
+  the old fixed `config.json.tmp` was shared by every writer.
+
+Why the contributor specifically, and not the other keys: `device_name`
+and `lan.allow_sync` are rewritten constantly, so a lost update to them
+is repaired within seconds. A person's name is written once and never
+again — so it stays lost.
+
+Still open, and the reason it stays open is lack of evidence rather than
+lack of a candidate: the mass loss at update time. The 0.55.32 diag line
+(`config.collab.contributor: set (N chars)` / `<UNSET>`) makes a
+before/after across one install readable from two boot logs.
+
+## 0.55.32 — name the missing object; report contributor presence
+
+**Contributor: not a display bug after all.** Kent on 0.55.30: *"still no
+git name."* That rules out 0.55.27–0.55.29, which would have covered a
+paint-over-blank. Two further paths ruled out by reading:
+
+- `save_contributor()` returns early when the field is empty, so a blur
+  on a blank field **cannot** clear the stored value;
+- `store.get_status()` does include `'contributor': get_contributor()`.
+
+So `config.json`'s `collab.contributor` really is empty on those devices,
+and re-entering it once will stick. The keyboard is deliberate:
+`_focus_contributor_if_empty` takes focus on a blank field and shows
+"Required: your name is used to label your work…" — correct behaviour
+that only *looked* like a symptom.
+
+Nothing in the diagnostic snapshot reported this either way, which is why
+it took a round-trip. Now it does: `config.collab.contributor: set (N
+chars)` or `<UNSET>` — length only, so a shared support bundle never
+carries the name itself.
+
+**Missing-object identity (0.55.31).** Recovery needs a source peer, and
+which peers could have it depends on what it is, so
+`repo.classify_missing_object` infers identity from referrers (the object
+itself can't be loaded — that's the problem): ref target, commit parent
+(a history gap any descendant-holder can supply), root tree, or a
+tree/blob whose **path** is reported so you can see which file's content
+is gone. Bounded at 500 commits / 20000 tree entries — this runs on a
+device already under strain, and one named referrer is worth as much as
+an exhaustive list. Fires from the `reset-blocked-missing-object`
+escalation, so it reports on the device already reproducing, with the
+60 s → 15 min backoff keeping it cheap.
+
+## 0.55.30 — a missing object was retrying a doomed reset every 15 s
+
+```
+[lan-listener] status-guard raised: KeyError(b'dcf320a895…')
+[lan-listener] post-receive reset 'nml' failed: KeyError(b'dcf320a895…')
+```
+…every ~15 s, without end. Same object that earlier cost a `[snapshot]
+status` and a pre-merge protection on a *different* device, so the
+integrity question is answered empirically: **not benign, and not
+confined to one device.** While it persists, received `nml` data on that
+device can never be absorbed.
+
+The `except Exception` handler logged and left the entry queued, so every
+scheduler tick retried a failure that cannot succeed — the object will
+not appear by itself. Same shape as the chunk cap in 0.55.21: a
+deterministic failure wearing transient clothing.
+
+- **The queue entry is deliberately KEPT.** Dropping it is worse than the
+  flood: a working tree never reset to HEAD shows the received merge as
+  *deleted*, and the next `commit_project` would stage that deletion and
+  erase the merge. So it still retries — on a 60 s → 15 min backoff
+  instead of every tick.
+- **`[data-quality] reset-blocked-missing-object`** names the langcode,
+  the absent object, the failure count, and the fact that it does not
+  self-heal.
+- The curve clears on a successful reset.
+
+**Not fixed: recovering the object.** A normal fetch won't do it — our
+refs already claim that history, so the peer offers nothing, and the gap
+is an *interior* object. Healing needs a deliberate repair path (fetch
+into a scratch repo from a peer that still has it, then copy the objects
+in). That's the real cure and it's a decision, not a detail.
+
+## 0.55.29 — splash budget and value budget stop sharing a limit
+
+The missing username, explained. Kent: *"keyboards on every one. OH,
+that's so I can type in my username. That's correct. Just shouldn't be
+missing the username."* The keyboard was right — the field was empty, so
+it auto-focused and prompted. **Every device** is the tell: timing, not
+per-device data loss, and therefore mine.
+
+0.55.25 moved `get_credentials_status()` off the UI thread. Before that
+it ran *after* 36–77 s of blocking main-thread work, by which point the
+daemon was always up. Now it fires ~1 s after the screen appears — often
+while `:provider` is still importing. The transport burns its fixed 3.1 s
+null-bundle budget, raises `ServerUnavailable`, and returns the fallback
+with no `contributor`. The cold-start ladder is 6 × 0.8 s ≈ 4.8 s, too
+short for a cold daemon here, and on expiry it gave up **permanently** —
+blank field until a manual refresh.
+
+The bug was one budget serving two purposes. Now separated:
+
+- **Presplash release stays fast** — unchanged short ladder, so a down
+  daemon can't hold the splash.
+- **Values keep trying** — `_schedule_credentials_backfill`, 3 s ticks up
+  to 20 (~60 s of cover), only while the settings screen is current, and
+  reset the moment the daemon answers. A daemon still silent after a
+  minute is a real fault, and the status label already says so.
+
+This is the same lesson as 0.55.13 and 0.55.27 arriving a third time:
+a fast path that gives up leaves a **blank that looks like data**. The
+fix each time is to hold or keep asking, never to paint the absence.
+
+## 0.55.28 — the contributor field's focus guard could latch
+
+Kent 2026-07-27: *"the keyboards are coming up, too. I assume those are
+related? Is text going to the wrong place?"* — related, yes, and by a
+mechanism worth writing down.
+
+A soft keyboard means a `TextInput` holds focus. The contributor field's
+repopulate was guarded on exactly that:
+
+```python
+if contrib_input is not None and not contrib_input.focus:
+    contrib_input.text = status.get('contributor', '') or ''
+```
+
+The guard is right in intent — a background refresh must not clobber
+typing — but it **latches**. Stray focus (the same misrouted input that
+makes a scroll swipe jump to Connect-to-GitHub) means every later
+refresh skips the field, so it stays blank indefinitely and reads as lost
+credentials. Now it also fills when the focused field is **empty**: an
+empty field holds no in-progress input to protect, while a non-empty
+focused one is still left alone.
+
+**The underlying input misrouting is NOT fixed**, and it is the more
+serious half: a focused-but-unnoticed field takes keystrokes, so text can
+land in the contributor input, and anything that commits on blur or Enter
+would change the contributor silently. Tracked with the swipe /
+touch_down audit in
+`agenda/presplash_hold_until_responsive.md`.
+
+## 0.55.27 — "couldn't ask" stops masquerading as "nothing configured"
+
+Kent 2026-07-27: *"I seem to have lost my git username? table is still
+there."* Regression from 0.55.22, and it broke a rule this repo states
+explicitly.
+
+Giving `get_credentials_status()` a timeout meant that on **desktop**
+(where, unlike Android's binder call, the timeout actually fires) a busy
+daemon returned the unreachable fallback — `connected: False`, empty
+username, no `contributor` key. That is indistinguishable from a real
+"nothing is configured" answer, so the UI painted it and the user's own
+values vanished. `azt_collab_client/CLAUDE.md`, daemon obligation #1:
+*"No silent empty… The peer reads empty as 'user hasn't set it'."*
+
+Telling that the **peer-sync table survived** — 0.55.13 taught it to hold
+last-known rows when the daemon is silent. The credentials fields never
+learned the same lesson, which is why one went blank and the other
+didn't.
+
+- **The fallback now carries `unreachable: True`**, so "couldn't ask" is
+  distinguishable from a negative answer.
+- **`_apply_credentials_state` holds the UI** on that flag: the status
+  label reads *"Service busy — status not updated"* and the contributor
+  input and GitHub/GitLab buttons are left exactly as they were. The
+  cold-start retry ladder and the release-on-budget-spent policy are
+  unchanged, so a genuinely-down daemon still can't outlast the splash.
+
+## 0.55.26 — prune dangling refs; flag dangling branches instead
+
+**Integrity census added in the same pass (0.55.27, option 1 of the fork
+Kent picked).** `_integrity_probe` counts refs with absent targets plus a
+parent-only walk from HEAD over at most `integrity.head_walk_commits`
+(default 200) commits — parents only, never trees, since tree loads are
+what make the existing 3822-commit walks slow on these devices.
+`_record_integrity` persists to `$AZT_HOME/integrity.json`
+(tempfile + `os.replace`) and logs the delta since the previous boot,
+escalating to `[data-quality] integrity-GROWING … objects are still
+going missing; this is not stale recovery residue` when a count climbs.
+Flat counts mean the phone's two missing objects were one-off recovery
+residue and nothing further is needed; climbing counts mean the cause
+has to be found.
+
+Field 2026-07-27, phone `3a0285ec`, once per served `info/refs`:
+
+```
+[WARNING] ref refs/tags/main-before-itservices-merge points at
+          non-present sha 1db02cfa4960…
+```
+
+A before-merge safety tag whose target object is gone protects nothing —
+there is no state recoverable through it — so pruning destroys nothing
+and silences a warning that fires on every fetch.
+
+- **`_prune_dangling_refs_on_startup`**, at the end of the existing
+  `diag-repair` pass. Uses `remove_if_equals`, so a ref that moved
+  between check and delete is left alone, and holds `project_lock` for
+  2 s, skipping any busy project — this is hygiene, the next boot gets it.
+- **Tags and remote-tracking refs only.** A dangling `refs/heads/*` is a
+  categorically worse condition: that's the branch, and deleting it would
+  turn a damaged repo into an empty one. Those log
+  `[data-quality] dangling-branch-ref … NOT removed` for a human.
+
+**This treats a symptom, and the symptom is not the only one.** The same
+device had a second, different absent object — `dcf320a895…` — surfacing
+as `[snapshot] status raised KeyError` and a skipped pre-merge commit,
+which cost the working-tree protection on that merge. Two distinct
+missing objects means the store is short of more than one thing. Why
+objects go missing is unanswered here; candidates are an interrupted
+fetch that recorded refs before objects, a hard reset that orphaned
+objects a ref still names, or a repo materialised from a peer without the
+commit a local tag pointed at (the `main-before-itservices-merge` name
+suggests a hand-run recovery on that device, which fits).
+
+## 0.55.25 — the settings refresh is off the UI thread
+
+The third item, which I had been deferring and Kent asked for directly.
+
+`refresh()` called `get_credentials_status()` and `is_online()`
+synchronously on the Kivy thread. Indefensible twice over on Android:
+the daemon is a separate process so either call blocks for as long as it
+is busy, and `transports/android_cp.py:148` documents that `timeout` is
+**advisory** — `ContentResolver.call` has no timeout facility, so
+0.55.22's 4 s / 8 s bounds do nothing there. There is no caller-side way
+to bound a binder call; the only fix is to not make it on the frame's
+thread.
+
+- **`_fetch_creds_and_online`** (worker) + **`_apply_credentials_state`**
+  (main thread), via the existing `_rpc_then` seam. Everything that
+  touches a widget, the cold-start retry ladder, and the presplash
+  release all stay on the Kivy thread.
+- **The two RPCs stay independent.** A transient `is_online` failure must
+  not cost the credentials answer — collapsing them into one `try` was a
+  real past bug that left "Connect to GitHub" on screen with credentials
+  confirmed.
+- **This also restores the presplash watchdog.** It is a
+  `threading.Timer`, so it always fired — but `release()` marshals the
+  removal through `Clock.schedule_once`, which cannot run on a blocked
+  main thread. The 45 s overrun to 98 s / 153 s and the freeze were the
+  same stuck thread, so unblocking it fixes both.
+
+Not verified beyond reading: this is the presplash-release path, and the
+failure mode of a mistake here is a splash that never lifts. The seam,
+the ladder (`_CRED_RETRY_MAX`), and release-on-daemon-answered are
+preserved as written, and `_rpc_then` / `refresh()` /
+`_apply_credentials_state` are confirmed to sit in one class
+(`SettingsScreen`, 1155–3702) — but it wants a cold launch on a real
+device before being trusted.
+
+## 0.55.24 — project_lock no longer spans the fetch; offline probe needs no DNS
+
+Both fixes come straight from the 2026-07-27 22:07 watchdog dump, which
+is the first one to name culprits rather than describe symptoms.
+
+**1. `project_lock` held 147 s across a socket read.**
+
+```
+[watchdog] STALL DETECTED: project lock '60206912458536ae.lock'
+           held 147s by thread 'lan-reverse-deliver'
+  lan_push.py:986  _merge_then_push_locked
+  dulwich/client.py:1671 fetch → _read_side_band64k_data
+  ssl.py:1167 read              ← parked here
+```
+
+This is `agenda/daemon_lock_across_network_io.md` (#9) with evidence at
+last, and the direct cause of `post-receive reset 'nml': lock busy (5s
+timeout)` repeating every 20–40 s for minutes on every device: inbound
+data landed and could never be absorbed, because an **outbound** merge
+was parked in a socket read holding the project.
+
+`_merge_then_push` is now two phases. `_fetch_peer_objects_unlocked`
+populates the object store with **no lock held** and resolves the peer's
+tip; the lock is taken only for `_merge_diverged`, the ref update, the
+reset and the push. Safe because a fetch only ADDS content-addressed
+objects — two writers cannot disagree about what a SHA means, and
+nothing observes them until a ref points there, which still happens
+locked. The 5 s lock timeout now means what it says instead of being a
+hostage to a peer's link. The tip observation moved to the fetch phase
+too, so a merge that later defers on a busy lock still leaves an honest
+board entry.
+
+**2. `_has_internet` blocked the watcher in `getaddrinfo`.**
+
+Same dump: `_watcher_loop` → `_has_internet` → `create_connection` →
+`getaddrinfo`, blocked. `create_connection(timeout=3)` bounds the
+CONNECT only; name resolution runs first, unbounded, and this module
+falls back to DoH — over the network that is by hypothesis down. Two
+hostnames meant two full resolver cycles, on the loop that also runs
+`_drain_pending_push` and `drain_pending_resets`. So an offline device
+stalled the very loop retrying the lock-busy resets.
+
+Now numeric anycast probes first (`1.1.1.1:443`, `8.8.8.8:53`, 1.5 s
+each) — **zero name resolution**, ~3 s worst case offline. A false
+negative is the safe direction: it suppresses WAN attempts rather than
+inviting them, Sync overrides it, and the next poll re-checks.
+`sync.connectivity_probe_host` (default empty) restores a hostname
+attempt for a network that filters both probe IPs while permitting
+github; off by default because enabling it puts the DNS cost back on
+every offline poll.
+
+## 0.55.23 — offline is a supported state, so it must be the cheap answer
+
+Kent, correcting how 0.55.22 framed this: *"'With no upstream network': we
+should work with or without this just fine."* Right — running on a LAN
+with no internet is a **target** operating state for field use, not a
+degraded one, so no-upstream must cost nothing. It was costing the most.
+
+```python
+def _h_online(_body):
+    return 200, {"ok": True, "online": _has_internet()}   # live probe, every call
+```
+
+`is_online_cached`'s own docstring prices that probe at *"3–6 s
+TCP-timeout cost on offline networks"*. Meanwhile the watcher already
+maintains `_last_online_state`, refreshed every
+`sync.connectivity_poll_s` (30 s) — the same value the scheduler's
+push-gating trusts. The endpoint ignored it and paid the offline timeout
+on every poll, forever. With the settings screen asking on the UI thread,
+that landed straight on the frame.
+
+- **`_h_online` now serves the cache**, falling back to a single live
+  probe only when the watcher has never populated it (cold start). A
+  verdict up to 30 s old beats one that costs 6 s and is stale on
+  arrival. Response carries `source: cache|probe` so the log can tell
+  which happened.
+
+Kent confirms both devices *were* responsive once loaded — this is
+startup latency, not a wedge, which is consistent with blocking RPCs on
+the frame rather than a lock or a deadlock.
+
+Remaining, in order of expected size: `refresh()` still calls both RPCs
+**on the UI thread** (bounded now, ~12 s worst case, was 77 s) and should
+go through `_rpc_then`; and the presplash's own 45 s watchdog did not cut
+in at 45 s on either device. Both in
+`agenda/presplash_hold_until_responsive.md`.
+
+## 0.55.22 — two UI-thread RPCs had a 300-second timeout
+
+Kent, two devices, 2026-07-27:
+
+| | presplash held | Activity silent for |
+|---|---|---|
+| `74453504` | 98 s (45 s watchdog overrun) | 36.4 s, then 35.4 s |
+| `841d43a8` | 153 s | 77 s, then 39 s |
+
+Every gap is bracketed by `[settings] publish candidate` — a settings
+refresh, on the UI thread. `refresh()` calls `get_credentials_status()`
+and `is_online()` synchronously (`ui/app.py:1838`, `:1845`), and **neither
+wrapper passed a timeout**, so both inherited `rpc.call`'s 300 s default.
+On Android those cross into `:provider`, which in these logs was busy
+with LAN merges (`project busy — deferring`) and 5 s dial timeouts, with
+no upstream DNS at all (`No address associated with hostname`). The
+Activity simply queued behind that, holding the frame.
+
+- **`is_online(timeout=4)`** — a connectivity verdict that arrives after
+  30 s has no value to a UI; it has changed by then, and the daemon keeps
+  a cached one regardless. Timing out returns `False`, i.e. assume
+  offline, which is the safe direction: it suppresses network attempts
+  rather than inviting them.
+- **`get_credentials_status(timeout=8)`** — the work behind it is a local
+  config read, so 8 s is already generous; the delay was queueing, not
+  reading. On timeout it returns the same daemon-unreachable fallback as
+  `ServerUnavailable` (no `confirmed` key), which is exactly what the
+  caller's cold-start retry ladder detects — so a slow daemon now
+  re-polls quickly instead of freezing the screen once.
+
+**This bounds the freeze; it does not move the work.** The proper fix is
+still to route both through the `_rpc_then` seam so `refresh()` never
+blocks the frame at all — preserving the deliberate two-`try` split, the
+`_credentials_retry_count` ladder, and release-on-daemon-answered. That
+refactor touches the presplash-release path, where a mistake means a
+permanently stuck splash, so it is not something to do at the tail of a
+long session. Worst case after this change is ~12 s per refresh instead
+of 77; the remaining work is tracked in
+`agenda/presplash_hold_until_responsive.md`.
+
+Also unexplained and worth its own look: the presplash's own 45 s
+watchdog did not cut in at 45 s on either device.
+
+## 0.55.21 — the chunk cap, found and lifted
+
+0.55.20's instrumentation named it on the first occurrence:
+
+```
+[data-quality]   raiser=dulwich.web.ChunkedEncodingError
+[data-quality]     File ".../dulwich/web.py", line 494, in _chunk_iter
+```
+
+An upstream mismatch, not our bug. `dulwich/web.py` caps a single
+dechunked chunk at **1 MiB**, reasoning that smart-http emits at most
+~64 KiB pkt-lines — but dulwich's own `HttpGitClient` sends a push body
+as one write under `Transfer-Encoding: chunked`, so urllib3 emits ONE
+chunk carrying the whole packfile. Any repo whose pack exceeds 1 MiB can
+therefore never be pushed to a dulwich server: small histories squeak
+under, large ones fail forever, identically, on every retry. That is why
+`nml` would not move between two machines that could see each other
+perfectly.
+
+- **`_raise_dulwich_chunk_limit()`** replaces `dulwich.web._chunk_iter`
+  with a partial carrying a 128 MiB single-chunk cap (tunable via
+  `lan.max_chunk_bytes`, so a field case never waits on a rebuild).
+  Reassigning `MAX_CHUNK_SIZE` would NOT have worked — `_chunk_iter`
+  takes it as a **default argument**, bound at def time; it's
+  `ChunkReader.__init__`'s lookup of the module-global function that the
+  replacement catches. dulwich's separate 1 GiB whole-body cap still
+  applies, and our peers are fingerprint-pinned allowlisted devices, so
+  the cap's original purpose survives at a workable size.
+
+**`SSLEOFError` — quieted, but not dismissed.** Kent: *"You seem
+unconcerned by the ssl.SSLEOFError; will that not bite us some day?"* It
+would have. 0.54.68 wrapped the response *iteration*; wsgiref writes the
+response *headers* outside that generator, so a peer hanging up early
+raised there and dumped nine raw frames (`finish_response` →
+`finish_content` → `send_headers` → `send_preamble`). `BaseHandler.run`
+absorbs only `ConnectionAborted/BrokenPipe/ConnectionReset`, and
+`SSLEOFError` is none of those.
+
+One of these is ordinary on a mobile LAN. But the one in that log landed
+~35 s after the chunk failure — it was **the tail of our own error**: the
+body parse failed, wsgiref went to write a 500, the sender had already
+given up. Blanket silence would have hidden the consequence of a real
+bug. So the event is one line and the **rate** is the signal:
+`_note_early_hangup` counts them in a 5-minute window and emits
+`[data-quality] lan-early-hangups n=… — Not ordinary churn at this rate`
+on every fifth, pointing at what to look for just before each one.
+
+One near-miss worth recording: the quiet check first called the
+middleware's `_is_peer_disconnect`, which is **nested inside another
+function** and unreachable from the patch. The `NameError` would have
+been swallowed by the surrounding `except` and fallen straight through to
+the nine-frame dump — a fix that silently did nothing. Now self-contained,
+walking the `__cause__`/`__context__` chain.
+
+## 0.55.20 — the board says WHY a row stopped moving
+
+Kent 2026-07-27: *"I haven't been able to distinguish between such
+problems and more normal 'I can't be bothered to reciprocate'
+problems."* Both presented identically — a row that simply stopped
+updating — despite having opposite remedies: put the devices on one
+network, versus fix a share.
+
+- **Peek outcomes are now recorded per (peer, project)** and classified
+  at the source: `timeout`, `no_route`, `refused`, `not_served`,
+  `error`, `ok`. The first three are connectivity (`refused` separated
+  deliberately — host up, listener down, network fine); `not_served`
+  means the peer **answered** and would not serve this project, which
+  has nothing to do with the network.
+- **Kept rigorously apart from `observed_at`.** `set_peer_probe_result`
+  touches neither `project_seen_at` nor `last_seen_at`: an attempt is
+  not an observation, and a *failed* attempt certainly isn't. The as-of
+  stamp still moves only on a verified read of the peer's refs.
+- **The row appends the reason**: `no answer`, `no route`, `not
+  listening`, `not shared to us`. Terse per the UI-strings rule, with
+  French.
+- Client wrapper documents `probe_outcome` / `probe_at`; empty on
+  daemons older than 0.55.20.
+
+**Chunk-size cap: instrumented, not fixed — and I can't fix it blind.**
+The message "Chunk size exceeds maximum allowed" appears in no file of
+ours, and our only `wsgi.input` reads are the body-auth handlers, so the
+limit is inside a dependency I can't identify from source.
+`_log_hard_transfer_error` now prints the raiser's defining module, the
+`__cause__`/`__context__` chain and the frames, so the next occurrence
+names what is imposing the limit instead of costing another round-trip
+to the rig. **This is still the reason `nml` will not move between those
+two machines.**
+
+## 0.55.19 — what the first real stack dump actually showed
+
+The 0.55.12 dump worked (2026-07-27 14:30) and named three separate
+things. Kent's question — *"why do I have two computers on my desk who
+each claim to see the other, who haven't shared data, even after I hit
+retry on each?"* — is answered by all three at once.
+
+**1. `nml` receive-pack fails deterministically and we call it
+transient.** Three attempts (14:31:15, 14:32:27, 14:38:32), same error:
+`ChunkedEncodingError('Chunk size exceeds maximum allowed')`, each logged
+as *"peer disconnected mid-transfer; sender will retry"*. It is not a
+disconnect — it is a size cap, and it recurs byte-for-byte forever.
+`requests.ChunkedEncodingError` inherits `RequestException` → `IOError` →
+`OSError`, so it fell into the disconnect branch and was indistinguishable
+from a peer walking away. Now classified separately and logged
+`[data-quality] lan-receive-hard-failure … NOT a disconnect: this recurs
+identically on every retry`. **The underlying cap is not yet fixed** —
+this change stops it hiding.
+
+**2. Five concurrent board recomputes.** The dump caught five dispatch
+threads simultaneously in `_compute_peer_sync_rows` → `_is_ancestor` →
+`dulwich.unpack_object`. The cache prevented *frequent* recomputes but
+not *concurrent* ones: every poller that finds the rows stale at the same
+instant starts its own full git walk. `lan_peer_sync_rows` now
+single-flights on a **non-blocking** lock — the winner walks, everyone
+else serves slightly-stale rows rather than queueing behind a walk.
+
+**3. The stall is `_reset_working_tree_after_receive` under
+`project_lock`.** The `watcher` thread was inside
+`drain_pending_resets` → `porcelain.reset(mode='hard')` →
+`update_working_tree` → object unpacking for over 120 s, which is why
+`post-receive reset 'nml': lock busy (5s timeout)` repeated every 20–40 s
+from 14:31:20 to 14:38:20 — received data kept arriving and never landed.
+This is exactly the evidence `agenda/daemon_lock_across_network_io.md`
+(#9) was waiting for; recorded there, not fixed here.
+
+**Regression fixed: my own 0.55.13 cap was starving reverse delivery.**
+`reverse delivery for '74453504' skipped — 2 already in flight` appears
+eight times in that log. The flat global cap of 2 was being held for
+minutes by merges blocked on `project_lock`, so every *other* peer lost
+its only chance at an observation — the exact staleness the mechanism
+exists to prevent. Now **one in flight per peer** (a second dial to the
+same peer is duplicate work), with the global ceiling raised to 8 purely
+as a runaway backstop.
+
+## 0.55.18 — idle-stop was killing the LAN listener it just promoted for
+
+Kent asked whether 0.55.17 settled the foreground/killing problem. It
+did not, and reading the idle loop says why: the only deferral was an
+in-flight WAN sync.
+
+```python
+if bound == 0 and idle_for > IDLE_TIMEOUT_SECONDS:
+    if sync_flight is not None and sync_flight.in_flight():
+        continue
+    _stop_self()
+```
+
+`idle_for` counts **ContentProvider touches** — local activity only. A
+device whose UI is closed but which is serving nearby peers therefore
+read as idle and called `stopSelf()` after five minutes, tearing down
+the LAN listener, the WifiLock, the MulticastLock and the mDNS
+registration — the exact state the LAN foreground service had just been
+promoted to hold.
+
+It did not recover on its own, either. Android's provider lazy-spawn
+contract revives this process on the next ContentProvider call, but an
+arriving LAN peer makes no such call — it opens a TCP connection to a
+listener that is no longer there. **So LAN sync silently stopped working
+five minutes after the user closed the UI**, contradicting the
+documented design ("mDNS keeps working with the screen off"). With
+`NotificationCompat` also failing, the promotion never happened either,
+so this had been masked: the process was being killed by Android
+*before* it got around to stopping itself.
+
+- **Layer 2 guard: never idle-stop while the LAN listener is bound.**
+  Same shape as the WAN in-flight guard, and gated on
+  `lan_listener.is_running()` — **actually bound**, not on the toggle. If
+  the user asked for LAN sync but the bind failed there is nothing to
+  serve and no reason to pin the process. Staying up while bound is the
+  user's own choice, made visible by the FGS notification and reversible
+  with the toggle.
+
+## 0.55.17 — `:provider` had no jnius prewarm at all
+
+Second ClassNotFoundException of the evening, 2026-07-27 20:21:
+
+```
+[lan-fgs] missing NotificationCompat classes: JavaException(
+  'JVM exception occurred: androidx.core.app.NotificationCompat$Builder
+   java.lang.ClassNotFoundException')
+```
+
+Cost was silent and total: `_build_minimal_notification` returns None,
+`start_fgs` bails on a None notification, so while `lan.allow_sync` was
+on the service was **never promoted to foreground** — no WifiLock, no
+MulticastLock, mDNS dying with the screen. The toggle looked fine.
+
+Same root cause as the connector, and it finally names the general rule:
+**threads Python creates attach to the JVM with the bootstrap
+classloader**, which resolves framework classes but not app or bundled
+-library ones; **threads Java creates** (SDLThread, binder threads)
+carry the app classloader. That is why `autoclass` on
+`androidx.core.view.WindowCompat` works from `picker_app` on the SDL
+thread while these two fail from workers.
+
+- **`server_apk/service.py:main()` now prewarms.** It had none.
+  `main.py`'s step 2a has covered this since 0.43.23 — but main.py is
+  the **Activity** entry point, and jnius caches per process. `:provider`
+  is a different process with its own interpreter and its own empty
+  cache, and it is where the daemon actually runs. The same dual-entry
+  -path trap as the 0.50.53 reconcile hook. Warms our own
+  `AZTServiceProviderhost` (the idle loop's `_bound_count` resolves it
+  from a Python thread), plus the notification / wifi / NSD classes,
+  each in its own `try` so one miss can't skip the rest and the log
+  names which class an APK lacks.
+- **`lan_fgs` drops AndroidX for the framework class.**
+  `android.app.Notification$Builder` has the `(Context, channelId)`
+  constructor from API 26, suite `minapi` **is** 26, and the channel was
+  already gated on 26 — so `NotificationCompat` was shimming a range we
+  do not ship, while carrying two failure modes: transitive-only in the
+  spec (`appcompat` and `fragment` are listed, `androidx.core` is not)
+  and app-classloader-bound. Framework classes resolve from the
+  bootstrap loader, which removes both rather than papering over either.
+
+`androidx.core.view.WindowCompat` in `picker_app.py` is left alone: it
+runs on the SDL thread where resolution works, and its framework
+equivalent (`Window.setDecorFitsSystemWindows`) is API 30, above our
+floor — so the shim there is doing real work.
+
+**0.55.16 was a premature stamp** — I bumped before the change-set was
+finished, then kept editing. It is superseded by 0.55.17; don't build it.
+
+## 0.55.15 — the connector's success path says so
+
+0.55.14's prewarm reported `AZTServiceConnector prewarm ok — class is in
+this APK`, and the `ensureBound failed` line was then absent from the log
+— which is the expected shape of success, but only weak evidence for it:
+that message exists on the failure path alone, so its absence equally
+means `discover()` never ran. Same defect as the one that made this hunt
+take four days.
+
+- **`discover()` now logs on success**, so the bind request is positive
+  evidence rather than an inference from silence. The line says
+  *requested*, not *connected* — `bindService` is async, and the Java
+  side logs `AZTServiceConnector: bound to …` under its own tag when
+  `onServiceConnected` fires. Those are two distinct facts and the log
+  now distinguishes them.
+
+Per `always emit a summary line, even on no-op paths`: a silent function
+is indistinguishable from one that never fired.
+
+## 0.55.14 — AZTServiceConnector: it was the classloader, not the build
+
+Recurring since 2026-07-23, survived a clean build, seen again
+2026-07-27 13:39 — and Kent confirmed it was the **server UI**, the one
+app whose spec definitely carries `android.add_src`
+(`server_apk/buildozer.spec.tmpl:217`). Not AAR dep-propagation either:
+that java imports only framework classes, so there is no transitive
+dependency to fail. Two candidates left, and the log could separate
+neither, which is why four days passed without a verdict.
+
+**Settled by inspecting the dex of every APK on disk:**
+
+```
+aztrecorder-1.62.2-…release.apk   2
+aztviewer-0.18.2-…release.apk     2
+aztcollab-0.55.10-…release.apk    2      ← the build in the field
+```
+
+The class is present in all of them, peers included — two hits being its
+class descriptor and its `TAG` literal, and nothing else in the java
+references it. So "missing from the dex" is eliminated, leaving the
+**bootclassloader**: `discover()` calls `ensureBound` from whichever
+thread makes the first RPC — a worker — and Python-spawned threads
+attach to the JVM with the bootstrap loader, which carries framework
+classes but not app classes. Precisely the trap `server_apk/main.py`
+step 2a already prewarms against (SIGSEGV precedent, baf 2026-05-20).
+`PythonActivity` resolving four lines earlier in the same function never
+disproved it: that one is warmed on the main thread at startup and
+served from jnius's per-class cache.
+
+- **Step 2a.3 resolves the class on the main thread** during Activity
+  startup, so every later worker-thread lookup hits the cache. It also
+  **discriminates**, in case this reasoning is wrong: `prewarm ok` plus
+  no further `ensureBound failed` ⇒ classloader, fixed; `prewarm ok` but
+  `ensureBound` still failing ⇒ reopen; `prewarm FAILED on the main
+  thread` ⇒ the class isn't in that APK after all.
+- **`discover()`'s failure line now names the calling package** and, for
+  ClassNotFoundException, the remedy. The old line reported only the
+  exception, so the same message recurred for days without ever saying
+  which app it came from.
+
+Consequence worth re-timing: while this bind never happened,
+`:provider` never got bind-priority protection, leaving Android 15's
+freezer free to suspend the daemon. That is on the suspect list for the
+44 s startup silence in `agenda/presplash_hold_until_responsive.md` —
+re-time a cold launch before doing more work there.
+
 ## 0.55.13 — reverse delivery was a mutual amplifier (regression, 0.55.10)
 
 **Fixes a regression I shipped in 0.55.10.** Its changelog claimed a
@@ -57,6 +1084,12 @@ tempfile-plus-`os.replace`, and the display was the only casualty.
 Also: the **Retry** button's board refresh never ran. It called
 `self._tick_peer_sync(0)` — that method takes no argument, so it raised
 `TypeError` straight into a bare `except: pass` on every tap.
+
+**Note on the 0.55.13 build:** the version was bumped and then two more
+changes landed under the same number (`android_cp`'s enriched failure
+line, and `server_apk/main.py` step 2a.3). An APK built at the moment of
+the bump has the three items above but not those two. 0.55.14 carries
+the complete set — prefer it.
 
 ## 0.55.12 — the watchdog's stack dump now actually prints
 

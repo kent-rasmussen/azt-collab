@@ -58,7 +58,11 @@ When adding a new suite component:
    grants survive picker dismissal and any peer that received a
    `content://` URI can still call `openFileDescriptor` on it. The
    service auto-stops after 5 min idle (no bound peers + no provider
-   activity); under memory pressure Android may kill earlier, in
+   activity + **no bound LAN listener** + no WAN sync in flight — the
+   last two are deferral guards; `idle_for` counts only ContentProvider
+   touches, so without them a device busy serving peers or mid-push
+   reads as idle and stops itself); under memory pressure Android may
+   kill earlier, in
    which case the next peer ContentResolver call lazy-spawns the
    host (Android's unconditional contract for ContentProvider
    authorities) and `Service.onCreate` re-runs

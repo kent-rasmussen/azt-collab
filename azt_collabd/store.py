@@ -32,7 +32,9 @@ recorder's prefs.json.
 
 import json
 import os
+import sys
 import tempfile
+import threading
 import time
 
 from .paths import azt_home
@@ -368,21 +370,102 @@ def _config_path():
     return os.path.join(azt_home(), 'config.json')
 
 
-def _load_config_file():
+_CONFIG_RMW_LOCK = threading.RLock()
+
+
+def _load_config_file(strict=False):
+    """Read ``config.json``. Missing file → ``{}`` (legitimately empty).
+
+    **Unparseable is NOT empty** (0.55.33). It used to be: this swallowed
+    ``ValueError`` and returned ``{}``, and since every setter is
+    read-modify-write (``cfg = _load_config_file()`` → set one key →
+    save), one unreadable moment made the next setter rewrite the file
+    from nothing — silently discarding contributor, device_name,
+    work_offline, CAWL prefs, everything but the key being written.
+
+    That is how Kent lost his contributor name on five devices on
+    2026-07-27 while toggling LAN sync: the toggle rewrote its own key
+    afterwards, so ``lan.allow_sync`` survived and the name — which
+    nothing rewrites — did not. Same class as the ``peers.json``
+    strict/non-strict split (field incident 2026-07-10), which exists
+    for exactly this reason.
+
+    ``strict=True`` raises on a parse failure. Writers MUST use it: a
+    writer that cannot read the current contents has no business
+    rewriting the file."""
     try:
         with open(_config_path()) as f:
             return json.load(f) or {}
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        if strict:
+            raise
+        print(f'[store] config.json is unparseable; treating as empty '
+              f'for THIS READ only. Writers use strict=True and will '
+              f'refuse rather than clobber.',
+              file=sys.stderr, flush=True)
         return {}
 
 
 def _save_config_file(d):
+    """Atomic write with a UNIQUE temp name (0.55.33).
+
+    The old fixed ``config.json.tmp`` was shared by every writer, so two
+    concurrent setters could interleave — one truncating the other's
+    partial write, then ``os.replace`` publishing a malformed file, which
+    the next read turned into ``{}`` and the next write turned into data
+    loss. ``mkstemp`` gives each writer its own path; ``fsync`` before
+    replace means a power cut can't publish a short file."""
+    import tempfile
     p = _config_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(d, f, indent=2, sort_keys=True)
-    os.replace(tmp, p)
+    target_dir = os.path.dirname(p)
+    os.makedirs(target_dir, exist_ok=True)
+    payload = json.dumps(d, indent=2, sort_keys=True).encode('utf-8')
+    fd, tmp = tempfile.mkstemp(prefix='.config.', suffix='.tmp',
+                               dir=target_dir)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _update_config(mutate, what='update'):
+    """Serialized read-modify-write for ``config.json`` (0.55.33).
+
+    **Delegates to ``settings.update``**, which owns the file. That is
+    the whole point: ``store`` and ``settings`` both write
+    ``config.json``, and each having its own lock serializes nothing —
+    two mutexes guarding one file are no mutex at all. ``settings.update``
+    holds a thread lock AND an ``flock``, so writers in different
+    processes (the picker Activity's prewarm and ``:provider``'s boot both
+    write this file on startup) actually take turns.
+
+    Falls back to a local serialized write if ``settings`` can't be
+    imported, so a bootstrapping edge case can't make the setter fail
+    outright.
+
+    *mutate* receives the config dict and modifies it in place."""
+    try:
+        from . import settings as _settings_mod
+        return _settings_mod.update(mutate, what=what)
+    except ImportError:
+        with _CONFIG_RMW_LOCK:
+            cfg = _load_config_file(strict=True)
+            mutate(cfg)
+            _save_config_file(cfg)
+        return True
 
 
 def get_contributor():
@@ -437,9 +520,9 @@ def set_contributor(name):
     stripped = (name or '').strip()
     if stripped and not is_valid_contributor(stripped):
         return False
-    cfg = _load_config_file()
-    cfg.setdefault('collab', {})['contributor'] = stripped
-    _save_config_file(cfg)
+    def _mutate(cfg):
+        cfg.setdefault('collab', {})['contributor'] = stripped
+    _update_config(_mutate, what='set contributor')
     return True
 
 
@@ -466,9 +549,10 @@ def set_last_popped_update_tag(tag):
     Subsequent boots skip the popup until a strictly newer tag
     is published. Empty string clears the throttle (next boot
     re-pops if an update is available)."""
-    cfg = _load_config_file()
-    cfg.setdefault('update', {})['last_popped_tag'] = (tag or '').strip()
-    _save_config_file(cfg)
+    def _mutate(cfg):
+        cfg.setdefault('update', {})['last_popped_tag'] = \
+            (tag or '').strip()
+    _update_config(_mutate, what='set last_popped_tag')
 
 
 # ── device name (commit identity disambiguator) ─────────────────────────────
@@ -635,9 +719,9 @@ def set_last_langcode(langcode):
             (_load_config_file().get('recent') or {}).get('last_langcode', ''))
     if val == _last_langcode_cache:
         return
-    cfg = _load_config_file()
-    cfg.setdefault('recent', {})['last_langcode'] = val
-    _save_config_file(cfg)
+    def _mutate(cfg):
+        cfg.setdefault('recent', {})['last_langcode'] = val
+    _update_config(_mutate, what='set last_langcode')
     _last_langcode_cache = val
 
 
@@ -661,9 +745,10 @@ def get_cawl_prefetch_all_variants():
 
 def set_cawl_prefetch_all_variants(enabled):
     """Persist the prefetch policy."""
-    cfg = _load_config_file()
-    cfg.setdefault('cawl', {})['prefetch_all_variants'] = bool(enabled)
-    _save_config_file(cfg)
+    def _mutate(cfg):
+        cfg.setdefault('cawl', {})['prefetch_all_variants'] = \
+            bool(enabled)
+    _update_config(_mutate, what='set cawl.prefetch_all_variants')
 
 
 # ── migration from recorder's legacy prefs.json ─────────────────────────────

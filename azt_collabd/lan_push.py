@@ -782,13 +782,62 @@ def _peek_peer_main(url, pm, pid):
         if hasattr(refs, 'refs'):
             refs = refs.refs
         main = refs.get(b'HEAD') or refs.get(b'refs/heads/main')
+        _record_probe(url, pid, 'ok')
         if isinstance(main, bytes):
             return main.decode('ascii')
         return main
     except Exception as ex:
-        print(f'[lan-push] ls-remote peek failed for {pid[:8]!r}: '
-              f'{ex!r}', file=sys.stderr, flush=True)
+        outcome = _classify_peek_failure(ex)
+        _record_probe(url, pid, outcome, repr(ex))
+        print(f'[lan-push] ls-remote peek failed for {pid[:8]!r} '
+              f'[{outcome}]: {ex!r}', file=sys.stderr, flush=True)
         return None
+
+
+def _classify_peek_failure(ex):
+    """Bucket a failed peek so the board can distinguish a CONNECTIVITY
+    problem from a RECIPROCATION one (0.55.20).
+
+    Kent 2026-07-27: *"I haven't been able to distinguish between such
+    problems and more normal 'I can't be bothered to reciprocate'
+    problems."* The two have completely different remedies — move the
+    devices onto one network, versus fix a share — and both presented
+    identically as a row that stopped updating.
+
+    - ``timeout`` / ``no_route`` / ``refused`` — we never got an answer:
+      connectivity. (``refused`` is host-up-listener-down, which is
+      worth separating: the network is fine.)
+    - ``not_served`` — they ANSWERED and would not serve this project.
+      Nothing to do with the network.
+    - ``error`` — anything else; the detail string carries it."""
+    name = type(ex).__name__
+    text = f'{ex!r} {ex}'.lower()
+    if 'notgitrepository' in name.lower():
+        return 'not_served'
+    if 'timed out' in text or 'timeout' in text:
+        return 'timeout'
+    if 'no route to host' in text or 'errno 113' in text:
+        return 'no_route'
+    if 'connection refused' in text or 'errno 111' in text:
+        return 'refused'
+    if 'unreachable' in text or 'errno 101' in text:
+        return 'no_route'
+    return 'error'
+
+
+def _record_probe(url, pid, outcome, detail=''):
+    """Persist a peek outcome against (peer, project). The langcode is
+    derived from the URL path (``/nml.git`` → ``nml``) so this needs no
+    signature change at the several ``_peek_peer_main`` call sites."""
+    try:
+        from urllib.parse import urlparse
+        path = (urlparse(url).path or '').lstrip('/')
+        langcode = path.split('.git', 1)[0] if '.git' in path \
+            else path.split('/', 1)[0]
+        if langcode and pid:
+            _peers.set_peer_probe_result(pid, langcode, outcome, detail)
+    except Exception:
+        pass
 
 
 def _merge_then_push(project, url, pm, pid, host, port):
@@ -806,21 +855,51 @@ def _merge_then_push(project, url, pm, pid, host, port):
     ``<working_dir>/.azt-collab/diagnostics/``. The merge commit
     has both parents (our HEAD + peer HEAD), bot author.
 
-    Runs entirely under ``project_lock``: fetch writes packs to
-    the local object store, ``_merge_diverged`` mutates the
-    working tree + index + HEAD, and the post-merge push reads
-    the freshly-committed merge SHA. Without the lock, any of
-    these can interleave with a concurrent ``commit_project``,
-    ``atomic_finalize``, or post-receive reset — same hazards
-    the github sync path locks against (see
-    ``_sync_repo_locked`` in repo.py). LAN delivery is
-    opportunistic; a 5 s timeout means we skip this round if the
-    project is busy and the next drain pass retries.
+    **Two phases since 0.55.24: fetch UNLOCKED, then mutate LOCKED.**
+    The fetch only adds content-addressed objects, so it is safe outside
+    the lock; ``_merge_diverged`` (working tree + index + HEAD) and the
+    post-merge push read/write local state and stay inside it, against
+    the same hazards the github path locks against (concurrent
+    ``commit_project``, ``atomic_finalize``, post-receive reset — see
+    ``_sync_repo_locked`` in repo.py). LAN delivery is opportunistic; a
+    5 s timeout means we skip this round if the project is busy and the
+    next drain pass retries — and that timeout is now bounded by LOCAL
+    work only, instead of being a hostage to a peer's socket.
     """
+    # PHASE 1 — fetch the peer's objects with NO LOCK HELD (0.55.24).
+    #
+    # This used to happen inside the lock. Watchdog stack, field
+    # 2026-07-27 22:07:
+    #
+    #   project lock '60206912458536ae.lock' held 147s by
+    #   thread 'lan-reverse-deliver'
+    #     lan_push.py:986  _merge_then_push_locked
+    #     dulwich/client.py:1671 fetch → _read_side_band64k_data
+    #     ssl.py:1167 read            ← parked here, 147 s
+    #
+    # A peer on a slow or half-dead link therefore held the project
+    # against every other worker for as long as its socket took, which
+    # is what produced `post-receive reset 'nml': lock busy (5s
+    # timeout)` every 20–40 s for minutes on all four devices: inbound
+    # data landed and could never be absorbed because an OUTBOUND merge
+    # was parked in a socket read.
+    #
+    # Safe to hoist because a fetch only ADDS to the object store, and
+    # git objects are content-addressed: two writers cannot disagree
+    # about what a SHA means, and nothing observes these objects until a
+    # ref points at them — which still happens under the lock in phase
+    # 2. Refs, index, working tree and HEAD are untouched here.
+    peer_head = _fetch_peer_objects_unlocked(project, url, pm, pid)
+    if peer_head is None:
+        return False
+    # PHASE 2 — everything that mutates local state, under the lock.
+    # Now bounded by local work only, so the 5 s timeout means what it
+    # says instead of being a hostage to the network.
     try:
         with project_lock(project.working_dir, timeout=5.0):
             return _merge_then_push_locked(
-                project, url, pm, pid, host, port)
+                project, url, pm, pid, host, port,
+                peer_head=peer_head)
     except LockTimeout:
         print(f'[lan-merge] {pid[:8]!r}: project busy — deferring '
               f'merge; next drain pass will retry',
@@ -828,7 +907,69 @@ def _merge_then_push(project, url, pm, pid, host, port):
         return False
 
 
-def _merge_then_push_locked(project, url, pm, pid, host, port):
+def _fetch_peer_objects_unlocked(project, url, pm, pid):
+    """Populate our object store from *pid*'s refs, holding NO lock.
+
+    Returns the peer's canonical head as a hex ``bytes`` sha, or None if
+    the fetch failed or the peer exposed no usable ref. Also records the
+    tip observation — that's a read of their refs, valid regardless of
+    what we do with it next, and doing it here means a peer whose merge
+    later defers on a busy lock still leaves an honest board entry.
+
+    Prefers ``HEAD`` over ``refs/heads/main`` for the same reason
+    ``_peek_peer_main`` does: after a force-overwrite the peer's real
+    state lives at HEAD."""
+    from dulwich.repo import Repo
+    repo = None
+    try:
+        repo = Repo(project.working_dir)
+    except Exception as ex:
+        print(f'[lan-merge] open repo failed (fetch phase): {ex!r}',
+              file=sys.stderr, flush=True)
+        return None
+    try:
+        from dulwich.client import HttpGitClient
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        base = f'{parsed.scheme}://{parsed.netloc}'
+        path = parsed.path or '/'
+        client = HttpGitClient(base, pool_manager=pm)
+        fetch_result = client.fetch(path, repo)
+    except Exception as ex:
+        print(f'[lan-merge] fetch from {pid[:8]!r} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        return None
+    finally:
+        try:
+            repo.close()
+        except Exception:
+            pass
+    peer_refs = getattr(fetch_result, 'refs', None) or {}
+    peer_head = peer_refs.get(b'HEAD') \
+        or peer_refs.get(b'refs/heads/main')
+    if peer_head is None:
+        print(f'[lan-merge] {pid[:8]!r}: no main / HEAD ref in fetch '
+              f'result; refs={list(peer_refs.keys())!r}',
+              file=sys.stderr, flush=True)
+        return None
+    try:
+        _peers.set_peer_last_seen_main(
+            pid, project.langcode,
+            peer_head.decode('ascii', 'replace')
+            if isinstance(peer_head, bytes) else str(peer_head))
+    except Exception as ex:
+        print(f'[lan-merge] set_peer_last_seen_main {pid[:8]!r} '
+              f'raised: {ex!r}', file=sys.stderr, flush=True)
+    return peer_head
+
+
+def _merge_then_push_locked(project, url, pm, pid, host, port,
+                            peer_head=None):
+    """*peer_head* (hex ``bytes``) comes from
+    ``_fetch_peer_objects_unlocked``, which has already populated our
+    object store outside the lock (0.55.24). It is required; the inline
+    fetch that used to live here is gone, because holding the lock
+    across a socket read is the regression this split exists to end."""
     from dulwich import porcelain
     from dulwich.repo import Repo
     from . import repo as _repo_mod
@@ -920,56 +1061,23 @@ def _merge_then_push_locked(project, url, pm, pid, host, port):
                       f'preserve, proceeding',
                       file=sys.stderr, flush=True)
 
-        # The bundled dulwich's ``porcelain.fetch`` doesn't accept
-        # ``pool_manager=`` even though ``porcelain.push`` does.
-        # Go one level lower: build an ``HttpGitClient`` directly
-        # (its ``__init__`` accepts ``pool_manager`` across every
-        # version of dulwich that's shipped a ``HttpGitClient``)
-        # and call ``client.fetch(path, repo)`` to populate the
-        # local object store with the peer's commits.
-        try:
-            from dulwich.client import HttpGitClient
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            base = f'{parsed.scheme}://{parsed.netloc}'
-            path = parsed.path or '/'
-            client = HttpGitClient(base, pool_manager=pm)
-            fetch_result = client.fetch(path, repo)
-        except Exception as ex:
-            print(f'[lan-merge] fetch from {pid[:8]!r} failed: '
-                  f'{ex!r}', file=sys.stderr, flush=True)
-            return False
-
-        # Resolve peer's canonical current commit. dulwich
-        # returns refs via the FetchPackResult's ``refs`` attr.
-        # Prefer ``HEAD`` over ``refs/heads/main`` for the same
-        # reason ``_peek_peer_main`` does (since 0.46.4): a peer
-        # whose main was force-overwritten still has its real
-        # state at HEAD.
-        peer_refs = getattr(fetch_result, 'refs', None) or {}
-        peer_head = peer_refs.get(b'HEAD') \
-            or peer_refs.get(b'refs/heads/main')
+        # The fetch and the tip resolution both happened in
+        # ``_fetch_peer_objects_unlocked``, before this lock was taken
+        # (0.55.24) — see ``_merge_then_push`` for why the network step
+        # must not run in here. The peer's objects are already in our
+        # store and ``peer_head`` is what that phase resolved, so from
+        # here down everything is local work.
         if peer_head is None:
-            print(f'[lan-merge] {pid[:8]!r}: no main / HEAD ref in '
-                  f'fetch result; refs={list(peer_refs.keys())!r}',
+            print(f'[lan-merge] {pid[:8]!r}: no peer_head supplied; '
+                  f'caller must fetch first',
                   file=sys.stderr, flush=True)
             return False
-        # A live ref-level observation of the peer's tip — record it
-        # HERE, once, so every downstream branch (converged / FF /
-        # we're-behind / identical-trees / three-way) leaves the board
-        # with a real ``last_seen_main``. Without this the only tip
-        # observations came from ``_peek_peer_main``; a delivery that
-        # reached the merge path recorded coverage only, which reads
-        # back as ``incoming_known=False`` — "nothing to send · theirs
-        # unknown" (0.55.11).
-        try:
-            _peers.set_peer_last_seen_main(
-                pid, project.langcode,
-                peer_head.decode('ascii', 'replace')
-                if isinstance(peer_head, bytes) else str(peer_head))
-        except Exception as ex:
-            print(f'[lan-merge] set_peer_last_seen_main {pid[:8]!r} '
-                  f'raised: {ex!r}', file=sys.stderr, flush=True)
+        # The tip observation is recorded by the fetch phase (0.55.11
+        # put it on the merge path so every downstream branch —
+        # converged / FF / we're-behind / identical-trees / three-way —
+        # leaves the board with a real ``last_seen_main``; 0.55.24 moved
+        # it earlier, which also means a merge that later defers on a
+        # busy lock still leaves an honest board entry).
         try:
             local_head = repo.refs[b'HEAD']
         except KeyError:

@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.13"
+__version__ = "0.55.44"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -711,11 +711,30 @@ def _pick_project_android_once(timeout_seconds, autoclass,
     return holder['result'] or {'ok': False, 'error': 'cancelled'}
 
 
-def is_online():
-    """Ask the server whether it has internet access."""
+def is_online(timeout=4):
+    """Ask the server whether it has internet access.
+
+    Bounded at 4 s (0.55.22). This is called from the settings screen's
+    ``refresh()`` **on the UI thread**, and it was inheriting
+    ``rpc.call``'s 300 s default — so a busy or network-starved daemon
+    froze the screen for as long as it took. Field 2026-07-27: two
+    devices, presplash held 98 s and 153 s, the Activity going silent in
+    36–77 s blocks bracketed by settings refreshes, while ``:provider``
+    was occupied with LAN merges and 5 s dial timeouts and had no
+    upstream DNS at all.
+
+    A connectivity verdict that arrives after 30 s has no value to a UI —
+    the answer has changed by then, and the daemon keeps a cached one
+    anyway. Timing out returns False, i.e. "assume offline", which is the
+    safe direction: it suppresses network attempts rather than inviting
+    them."""
     try:
-        resp = call('GET', '/v1/online')
+        resp = call('GET', '/v1/online', timeout=timeout)
     except ServerUnavailable:
+        return False
+    except Exception:
+        # Timeout or transport fault — treat as offline rather than
+        # letting it reach a UI-thread caller.
         return False
     return bool(resp.get('online'))
 
@@ -826,22 +845,65 @@ def check_server_compat():
 
 # ── Credentials API (server-owned credentials.json) ────────────────────────
 
-def get_credentials_status():
+def get_credentials_status(timeout=8):
     """Return a dict describing what's configured:
         {host, github: {connected, username, app_installed},
          gitlab: {connected, username}}
     Never contains raw tokens. On transport failure returns an empty
-    status so the UI degrades gracefully."""
+    status so the UI degrades gracefully.
+
+    Bounded at 8 s (0.55.22) for the same reason as ``is_online``: the
+    settings screen calls this on the UI thread and it was inheriting
+    ``rpc.call``'s 300 s default. The work behind it is a local config
+    read, so 8 s is already generous — the delay comes from queueing
+    behind a busy daemon, not from the read.
+
+    Timing out returns the same daemon-unreachable fallback as
+    ``ServerUnavailable`` (no ``confirmed`` key), which is what the
+    caller's cold-start retry ladder is built to detect — so a slow
+    daemon now re-polls quickly instead of freezing the screen once."""
     try:
-        resp = call('GET', '/v1/credentials/status')
+        resp = call('GET', '/v1/credentials/status', timeout=timeout)
     except ServerUnavailable:
-        return {'host': 'github',
+        # ``unreachable`` marks this as "couldn't ask", NOT as "nothing
+        # is configured" (0.55.27). Without it the fallback is
+        # indistinguishable from a real negative answer, and a UI that
+        # paints it blanks the user's own username and contributor —
+        # Kent 2026-07-27: *"I seem to have lost my git username?"*
+        # after 0.55.22 gave this call a timeout that actually fires on
+        # desktop. Daemon obligation #1 in CLAUDE.md: no silent empty,
+        # because the peer reads empty as "user hasn't set it".
+        return {'host': 'github', 'unreachable': True,
+                'github': {'connected': False, 'username': '',
+                           'app_installed': False},
+                'gitlab': {'connected': False, 'username': ''}}
+    except Exception:
+        # ``unreachable`` marks this as "couldn't ask", NOT as "nothing
+        # is configured" (0.55.27). Without it the fallback is
+        # indistinguishable from a real negative answer, and a UI that
+        # paints it blanks the user's own username and contributor —
+        # Kent 2026-07-27: *"I seem to have lost my git username?"*
+        # after 0.55.22 gave this call a timeout that actually fires on
+        # desktop. Daemon obligation #1 in CLAUDE.md: no silent empty,
+        # because the peer reads empty as "user hasn't set it".
+        return {'host': 'github', 'unreachable': True,
                 'github': {'connected': False, 'username': '',
                            'app_installed': False},
                 'gitlab': {'connected': False, 'username': ''}}
     if resp.get('ok'):
         return {k: v for k, v in resp.items() if k != 'ok'}
-    return {}
+    # A non-ok response is "couldn't answer", not "nothing configured"
+    # (0.55.34). This returned a bare ``{}``, which reaches the UI as a
+    # SUCCESSFUL answer carrying no contributor and no username — so the
+    # UI dutifully painted blanks over real values. Field 2026-07-27: the
+    # daemon's own diagnostic said ``config.collab.contributor: set (10
+    # chars)`` while the settings field showed nothing. 0.55.27 marked
+    # the two exception fallbacks and missed this branch, one line over.
+    return {'host': 'github', 'unreachable': True,
+            'error': str(resp.get('error', '') or 'not_ok'),
+            'github': {'connected': False, 'username': '',
+                       'app_installed': False},
+            'gitlab': {'connected': False, 'username': ''}}
 
 
 def set_collab_host(host):
@@ -991,6 +1053,15 @@ def lan_peer_sync():
         capped         — bool: to_send hit the cap (render 'N+'),
         incoming       — bool: the peer holds commits we don't
                          (count unknown by design),
+        probe_outcome  — str: why the last reach ATTEMPT for this project
+                         didn't become an observation. 'ok' | 'timeout' |
+                         'no_route' | 'refused' | 'not_served' | 'error'
+                         (empty on daemons < 0.55.20). The first three
+                         are CONNECTIVITY; 'not_served' means the peer
+                         answered and declined to serve the project,
+                         which is a sharing problem. Never advances
+                         observed_at — an attempt is not an observation,
+        probe_at       — str: ISO8601-UTC of that attempt,
         incoming_known — bool: False when we have never observed this
                          peer's tip for this project, so the
                          ``incoming: False`` above means 'unknown',

@@ -82,10 +82,46 @@ def discover():
             Connector = autoclass(
                 'org.atoznback.aztcollab.AZTServiceConnector')
             Connector.ensureBound(activity)
+            # Say so on success too (0.55.15). Previously only the
+            # failure path logged, so "no ensureBound line" meant
+            # EITHER the bind was requested fine OR discover() never
+            # ran — indistinguishable, which is exactly the ambiguity
+            # that made the ClassNotFoundException hunt take four days.
+            # The bind itself is async; the Java side logs 'bound to …'
+            # under tag AZTServiceConnector when onServiceConnected
+            # fires, so this line means "requested", not "connected".
+            import sys as _sys
+            print('[android_cp] AZTServiceConnector.ensureBound '
+                  'requested (bind is async; look for '
+                  '"AZTServiceConnector: bound to" next)',
+                  file=_sys.stderr, flush=True)
         except Exception as ex:
             import sys as _sys
+            # Name the CALLING package and the remedy (0.55.13). The
+            # connector's java is compiled per-APK via
+            # ``android.add_src`` (CLIENT_INTEGRATION.md § 2), so
+            # ClassNotFoundException means *this* app didn't compile it
+            # — a build-config fact about one specific APK. The old
+            # message reported only the exception, so the same line
+            # recurred across builds without ever saying WHICH app was
+            # missing it, and it read like a runtime fault rather than a
+            # spec omission (field 2026-07-23 → 2026-07-27, survived a
+            # clean build with the cause still unidentified).
+            pkg = '?'
+            try:
+                pkg = str(activity.getPackageName())
+            except Exception:
+                pass
+            hint = ''
+            if 'ClassNotFoundException' in repr(ex):
+                hint = (' — this APK did not compile the connector; '
+                        'its buildozer.spec needs android.add_src '
+                        'pointing at azt-collab/android/src/main/java '
+                        '(CLIENT_INTEGRATION.md § 2). The provider '
+                        'transport still works; only the un-freezer '
+                        'bind is missing.')
             print(f'[android_cp] AZTServiceConnector.ensureBound '
-                  f'failed: {ex}',
+                  f'failed in {pkg!r}: {ex}{hint}',
                   file=_sys.stderr, flush=True)
         return AndroidContentProviderTransport(CANONICAL_AUTHORITY)
     except Exception:

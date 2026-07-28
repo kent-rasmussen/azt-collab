@@ -727,7 +727,7 @@ def drain_pushes_now(langcode=''):
                 wan_backoff.nudge(lang)
         _drain_pending_push(ignore_backoff=True)
     except Exception as ex:
-        print(f'[scheduler] drain_pushes_now failed: {ex}',
+        print(f'[scheduler] WAN drain (user nudge) failed: {ex}',
               file=sys.stderr, flush=True)
 
 
@@ -980,14 +980,15 @@ def _watcher_loop():
         try:
             _lan_listener.drain_pending_resets()
         except Exception as ex:
-            print(f'[scheduler] lan_listener.drain_pending_resets '
-                  f'failed: {ex!r}', file=sys.stderr, flush=True)
+            print(f'[scheduler] LAN drain (post-receive resets, local '
+                  f'work only) failed: {ex!r}',
+                  file=sys.stderr, flush=True)
         if github_eligible:
             try:
                 _drain_pending_push()
             except Exception as ex:
-                print(f'[scheduler] _drain_pending_push failed: {ex}',
-                      file=sys.stderr, flush=True)
+                print(f'[scheduler] WAN drain (github push) failed: '
+                      f'{ex}', file=sys.stderr, flush=True)
             # Cheap access re-probe for projects blocked on a remote-
             # fixable access error (0.52.24). Decoupled from the push
             # backoff: one small GET per blocked project, throttled to
@@ -1225,7 +1226,7 @@ def _log_drain_skip_due_to_backoff(langcode):
         remaining = f'{remaining_s // 60}m{remaining_s % 60}s'
     else:
         remaining = f'{remaining_s}s'
-    print(f'[scheduler] drain skipped: {langcode!r} '
+    print(f'[scheduler] WAN drain skipped: {langcode!r} '
           f'wan_backoff next={when} (in {remaining}, '
           f'{failures} consecutive failure(s))',
           file=sys.stderr, flush=True)
@@ -1240,10 +1241,17 @@ def _drain_pending_push(ignore_backoff=False):
     cleared ``next_attempt_at``, and we fire all pending projects
     regardless of the WAN due times so a tap-to-sync is responsive.
 
+    Suppressed entirely while ``sync.work_offline`` is on (0.55.42) —
+    including the ``ignore_backoff`` nudge path, since the Sync RPC
+    already refuses with ``WORK_OFFLINE_ENABLED`` before reaching here.
+    Turning the toggle off is how the user says "try now".
+
     LAN fan-out is independent and (per the design rebuild in
     0.50) is no longer fired from this drain loop — it's fired
     by user nudges and by ``_run_commit`` after a successful
-    local commit. The scheduler drain stays WAN-only."""
+    local commit. The scheduler drain stays WAN-only, and
+    work-offline therefore stops github convergence WITHOUT
+    stopping peer-to-peer sharing."""
     try:
         data = projects._load_raw()
     except Exception:
@@ -1252,7 +1260,40 @@ def _drain_pending_push(ignore_backoff=False):
                   if entry.get('pending_push')]
     if not candidates:
         return
-    print(f'[scheduler] drain pushes: {candidates!r}',
+    # Honour ``sync.work_offline`` (0.55.42). Until now the toggle was
+    # enforced ONLY in the Sync-button RPC handler
+    # (``server._h_sync_project``); this drain ignored it, so the
+    # daemon-wide "work offline" setting did not actually stop the
+    # daemon from going to the network. Both this function's own
+    # docstring and ``repo.push_repo``'s claimed otherwise.
+    #
+    # It matters because the WAN push path still holds ``project_lock``
+    # across the network (``repo.sync_repo`` → ``_push_step_locked``,
+    # bounded by _FETCH_TIMEOUT_S=60 + _PUSH_TIMEOUT_S=180). On a wifi
+    # link with internet that is slow or half-dead, an unprompted drain
+    # can therefore stall every local operation on that project for
+    # minutes — the "azt clients freeze when wifi internet is on"
+    # symptom (Kent 2026-07-28). The lock phase-split is the real fix
+    # (``agenda/daemon_lock_across_network_io.md``); this restores the
+    # user's ability to say "not now" and have it mean something.
+    #
+    # LAN sync is deliberately unaffected: ``lan_push`` never consults
+    # this flag, and fan-out is fired by ``_run_commit`` after each
+    # local commit, not from here. Work-offline suppresses github
+    # convergence only — peer-to-peer sharing continues.
+    try:
+        from . import settings as _settings
+        if _settings.work_offline():
+            print(f'[scheduler] WAN drain suppressed: work_offline is '
+                  f'on ({len(candidates)} project(s) pending github '
+                  f'push: {candidates!r}). LAN drain + LAN fan-out are '
+                  f'unaffected; github push resumes when the toggle is '
+                  f'off', file=sys.stderr, flush=True)
+            return
+    except Exception as ex:
+        print(f'[scheduler] work_offline check raised: {ex!r} — '
+              f'proceeding with WAN drain', file=sys.stderr, flush=True)
+    print(f'[scheduler] WAN drain: pushing to github {candidates!r}',
           file=sys.stderr, flush=True)
     for langcode in candidates:
         p = projects.get(langcode)
@@ -1396,6 +1437,11 @@ _ACCESS_REPROBE_CODES = (
 # grant, at negligible cost.
 _ACCESS_REPROBE_MIN_INTERVAL_S = 300.0
 _access_reprobe_last = {}   # langcode -> monotonic time of last probe
+# Rate limit for the work_offline suppression notice (0.55.44). The
+# probe is consulted every watcher tick, so an unconditional line would
+# bury the log; a silent return would be indistinguishable from "never
+# ran". Once per 10 min is the compromise.
+_access_reprobe_offline_logged_at = 0.0
 
 
 def nudge_access_blocked_projects(codes=None):
@@ -1450,6 +1496,38 @@ def _drain_access_reprobe():
                if (e.get('last_sync_error') or '') in _ACCESS_REPROBE_CODES]
     if not blocked:
         return
+    # Also honour ``work_offline`` (0.55.43). This probe is cheap but it
+    # IS github traffic — ``try_accept_repo_invitation`` plus a
+    # ``GET /repos`` — so running it while the user has said "work
+    # offline" spends their data and contradicts the toggle. Unlike
+    # ``_drain_pending_push`` this takes no ``project_lock``, so it was
+    # never part of the client-freeze symptom; the reason to gate it is
+    # honesty about the setting, not lock contention.
+    #
+    # Consequence accepted: a collaborator invitation that arrives while
+    # the toggle is on isn't auto-accepted until it's turned off. That
+    # matches what "work offline" says, and the user controls it.
+    try:
+        from . import settings as _settings
+        if _settings.work_offline():
+            # Say so, but rarely — this runs every watcher tick, and a
+            # silent return is indistinguishable from "never ran"
+            # (the defect class that cost several round-trips on
+            # 2026-07-27).
+            global _access_reprobe_offline_logged_at
+            _now = time.monotonic()
+            if (_now - _access_reprobe_offline_logged_at) > 600:
+                _access_reprobe_offline_logged_at = _now
+                print(f'[scheduler] WAN access re-probe suppressed: '
+                      f'work_offline is on ({len(blocked)} project(s) '
+                      f'blocked on a remote-fixable access error: '
+                      f'{blocked!r}). Pending collaborator invites are '
+                      f'not auto-accepted until the toggle is off',
+                      file=sys.stderr, flush=True)
+            return
+    except Exception as ex:
+        print(f'[scheduler] access re-probe work_offline check raised: '
+              f'{ex!r} — proceeding', file=sys.stderr, flush=True)
     from . import auth as _auth
     now = time.monotonic()
     for langcode in blocked:

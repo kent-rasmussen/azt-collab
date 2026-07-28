@@ -109,10 +109,19 @@ _pending_qr_offers = {}   # langcode (str) → last-heartbeat unix ts
 # threads in ~10 s and a dead ``:provider`` process, every delivery a
 # no-op. One look per contact burst is all convergence needs.
 _REVERSE_COOLDOWN_S = 60.0
-_REVERSE_MAX_INFLIGHT = 2
+# Per-PEER concurrency, not a global counter (0.55.19). A flat cap of 2
+# was starving the mechanism it was meant to protect: reverse-delivery
+# slots get held for minutes by a merge waiting on project_lock, and
+# every other peer then lost its only chance at an observation —
+# ``reverse delivery for '74453504' skipped — 2 already in flight``
+# eight times in one field log while that peer's board went stale. One
+# in flight PER PEER is the real invariant (a second concurrent dial to
+# the same peer is pure duplicate work); the global ceiling only exists
+# so a pathological fan-out can't spawn without bound.
+_REVERSE_MAX_INFLIGHT_TOTAL = 8
 _reverse_gate_lock = threading.Lock()
 _reverse_last_at = {}      # (peer_id, langcode) → admission unix ts
-_reverse_inflight = [0]    # one-slot list: mutable under the lock
+_reverse_inflight_peers = set()   # peer_ids currently being delivered to
 
 
 def record_qr_offered(langcode):
@@ -712,15 +721,40 @@ def _reverse_deliver_by_addr(environ, path_info):
             for ep in (list(peer.get('endpoints') or [])
                        + list(peer.get('static_endpoints') or [])):
                 if str(ep).rsplit(':', 1)[0] == host:
-                    _reverse_deliver(peer.get('peer_id', ''),
-                                     langcode=langcode)
+                    pid = peer.get('peer_id', '')
+                    # PROMOTE the arrival address before dialing back
+                    # (0.55.41). Until now REMOTE_ADDR was used only to
+                    # IDENTIFY the caller; the dial then took whatever
+                    # ``_candidate_endpoints`` offered first, which could
+                    # be — and in the field was — a dead address from a
+                    # previous network, while the address that had just
+                    # provably carried their request sat further down the
+                    # same list.
+                    #
+                    # Kent 2026-07-27: peer reaches us from
+                    # 192.168.124.5, log says "checking … on the address
+                    # they just reached us from", and we then dial
+                    # 192.168.124.153 twice and fail with EHOSTUNREACH.
+                    # The message was aspirational; the code never used
+                    # the arrival address. ``_note_inbound_endpoint``
+                    # does exactly this promotion but was only wired to
+                    # the body-authenticated routes (hello, share_offer),
+                    # never to the git routes this fires from.
+                    try:
+                        _peers.promote_endpoint(pid, str(ep))
+                    except Exception as ex:
+                        print(f'[lan-listener] promote {ep!r} for '
+                              f'{pid[:8]!r} raised: {ex!r}',
+                              file=sys.stderr, flush=True)
+                    _reverse_deliver(pid, langcode=langcode,
+                                     via=str(ep))
                     return
     except Exception as ex:
         print(f'[lan-listener] reverse-by-address raised: {ex!r}',
               file=sys.stderr, flush=True)
 
 
-def _reverse_deliver(peer_id, langcode=''):
+def _reverse_deliver(peer_id, langcode='', via=''):
     """"Do I owe this peer anything?" — asked the moment they reach us
     (0.55.5). Scoped to *langcode* when the inbound request names one.
 
@@ -763,16 +797,20 @@ def _reverse_deliver(peer_id, langcode=''):
         last = _reverse_last_at.get(key, 0.0)
         if now - last < _REVERSE_COOLDOWN_S:
             return
-        if _reverse_inflight[0] >= _REVERSE_MAX_INFLIGHT:
+        if key[0] in _reverse_inflight_peers:
+            # A dial to THIS peer is already running; a second one is
+            # duplicate work. Other peers are unaffected.
+            return
+        if len(_reverse_inflight_peers) >= _REVERSE_MAX_INFLIGHT_TOTAL:
             print(f'[lan-listener] reverse delivery for '
-                  f'{key[0][:8]!r} skipped — '
-                  f'{_reverse_inflight[0]} already in flight',
+                  f'{key[0][:8]!r} skipped — global ceiling '
+                  f'({len(_reverse_inflight_peers)} peers in flight)',
                   file=sys.stderr, flush=True)
             return
         # Stamp at ADMISSION, not completion: a slow delivery must not
         # leave the gate open for a burst behind it.
         _reverse_last_at[key] = now
-        _reverse_inflight[0] += 1
+        _reverse_inflight_peers.add(key[0])
         if len(_reverse_last_at) > 512:
             for k, t in list(_reverse_last_at.items()):
                 if now - t > _REVERSE_COOLDOWN_S * 10:
@@ -786,9 +824,16 @@ def _reverse_deliver(peer_id, langcode=''):
                 project = _proj.get(langcode)
                 if project is None:
                     return
+                # Name the address, and only claim the arrival address
+                # when we actually promoted it (0.55.41). The old
+                # wording asserted "on the address they just reached us
+                # from" unconditionally while the dial could go
+                # somewhere else entirely.
                 print(f'[lan-listener] reverse delivery: checking '
-                      f'{langcode!r} for {peer_id[:8]!r} on the '
-                      f'address they just reached us from',
+                      f'{langcode!r} for {peer_id[:8]!r}'
+                      + (f' via {via} (their arrival address, promoted '
+                         f'to head)' if via else
+                         ' (no arrival address; using stored order)'),
                       file=sys.stderr, flush=True)
                 entry = _peers.get_peer(peer_id)
                 if entry is not None:
@@ -801,15 +846,15 @@ def _reverse_deliver(peer_id, langcode=''):
                   file=sys.stderr, flush=True)
         finally:
             with _reverse_gate_lock:
-                _reverse_inflight[0] = max(0, _reverse_inflight[0] - 1)
+                _reverse_inflight_peers.discard(key[0])
     try:
         threading.Thread(target=_work, daemon=True,
                          name='lan-reverse-deliver').start()
     except Exception as ex:
         # Never leak the slot the gate above reserved — a spawn failure
-        # would otherwise permanently shrink the in-flight budget.
+        # would otherwise block this peer's reverse delivery forever.
         with _reverse_gate_lock:
-            _reverse_inflight[0] = max(0, _reverse_inflight[0] - 1)
+            _reverse_inflight_peers.discard(key[0])
         print(f'[lan-listener] reverse delivery thread raised: '
               f'{ex!r}', file=sys.stderr, flush=True)
 
@@ -1599,6 +1644,188 @@ def _peer_acl_middleware(app):
     return wrapped
 
 
+def _raise_dulwich_chunk_limit():
+    """Lift dulwich's 1 MiB single-chunk receive cap (0.55.21).
+
+    Field 2026-07-27: every `nml` push between two of Kent's machines
+    died with ``dulwich.web.ChunkedEncodingError('Chunk size exceeds
+    maximum allowed')`` — identically, on every retry, for hours, while
+    the sync board showed the pair happily seeing each other.
+
+    Upstream mismatch, not our bug. ``dulwich/web.py`` caps one
+    dechunked chunk at 1 MiB, reasoning that the smart-http protocol
+    emits at most ~64 KiB pkt-lines. But dulwich's own ``HttpGitClient``
+    sends a push body as a single write under ``Transfer-Encoding:
+    chunked``, so urllib3 emits ONE chunk carrying the whole packfile.
+    Any repo whose pack exceeds 1 MiB can therefore never be pushed to a
+    dulwich server — small histories squeak under and large ones fail
+    forever.
+
+    ``MAX_CHUNK_SIZE`` cannot be monkeypatched: ``_chunk_iter`` takes it
+    as a DEFAULT ARGUMENT, bound at def time. ``ChunkReader.__init__``
+    calls the module-global ``_chunk_iter``, so replacing that name is
+    what takes effect.
+
+    The cap's purpose — stop a hostile peer forcing one huge allocation —
+    is preserved, just at a workable size, and dulwich's separate 1 GiB
+    whole-body cap still applies. Our peers are fingerprint-pinned,
+    allowlisted devices on a LAN, so the residual exposure is a paired
+    device asking for one large buffer. Tunable via
+    ``lan.max_chunk_bytes`` so a field case never waits on a rebuild."""
+    try:
+        from dulwich import web as _dweb
+    except Exception as ex:
+        print(f'[lan-listener] dulwich.web unavailable; chunk cap '
+              f'unpatched: {ex!r}', file=sys.stderr, flush=True)
+        return
+    if getattr(_dweb, '_azt_chunk_cap_raised', False):
+        return
+    orig = getattr(_dweb, '_chunk_iter', None)
+    if orig is None:
+        print('[lan-listener] dulwich.web._chunk_iter absent — cap '
+              'patch skipped (dulwich version without the cap?)',
+              file=sys.stderr, flush=True)
+        return
+    try:
+        want = int(_settings.get('lan.max_chunk_bytes',
+                                 128 * 1024 * 1024) or 0)
+    except Exception:
+        want = 128 * 1024 * 1024
+    if want <= 0:
+        return
+    total_cap = getattr(_dweb, 'MAX_REQUEST_SIZE', 1024 ** 3)
+
+    def _chunk_iter_patched(f, max_chunk_size=None, max_total_size=None):
+        return orig(f,
+                    max_chunk_size=(want if max_chunk_size is None
+                                    else max_chunk_size),
+                    max_total_size=(total_cap if max_total_size is None
+                                    else max_total_size))
+
+    _dweb._chunk_iter = _chunk_iter_patched
+    _dweb._azt_chunk_cap_raised = True
+    print(f'[lan-listener] dulwich receive chunk cap raised '
+          f'{getattr(_dweb, "MAX_CHUNK_SIZE", "?")} → {want} bytes',
+          file=sys.stderr, flush=True)
+
+
+_EARLY_HANGUP_WINDOW_S = 300.0
+_EARLY_HANGUP_ESCALATE_AT = 5
+_early_hangups = []          # unix timestamps, trimmed to the window
+_early_hangup_lock = threading.Lock()
+
+
+def _note_early_hangup():
+    """Count peer-hangup-before-response events and escalate on a burst.
+
+    Kent 2026-07-27: *"You seem unconcerned by the ssl.SSLEOFError; will
+    that not bite us some day?"* — a fair challenge. One of these is
+    ordinary on a mobile LAN: a screen sleeps, a phone walks out of
+    range, a socket dies with no ``close_notify``. That is why it must
+    not print nine frames. But it is NOT always benign, and the case
+    that proves it is in the same log: the hangup at 15:48:30 followed
+    the ``nml`` chunk failure, i.e. it was the TAIL OF OUR OWN ERROR —
+    the body parse failed, wsgiref went to write a 500, and the sender
+    had already given up. Silencing that outright would hide the
+    consequence of a real bug.
+
+    So the event stays one line and the RATE becomes the signal: a
+    handful in five minutes is not weather, and says so in a form a
+    log search for ``[data-quality]`` will surface."""
+    try:
+        now = _time.time()
+        with _early_hangup_lock:
+            _early_hangups.append(now)
+            while _early_hangups and \
+                    now - _early_hangups[0] > _EARLY_HANGUP_WINDOW_S:
+                _early_hangups.pop(0)
+            n = len(_early_hangups)
+            burst = (n >= _EARLY_HANGUP_ESCALATE_AT
+                     and n % _EARLY_HANGUP_ESCALATE_AT == 0)
+        if burst:
+            print(f'[data-quality] lan-early-hangups n={n} '
+                  f'window={int(_EARLY_HANGUP_WINDOW_S)}s — peers are '
+                  f'dropping connections before our response lands. '
+                  f'Not ordinary churn at this rate: look for a '
+                  f'server-side failure just before each one (a '
+                  f'lan-receive-hard-failure, a 500, or a stall)',
+                  file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _install_wsgiref_quiet_disconnects():
+    """Collapse peer-disconnect tracebacks that escape the body
+    generator (0.55.21).
+
+    0.54.68 wrapped the response ITERATION, which covers a peer that
+    vanishes mid-packfile. But wsgiref writes the response HEADERS
+    outside that generator, and a peer that hangs up before they land
+    raises there instead — field 2026-07-27 15:48, a bare nine-frame
+    ``ssl.SSLEOFError`` traceback through ``finish_response`` →
+    ``finish_content`` → ``send_headers`` → ``send_preamble``, with no
+    ``[lan-listener]`` line to explain it.
+
+    ``BaseHandler.run`` swallows only ``ConnectionAbortedError`` /
+    ``BrokenPipeError`` / ``ConnectionResetError``; ``SSLEOFError`` is an
+    ``OSError`` but none of those, so it reaches ``handle_error`` →
+    ``log_exception``, which dumps the traceback. Patching
+    ``log_exception`` process-wide is safe here: the LAN listener is the
+    only wsgiref user in this process, and it beats reimplementing
+    ``WSGIRequestHandler.handle`` to inject a ServerHandler subclass
+    (which would drift with the stdlib)."""
+    try:
+        from wsgiref import handlers as _wh
+    except Exception:
+        return
+    if getattr(_wh.BaseHandler, '_azt_quiet_disconnects', False):
+        return
+    orig = _wh.BaseHandler.log_exception
+
+    def log_exception(self, exc_info):
+        ex = exc_info[1] if exc_info else None
+        quiet = False
+        try:
+            # Self-contained on purpose: the middleware's
+            # ``_is_peer_disconnect`` is nested inside another function
+            # and is NOT reachable from here. Referencing it would have
+            # raised NameError into the ``except`` below, silently
+            # falling through to the nine-frame dump this exists to
+            # prevent — a fix that quietly does nothing.
+            cur, depth = ex, 0
+            while cur is not None and depth < 5:
+                if isinstance(cur, (ssl.SSLEOFError,
+                                    ssl.SSLZeroReturnError,
+                                    ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    BrokenPipeError)):
+                    quiet = True
+                    break
+                cur = getattr(cur, '__cause__', None) \
+                    or getattr(cur, '__context__', None)
+                depth += 1
+        except Exception:
+            quiet = False
+        if quiet:
+            where = ''
+            try:
+                env = getattr(self, 'environ', None) or {}
+                where = (f' {env.get("REQUEST_METHOD", "?")} '
+                         f'{env.get("PATH_INFO", "?")} from '
+                         f'{env.get("REMOTE_ADDR", "?")}')
+            except Exception:
+                pass
+            print(f'[lan-listener] peer hung up before the response '
+                  f'was written: {type(ex).__name__}{where}',
+                  file=sys.stderr, flush=True)
+            _note_early_hangup()
+            return
+        return orig(self, exc_info)
+
+    _wh.BaseHandler.log_exception = log_exception
+    _wh.BaseHandler._azt_quiet_disconnects = True
+
+
 def _build_handler_class():
     """Subclass the stdlib WSGI request handler so each request's
     WSGI environ carries the verified peer cert (DER) extracted from
@@ -1727,6 +1954,111 @@ def load_pending_resets_from_disk():
               file=sys.stderr, flush=True)
 
 
+_reset_hard_failures = {}      # langcode → {count, next_at, detail}
+_RESET_BACKOFF_START_S = 60.0
+_RESET_BACKOFF_MAX_S = 900.0
+
+
+def _note_reset_hard_failure(langcode, ex):
+    """Back off a post-receive reset that fails for a NON-transient
+    reason, and say so once per escalation (0.55.30).
+
+    Field 2026-07-27: `post-receive reset 'nml' failed:
+    KeyError(b'dcf320a8951496fd909c91f5159fbe03cfd8f65c')` every ~15 s
+    without end — the object the reset needs is absent from the store, so
+    every retry fails identically. Same shape as the chunk cap in
+    0.55.21: a deterministic failure wearing transient clothing.
+
+    **The queue entry is deliberately KEPT.** Dropping it would be worse
+    than the flood: a project whose working tree never gets reset to HEAD
+    shows the received merge as *deleted* in status, and the next
+    ``commit_project`` would stage that deletion and erase the merge (see
+    the comment at the ``_add_pending_reset`` call site, and the absorbing
+    half in ``repo._commit_repo_locked``). So we keep retrying — just on
+    a 60 s → 15 min curve instead of every tick — and make the condition
+    legible rather than letting it hide in a repeating line."""
+    detail = repr(ex)
+    with _pending_resets_lock:
+        st = _reset_hard_failures.get(langcode) or {
+            'count': 0, 'next_at': 0.0, 'detail': ''}
+        st['count'] += 1
+        st['detail'] = detail
+        delay = min(_RESET_BACKOFF_MAX_S,
+                    _RESET_BACKOFF_START_S * (2 ** (st['count'] - 1)))
+        st['next_at'] = _time.time() + delay
+        _reset_hard_failures[langcode] = st
+        count, wait = st['count'], delay
+    missing = ''
+    if isinstance(ex, KeyError) and ex.args:
+        raw = ex.args[0]
+        try:
+            missing = (raw.decode('ascii', 'replace')
+                       if isinstance(raw, bytes) else str(raw))[:40]
+        except Exception:
+            missing = ''
+    if missing:
+        print(f'[data-quality] reset-blocked-missing-object '
+              f'langcode={langcode!r} object={missing} '
+              f'failures={count} — the working tree cannot be reset to '
+              f'HEAD because this object is not in the store, so '
+              f'received data stays unabsorbed. Retrying in '
+              f'{wait:.0f}s. This does not self-heal: the object has to '
+              f'be recovered from a peer that still has it',
+              file=sys.stderr, flush=True)
+        _log_missing_object_classification(langcode, missing)
+    else:
+        print(f'[data-quality] reset-blocked langcode={langcode!r} '
+              f'failures={count} detail={detail} — retrying in '
+              f'{wait:.0f}s', file=sys.stderr, flush=True)
+
+
+def _log_missing_object_classification(langcode, sha_hex):
+    """Say what the absent object IS, once per escalation (0.55.31).
+
+    Kent 2026-07-27: *"let's see what it is first, then find where else
+    it is."* Recovery needs a source peer, and which peers could possibly
+    have it depends on what it is — a missing commit is a history gap any
+    descendant-holder can supply, while a missing blob is one file's
+    content. Runs on the device that is already reproducing, so no manual
+    step is needed; the 60 s → 15 min backoff is what keeps it cheap."""
+    try:
+        from . import projects as _proj
+        from . import repo as _repo_mod
+        project = _proj.get(langcode)
+        if project is None:
+            return
+        info = _repo_mod.classify_missing_object(
+            project.working_dir, sha_hex)
+        print(f'[data-quality] missing-object-identity '
+              f'langcode={langcode!r} object={info.get("object", "")} '
+              f'kind={info.get("kind", "?")!r} '
+              f'referrers={info.get("referrers", [])[:4]!r} '
+              f'paths={info.get("paths", [])[:4]!r} '
+              f'commits_walked={info.get("walked", 0)} '
+              f'capped={info.get("capped", False)}',
+              file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[data-quality] missing-object-identity failed for '
+              f'{langcode!r}: {ex!r}', file=sys.stderr, flush=True)
+
+
+def _reset_backoff_active(langcode):
+    """True while a hard-failing langcode is still inside its backoff."""
+    with _pending_resets_lock:
+        st = _reset_hard_failures.get(langcode)
+        if not st:
+            return False
+        return _time.time() < float(st.get('next_at', 0) or 0)
+
+
+def clear_reset_hard_failure(langcode):
+    """Forget a langcode's hard-failure curve — call after a successful
+    reset, or after a repair that could plausibly have supplied the
+    missing object."""
+    with _pending_resets_lock:
+        _reset_hard_failures.pop(langcode, None)
+
+
 def drain_pending_resets():
     """Retry each langcode in the deferred-reset queue. Called from
     the scheduler watcher tick. Each retry goes through
@@ -1739,6 +2071,8 @@ def drain_pending_resets():
     if not pending:
         return
     for langcode in pending:
+        if _reset_backoff_active(langcode):
+            continue
         try:
             _reset_working_tree_after_receive(langcode)
         except Exception as ex:
@@ -2011,6 +2345,7 @@ def _reset_working_tree_after_receive(langcode):
                 # Success: clear any prior deferred-reset entry for
                 # this langcode. (Idempotent — no-op if not queued.)
                 _remove_pending_reset(langcode)
+                clear_reset_hard_failure(langcode)
                 # HEAD advanced + working tree changed; push-notify
                 # observers so they re-poll project_status without
                 # waiting for the next background tick.
@@ -2070,6 +2405,7 @@ def _reset_working_tree_after_receive(langcode):
         print(f'[lan-listener] post-receive reset {langcode!r} '
               f'failed: {ex!r}',
               file=sys.stderr, flush=True)
+        _note_reset_hard_failure(langcode, ex)
 
 
 def _refresh_peer_last_seen_after_receive(langcode, new_head_sha_hex):
@@ -2210,6 +2546,74 @@ def _post_receive_pack_middleware(inner_app):
         langcode = m.group(1)
         status_holder = [None]
 
+        def _is_hard_transfer_error(ex):
+            """True when a receive failure is DETERMINISTIC — a limit or
+            a framing violation — not a peer that walked away (0.55.19).
+
+            Both classes arrive as ``OSError`` subclasses, so they were
+            being reported identically: ``requests.ChunkedEncodingError``
+            inherits ``RequestException`` → ``IOError`` → ``OSError`` and
+            landed in the disconnect branch. But "Chunk size exceeds
+            maximum allowed" is a SIZE CAP being hit; it will recur
+            byte-for-byte on every retry, so "sender will retry" reads as
+            reassurance about a loop that cannot terminate.
+
+            Field 2026-07-27: 'nml' receive-pack from 10.191.129.100
+            failed this way at 14:31:15, 14:32:27 and 14:38:32 — same
+            error each time, no convergence, while the board showed the
+            pair happily seeing each other. Kent: *"I'm a bit unclear why
+            i have two computers on my desk who each claim to see the
+            other, who haven't shared data."* This is why."""
+            text = f'{ex!r} {ex}'.lower()
+            return ('exceeds maximum' in text
+                    or 'chunk size' in text
+                    or 'too large' in text
+                    or 'maximum allowed' in text)
+
+        def _log_hard_transfer_error(langcode, ex):
+            print(f'[data-quality] lan-receive-hard-failure '
+                  f'langcode={langcode!r} error={ex!r} — NOT a '
+                  f'disconnect: this recurs identically on every '
+                  f'retry, so this project cannot converge over LAN '
+                  f'until the cause is fixed',
+                  file=sys.stderr, flush=True)
+            # Name the RAISER (0.55.20). The message text
+            # ("Chunk size exceeds maximum allowed") appears in no file
+            # of ours, and our only ``wsgi.input`` reads are the
+            # body-auth handlers — so the cap lives in a dependency and
+            # cannot be located from our source. Print the defining
+            # module, the __cause__/__context__ chain and the frames, so
+            # the next occurrence identifies what is imposing the limit
+            # instead of costing another round-trip to Kent's rig.
+            try:
+                import traceback as _tb
+                cls = type(ex)
+                print(f'[data-quality]   raiser='
+                      f'{getattr(cls, "__module__", "?")}.'
+                      f'{getattr(cls, "__name__", "?")}',
+                      file=sys.stderr, flush=True)
+                seen, cur, depth = set(), ex, 0
+                while cur is not None and depth < 6:
+                    if id(cur) in seen:
+                        break
+                    seen.add(id(cur))
+                    nxt = getattr(cur, '__cause__', None) \
+                        or getattr(cur, '__context__', None)
+                    if nxt is not None:
+                        print(f'[data-quality]   caused-by='
+                              f'{type(nxt).__module__}.'
+                              f'{type(nxt).__name__}: {nxt}',
+                              file=sys.stderr, flush=True)
+                    cur, depth = nxt, depth + 1
+                for line in _tb.format_exception(
+                        type(ex), ex, ex.__traceback__):
+                    for sub in line.rstrip().splitlines():
+                        print(f'[data-quality]   {sub}',
+                              file=sys.stderr, flush=True)
+            except Exception as ex2:
+                print(f'[data-quality]   raiser detail failed: {ex2!r}',
+                      file=sys.stderr, flush=True)
+
         def _capture_start(status, headers, exc_info=None):
             status_holder[0] = status
             return start_response(status, headers, exc_info)
@@ -2229,10 +2633,13 @@ def _post_receive_pack_middleware(inner_app):
                 # traceback (field 2026-07-23). Transient by design —
                 # the sender still holds the data and re-pushes; one
                 # line is the whole story.
-                print(f'[lan-listener] {langcode!r} receive '
-                      f'interrupted (peer disconnected mid-transfer; '
-                      f'sender will retry): {ex!r}',
-                      file=sys.stderr, flush=True)
+                if _is_hard_transfer_error(ex):
+                    _log_hard_transfer_error(langcode, ex)
+                else:
+                    print(f'[lan-listener] {langcode!r} receive '
+                          f'interrupted (peer disconnected '
+                          f'mid-transfer; sender will retry): {ex!r}',
+                          file=sys.stderr, flush=True)
             except Exception as ex:
                 # dulwich wraps socket errors in GitProtocolError
                 # (raised ``from`` the original, so __cause__ carries
@@ -2240,10 +2647,13 @@ def _post_receive_pack_middleware(inner_app):
                 # else re-raises untouched (0.54.68).
                 if not _is_peer_disconnect(ex):
                     raise
-                print(f'[lan-listener] {langcode!r} receive '
-                      f'interrupted (peer disconnected mid-transfer; '
-                      f'sender will retry): {ex!r}',
-                      file=sys.stderr, flush=True)
+                if _is_hard_transfer_error(ex):
+                    _log_hard_transfer_error(langcode, ex)
+                else:
+                    print(f'[lan-listener] {langcode!r} receive '
+                          f'interrupted (peer disconnected '
+                          f'mid-transfer; sender will retry): {ex!r}',
+                          file=sys.stderr, flush=True)
             finally:
                 try:
                     s = status_holder[0] or ''
@@ -2267,6 +2677,14 @@ def _build_server(port):
     from socketserver import ThreadingMixIn
     from wsgiref.simple_server import WSGIServer
     from dulwich.web import make_wsgi_chain
+
+    # Both are process-wide, idempotent, and must be in place before the
+    # first request is served — so they live here, on the one path every
+    # bind goes through (desktop ``serve()`` and the server APK's
+    # ``service.py`` both reach the listener this way, per the
+    # both-entry-points rule).
+    _raise_dulwich_chunk_limit()
+    _install_wsgiref_quiet_disconnects()
 
     backend = _build_dict_backend()
     # ``make_wsgi_chain(backend, …)`` wraps ``HTTPGitApplication``

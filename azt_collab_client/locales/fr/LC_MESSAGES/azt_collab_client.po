@@ -193,6 +193,21 @@ msgstr "à jour"
 msgid "nothing to send · theirs unknown"
 msgstr "rien à envoyer · le leur inconnu"
 
+msgid "Service busy — status not updated"
+msgstr "Service occupé — état non mis à jour"
+
+msgid "no answer"
+msgstr "pas de réponse"
+
+msgid "no route"
+msgstr "pas de route"
+
+msgid "not listening"
+msgstr "n'écoute pas"
+
+msgid "not shared to us"
+msgstr "pas partagé avec nous"
+
 msgid "incoming"
 msgstr "en réception"
 

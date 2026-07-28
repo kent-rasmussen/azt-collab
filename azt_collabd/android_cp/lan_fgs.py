@@ -123,15 +123,32 @@ def _build_minimal_notification(ctx):
         from jnius import autoclass
     except ImportError:
         return None
+    # Framework ``android.app.Notification$Builder``, NOT
+    # ``androidx.core.app.NotificationCompat$Builder`` (0.55.16). The
+    # AndroidX class failed to resolve on the tablet — field 2026-07-27
+    # 20:21: ``missing NotificationCompat classes:
+    # ClassNotFoundException`` — which silently cost the FGS promotion
+    # entirely (``start_fgs`` bails on a None notification), so mDNS and
+    # the WifiLock stopped surviving screen-off while LAN sync was on.
+    #
+    # AndroidX bought nothing here and carried two failure modes: it is
+    # only a TRANSITIVE dependency (the spec lists appcompat and
+    # fragment, not androidx.core), and being an app class it also needs
+    # the app classloader, so a worker-thread first-lookup can miss it.
+    # The framework Builder has the ``(Context, channelId)`` constructor
+    # from API 26, suite ``minapi`` IS 26, and the channel below is
+    # already gated on 26 — so the compat shim was covering a range we
+    # do not ship. Framework classes resolve from the bootclassloader,
+    # which removes both failure modes at once rather than papering over
+    # either.
     try:
-        NotificationCompat = autoclass(
-            'androidx.core.app.NotificationCompat$Builder')
+        NotificationBuilder = autoclass('android.app.Notification$Builder')
         NotificationManager = autoclass(
             'android.app.NotificationManager')
         NotificationChannel = autoclass('android.app.NotificationChannel')
         Build = autoclass('android.os.Build$VERSION')
     except Exception as ex:
-        print(f'[lan-fgs] missing NotificationCompat classes: {ex!r}',
+        print(f'[lan-fgs] missing Notification classes: {ex!r}',
               file=sys.stderr, flush=True)
         return None
     try:
@@ -145,7 +162,7 @@ def _build_minimal_notification(ctx):
                 'AZT Collaboration keeping your work backed up '
                 'and shared.')
             nm.createNotificationChannel(channel)
-        builder = NotificationCompat(ctx, _NOTIFICATION_CHANNEL_ID)
+        builder = NotificationBuilder(ctx, _NOTIFICATION_CHANNEL_ID)
         # Neutral copy: this FGS now covers both LAN peer sharing and
         # WAN github backup (0.52.21 run-to-completion), so it must
         # not claim to be only "nearby devices".

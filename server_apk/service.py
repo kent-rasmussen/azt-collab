@@ -627,6 +627,60 @@ def main():
     cp_service.install_callbacks()
     _boot_trace('after_install_callbacks')
 
+    # Prewarm jnius classes on the SERVICE's main thread (0.55.17).
+    #
+    # ``server_apk/main.py`` step 2a has done this since 0.43.23 — but
+    # main.py is the ACTIVITY entry point, and every class it warms is
+    # cached in the Activity's process. This is ``:provider``, a
+    # different process with its own interpreter and its own empty jnius
+    # cache, and it is where the daemon actually runs. It had no prewarm
+    # at all. Same dual-entry-path trap as the reconcile hook (0.50.53).
+    #
+    # Why it matters: threads that PYTHON creates attach to the JVM with
+    # the bootstrap classloader, which resolves framework classes but
+    # NOT app or bundled-library ones. Threads that JAVA creates (the
+    # SDLThread, binder threads) carry the app classloader — which is
+    # why the same ``autoclass`` succeeds from ``picker_app`` on the SDL
+    # thread and fails from a scheduler worker. jnius caches per class,
+    # so one resolution here on a Java-created thread serves every later
+    # worker.
+    #
+    # Field 2026-07-27 20:21, the failure that found this:
+    # ``[lan-fgs] missing NotificationCompat classes:
+    # ClassNotFoundException`` — reached from a worker via
+    # ``apply_toggle``. Cost was silent and total: no notification means
+    # ``start_fgs`` bails, so the FGS promotion, the WifiLock and the
+    # MulticastLock never happened while LAN sync was on.
+    try:
+        from jnius import autoclass as _autoclass
+        for _cls in (
+                # Our own java — resolved by the idle loop's
+                # ``_bound_count`` from a Python thread.
+                'org.atoznback.aztcollab.AZTServiceProviderhost',
+                'org.kivy.android.PythonService',
+                # lan_fgs: notification + startForeground + wifi locks.
+                'android.app.Notification$Builder',
+                'android.app.NotificationManager',
+                'android.app.NotificationChannel',
+                'android.content.pm.ServiceInfo',
+                'android.net.wifi.WifiManager',
+                # lan_discovery: mDNS register / resolve.
+                'android.net.nsd.NsdManager',
+                'android.net.nsd.NsdServiceInfo',
+                'android.app.ActivityThread',
+                'android.os.Build$VERSION'):
+            try:
+                _autoclass(_cls)
+            except Exception as ex:
+                # Per-class so one miss can't skip the rest, and named
+                # so the log identifies WHICH class is unavailable in
+                # this APK rather than just that something was.
+                print(f'[service] prewarm miss {_cls}: {ex!r}',
+                      flush=True)
+        print('[service] jnius prewarm done', flush=True)
+    except Exception as ex:
+        print(f'[service] jnius prewarm skipped: {ex}', flush=True)
+
     # Reconcile any in-flight scheduler jobs left over from the
     # previous daemon process (kill -9, OOM, etc.). Marks PENDING /
     # RUNNING jobs as DONE+JOB_INTERRUPTED so peer poll_job calls
@@ -757,6 +811,40 @@ def main():
                 print('[service] idle-stop deferred: WAN sync in '
                       'flight', flush=True)
                 continue
+            # Layer 2 (0.55.18): never stop while the LAN listener is
+            # bound. The idle measure counts ContentProvider touches
+            # only — i.e. LOCAL activity — so a device whose UI is
+            # closed but which is serving nearby peers read as idle and
+            # called stopSelf(), tearing down the listener, the
+            # WifiLock, the MulticastLock and mDNS registration.
+            #
+            # That is exactly the state the LAN foreground service
+            # exists to hold: screen off, waiting for a peer to appear.
+            # And it did not recover on its own — Android's provider
+            # lazy-spawn contract revives this process on the next
+            # ContentProvider call, but an arriving LAN peer makes no
+            # such call; it opens a TCP connection to a listener that is
+            # no longer there. So LAN sync silently stopped working five
+            # minutes after the user closed the UI, which contradicts
+            # the documented design ("mDNS keeps working with the screen
+            # off"). Found 2026-07-27 while answering "are we set on the
+            # foreground/killing problem?" — we were not.
+            #
+            # Gated on ACTUALLY BOUND, not on the toggle: if the user
+            # asked for LAN sync but the bind failed, there is nothing
+            # to serve and no reason to pin the process. Staying up
+            # while bound is the user's own choice, made visible by the
+            # FGS notification and reversible with the toggle.
+            try:
+                from azt_collabd import lan_listener as _lan
+                if _lan.is_running():
+                    print('[service] idle-stop deferred: LAN listener '
+                          f'bound at {_lan.bound_endpoint()}',
+                          flush=True)
+                    continue
+            except Exception as ex:
+                print(f'[service] LAN idle-stop guard raised: {ex!r} — '
+                      f'treating as not listening', flush=True)
             print(f'[service] idle-stop: bound={bound} '
                   f'idle_for={idle_for:.0f}s — stopSelf()',
                   flush=True)

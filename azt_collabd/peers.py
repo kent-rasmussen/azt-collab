@@ -116,6 +116,19 @@ def _normalize_entry(entry):
         for k, v in raw_lcl.items():
             if isinstance(k, str) and isinstance(v, str) and v:
                 last_covered_local[k] = v
+    # Why the last reach ATTEMPT didn't become an observation (0.55.20).
+    # Kept strictly separate from ``project_seen_at``: an attempt is not
+    # an observation, and must never advance the board's as-of stamp.
+    raw_probe = entry.get('probe') or {}
+    probe = {}
+    if isinstance(raw_probe, dict):
+        for k, v in raw_probe.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                probe[k] = {
+                    'outcome': str(v.get('outcome', '') or ''),
+                    'at': str(v.get('at', '') or ''),
+                    'detail': str(v.get('detail', '') or '')[:200],
+                }
     raw_psa = entry.get('project_seen_at') or {}
     project_seen_at = {}
     if isinstance(raw_psa, dict):
@@ -196,6 +209,14 @@ def _normalize_entry(entry):
         # older than the peer-level ``last_seen_at`` (bumped by any
         # project's contact). Since 0.54.70.
         'project_seen_at': project_seen_at,
+        # {langcode: {outcome, at, detail}} — outcome is one of
+        # 'ok' | 'timeout' | 'no_route' | 'refused' | 'not_served' |
+        # 'error'. Lets the board separate "we could not reach them"
+        # (connectivity) from "we reached them and they would not serve
+        # this project" (reciprocation) — indistinguishable before
+        # 0.55.20, which is the ambiguity Kent could not diagnose
+        # around.
+        'probe': probe,
     }
 
 
@@ -618,6 +639,40 @@ def set_peer_last_seen_main(peer_id, langcode, sha):
         data['peers'] = peers
         _save_raw(data)
     _invalidate_sync_board()  # timestamp (and possibly state) moved
+    return True
+
+
+def set_peer_probe_result(peer_id, langcode, outcome, detail=''):
+    """Record the outcome of the last reach ATTEMPT for this project.
+
+    Deliberately does NOT touch ``project_seen_at`` or ``last_seen_at``:
+    an attempt is not an observation, and a failed attempt certainly
+    isn't. This exists so the board can say WHY a row is stale —
+    'unreachable' (timeout / no route / refused) is a connectivity
+    problem, while 'not_served' means the peer answered and declined to
+    serve the project, which is a sharing/reciprocation problem. Before
+    0.55.20 both looked identical: a row that simply stopped updating.
+
+    ``outcome='ok'`` clears the condition after a successful peek."""
+    if not peer_id or not langcode or not outcome:
+        return False
+    with _LOCK:
+        data = _load_raw()
+        peers = dict(data.get('peers') or {})
+        if peer_id not in peers:
+            return False
+        entry = dict(peers[peer_id] or {})
+        probe = dict(entry.get('probe') or {})
+        probe[str(langcode)] = {
+            'outcome': str(outcome),
+            'at': _now_iso(),
+            'detail': str(detail or '')[:200],
+        }
+        entry['probe'] = probe
+        peers[peer_id] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    _invalidate_sync_board()
     return True
 
 

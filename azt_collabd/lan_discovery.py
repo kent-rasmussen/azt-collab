@@ -11,6 +11,37 @@ peer's identity advertised in the spec:
 
 Instance name = ``device_name`` (daemon-owned, user-overridable).
 
+**The contributor's NAME is therefore broadcast in the clear** — the
+instance name is ``<contributor> — <os device label>``, multicast to every
+host on the subnet, unauthenticated and without pairing, for as long as
+``lan.allow_sync`` is on. That includes hotel / conference / cafe
+networks, not just a desk.
+
+**Decided 2026-07-27 (Kent): leave it. Do not "fix" this.** In his words:
+*"We're going to assume basic trust for now. If people need to obfuscate
+their names, that field is available. And ultimately we can do other stuff
+later."*
+
+Three reasons, in his order of weight:
+
+1. **Basic trust is the assumed operating context** for this deployment.
+2. **Obfuscation is already self-service** — ``contributor`` is a
+   user-editable field, so anyone who needs a pseudonym on the network
+   just types one. No code owes them anything.
+3. **Later work isn't foreclosed** by leaving it now.
+
+Secondary, and mine rather than his: the string must be
+human-distinguishable BEFORE pairing or the device-chooser shows hex
+peer-ids, and on Android it feeds a *system* picker dialog
+(``FLAG_SHOW_PICKER``) that an opaque identifier would make useless.
+Exposure is the same class as AirDrop / Chromecast names.
+
+The alternative considered and rejected: split identity — advertise the
+device label alone and deliver the contributor over the authenticated
+``hello`` after pairing. Viable if a deployment ever needs it; unnecessary
+while (2) holds, since it would build in code what the user can already do
+by typing.
+
 Two platforms, one facade:
 
   - **Android** — ``NsdManager`` via pyjnius. Browse uses
