@@ -169,6 +169,23 @@ class LoopbackTransport(Transport):
         except OSError:
             return True
 
+    # A daemon rewrites ``server.json`` as it comes up, so a very recent
+    # mtime means a restart just happened. Wide enough to cover a desktop
+    # re-exec (new interpreter boot) without masking a daemon that has
+    # been unresponsive for any length of time.
+    _RESTART_GRACE_S = 20.0
+
+    def _server_json_written_recently(self):
+        """True iff ``server.json`` was rewritten within the restart
+        grace window (0.55.86). Used only to choose WORDING — never to
+        change whether we respawn or touch the file."""
+        try:
+            import time as _time
+            return (_time.time() - os.path.getmtime(self._server_json_path())
+                    ) < self._RESTART_GRACE_S
+        except Exception:
+            return False
+
     def _server_alive(self, info):
         if not self._pid_alive(info.get('pid')):
             return False
@@ -234,6 +251,33 @@ class LoopbackTransport(Transport):
             # cannot take the lock. Say so instead — the remedy is a
             # restart of THAT process, which the caller can name.
             if info is not None and self._pid_alive(info.get('pid')):
+                # A RESTART LOOKS EXACTLY LIKE A WEDGE FOR A SECOND OR
+                # TWO (0.55.86). The daemon re-execs in place, so the pid
+                # is unchanged and alive throughout, but there is a gap
+                # between the old image stopping and the new one binding
+                # its socket. Probed inside that gap the test above is
+                # satisfied and we shout SERVICE_WEDGED at a daemon that
+                # is merely mid-restart.
+                #
+                # Field 2026-07-29: pressing Restart produced two
+                # SERVICE_WEDGED lines; ``ps`` then showed pid 1021991
+                # with 1d12h elapsed (execv preserves both pid and start
+                # time) running the NEW version, answering normally. The
+                # message was alarming, accurate about the probe, and
+                # wrong about the conclusion.
+                #
+                # ``server.json`` is rewritten by the daemon as it comes
+                # up, so a fresh mtime means a restart just happened.
+                # Stay quiet inside that window and let the caller retry;
+                # the refusal to respawn or delete the file is unchanged
+                # either way, so this only affects what we SAY.
+                if self._server_json_written_recently():
+                    print(f'[azt_collab_client] service not answering '
+                          f'yet (pid {info.get("pid")} alive, '
+                          f'server.json just rewritten) — looks like a '
+                          f'restart in progress, not a wedge; retrying',
+                          file=sys.stderr, flush=True)
+                    return 'wedged'
                 print(f'[azt_collab_client] SERVICE_WEDGED (pid '
                       f'{info.get("pid")} is running but not answering '
                       f'/v1/health) — not respawning, not touching '

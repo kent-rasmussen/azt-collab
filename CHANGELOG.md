@@ -9,6 +9,124 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.90 — …and the screen actually asks for it
+
+0.55.89 published live progress at every depth and the daemon duly reported
+it. The line still didn't move, because **nothing re-rendered it**:
+`_refresh_project_actions_row` builds the current-project block once, and the
+only periodic timers on the settings screen are the CAWL cache poll and the
+peer-sync board. So it showed whatever was true when the screen was built.
+
+Field: the log ticked `374 → 373 → 372 → 371` while the label sat at "816
+commit(s) to go" — with both processes on 0.55.89. The number existed, on
+both sides of the wire; no one asked for it again. Three versions of this
+feature shipped before the display was wired to a clock.
+
+Now piggybacked on the existing 5 s peer-sync poll: same off-UI-thread fetch,
+and `project_status` is a daemon-side dict read unless something changed.
+`_update_backup_line` splices just the `GitHub backup:` line rather than
+rebuilding the block — cheaper, and a partial poll can't blank Project/Remote
+above it. No-op when the block hasn't been built or has no backup line, so
+the poll can't invent UI the render path deliberately withheld (a LAN-only
+project with no remote).
+
+## 0.55.89 — the moving number reaches the screen
+
+Kent: *"It would be nice to see 374 → 373 → 372 → 371 reflected in the '816
+to go', which would not seem to be literally true."*
+
+816 **is** literally true — that many commits aren't on `main` — but it is
+the wrong number to watch, because it is pinned by construction: a merge
+can't be pushed until its side branch is banked, so the headline can't move
+for hours while real work ticks down one commit a minute on a side ref.
+
+0.55.83 published progress only at `_side_depth == 0`, reasoning that side
+refs shouldn't overwrite the headline. Wrong: the deepest level is where the
+bytes move, and gating it meant the display could only ever show the frozen
+number.
+
+Now every depth publishes, and deeper calls write later so the newest entry
+is naturally the innermost. `depth` rides along so the UI can phrase it
+without implying it's progress against the headline:
+
+```
+depth 0   GitHub backup: 816 to go — uploading 42 of 816
+depth >0  GitHub backup: 816 to go — sending batch, 371 left
+```
+
+"batch", not "of 816", because a depth-2 count is genuine progress toward a
+different thing. Completion still clears only at depth 0, so an inner finish
+doesn't blank the line while outer work continues.
+
+## 0.55.88 — topic-push lines name their ref and depth
+
+Side-ref banking (0.55.81) made `_push_chunked_to_ref` recursive, so up to
+three nested invocations interleave in the log — each with its own
+`remaining`, all under an identical prefix, and only the one-off
+`topic-push begin ref=…` line saying which ref is which.
+
+Kent, reading 816 / 572 / 374 in a single run: *"why does it count down from
+816 on restarts? I thought what was done before was done."* It was: those are
+three different refs, nested, and the outer two cannot move until their
+children finish. The innermost resumed at 374 after a restart, exactly where
+the previous run left it. Nothing was lost — the log just couldn't say so.
+
+Now `topic-push[d1] 'azt-side-c6858018' attempt target=… remaining=572`.
+The depth marker also makes the recursion visible as a stack rather than
+looking like three competing pushes.
+
+## 0.55.87 — the sideband reaches the screen, not just the log
+
+0.55.83 published `push_progress` only at chunk-*attempt* boundaries. During
+a single multi-minute unit — exactly what the display exists for — nothing
+updated, the entry aged past `PUSH_PROGRESS_STALE_S`, and the line correctly
+fell back to the static "816 commit(s) to go". 0.55.79's progress stream, the
+only thing that ticks during such a transfer, went to the daemon log and
+nowhere else.
+
+Wired together: `_PushProgressStream` now takes the project dir and calls
+`touch_push_progress` on each rate-limited emit, carrying git's own text.
+The settings line renders it — *"GitHub backup: 816 to go — Resolving
+deltas: 47%"* — which is worth far more during one long unit than a commit
+count that cannot move until the unit lands.
+
+`touch_push_progress` creates an entry if none exists, since a preseed batch
+or a side-ref push can be the first thing to report, and "something is
+uploading" beats silence even without a banked/total.
+
+Also fixed in this pass: `SERVICE_WEDGED` no longer cries wolf during a
+restart. The daemon re-execs in place, so the pid stays alive and unchanged
+across the gap where the old image has stopped and the new one hasn't bound
+its socket — a probe landing there satisfies every wedge test. Field
+2026-07-29: two `SERVICE_WEDGED` lines after pressing Restart, then `ps`
+showed the same pid with 1d12h elapsed (execv preserves pid *and* start
+time) running the new version and answering fine. When `server.json` was
+rewritten within 20 s, the message now says a restart looks to be in
+progress. The refusal to respawn or touch the file is unchanged — only the
+wording differs, because that refusal is what protects the new daemon.
+
+## 0.55.86 — "Sync service is restarting…" stops lying after it restarted
+
+The label is set when the restart fires and nothing ever unset it, so the
+screen kept saying *"Sync service is restarting…"* indefinitely — while the
+strip directly beneath it already read `client 0.55.85 · server 0.55.85`,
+which is proof the new daemon was up and had answered a version probe.
+
+Two widgets on one screen contradicting each other, and the alarming one
+wins the user's attention. That invites another restart — which, during a
+long push, is the single most destructive thing available (0.55.73's
+watchdog deferral exists because restarts were killing transfers that were
+working).
+
+`_refresh_version_strip_after_restart` already re-probes at +2 s; it now
+clears the label to *"Sync service restarted."* once that probe returns a
+version. `_set_restart_msg` walks the candidate label ids, since the
+desktop settings host and the Android picker host name theirs differently,
+and never raises into a caller that just succeeded.
+
+Same defect family as CLAUDE.md invariant #15, seen from the other end: not
+a message that outran its truth, but one that outlived it.
+
 ## 0.55.85 — LAN off means silent, so WAN gets the whole link
 
 Kent 2026-07-29, watching a WAN push crawl: *"if the user has clicked share

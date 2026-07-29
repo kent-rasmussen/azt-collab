@@ -1158,10 +1158,27 @@ def _github_backup_line(ps):
         if isinstance(prog, dict):
             banked = int(prog.get('banked') or 0)
             total = int(prog.get('total') or 0)
+            # The remote's own words when we have them (0.55.87) — git
+            # says things like "Resolving deltas: 47%", which is far more
+            # use during a single multi-minute unit than a commit count
+            # that cannot move until the unit lands.
+            note = str(prog.get('note') or '').strip()
+            depth = int(prog.get('depth') or 0)
             if total > 0:
+                if depth > 0:
+                    # A side branch being banked so an outer merge can
+                    # shrink (0.55.89). Real progress, but NOT progress
+                    # against ``wan``, which stays pinned until the merge
+                    # lands — so say "batch", not "of 816".
+                    return _tr('GitHub backup: {n} to go — sending '
+                               'batch, {left} left').format(
+                                   n=wan, left=max(0, total - banked))
                 return _tr('GitHub backup: {n} to go — uploading '
                            '{done} of {total}').format(
                                n=wan, done=banked, total=total)
+            if note:
+                return _tr('GitHub backup: {n} to go — {note}').format(
+                    n=wan, note=note[:60])
             return _tr('GitHub backup: {n} commit(s) to go '
                        '— uploading…').format(n=wan)
     except Exception:
@@ -1280,6 +1297,36 @@ class SettingsScreen(Screen):
         self._peer_sync_event = Clock.schedule_interval(
             lambda _dt: self._tick_peer_sync(), 5.0)
 
+    def _update_backup_line(self, text):
+        """Replace just the ``GitHub backup:`` line in the current-project
+        info label, leaving Project/Remote above it untouched (0.55.90).
+
+        Rewriting the whole label from the poll would need the project
+        record and the live remote URL that
+        ``_refresh_project_actions_row`` resolves; splicing one line is
+        cheaper and can't blank the block if the poll is partial.
+
+        No-op when the block hasn't been built yet, or has no backup line
+        to replace — the poll must never invent UI that the render path
+        decided not to show (e.g. a LAN-only project with no remote)."""
+        try:
+            info = self.ids.get('project_actions_info')
+        except Exception:
+            info = None
+        if info is None:
+            return
+        try:
+            lines = (info.text or '').split('\n')
+            marker = _tr('GitHub backup:').split(':')[0]
+            for i, line in enumerate(lines):
+                if line.startswith(marker):
+                    if lines[i] != text:
+                        lines[i] = text
+                        info.text = '\n'.join(lines)
+                    return
+        except Exception:
+            pass
+
     def _stop_peer_sync_poll(self):
         if self._peer_sync_event is not None:
             try:
@@ -1315,6 +1362,28 @@ class SettingsScreen(Screen):
             except Exception:
                 lan_state = None
 
+            # Piggyback the GitHub backup line too (0.55.90). It was
+            # rendered once by ``_refresh_project_actions_row`` and never
+            # again — the only periodic timers on this screen are the
+            # CAWL cache and this peer-sync poll — so it showed whatever
+            # was true when the screen was built. Kent 2026-07-29,
+            # watching a push tick 374 → 371 in the log while the line
+            # sat at "816 commit(s) to go": the live number existed, on
+            # both sides of the wire, and nothing asked for it again.
+            #
+            # Same 5 s cadence and same off-UI-thread fetch as the peer
+            # board; ``project_status`` is a dict read on the daemon side
+            # unless something changed.
+            backup_line = None
+            try:
+                _cur = (current or '').strip()
+                if _cur:
+                    _ps = project_status(_cur)
+                    if _ps is not None and (_ps.remote_url or '').strip():
+                        backup_line = _github_backup_line(_ps)
+            except Exception:
+                backup_line = None
+
             # Hold the board on a failed poll (0.55.13). ``rows == []``
             # is ambiguous — the client wrapper returns [] both for
             # "daemon says no peers" and for "couldn't ask", because a
@@ -1335,6 +1404,8 @@ class SettingsScreen(Screen):
             def _land(_dt):
                 if rows_out is not None:
                     self._render_peer_sync(rows_out, current)
+                if backup_line:
+                    self._update_backup_line(backup_line)
                 if lan_state is None:
                     return
                 on = bool(lan_state.get('on'))
@@ -3265,12 +3336,56 @@ class SettingsScreen(Screen):
                 if app is not None and hasattr(
                         app, '_probe_server_version'):
                     import threading as _th
-                    _th.Thread(target=app._probe_server_version,
+
+                    def _probe_then_clear():
+                        # CLEAR THE "restarting…" LABEL ONCE THE SERVER
+                        # ANSWERS (0.55.86). The message was set on
+                        # restart and nothing ever unset it, so the
+                        # screen kept saying "Sync service is
+                        # restarting…" indefinitely — while the strip
+                        # beside it already read ``server 0.55.85``,
+                        # proving the daemon was up and had answered.
+                        # Two widgets, same screen, contradicting each
+                        # other; the alarming one wins the user's
+                        # attention and invites another restart.
+                        try:
+                            app._probe_server_version()
+                        finally:
+                            try:
+                                ver = getattr(
+                                    app, 'version_string', '') or ''
+                            except Exception:
+                                ver = ''
+                            if ver:
+                                Clock.schedule_once(
+                                    lambda *_: self._set_restart_msg(
+                                        _tr('Sync service restarted.')),
+                                    0)
+                    _th.Thread(target=_probe_then_clear,
                                daemon=True).start()
             except Exception as ex:
                 print(f'[settings] version strip refresh failed: '
                       f'{ex}', flush=True)
         Clock.schedule_once(_do_probe, 2.0)
+
+    def _set_restart_msg(self, text):
+        """Set the restart status label, if this screen has one.
+
+        Best-effort by design: the label id differs between the
+        desktop settings host and the Android picker host, and a
+        status message must never be able to raise into the caller
+        that just succeeded."""
+        for _id in ('restart_msg', 'update_msg', 'status_msg'):
+            try:
+                widget = self.ids.get(_id)
+            except Exception:
+                widget = None
+            if widget is not None:
+                try:
+                    widget.text = text
+                    return
+                except Exception:
+                    continue
 
     def _force_kill_daemon_process(self):
         """Non-cooperative kill of the daemon process.

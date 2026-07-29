@@ -12,9 +12,34 @@
   must not cry wolf during the routine minutes after a commit — the
   reason peer coverage was allowed to count in the first place.
 - **Deadline:** none
-- **Waiting on:** Kent's call on the question below. Do not implement
-  before that: what counts as "safe" is a risk judgement, not an
-  engineering one.
+- **Waiting on:** Nothing — **CLOSED 2026-07-29, no change needed.**
+
+## Resolution (2026-07-29)
+
+**Wrong premise. `at_risk` is not a status surface.** Kent: *"where does
+at_risk surface for the user? This seems like a you problem… with
+wan_unshared, we give users WAN-X and LAN-y, and we now have real status
+both for github and LAN peers."*
+
+Checked: `at_risk` has exactly ONE user-facing use — the forget-project
+confirmation in `azt_collab_client/ui/picker.py::_forget_dialog`, where it
+gates the red warning before *"Delete data too"*. It does not feed the sync
+indicator; that is `wan_unshared` / `lan_unshared`, rendered as WAN-X /
+LAN-Y.
+
+And in that one place the current definition is **correct**. Before deleting
+a working tree the question really is "does a copy exist anywhere else",
+and a peer copy really does count. Discounting peers would fire the
+scary warning on projects that are entirely safe to delete locally —
+strictly worse.
+
+The observation that started this (reading `at_risk → 0` while 1,264
+commits were off github) was me treating a **delete guard** as a safety
+claim, in a diagnostic log where it was never presented as one. The
+off-site figure was on screen the whole time as `wan_unshared`.
+
+No code change. Kept as a record so the same reasoning isn't re-derived
+from the same log line.
 
 ## The observation
 

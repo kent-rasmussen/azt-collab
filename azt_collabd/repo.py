@@ -5721,11 +5721,15 @@ class _PushProgressStream:
     Never raises. A progress reporter must not be able to fail the
     transfer it is reporting on."""
 
-    def __init__(self, label='', min_interval_s=15.0):
+    def __init__(self, label='', min_interval_s=15.0, project_dir=''):
         self._label = label or 'push'
         self._buf = b''
         self._min = float(min_interval_s)
         self._last = 0.0
+        # When given, each emit also refreshes the live push-progress
+        # marker (0.55.87) so the UI keeps showing movement through a
+        # single long transfer instead of ageing into "no push running".
+        self._project_dir = str(project_dir or '')
 
     def write(self, data):
         try:
@@ -5748,6 +5752,8 @@ class _PushProgressStream:
             self._last = now
             lift_merge.trace(
                 f'[sync-trace] {self._label} remote: {text}')
+            if self._project_dir:
+                touch_push_progress(self._project_dir, note=text)
         except Exception:
             pass
 
@@ -6271,7 +6277,8 @@ def _preseed_oversize_blobs(
                     repo, remote_url, refspec,
                     username=username, password=token,
                     errstream=_PushProgressStream(
-                        label=f'preseed batch {batch_i + 1}'),
+                        label=f'preseed batch {batch_i + 1}',
+                        project_dir=getattr(repo, 'path', '') or ''),
                 )
             try:
                 repo.refs[tracking_ref] = commit.id
@@ -6433,8 +6440,14 @@ _push_progress_lock = threading.Lock()
 PUSH_PROGRESS_STALE_S = 180.0
 
 
-def set_push_progress(project_dir, *, banked, total, ref='', phase='A'):
-    """Record how far the current chunked push has banked."""
+def set_push_progress(project_dir, *, banked, total, ref='', phase='A',
+                      depth=0):
+    """Record how far the current chunked push has banked.
+
+    ``depth`` is the side-ref recursion level: 0 is the main topic ref,
+    >0 a side branch being banked so an outer merge can shrink. The UI
+    needs it to phrase the reading honestly — a depth-2 count is real
+    progress but is NOT progress against the headline commit total."""
     try:
         with _push_progress_lock:
             _push_progress[str(project_dir)] = {
@@ -6442,6 +6455,7 @@ def set_push_progress(project_dir, *, banked, total, ref='', phase='A'):
                 'total': int(total or 0),
                 'ref': str(ref or ''),
                 'phase': str(phase or ''),
+                'depth': int(depth or 0),
                 'at': time.time(),
             }
     except Exception:
@@ -6452,6 +6466,32 @@ def clear_push_progress(project_dir):
     try:
         with _push_progress_lock:
             _push_progress.pop(str(project_dir), None)
+    except Exception:
+        pass
+
+
+def touch_push_progress(project_dir, note=''):
+    """Refresh the in-flight marker mid-transfer, carrying the remote's
+    own progress text (0.55.87).
+
+    ``set_push_progress`` only fires at chunk-attempt boundaries, so a
+    single multi-minute unit — exactly the case the display exists for —
+    published nothing, aged past ``PUSH_PROGRESS_STALE_S``, and the UI
+    fell back to the static count. The sideband stream is the only thing
+    that ticks during such a transfer, so it is what should drive the
+    display.
+
+    Creates an entry if none exists: a preseed batch or a side-ref push
+    can be the first thing to report, and "something is uploading" beats
+    silence even without a banked/total to go with it."""
+    try:
+        with _push_progress_lock:
+            row = _push_progress.get(str(project_dir)) or {
+                'banked': 0, 'total': 0, 'ref': '', 'phase': 'A'}
+            row['at'] = time.time()
+            if note:
+                row['note'] = str(note)[:120]
+            _push_progress[str(project_dir)] = row
     except Exception:
         pass
 
@@ -6815,23 +6855,48 @@ def _push_chunked_to_ref(
             label = _sha_str(intermediate)[:8]
         except Exception:
             label = '?'
+        # NAME THE REF AND THE DEPTH (0.55.88). Side-ref banking makes
+        # this function recursive, so up to three nested invocations
+        # interleave in the log — each with its own ``remaining``, all
+        # under an identical prefix. Kent 2026-07-29, reading
+        # 816 / 572 / 374 in one run: *"why does it count down from 816
+        # on restarts? I thought what was done before was done."* The
+        # work WAS kept; the outer counts simply cannot move until their
+        # children finish, and nothing on the line said which ref it was
+        # talking about.
         lift_merge.trace(
-            f'[sync-trace] topic-push attempt target={label} '
+            f'[sync-trace] topic-push[d{_side_depth}] '
+            f'{topic_ref_name!r} attempt target={label} '
             f'chunk_n={chunk_n} remaining={remaining} '
             f'consecutive_failures={consecutive_failures}')
         # Publish live position so the UI can show movement during Phase A
         # (0.55.83). Only the main topic ref reports; side refs would
         # otherwise overwrite the headline figure with their own smaller
         # counts.
-        if _side_depth == 0:
-            try:
-                _total = int(initial_remaining or remaining or 0)
-                set_push_progress(
-                    project_dir,
-                    banked=max(0, _total - int(remaining or 0)),
-                    total=_total, ref=topic_ref_name, phase='A')
-            except Exception:
-                pass
+        # PUBLISH FROM EVERY DEPTH (0.55.89). This was gated to depth 0
+        # so side refs wouldn't overwrite the headline count — wrong, as
+        # the deepest level is where the bytes actually move. The outer
+        # counts are pinned for hours by construction (a merge can't be
+        # pushed until its side is banked), so showing only those means
+        # showing a frozen number while real work ticks down.
+        #
+        # Kent 2026-07-29: *"It would be nice to see 374 → 373 → 372 →
+        # 371 reflected in the '816 to go', which would not seem to be
+        # literally true."* 816 IS true — that many commits aren't on
+        # main — but it's the wrong number to watch.
+        #
+        # Deeper calls write later, so the most recent entry is naturally
+        # the innermost. ``depth`` lets the UI say which scope it is
+        # reporting instead of implying it's the whole job.
+        try:
+            _total = int(initial_remaining or remaining or 0)
+            set_push_progress(
+                project_dir,
+                banked=max(0, _total - int(remaining or 0)),
+                total=_total, ref=topic_ref_name, phase='A',
+                depth=_side_depth)
+        except Exception:
+            pass
 
         # Pre-flight pack-size estimate. Pre-compression upper bound;
         # the wire pack will be smaller, but raw_bytes is the right
@@ -6961,7 +7026,8 @@ def _push_chunked_to_ref(
                     # run for hours, and it was the one with no liveness
                     # signal at all.
                     errstream=_PushProgressStream(
-                        label=f'topic-push {label}'),
+                        label=f'topic-push {label}',
+                        project_dir=project_dir),
                 )
             lift_merge.trace(
                 f'[sync-trace] topic-push chunk OK '
