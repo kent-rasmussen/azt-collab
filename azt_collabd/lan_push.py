@@ -2136,6 +2136,33 @@ def _https_post_to_peer(peer_id, path, payload, force=False):
     # signalling POST (share_offer / hello / share_unshared) to a
     # peer that's currently unreachable would otherwise pay the
     # 5s connect timeout. Skip when we've seen them down recently.
+    # LAN OFF MEANS NO LAN NETWORK ACTIVITY (0.55.85). 0.55.68 gated the
+    # git dials in ``_push_to_peer`` but not the signalling POSTs, so with
+    # the toggle off a sweep still spent 5 s per peer on share_offer /
+    # hello connect timeouts — on the very link a WAN push was using.
+    #
+    # Kent 2026-07-29: *"if the user has clicked share LAN off and work
+    # offline off, then WAN should be able to flow freely without being
+    # impeded by LAN in any way."* Exactly right, and it is the same
+    # half-enforced-toggle defect as work_offline (0.55.42) and the LAN
+    # dials (0.55.68): honoured where it was cheap, not where the network
+    # is touched.
+    #
+    # ``force`` still wins: that is the user-gesture path (QR pair,
+    # cable), where the operator is deliberately reaching out and the
+    # toggle they just changed may not be the one being read here.
+    if not force:
+        try:
+            from . import settings as _settings
+            if not _settings.lan_allow_sync():
+                print(f'[lan-push] {str(peer_id)[:8]!r}: LAN sync is off '
+                      f'— not sending {path!r} (the toggle stops '
+                      f'signalling POSTs too, not just git dials)',
+                      file=sys.stderr, flush=True)
+                return 0, b''
+        except Exception as ex:
+            print(f'[lan-push] lan_allow_sync check raised: {ex!r} — '
+                  f'proceeding', file=sys.stderr, flush=True)
     if not force and _recently_unreachable(peer_id):
         return 0, b''
     endpoint = _resolve_endpoint(entry)

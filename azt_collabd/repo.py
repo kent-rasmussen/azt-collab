@@ -50,6 +50,45 @@ def _busy_result(working_dir):
 _FETCH_TIMEOUT_S = 60.0
 _PUSH_TIMEOUT_S = 180.0
 
+# Bytes-per-second a push is ASSUMED to achieve at worst, for sizing the
+# socket timeout (0.55.84). Deliberately pessimistic: field links in this
+# deployment measured ~63 KB/s while also serving two LAN peers.
+_PUSH_MIN_RATE_BYTES_S = 20_000.0
+# Never wait longer than this for one socket operation, however large the
+# payload — past here something is wrong, not merely slow.
+_PUSH_TIMEOUT_MAX_S = 3600.0
+
+
+def _push_timeout_for(raw_bytes):
+    """Socket timeout scaled to the payload (0.55.84).
+
+    A flat 180 s assumed any single push either completes quickly or is
+    broken. That is false for an ATOMIC unit on a slow link: a git blob
+    cannot be split, so a large one either fits in the window or can
+    never be sent at all, no matter how many times it is retried.
+
+    Field 2026-07-28, after the side-bank recursion had already reduced
+    an 8.9 GB merge down to a single 16.9 MB blob:
+
+        preseed: 1 blob(s) exceed budget (biggest 16,963,525);
+            each will be pushed alone in its own batch (atomic — cannot split)
+        … 4½ minutes later …
+        preseed batch 1 push failed:
+            TimeoutError('The write operation timed out')
+
+    ~63 KB/s. Every decomposition step had worked; the transfer then
+    failed on a fixed timeout that had no relationship to how much was
+    being sent. Retrying it changes nothing, which is how a project ends
+    up never converging while every log line looks like ordinary
+    slowness.
+
+    Returns at least ``_PUSH_TIMEOUT_S`` so small pushes are unaffected."""
+    try:
+        need = float(raw_bytes or 0) / _PUSH_MIN_RATE_BYTES_S
+    except Exception:
+        return _PUSH_TIMEOUT_S
+    return max(_PUSH_TIMEOUT_S, min(need, _PUSH_TIMEOUT_MAX_S))
+
 
 # Per-project memory of the chunk_n that *failed* on the previous
 # push attempt. Used so the scheduler's drain loop converges on a
@@ -5176,12 +5215,105 @@ def push_repo(project_dir, username, token):
     is_online — push_repo will attempt the network operation
     unconditionally so user-gestured 'try anyway' paths work."""
     _ensure_ssl()
+    # PHASE A RUNS WITHOUT THE PROJECT LOCK (0.55.84).
+    #
+    # The lock used to be held for the whole push, and Phase A — the
+    # chunked upload — is the part that takes hours. Field 2026-07-28:
+    # ``project_lock`` held 125–625 s repeatedly, which is what made LAN
+    # post-receive resets time out at 5 s (received peer data sat
+    # unabsorbed all day) and AZT saves return BUSY. It is the WAN half
+    # of agenda/daemon_lock_across_network_io.md.
+    #
+    # Safe to hoist because Phase A only:
+    #   - READS local objects, which are content-addressed — two readers
+    #     cannot disagree about what a sha means;
+    #   - writes ``refs/remotes/origin/azt-pending-*`` (our own mirror of
+    #     the server's topic ref) and ``refs/azt-collab/temp``. No other
+    #     code path mutates either, and the WAN in-flight guard added in
+    #     0.55.83 means a second push of the SAME project can't run
+    #     concurrently.
+    # Nothing in Phase A touches the working tree, the index, HEAD, or
+    # the branch ref — those all belong to Phase B/C, still under the
+    # lock below.
+    #
+    # After this returns, the locked pass finds the server's topic tip
+    # already at target, so its own Phase A is a no-op and it proceeds
+    # straight to the (short) promote.
+    try:
+        _phase_a_unlocked(project_dir, username, token)
+    except Exception as ex:
+        # Never fatal: the locked path below still performs Phase A the
+        # old way. Worst case we're back to today's behaviour.
+        lift_merge.trace(
+            f'[sync-trace] unlocked phase-A skipped: {ex!r}')
     try:
         with project_lock(project_dir):
             with _track_opened_repos():
                 return _push_repo_locked(project_dir, username, token)
     except LockTimeout:
         return _busy_result(project_dir)
+
+
+def _phase_a_unlocked(project_dir, username, token):
+    """Run the chunked topic-branch upload with NO project lock held.
+
+    Mirrors the route decision in ``_push_step_locked`` — if that says
+    ``direct-push`` there is no Phase A to do and we return immediately,
+    leaving everything to the locked pass. Read-only with respect to that
+    decision; the locked pass re-derives it independently and remains the
+    authority.
+
+    Returns None. Failures are the caller's to swallow: this is an
+    optimisation of WHERE the transfer happens, never a change to whether
+    it happens."""
+    from dulwich import porcelain
+    repo = _get_repo(project_dir)
+    if repo is None:
+        return
+    with _track_opened_repos():
+        try:
+            remote_url = repo.get_config().get(
+                (b'remote', b'origin'), b'url'
+            ).decode('utf-8').strip()
+        except KeyError:
+            return
+        if not remote_url:
+            return
+        remote_url = wan_url(remote_url)
+        try:
+            branch = porcelain.active_branch(repo).decode(
+                'utf-8', errors='replace')
+        except Exception:
+            branch = 'main'
+
+        def _read_ref(name):
+            try:
+                return repo.refs[name]
+            except KeyError:
+                return None
+
+        local_sha = _read_ref(_enc(f'refs/heads/{branch}'))
+        remote_sha = _read_ref(_enc(f'refs/remotes/origin/{branch}'))
+        if not local_sha or not remote_sha or local_sha == remote_sha:
+            return          # nothing to do, or the locked pass will fetch
+        if _all_commits_descend_from(repo, remote_sha, local_sha):
+            return          # direct-push route: no Phase A at all
+        from . import store as _store
+        from . import projects as _projects
+        langcode = _projects.find_langcode_by_working_dir(
+            project_dir) or 'unset'
+        device_name = _store.get_device_name() or 'unset'
+        topic_ref_name = _topic_branch_name(langcode, device_name)
+        lift_merge.trace(
+            f'[sync-trace] phase-A begins WITHOUT the project lock '
+            f'(0.55.84) — local work stays responsive while this '
+            f'uploads; ref {topic_ref_name!r}')
+        _push_chunked_to_ref(
+            repo, project_dir, username, token, remote_url,
+            local_sha, topic_ref_name, branch)
+        lift_merge.trace(
+            '[sync-trace] unlocked phase-A returned; taking the project '
+            'lock for the promote')
 
 
 def _push_repo_locked(project_dir, username, token):
@@ -6121,11 +6253,25 @@ def _preseed_oversize_blobs(
             f'→ {commit.id[:8].decode()}')
 
         try:
-            with _socket_timeout(_PUSH_TIMEOUT_S):
+            # Scale the timeout to THIS batch (0.55.84). A blob is atomic
+            # — it fits in the window or it can never be sent — so a flat
+            # 180 s silently caps the largest object the daemon can ever
+            # upload. Field: a 16.9 MB blob timed out at ~63 KB/s after
+            # every other decomposition step had already succeeded.
+            _batch_timeout = _push_timeout_for(
+                batch_blob_bytes + _PRESEED_OVERHEAD_PER_COMMIT
+                + len(batch) * _PRESEED_OVERHEAD_PER_BLOB)
+            if _batch_timeout > _PUSH_TIMEOUT_S:
+                lift_merge.trace(
+                    f'[sync-trace] preseed batch {batch_i + 1}: socket '
+                    f'timeout raised {_PUSH_TIMEOUT_S:.0f}s → '
+                    f'{_batch_timeout:.0f}s for this payload')
+            with _socket_timeout(_batch_timeout):
                 porcelain.push(
                     repo, remote_url, refspec,
                     username=username, password=token,
-                    errstream=io.BytesIO(),
+                    errstream=_PushProgressStream(
+                        label=f'preseed batch {batch_i + 1}'),
                 )
             try:
                 repo.refs[tracking_ref] = commit.id
@@ -6797,7 +6943,16 @@ def _push_chunked_to_ref(
         refspec = _enc(
             f'{TEMP_REF.decode()}:refs/heads/{topic_ref_name}')
         try:
-            with _socket_timeout(_PUSH_TIMEOUT_S):
+            # Timeout scaled to the measured payload (0.55.84) — a chunk
+            # can be legitimately large on a slow link, and a flat 180 s
+            # turns "slow" into "impossible".
+            _chunk_timeout = _push_timeout_for(raw_bytes)
+            if _chunk_timeout > _PUSH_TIMEOUT_S:
+                lift_merge.trace(
+                    f'[sync-trace] topic-push {label}: socket timeout '
+                    f'raised {_PUSH_TIMEOUT_S:.0f}s → '
+                    f'{_chunk_timeout:.0f}s for {raw_bytes:,} bytes')
+            with _socket_timeout(_chunk_timeout):
                 porcelain.push(
                     repo, remote_url, refspec,
                     username=username, password=token,

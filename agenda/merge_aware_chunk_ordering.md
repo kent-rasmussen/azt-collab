@@ -178,4 +178,23 @@ which in the field is most of them.
 Order of work: (3) measure, then (2) if still needed. (1) is already
 shipped as mitigation.
 
+## Open question for Kent (stored 2026-07-28, not acted on)
+
+**LAN serving competes with the WAN push for the same link.** The watchdog
+dump during the nml push showed two `process_request_thread` stacks in
+`write_pack_from_container` → `ssl.send` — serving upload-pack to peers —
+running concurrently with the WAN transfer, all sharing a link measured at
+~63 KB/s.
+
+The daemon was racing itself: peers pulling from us slowed the push that
+gets data off-site. Whether that's wrong is a policy call:
+
+- leave it (peers converge sooner, github takes longer);
+- yield LAN serving while a WAN push is in flight;
+- yield only for the escalated run-to-completion push.
+
+Not implemented. Relevant because the payload-scaled timeout (0.55.84)
+assumes a floor rate, and self-contention is one of the things that pushes
+the real rate below it.
+
 ## Research

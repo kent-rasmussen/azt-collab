@@ -9,6 +9,101 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.85 — LAN off means silent, so WAN gets the whole link
+
+Kent 2026-07-29, watching a WAN push crawl: *"if the user has clicked share
+LAN off and work offline off, then WAN should be able to flow freely without
+being impeded by LAN in any way."*
+
+With the toggle **off**, the log still showed:
+
+```
+[lan-push] POST …/v1/lan/share_offer failed: ConnectTimeoutError (5 s)
+[lan-discovery] add … [arrival] / arrival announced 2 URL(s)
+[lan-burst] started, window=30.0s
+[lan-listener] started on 192.168.31.60:34501      ← with LAN OFF
+```
+
+0.55.68 gated the git dials in `_push_to_peer`; nothing gated the signalling
+POSTs or the sweep that issues them. So every arrival cost several 5 s
+connect timeouts on the exact link the WAN push needed — the third instance
+of the same defect shape as `work_offline` (0.55.42) and the LAN dials
+(0.55.68): a toggle honoured where enforcement was cheap rather than where
+the network is touched.
+
+- `_https_post_to_peer` refuses when LAN is off (share_offer, hello,
+  share_unshared). `force=True` still wins — that's the user-gesture path
+  (QR pair, cable), where the operator is deliberately reaching out.
+- `lan_discovery._fire_arrival` returns immediately when LAN is off, rather
+  than starting a sweep whose every step then refuses individually.
+
+**Still outstanding:** `[lan-listener] started` fired at 03:14:59 on an
+online edge **while the toggle was off** — `apply_toggle` should have
+refused. Not fixed here; it needs reading the bind path rather than guessing,
+and it costs a listening socket rather than link bandwidth.
+
+## 0.55.84 — Phase A without the project lock; push timeout scaled to payload
+
+### The socket timeout was capping the largest object the daemon could ever send
+
+The side-bank recursion worked — field 2026-07-28, watch it decompose:
+
+```
+counting 510 remote-tracking ref(s) as already on the server   11.47 GB → 8.90 GB
+side-bank c6858018 (depth=0)                                    8.90 GB → 6.68 GB
+side-bank efd0db3a (depth=1)                                    5.90 GB → 716 MB
+                                    (depth=2)                    716 MB → 16.9 MB
+preseed: 1 blob(s) exceed budget (biggest 16,963,525); each will be
+    pushed alone in its own batch (atomic — cannot split)
+… 4½ minutes later …
+preseed batch 1 push failed: TimeoutError('The write operation timed out')
+```
+
+Every decomposition step succeeded, down to a single 16.9 MB blob — and
+then the transfer died on a **flat 180 s** timeout with no relationship to
+the payload. ~63 KB/s on that link, while also serving two LAN peers.
+
+A blob is atomic. It fits in the window or it can never be sent at all,
+however many times it is retried — so a fixed timeout silently caps the
+largest object this daemon can upload, and every log line on the way there
+looks like ordinary slowness. `_push_timeout_for(bytes)` scales it against
+a deliberately pessimistic 20 KB/s floor, never below the old 180 s, capped
+at an hour (past that, something is wrong rather than slow). Applied to the
+topic-push chunk and to each pre-seed batch, and both now report when they
+raise it.
+
+The pre-seed batch push also stops discarding its progress stream, same as
+0.55.79 did for the chunk push.
+
+### Phase A runs without the project lock (WAN half of agenda #11)
+
+The chunked upload no longer holds `project_lock`. That lock was held for
+the entire push, and Phase A is the part that takes hours — field
+2026-07-28: held **125–625 s** repeatedly, which is what made LAN
+post-receive resets time out at 5 s (peer data sat unabsorbed all day) and
+AZT saves return `BUSY`. This is the WAN half of
+`agenda/daemon_lock_across_network_io.md`; 0.55.83 fixed the other half
+(the quadratic `_pick_intermediate_sha` inside the same hold).
+
+Safe to hoist because Phase A only **reads** local objects — content
+addressed, so two readers cannot disagree about what a sha means — and
+writes `refs/remotes/origin/azt-pending-*` (our own mirror of the server's
+topic ref) plus `refs/azt-collab/temp`. No other path mutates either, and
+the WAN in-flight guard from 0.55.83 rules out a second push of the same
+project. Nothing in Phase A touches the working tree, the index, HEAD or
+the branch ref; those belong to Phase B/C, which still run locked.
+
+`_phase_a_unlocked` mirrors the route decision from `_push_step_locked`
+and returns immediately on the direct-push route. It is an optimisation of
+**where** the transfer happens, never of whether it happens: the locked
+pass re-derives the route independently and remains the authority, so any
+failure here simply falls back to today's behaviour. After the unlocked
+pass the server's topic tip is already at target, so the locked pass finds
+its own Phase A a no-op and proceeds straight to the short promote.
+
+**Built in a worktree, deliberately not deployed** — it changes locking in
+the function that was mid-upload when it was written.
+
 ## 0.55.83 — one walk instead of N² ancestry tests; push liveness; per-endpoint reachability; WAN in-flight guard
 
 **`_pick_intermediate_sha` was quadratic.** Its fallback called

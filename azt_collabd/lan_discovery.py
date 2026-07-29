@@ -115,6 +115,17 @@ def _fire_arrival(peer_id_hex):
     to act on; no auto-push without a prior pair gesture."""
     def _worker():
         try:
+            # LAN OFF ⇒ DON'T SWEEP AT ALL (0.55.85). With the toggle off
+            # an arrival still ran a full sweep: share-offer re-offers,
+            # hello attempts, URL announces — each a connect timeout on a
+            # link a WAN push may be using. Cheaper and more honest to
+            # not start than to have every step refuse individually.
+            from . import settings as _settings
+            if not _settings.lan_allow_sync():
+                return
+        except Exception:
+            pass
+        try:
             from . import peers as _peers
             entry = _peers.get_peer(peer_id_hex)
             if entry is None:
