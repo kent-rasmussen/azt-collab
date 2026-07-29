@@ -9,6 +9,164 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.96 — every pre-seed pass was re-uploading all prior work
+
+**This is why the batch totals inflated instead of shrinking (548 → 817).**
+
+`_enumerate_new_blobs` excluded already-seeded blobs by passing the
+`refs/remotes/origin/azt-blob-seed-*` refs to `MissingObjectFinder` as
+`haves`. That cannot work: seed commits are **orphans** — synthetic,
+parentless, unrelated to the main commit graph — and the finder reasons over
+commit ancestry, so a have with no path to the wants contributes nothing.
+
+What proved it, in three facts that only make sense together:
+
+- blob batch `8e4f48d9` was seeded at 04:15 and its ref confirmed on the
+  server (`refs/heads/azt-blob-seed-8e4f48d9a45fc3df`);
+- local tracking refs matched the remote exactly — **941 = 941**, so nothing
+  was lost or unrecorded;
+- the next pre-seed pass enumerated that same blob again and re-pushed it.
+
+So every pass re-did all prior work. On this link that is hours per pass, and
+it means the process could never converge — each failure produced a *larger*
+batch total than the one before.
+
+Now the seeded blob set is computed directly, by walking each seed commit's
+tree, and subtracted from the enumeration. Cheap (one synthetic commit over a
+handful of entries each) and it answers the real question — "which blobs are
+already up" — instead of an ancestry question that is meaningless for orphan
+refs. Logs how many it will skip.
+
+### Sub-stages are named in the UI
+
+Moving d2 → d1 → d0 made the count jump (355 → 572 → 816) with nothing to
+explain why — the same ambiguity the log had before 0.55.88. Now reads
+`(29 uploaded, 355 left in sub-stage 2)`. Counting inward from the outside, so
+a higher number means deeper, and generalises to d3+ without rewording.
+
+## 0.55.95 — pre-seed reports its own progress
+
+Kent: *"except that I still have '355 left', but you claim it's doing
+something…"* Both were true, and the display was wrong.
+
+"355 left" came from depth 2's chunk attempt at 04:15. Since then the work
+moved to depth-1 and then depth-0 pre-seeding, and **pre-seed only refreshed
+the marker's timestamp** (via the sideband stream) without ever publishing
+its own counts. So the row kept hour-old numbers from a stage that had been
+abandoned, while the daemon was on batch 393 of 817. 0.55.93's removal of
+expiry — correct in itself, since banked is banked — turned a temporary
+staleness into a permanent one.
+
+Pre-seed now publishes `phase='seed'` with its batch position, and the line
+words it in the unit that's actually moving:
+
+```
+GitHub backup: 816 to go (393 of 817 files sent)
+```
+
+Files, not commits, because that is what a pre-seed batch is. Shown from
+batch 0, since "0 of 817 files" is informative where a zero commit count
+isn't.
+
+Also fixed a latent key mismatch: the batch push's progress stream was keyed
+on `repo.path`, which can differ from the registry `working_dir` (trailing
+slash, symlink resolution). A mismatch there means the UI silently never sees
+the updates — the failure mode that hides. `project_dir` is now threaded
+through `_preseed_oversize_blobs` from both call sites.
+
+## 0.55.94 — stop writing raw sideband bytes into the log
+
+`_PushProgressStream` (0.55.79) passed git's sideband through verbatim, and
+that stream carries protocol framing, not just human text. The field log
+filled with `remote: \C0\80` and similar — and those bytes broke copy/paste
+out of the very log Kent reads to diagnose. Kent 2026-07-29: *"If we're
+adding that character, please let's stop."* We were.
+
+Printable characters only now, and if a chunk was pure framing the line is
+suppressed rather than emitted empty. **A diagnostic that damages the
+transcript is worse than no diagnostic** — the whole point of that stream
+was to make a long push legible, and it was corrupting the record instead.
+
+Worth noting what this also means: git is not sending useful progress text
+on these pushes, so the sideband was never going to be the liveness signal
+0.55.87 hoped for. That's already reflected in 0.55.92/0.55.93, which stopped
+depending on it.
+
+## 0.55.93 — state the fact, claim nothing about now
+
+Kent, on the 0.55.92 revert: *"the 'in process' message is the lie to
+control, not the progress. Going back to '816 to go' will be a hard thing for
+users to watch. Can we say '(x uploaded)'? So they don't know if it's moving,
+but they know that not all of the 816 is left to move."*
+
+That separates two things I had welded together. **How much is banked on the
+server is a durable fact.** **Whether bytes are moving right now is
+unknown.** 0.55.92 suppressed the first in order to avoid asserting the
+second — hiding a truth to avoid a guess.
+
+- `get_push_progress` no longer returns `None` past the staleness bound; it
+  returns the row with `stale: True`. Counts are always trustworthy;
+  recency is the only uncertain part.
+- Every moving verb is gone from the line. No "uploading", no "sending" — a
+  verb asserts the thing we can't verify.
+
+```
+depth 0   GitHub backup: 816 to go (42 uploaded)
+depth >0  GitHub backup: 816 to go (29 uploaded, 355 left in this stage)
+```
+
+Both hold whether the current unit is flying or dead, and the bare headline
+never again implies all 816 are still to move.
+
+## 0.55.92 — revert 0.55.91: silence beats a confident guess
+
+Kent: *"if the UI has a choice between saying '(maybe stalled, maybe working
+slowly, dunno)' or nothing, nothing there is fine."*
+
+0.55.91 extended the progress marker's validity to match the granted socket
+timeout, so the line wouldn't go quiet mid-transfer. But we **cannot
+distinguish slow from stalled** — git's sideband emits once at the end of a
+push, or not at all — so that change made the UI assert "sending batch, 355
+left" for up to fourteen minutes about a transfer that might already be
+dead. It converted "I don't know" into a confident claim, which is the
+defect this whole session has been removing.
+
+Back to evidence-based: the marker is refreshed only by things actually
+observed — a chunk completing, or a sideband emit — and lapses otherwise. A
+blank line means "no recent evidence", which is true. A count during a stall
+would not be.
+
+Field that prompted it: `e3ff0f89` (17,035,223 bytes) completed in **63 s**;
+`6971abe3` (16,971,899 bytes — essentially identical) was still running
+**7+ minutes** later. Same size, 7× the time, and nothing available to tell
+us which state it was in.
+
+The real fix is counting bytes handed to the socket, which lives inside
+dulwich's pack generator rather than anywhere we control. Until that exists,
+saying nothing is the honest option.
+
+## 0.55.91 — progress staleness follows the timeout we granted
+
+The line reverted to a bare "816 commit(s) to go" mid-push. The code did
+exactly what it was written to do and **displayed something false** — those
+are not the same thing, and calling the first one "correct" is how a screen
+stops being trustworthy while every code path still passes.
+
+`PUSH_PROGRESS_STALE_S` is 180 s, but one unit now legitimately occupies the
+link far longer — 17 MB at ~63 KB/s is ~4½ minutes, and 0.55.84 grants it an
+**852 s** socket timeout. The marker aged out while the push was healthy, so
+the reader stated "no push running" about a push that was running.
+
+Git's sideband was supposed to keep it fresh (0.55.87) but is not a
+heartbeat: field 2026-07-29 shows exactly one `remote:` emit, at the very
+end of a 63 s push. Some units will emit nothing at all.
+
+So the writer now states how long silence is expected — `valid_for`, set to
+the same timeout the unit was granted — and the reader honours it, falling
+back to the fixed bound for entries without one. Staleness now means "longer
+than this transfer could possibly take", not "longer than a number chosen
+before the timeout was payload-scaled".
+
 ## 0.55.90 — …and the screen actually asks for it
 
 0.55.89 published live progress at every depth and the daemon duly reported

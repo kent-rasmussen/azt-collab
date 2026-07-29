@@ -5746,7 +5746,20 @@ class _PushProgressStream:
             now = time.monotonic()
             if now - self._last < self._min:
                 return
-            text = self._buf.decode('utf-8', 'replace').strip()
+            # STRIP CONTROL BYTES (0.55.94). Git's sideband carries raw
+            # framing, not just human text — the field log filled with
+            # things like ``remote: \C0\80``, and those bytes broke
+            # copy/paste out of the log Kent reads to diagnose. A
+            # diagnostic that damages the transcript is worse than no
+            # diagnostic. Kent 2026-07-29: *"If we're adding that
+            # character, please let's stop."* We were.
+            #
+            # Keep printable characters and nothing else; if a chunk was
+            # pure framing, say nothing rather than emit an empty
+            # ``remote:`` line.
+            text = ''.join(
+                ch for ch in self._buf.decode('utf-8', 'replace')
+                if ch.isprintable() or ch == ' ').strip()
             if not text:
                 return
             self._last = now
@@ -6073,22 +6086,52 @@ def _enumerate_new_blobs(repo, chunk_base_sha, target_sha):
         return []
     try:
         from dulwich.object_store import MissingObjectFinder
-        haves = []
-        if chunk_base_sha:
-            haves.append(chunk_base_sha)
+        # SUBTRACT SEEDED BLOBS DIRECTLY, DON'T PASS SEED REFS AS HAVES
+        # (0.55.96).
+        #
+        # The seed refs used to be handed to ``MissingObjectFinder`` as
+        # ``haves``. That does not work: seed commits are ORPHANS —
+        # synthetic, parentless, unrelated to the main commit graph — and
+        # the finder reasons over commit ancestry, so a have with no path
+        # to the wants contributes nothing.
+        #
+        # Field 2026-07-29, and this is what proved it: blob batch
+        # ``8e4f48d9`` was seeded at 04:15, its ref confirmed present on
+        # the server (``refs/heads/azt-blob-seed-8e4f48d9a45fc3df``) with
+        # local tracking refs matching the remote exactly (941 = 941) —
+        # and the very next pre-seed pass enumerated the same blob again
+        # and re-pushed it. Every pass therefore re-did all prior work,
+        # which is why the batch total INFLATED (548 → 817) instead of
+        # shrinking as work banked.
+        #
+        # Walking the seed trees is cheap — each is one synthetic commit
+        # over a handful of entries — and it answers the actual question
+        # ("which blobs are already up") rather than an ancestry question
+        # that has no meaning for orphan refs.
+        seeded = set()
         for ref in list(repo.refs.allkeys()):
-            if ref.startswith(_PRESEED_TRACK_PREFIX):
-                try:
-                    haves.append(repo.refs[ref])
-                except Exception:
-                    continue
+            if not ref.startswith(_PRESEED_TRACK_PREFIX):
+                continue
+            try:
+                commit = repo[repo.refs[ref]]
+                for entry in repo.object_store.iter_tree_contents(
+                        commit.tree):
+                    seeded.add(entry.sha)
+            except Exception:
+                continue
+        if seeded:
+            lift_merge.trace(
+                f'[sync-trace] preseed: {len(seeded)} blob(s) already '
+                f'seeded on the server will be skipped')
         finder = MissingObjectFinder(
             repo.object_store,
-            haves=haves,
+            haves=[chunk_base_sha] if chunk_base_sha else [],
             wants=[target_sha],
         )
         out = []
         for sha, _hint in finder:
+            if sha in seeded:
+                continue
             try:
                 obj = repo.object_store[sha]
                 if obj.type_name == b'blob':
@@ -6104,7 +6147,7 @@ def _enumerate_new_blobs(repo, chunk_base_sha, target_sha):
 
 def _preseed_oversize_blobs(
     repo, chunk_base_sha, target_sha, remote_url,
-    username, token, budget_bytes,
+    username, token, budget_bytes, project_dir='',
 ):
     """Pre-seed blobs reachable from *target_sha* (but not from
     *chunk_base_sha* or any prior side ref) onto the server via
@@ -6257,6 +6300,25 @@ def _preseed_oversize_blobs(
             f'{len(batches)}: {len(batch)} blob(s) '
             f'~{batch_blob_bytes + _PRESEED_OVERHEAD_PER_COMMIT + len(batch) * _PRESEED_OVERHEAD_PER_BLOB:,} bytes '
             f'→ {commit.id[:8].decode()}')
+        # PUBLISH SEED PROGRESS (0.55.95). Pre-seed only refreshed the
+        # marker's timestamp via the sideband stream and never set its
+        # own counts, so the display kept whatever the last chunk-attempt
+        # had published — for hours. Field 2026-07-29: the line read
+        # "355 left" from depth 2's 04:15 attempt while the daemon was
+        # actually on batch 393 of 817 at depth 0. 0.55.93 removed expiry
+        # (rightly — banked is banked) which made the stale figure
+        # permanent rather than merely temporary.
+        #
+        # A batch count IS the honest current unit of work here, so
+        # report it: phase 'seed' tells the UI to word it as files
+        # rather than commits.
+        if project_dir:
+            try:
+                set_push_progress(
+                    project_dir, banked=batch_i, total=len(batches),
+                    ref='preseed', phase='seed')
+            except Exception:
+                pass
 
         try:
             # Scale the timeout to THIS batch (0.55.84). A blob is atomic
@@ -6278,7 +6340,11 @@ def _preseed_oversize_blobs(
                     username=username, password=token,
                     errstream=_PushProgressStream(
                         label=f'preseed batch {batch_i + 1}',
-                        project_dir=getattr(repo, 'path', '') or ''),
+                        # Registry working_dir, passed in (0.55.95).
+                        # ``repo.path`` can differ (trailing slash,
+                        # symlink resolution), and a key mismatch means
+                        # the UI silently never sees these updates.
+                        project_dir=project_dir),
                 )
             try:
                 repo.refs[tracking_ref] = commit.id
@@ -6441,7 +6507,7 @@ PUSH_PROGRESS_STALE_S = 180.0
 
 
 def set_push_progress(project_dir, *, banked, total, ref='', phase='A',
-                      depth=0):
+                      depth=0, valid_for=0.0):
     """Record how far the current chunked push has banked.
 
     ``depth`` is the side-ref recursion level: 0 is the main topic ref,
@@ -6456,6 +6522,16 @@ def set_push_progress(project_dir, *, banked, total, ref='', phase='A',
                 'ref': str(ref or ''),
                 'phase': str(phase or ''),
                 'depth': int(depth or 0),
+                # How long this entry stays trustworthy without another
+                # update (0.55.91). One unit can legitimately occupy the
+                # link far longer than the default staleness bound — a
+                # 17 MB blob at ~63 KB/s is ~4½ minutes and we now grant
+                # it an 852 s timeout — and git's sideband is not a
+                # reliable heartbeat: field 2026-07-29 saw exactly one
+                # ``remote:`` emit, at the very end of a 63 s push. So
+                # the reader must know how long silence is expected,
+                # rather than assuming a fixed 180 s.
+                'valid_for': float(valid_for or 0.0),
                 'at': time.time(),
             }
     except Exception:
@@ -6504,10 +6580,26 @@ def get_push_progress(project_dir):
             row = _push_progress.get(str(project_dir))
             if not row:
                 return None
-            if time.time() - float(row.get('at') or 0) > \
-                    PUSH_PROGRESS_STALE_S:
-                return None
-            return dict(row)
+            # NEVER DROP THE ROW — FLAG IT (0.55.93). Returning None past
+            # the bound threw away a durable FACT (how much has been
+            # banked on the server) in order to avoid asserting an
+            # UNKNOWN (whether bytes are moving right now). Those are
+            # separate things and only the second is uncertain.
+            #
+            # Kent 2026-07-29: *"the 'in process' message is the lie to
+            # control, not the progress… can we say '(x uploaded)'? so
+            # they don't know if it's moving, but they know that not all
+            # of the 816 is left to move."* Right — banked is banked,
+            # whether or not the current unit is alive.
+            #
+            # ``stale`` tells the reader which half is trustworthy: the
+            # counts always are; recency isn't.
+            _bound = max(PUSH_PROGRESS_STALE_S,
+                         float(row.get('valid_for') or 0.0))
+            out = dict(row)
+            out['stale'] = (
+                time.time() - float(row.get('at') or 0) > _bound)
+            return out
     except Exception:
         return None
 
@@ -6984,6 +7076,7 @@ def _push_chunked_to_ref(
             seed_ok, seed_status = _preseed_oversize_blobs(
                 repo, chunk_base, intermediate,
                 remote_url, username, token, budget,
+                project_dir=project_dir,
             )
             if seed_ok:
                 lift_merge.trace(
@@ -7017,6 +7110,21 @@ def _push_chunked_to_ref(
                     f'[sync-trace] topic-push {label}: socket timeout '
                     f'raised {_PUSH_TIMEOUT_S:.0f}s → '
                     f'{_chunk_timeout:.0f}s for {raw_bytes:,} bytes')
+            # NOT re-stamped with the socket timeout (reverted 0.55.92).
+            # 0.55.91 extended the marker's validity to match the granted
+            # timeout so the line wouldn't go quiet mid-transfer — but
+            # that makes it assert "sending batch, N left" for up to
+            # fourteen minutes on a transfer that may already be dead,
+            # because we cannot distinguish slow from stalled (git's
+            # sideband emits once at the end, or not at all).
+            #
+            # Kent 2026-07-29: *"if the UI has a choice between saying
+            # '(maybe stalled, maybe working slowly, dunno)' or nothing,
+            # nothing there is fine."* So the marker stays evidence-based:
+            # it is refreshed by things we actually observed — a chunk
+            # completing, or a sideband emit — and lapses into silence
+            # otherwise. A blank line means "no recent evidence", which
+            # is true; a confident count during a stall would not be.
             with _socket_timeout(_chunk_timeout):
                 porcelain.push(
                     repo, remote_url, refspec,
@@ -7130,6 +7238,7 @@ def _push_chunked_to_ref(
                     seed_ok, seed_status = _preseed_oversize_blobs(
                         repo, chunk_base, intermediate,
                         remote_url, username, token, budget,
+                        project_dir=project_dir,
                     )
                     if seed_ok:
                         lift_merge.trace(

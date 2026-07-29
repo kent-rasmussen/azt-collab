@@ -1162,25 +1162,49 @@ def _github_backup_line(ps):
             # says things like "Resolving deltas: 47%", which is far more
             # use during a single multi-minute unit than a commit count
             # that cannot move until the unit lands.
-            note = str(prog.get('note') or '').strip()
+            # STATE FACTS, CLAIM NOTHING ABOUT NOW (0.55.93). No
+            # "uploading" / "sending" wording at any point: we cannot
+            # tell a slow transfer from a dead one, and a moving verb
+            # asserts exactly the thing we don't know.
+            #
+            # What IS known is durable — how much of this stage has been
+            # banked on the server — and stays true whether or not the
+            # current unit is alive. Showing it means the bare headline
+            # ("816 to go") never again implies that all 816 are still
+            # to move.
             depth = int(prog.get('depth') or 0)
-            if total > 0:
-                if depth > 0:
-                    # A side branch being banked so an outer merge can
-                    # shrink (0.55.89). Real progress, but NOT progress
-                    # against ``wan``, which stays pinned until the merge
-                    # lands — so say "batch", not "of 816".
-                    return _tr('GitHub backup: {n} to go — sending '
-                               'batch, {left} left').format(
-                                   n=wan, left=max(0, total - banked))
-                return _tr('GitHub backup: {n} to go — uploading '
-                           '{done} of {total}').format(
+            phase = str(prog.get('phase') or '')
+            if phase == 'seed' and total > 0:
+                # Blob pre-seeding (0.55.95): the unit is FILES, not
+                # commits, and it's the honest description of what the
+                # daemon is doing during the long stretches. Shown from
+                # batch 0 — unlike the commit counts, "0 of 817 files"
+                # is informative rather than vacuous.
+                return _tr('GitHub backup: {n} to go '
+                           '({done} of {total} files sent)').format(
                                n=wan, done=banked, total=total)
-            if note:
-                return _tr('GitHub backup: {n} to go — {note}').format(
-                    n=wan, note=note[:60])
-            return _tr('GitHub backup: {n} commit(s) to go '
-                       '— uploading…').format(n=wan)
+            if total > 0 and banked > 0:
+                left = max(0, total - banked)
+                if depth > 0:
+                    # A side branch banked so an outer merge can shrink:
+                    # real progress, but not progress against ``wan``,
+                    # which stays pinned until the merge lands.
+                    #
+                    # NAME THE STAGE (0.55.96). Without it, moving
+                    # d2 → d1 → d0 makes the count jump (355 → 572 →
+                    # 816) with nothing to say why — the same ambiguity
+                    # the log had before 0.55.88 added depth labels.
+                    # Stages nest, so a HIGHER number is closer to done;
+                    # "stage 1" being the outermost would invert that, so
+                    # count inward from the outside.
+                    return _tr('GitHub backup: {n} to go '
+                               '({done} uploaded, {left} left in '
+                               'sub-stage {depth})').format(
+                                   n=wan, done=banked, left=left,
+                                   depth=depth)
+                return _tr('GitHub backup: {n} to go '
+                           '({done} uploaded)').format(
+                               n=wan, done=banked)
     except Exception:
         pass
     return _tr('GitHub backup: {n} commit(s) to go').format(n=wan)
