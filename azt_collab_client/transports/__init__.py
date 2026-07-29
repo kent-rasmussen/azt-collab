@@ -80,6 +80,73 @@ def _on_android():
         return False
 
 
+_remote_transport = None        # set by target_peer(); never auto-cleared
+_local_transport = None         # this device's daemon, cached separately
+
+
+def target_peer(transport):
+    """Pin this PROCESS to a remote peer's daemon (0.55.117).
+
+    Call once, before the first RPC — normally from ``--peer`` handling at
+    startup. Deliberately has no "go back to local" counterpart: a
+    process is either local or remote for its whole life, so a window can
+    never be ambiguous about which machine it is changing. Whatever
+    launched it must also make that visible (device name in the title).
+
+    Passing ``None`` is accepted only to make tests symmetrical; product
+    code should not un-target."""
+    global _remote_transport
+    _remote_transport = transport
+    reset()
+
+
+def target_remote_peer(peer_id):
+    """Point this process at *peer_id* by asking the LOCAL daemon for a
+    transport (0.55.127).
+
+    Android's in-place retarget path. The transport needs the private key,
+    ``peers.json`` and the pinned dialer — all daemon-side — and this
+    package may not import ``azt_collabd`` (hard rule #3). On Android the
+    daemon is in another process entirely, so it cannot hand back a live
+    Python object either.
+
+    So this builds the client half here and injects a dial that goes
+    through the LOCAL daemon's admin-relay: our daemon does the pinned
+    TLS and the signing, because it is the only one holding the key.
+
+    Raises on any failure — the caller shows the reason. Never leaves the
+    process half-targeted."""
+    from . import rpc_relay
+    tr = rpc_relay.build(peer_id)
+    target_peer(tr)
+    return tr
+
+
+def remote_peer_label():
+    """Device name of the peer this process is driving, or ''. For a UI
+    banner — nothing should branch behaviour on it."""
+    if _remote_transport is None:
+        return ''
+    return getattr(_remote_transport, 'device_name', '') or 'peer'
+
+
+def clear_remote_peer():
+    """Return this process to driving the LOCAL daemon (0.55.127).
+
+    Exists only for the Android retarget path, where there is no second
+    window to close. The desktop launcher deliberately has no equivalent:
+    a process there is local or remote for its whole life."""
+    global _remote_transport
+    _remote_transport = None
+    reset()
+
+
+def is_remote():
+    """True when this process is driving another device. UI uses it to
+    label itself; nothing should branch behaviour on it."""
+    return _remote_transport is not None
+
+
 def pick_transport():
     """Return the right transport for this platform. Cached after the
     first call. Use ``reset()`` to force re-discovery.
@@ -92,6 +159,38 @@ def pick_transport():
     global _transport
     if _transport is not None:
         return _transport
+    # REMOTE TARGET WINS (0.55.117). When this process has been pointed at
+    # a peer, EVERY RPC goes there — that is the whole design: the same
+    # settings UI, unmodified, driving another machine.
+    #
+    # Set once at process start (``--peer``) and never toggled, so there
+    # is no mode to lose track of. Kent, on an earlier design that
+    # retargeted a running UI: *"I'm not excited about this; I'm likely to
+    # get confused at some point. Can we not start another ui?"* Two
+    # windows side by side, each fixed to one machine.
+    if _remote_transport is not None:
+        _transport = _remote_transport
+        return _transport
+    _transport = pick_local()
+    return _transport
+
+
+def pick_local():
+    """The transport to THIS device's daemon, ignoring any remote target
+    (0.55.130).
+
+    Needed because the relay must not route through itself.
+    ``RelayTransport._relay`` called ``rpc.call``, which called
+    ``pick_transport()``, which returned the remote transport — i.e. the
+    relay — and recursed until ``RecursionError``. The relay's whole job is
+    to hand a request to the LOCAL daemon, so it must ask for local
+    explicitly rather than for "whatever is current".
+
+    Cached separately from ``_transport`` so a retarget doesn't invalidate
+    it and vice versa."""
+    global _local_transport
+    if _local_transport is not None:
+        return _local_transport
     if _on_android():
         from . import android_cp
         cp = android_cp.discover()
@@ -99,11 +198,11 @@ def pick_transport():
             raise ServerUnavailable(
                 'server_apk_not_installed',
                 kind='server_apk_not_installed')
-        _transport = cp
-        return _transport
+        _local_transport = cp
+        return _local_transport
     from .loopback import LoopbackTransport
-    _transport = LoopbackTransport()
-    return _transport
+    _local_transport = LoopbackTransport()
+    return _local_transport
 
 
 def reset():

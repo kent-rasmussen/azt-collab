@@ -1102,6 +1102,75 @@ def _offer_confirm_popup(decision, on_done, font_name='Roboto'):
     return popup
 
 
+def _retarget_this_app(peer_id, device_name, font_name='Roboto'):
+    """Point THIS running app at *peer_id*'s daemon (0.55.127).
+
+    Android's answer to "open that device's settings", because a second
+    Kivy process cannot exist here. Every subsequent RPC in this process
+    goes to that peer, so the settings screens show ITS values.
+
+    Loud and reversible on purpose — the objection to retargeting is that
+    you forget which machine you are changing, and on a phone there is no
+    second window to make it obvious. So: a confirm naming the device
+    before it happens, and a way back that is always visible afterwards.
+
+    The transport is built daemon-side (it needs the private key and
+    ``peers.json``), so this asks the local daemon to hand one over rather
+    than importing ``azt_collabd`` — hard rule #3."""
+    from .. import transports as _t
+
+    def _go(*_a):
+        try:
+            # The daemon owns the pinned dial + signing; ask IT to verify
+            # the grant first so a refusal is a sentence, not a screen of
+            # empty fields.
+            from .. import lan_can_admin
+            res = lan_can_admin(peer_id) or {}
+            if not res.get('allowed'):
+                _show_info_popup(
+                    _tr('Cannot open that device'),
+                    str(res.get('detail')
+                        or _tr('That device has not allowed this one to '
+                               'change its settings.')),
+                    font_name=font_name)
+                return
+            _t.target_remote_peer(peer_id)
+        except Exception as ex:
+            _show_info_popup(_tr('Cannot open that device'),
+                             str(ex), font_name=font_name)
+            return
+    # NO CONFIRM (0.55.128). There was a "Change settings on X instead of
+    # this device? / Yes, edit that device" step here. Kent: *"what's with
+    # the 'yes, edit that device?'"* — fair: it existed to make an
+    # otherwise-invisible retarget visible, and the persistent banner
+    # (`EDITING <device> — not this device`) plus the "Back to this
+    # device" button already do that, continuously, where a one-time
+    # dialog does it once. So the tap acts, and only a FAILURE speaks.
+    _go()
+
+
+def _show_info_popup(title, body, font_name='Roboto'):
+    """One-line-per-sentence read-only popup (0.55.121).
+
+    Exists because the remote-settings refusal is ACTIONABLE — it names
+    what to tap on the other device — and a button label truncated to 40
+    characters threw exactly that half away."""
+    box = BoxLayout(orientation='vertical', spacing=dp(10),
+                    padding=dp(12))
+    lbl = Label(text=str(body), font_size=sp(12), font_name=font_name,
+                halign='left', valign='top')
+    lbl.bind(size=lambda w, *_: setattr(
+        w, 'text_size', (w.width, None)))
+    box.add_widget(lbl)
+    pop = Popup(title=str(title), content=box,
+                size_hint=(0.9, None), height=dp(240))
+    close = Button(text=_tr('Close'), size_hint_y=None, height=dp(40),
+                   font_name=font_name)
+    close.bind(on_release=lambda *_a: pop.dismiss())
+    box.add_widget(close)
+    pop.open()
+
+
 def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
     """Per-peer detail popup: list shared projects (with toggles),
     static endpoints (with add/remove), and an unpair button."""
@@ -1209,6 +1278,191 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
         shared_box.add_widget(row)
     content.add_widget(shared_scroll)
 
+    # REMOTE SETTINGS GRANT (0.55.120). Belongs here, in the per-peer
+    # detail popup that already owns "which projects do I share with this
+    # device" and Unpair — 0.55.118 put it on the sync-board rows at the
+    # bottom of the settings page instead, which is a status readout, not
+    # a place anyone goes to change what a device may do. Kent: *"I don't
+    # see 'allow' … nor in the detail of the page."*
+    #
+    # Deliberately separate from sharing: sharing is about DATA, this is
+    # about CONTROL. Every field phone is paired and shares projects; a
+    # lost one must not be able to reconfigure a desktop. So this is its
+    # own row, its own words, and it starts off.
+    # Two ordinary buttons in the existing stack (0.55.122). 0.55.120 gave
+    # this a bold header, a grey subtitle and a two-button row; Kent:
+    # *"this is too complex … No extra section, just a couple more buttons
+    # to ignore if you don't understand them."* The label has to carry the
+    # whole meaning, so it is a sentence, not a state word.
+    admin_state = {'on': bool(peer.get('admin'))}
+
+    def _admin_label():
+        # Normal button colour in both states (0.55.123). Green-for-on
+        # against the blue stack was, in Kent's words, *"dizzying"* — and
+        # colour was carrying meaning the words can carry alone. STOP in
+        # capitals does the work instead: it reads as the reversal it is,
+        # without implying danger the way red would.
+        return (_tr('STOP letting this device change my settings')
+                if admin_state['on']
+                else _tr('Allow this device to change my settings'))
+
+    admin_btn = Button(
+        text=_admin_label(),
+        size_hint_y=None, height=dp(44),
+        font_size=sp(13), font_name=font_name)
+
+    def _toggle_admin(_btn):
+        from .. import lan_set_admin
+        want = not admin_state['on']
+        _btn.disabled = True
+        resp = lan_set_admin(pid, want) or {}
+        _btn.disabled = False
+        if not resp.get('ok'):
+            # Say it failed rather than flipping the label on a write that
+            # didn't land — a permission control that lies about its own
+            # state is worse than one that's hard to find.
+            _btn.text = _tr('Failed — try again')
+            return
+        admin_state['on'] = bool(resp.get('admin'))
+        _btn.text = _admin_label()
+
+    admin_btn.bind(on_release=_toggle_admin)
+    # Created here, ADDED after "Save manual IPs" (0.55.139) — Kent: *"allow
+    # this device should be after save manual IPs, not above it."* Sharing
+    # and addressing are about a device's ordinary participation; permission
+    # to change this machine is a different order of thing and belongs below
+    # them, next to diagnostics and Forget.
+
+    # OPEN THAT DEVICE'S SETTINGS (0.55.120). The mirror of the grant
+    # above: that button controls what THEY may do here, this one uses
+    # what WE have been allowed to do THERE. Only they can know whether
+    # they granted us, so this is always offered and a refusal explains
+    # itself rather than being pre-emptively hidden.
+    #
+    # Desktop only — a second Kivy window is not a thing on Android, and
+    # on a phone the person is holding the device already.
+    open_btn = Button(
+        text=_tr('Open settings for this device'),
+        size_hint_y=None, height=dp(44),
+        font_size=sp(13), font_name=font_name)
+
+    def _open_remote(_btn):
+        # Spawn, not import: the client may not import azt_collabd (hard
+        # rule #3). Same shape as pick_project's picker subprocess.
+        import subprocess
+        import sys as _sys
+        # ``on_android()``, NOT ``platform == 'android'`` (0.55.127).
+        # Unlike Kivy's ``platform``, this module's is a FUNCTION, so the
+        # comparison was function-vs-string — always false. The guard
+        # never fired, the spawn ran on Android, and the user got a bare
+        # ``[Errno 13] Permission denied`` with nothing else, which says
+        # nothing about the actual reason.
+        from .._platform import on_android as _on_android
+        if _on_android():
+            # In-place retarget — the only mechanism Android has, since a
+            # second Kivy process cannot exist there (one interpreter per
+            # PythonActivity; a second fighting the same GIL is the
+            # documented SIGSEGV).
+            #
+            # This reinstates a mode Kent had rejected, and I removed it
+            # again when he pointed that out — then he weighed it against
+            # the alternative: *"better than leave android
+            # non-functional."* The original objection assumed two windows
+            # were available; here they aren't, so the mode stays and the
+            # persistent banner plus "Back to this device" carry the state.
+            _retarget_this_app(pid, peer.get('device_name') or '',
+                               font_name=font_name)
+            return
+        _btn.disabled = True
+        try:
+            proc = subprocess.Popen(
+                [_sys.executable, '-m', 'azt_collabd', 'ui',
+                 '--peer', str(pid)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            try:
+                # It exits 2 immediately when that device hasn't granted
+                # us, or can't be reached. A short wait turns "no window
+                # ever appeared" into a sentence saying why.
+                # Must exceed the launcher's grant probe (0.55.121, 8 s)
+                # or we report "opened" for a process about to exit 2.
+                _out, _err = proc.communicate(timeout=15)
+                if proc.returncode not in (None, 0):
+                    # Show the daemon's own explanation, not a generic
+                    # failure: it names which of the three gates refused
+                    # and, for the common case, what to tap on the other
+                    # device. Truncating that to 40 chars threw away the
+                    # actionable half, so put it where it can be read.
+                    tail = [ln for ln in (_err or b'').decode(
+                        'utf-8', 'replace').strip().splitlines()
+                        if '[ui]' in ln]
+                    why = (tail[-1].split('[ui]')[-1].strip() if tail
+                           else _tr('Refused'))
+                    _btn.text = _tr('Not allowed there')
+                    _show_info_popup(
+                        _tr('Cannot open that device'), why,
+                        font_name=font_name)
+                else:
+                    _btn.text = _tr('Window closed')
+            except subprocess.TimeoutExpired:
+                _btn.text = _tr('Opened — see REMOTE window')
+        except Exception as ex:
+            _btn.text = str(ex)[:40]
+        finally:
+            _btn.disabled = False
+
+    open_btn.bind(on_release=_open_remote)
+
+    # (0.55.138 added an on-screen hint label here explaining why the
+    # button was absent; removed in 0.55.140 — it described a non-event on
+    # every peer nobody wants to control. The reason is logged instead.)
+
+    # SHOWN ONLY ONCE THAT DEVICE HAS EVER SAID YES (0.55.130).
+    #
+    # Kent: *"I can still see a settings button on every screen, even when
+    # unuseful."* Right — 0.55.125 made it unconditional, which put a
+    # button on every peer including the ones that had granted nothing.
+    #
+    # The version he actually asked for two steps earlier: *"can we not
+    # hide it until at least one OK ping on the permission?"* — hidden
+    # until confirmed once, then STICKY, so it doesn't come and go with
+    # reachability. ``they_admin_us`` (peers.json) is that memory: set on
+    # the first successful admin call, cleared only by an explicit refusal,
+    # never by a device merely being asleep.
+    #
+    # No probe on popup open, so nothing flickers and nothing costs a
+    # network round trip here.
+    def _reveal_open_btn(*_a):
+        open_btn.height = dp(44)
+        open_btn.opacity = 1
+        open_btn.disabled = False
+
+    if not bool(peer.get('they_admin_us')):
+        open_btn.height = 0
+        open_btn.opacity = 0
+        open_btn.disabled = True
+
+        # BOOTSTRAP (0.55.131). Without this the feature can never start:
+        # the sticky flag is set by a successful admin call, and the only
+        # way to make one is this button, which is hidden until the flag is
+        # set. A deadlock — Kent: *"how long should that take to appear?"*
+        # Never, as 0.55.130 shipped.
+        #
+        # So probe once per popup open, in the background, and use it ONLY
+        # to reveal — never to hide. That keeps 0.55.123's flicker away
+        # (nothing ever disappears) while giving the first success a way to
+        # happen. A hit also persists the flag daemon-side, so every later
+        # visit shows the button immediately with no probe at all.
+        def _bootstrap():
+            try:
+                from .. import lan_can_admin
+                if (lan_can_admin(pid) or {}).get('allowed'):
+                    Clock.schedule_once(_reveal_open_btn, 0)
+            except Exception:
+                pass        # unreachable is not a no; stay hidden quietly
+
+        threading.Thread(target=_bootstrap, daemon=True).start()
+
     # Static endpoint field — comma-separated 'ip:port' list.
     content.add_widget(Label(
         text=_tr('Manual IP / port (comma-separated)'),
@@ -1244,6 +1498,13 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
     save_endpoints_btn.bind(on_release=_save_endpoints)
     content.add_widget(endpoints_field)
     content.add_widget(save_endpoints_btn)
+
+    # Remote settings, BELOW the sharing/addressing controls (0.55.139).
+    # Those govern a device's ordinary participation; these govern whether
+    # it may reconfigure this machine — closer in kind to diagnostics and
+    # Forget, which follow.
+    content.add_widget(admin_btn)
+    content.add_widget(open_btn)
 
     # Diagnostics pull (0.54.74). Field workflow: the operator is on
     # SOMEONE ELSE'S machine, which normally has no collaboration UI
@@ -1386,6 +1647,79 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
     popup = Popup(title=_tr('Manage paired device'),
                   content=content, size_hint=(0.95, 0.95),
                   auto_dismiss=False)
+
+    # KEEP LOOKING WHILE THIS POPUP IS OPEN (0.55.134). The bootstrap probe
+    # (0.55.131) ran once at build time, so granting on the OTHER device
+    # after opening this had nothing to notice it — Kent: *"after I went out
+    # and came back it did, but not on just polling."* Correct, and closing
+    # and reopening to see a permission you just granted is silly.
+    #
+    # Re-probe on a slow timer, REVEAL ONLY (so nothing can flicker), and
+    # stop the moment it succeeds — the daemon persists the grant, so one
+    # success is the last probe this peer ever needs. Cancelled on dismiss
+    # so a closed popup leaves no timer behind.
+    _probe_ev = {'ev': None}
+    _said = {}          # last reason logged, so repeats stay quiet
+
+    def _stop_probe(*_a):
+        if _probe_ev['ev'] is not None:
+            _probe_ev['ev'].cancel()
+            _probe_ev['ev'] = None
+
+    def _tick_probe(_dt):
+        def _work():
+            try:
+                from .. import lan_can_admin
+                res = lan_can_admin(pid) or {}
+            except Exception:
+                return
+            if res.get('allowed'):
+                Clock.schedule_once(
+                    lambda _d: (_reveal_open_btn(), _stop_probe()), 0)
+                return
+
+            # LOG IT, DON'T DISPLAY IT (0.55.140). 0.55.138 put the reason
+            # on screen; Kent: *"the button doesn't show, and shouldn't,
+            # without permission. there is no way to ask a peer for
+            # permission … why would anyone expect an answer in this
+            # case?"*
+            #
+            # Right. A device you never granted has no button, that is
+            # unremarkable, and a line explaining the absence would appear
+            # on every peer you will never want to control — text about a
+            # non-event, leading nowhere, since no "request permission"
+            # flow exists.
+            #
+            # The case that IS confusing is a pair you DID grant where the
+            # button still doesn't appear. That is diagnosis, so it goes to
+            # the log where diagnosis lives.
+            # ONCE PER ANSWER, not once per tick (0.55.141). The probe
+            # repeats every 6 s while this popup is open — 0.55.140 would
+            # have logged on every one of them. Kent: *"will I see this each
+            # time I open that page"* — you would have seen it ten times a
+            # minute.
+            #
+            # The reason only matters when it CHANGES; a steady "refused" is
+            # the same fact restated. Same rule as the watchdog's in-flight
+            # line: suppress the repeat, keep the transition.
+            _r = str(res.get('reason', '?'))
+            if _said.get('reason') != _r:
+                _said['reason'] = _r
+                # ``[lan-admin-ui]``, not ``[lan-admin-client]`` (0.55.142).
+                # The latter is the DAEMON module's prefix
+                # (azt_collabd/lan_admin_client.py); reusing it here made a
+                # UI-process line look like a daemon one, so "do I need to
+                # restart the server for this?" had no answer from the log.
+                # One prefix per process.
+                print(f'[lan-admin-ui] no remote-settings button for '
+                      f'{str(pid)[:8]}: {_r} '
+                      f'({str(res.get("detail", ""))[:120]})',
+                      file=sys.stderr, flush=True)
+        threading.Thread(target=_work, daemon=True).start()
+
+    if not bool(peer.get('they_admin_us')):
+        _probe_ev['ev'] = Clock.schedule_interval(_tick_probe, 6.0)
+        popup.bind(on_dismiss=_stop_probe)
 
     def _unpair(*_):
         lan_unpair(pid)

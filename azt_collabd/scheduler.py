@@ -1077,11 +1077,33 @@ def _watcher_loop():
                   f'work only) failed: {ex!r}',
                   file=sys.stderr, flush=True)
         if github_eligible:
+            # OFF THIS THREAD (0.55.119). ``_drain_pending_push`` runs the
+            # whole push synchronously — chunked Phase A, side-ref
+            # banking, pre-seed batches — which on a big history is HOURS.
+            # Called inline, this loop cannot tick for that entire time,
+            # so everything else it owes is starved: connectivity
+            # re-probing, the LAN reset drain, the 10-minute
+            # ahead-of-github sweep, and its own heartbeat.
+            #
+            # Field 2026-07-29, desktop mid-preseed: `[watchdog] STALL
+            # DETECTED loop 'watcher' last ticked 150s ago` with the
+            # thread parked in ``ssl.write`` — healthy work, reported as a
+            # stall, and the watchdog only refrained from restarting
+            # because ``sync_flight`` said a push was in flight. The
+            # protection was doing its job; the starvation underneath it
+            # was still real.
+            #
+            # ``_wan_inflight`` (0.55.83) already prevents a second push
+            # per project, so spawning here cannot double-push: a tick
+            # arriving while the previous drain still runs finds the
+            # project in flight and skips it.
             try:
-                _drain_pending_push()
+                threading.Thread(
+                    target=_drain_pending_push,
+                    name='wan-drain', daemon=True).start()
             except Exception as ex:
-                print(f'[scheduler] WAN drain (github push) failed: '
-                      f'{ex}', file=sys.stderr, flush=True)
+                print(f'[scheduler] WAN drain (github push) could not be '
+                      f'started: {ex}', file=sys.stderr, flush=True)
             # Cheap access re-probe for projects blocked on a remote-
             # fixable access error (0.52.24). Decoupled from the push
             # backoff: one small GET per blocked project, throttled to
@@ -1379,7 +1401,31 @@ def _drain_pending_push(ignore_backoff=False):
     # walks history, which is too costly for the 15 s periodic tick — the
     # tick keeps using the flag, and a nudge catches whatever the flag
     # missed.
-    if ignore_backoff:
+    # PERIODICALLY, NOT ONLY ON A GESTURE (0.55.98). 0.55.69 restricted
+    # the ahead-of-github check to the nudge path because it walks
+    # history and the tick runs every 15 s. Correct about the cost, wrong
+    # about the consequence: LAN-received work never sets
+    # ``pending_push``, so a daemon nobody touches never discovers it is
+    # behind. Kent 2026-07-29, on being told the server now runs itself:
+    # *"Well, I still had to toggle it online…"* — he did, and that was
+    # the only thing that started it.
+    #
+    # That defeats the whole goal (a server left with a team that gets
+    # data online unattended), so run it on a slow cadence: often enough
+    # that a device left alone converges within the hour, rare enough
+    # that the walk's cost is negligible.
+    _due_for_sweep = False
+    if not ignore_backoff:
+        global _last_ahead_sweep_at
+        _now = time.time()
+        if _now - _last_ahead_sweep_at >= _AHEAD_SWEEP_INTERVAL_S:
+            _last_ahead_sweep_at = _now
+            _due_for_sweep = True
+            print(f'[scheduler] periodic ahead-of-github sweep '
+                  f'(every {int(_AHEAD_SWEEP_INTERVAL_S / 60)} min) — '
+                  f'catches work received over LAN, which never sets '
+                  f'pending_push', file=sys.stderr, flush=True)
+    if ignore_backoff or _due_for_sweep:
         from . import repo as _repo
         for _lang in data:
             if _lang in candidates:
@@ -1699,6 +1745,12 @@ _ghost_drain_logged = set()
 # ``lan_push._push_inflight``.
 _wan_inflight = set()
 _wan_inflight_lock = threading.Lock()
+# Slow cadence for the ahead-of-github sweep (0.55.98) — the only thing
+# that notices LAN-received work, which never sets ``pending_push``.
+# 10 min: a device left alone converges within the hour, and the history
+# walk's cost is negligible at that rate.
+_AHEAD_SWEEP_INTERVAL_S = 600.0
+_last_ahead_sweep_at = 0.0
 _ACCESS_REPROBE_MIN_INTERVAL_S = 300.0
 _access_reprobe_last = {}   # langcode -> monotonic time of last probe
 # Rate limit for the work_offline suppression notice (0.55.44). The

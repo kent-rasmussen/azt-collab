@@ -738,7 +738,51 @@ class PickerApp(App):
         persisted = _client_i18n.language_pref()
         if persisted == _client_i18n.current_language():
             return
-        _client_i18n.set_language(persisted)
+        # DON'T LOOP ON A PREFERENCE WE CANNOT HONOUR (0.55.109).
+        #
+        # ``set_language`` returns the language it ACTUALLY applied,
+        # falling back to 'en' when the catalog can't be loaded. This
+        # function ignored that, so an unloadable preference never
+        # converged: config says 'fr', ``_apply`` falls back to 'en',
+        # ``persisted != current`` stays true forever, and **every
+        # subsequent config.json write rebuilt every screen** — which
+        # discards anything already rendered into them.
+        #
+        # That is the contributor bug. The value was delivered and
+        # written correctly (the log proves it), then the screen holding
+        # it was destroyed by the next rebuild, leaving a fresh empty
+        # field. One field on the page, populated widget out of the tree,
+        # placeholder visible — all consistent. Desktop was unaffected
+        # because its catalog loads.
+        #
+        # It also explains "why since yesterday": tapping a language
+        # button is all it takes to start it, and the UI still SHOWS
+        # English afterwards, so nothing about the device looks French.
+        if getattr(self, '_lang_pref_unhonoured', None) == persisted:
+            return
+        # LOG THE REBUILD (0.55.108). This tears down and re-creates every
+        # screen, which silently discards anything already rendered into
+        # the old ones — the cause of the "contributor field is empty on
+        # every French phone but fine on the English desktop" bug. It ran
+        # with no trace at all, so the destruction was invisible while the
+        # render that preceded it was logged as a success.
+        print(f'[picker] UI language changed '
+              f'{_client_i18n.current_language()!r} → {persisted!r} — '
+              f'rebuilding all screens; anything already rendered into '
+              f'them is discarded and must be re-fetched',
+              file=sys.stderr, flush=True)
+        applied = _client_i18n.set_language(persisted)
+        if applied != persisted:
+            # Remember it so we stop retrying, and say so ONCE. Silence
+            # here is what let the loop run unnoticed.
+            self._lang_pref_unhonoured = persisted
+            print(f'[picker] UI language {persisted!r} could NOT be '
+                  f'applied (got {applied!r}) — the catalog is missing or '
+                  f'failed to compile. NOT rebuilding screens: retrying '
+                  f'on every config write would destroy rendered state '
+                  f'forever without ever converging',
+                  file=sys.stderr, flush=True)
+            return
         self.subtitle = _tr('Pick a project')
         sm = self.sm
         old_t = sm.transition

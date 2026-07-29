@@ -23,8 +23,16 @@
   the LIFT content genuinely changed beyond what they themselves
   wrote. Prompts on real peer content remain.
 - **Deadline:** none
-- **Waiting on:** Nothing (grep output from the affected machine will
-  confirm the trigger; the fix legs are already actionable)
+- **Waiting on:** VERIFICATION of the self-authored-range suppression built
+  2026-07-29 (below). On the machine that was asked to take its own single
+  commit, the log line to look for on the next save is
+  `Not prompting: HEAD advanced by N change(s), all written by us (…)`.
+  If a prompt still appears, that message names why — a second author, or a
+  capped walk.
+- **Split off 2026-07-29 (Kent):** the two daemon-lane legs (3 = content-aware
+  post-receive reset, 5 = canon-equal classification) moved to
+  `identical_deliveries_read_as_changes.md`. This item is now the azt-side
+  prompt logic only.
 
 ## Plans
 
@@ -50,11 +58,49 @@ miss the route). Merge bot excluded from authors; `known: False` means
 can't-tell and must never render as nothing-changed; the walk is
 capped for poll safety, with `capped: True` making the count a floor.
 
-**azt half OPEN:** the one-line format change in
-`collab_offer_reload` to render it — alongside the three suppression
-legs below, which are also still open.
+**azt half SHIPPED:** `CollabSession.changes_summary()` renders it
+(`"{count} change(s) from {who}"`, `"(couldn’t tell what changed)"` for
+`known: False`), appended outside the existing msgid so the five
+catalogs keep their translation.
 
-Fix legs, in likely order of payoff:
+## STATUS CORRECTION 2026-07-29 — this doc was stale
+
+Legs 1 and 2b, and more besides, are IN. `poll_remote_change` now
+suppresses four ways before it will latch:
+- HEAD moved but the LIFT on disk is unchanged → `'benign'`, base
+  adopted (leg 1's purpose, plus peer changes to non-LIFT files);
+- every commit in the range is a daemon merge (`bot_count`, no human
+  commits) → `'benign'`;
+- a latch already set self-heals when the LIFT blob at HEAD equals the
+  blob at base and disk still matches what we wrote (F2, by CONTENT
+  identity rather than stat);
+- **NEW 2026-07-29: every human commit in the range is OURS** —
+  see below.
+And leg 1 itself (`record_lift_stat` after the fallback `os.replace`) is
+implemented at `azt/io_put/lift.py:1265-1276`.
+
+### The hole that remained (Kent 2026-07-29, field)
+A computer updated that morning asked to take a "team update" citing
+ONE change **from that same computer**. A commit authored by our own
+contributor is a human commit like any other, so it latched — and the
+obl. 3a summary then named us as the author. The citation naming the
+same machine IS the diagnosis, not a coincidence.
+
+**FIXED (azt, awaiting live verify):** `CollabSession._only_our_own_commits`
++ a fourth suppression branch in `poll_remote_change` — adopt HEAD and
+return `'benign'` when every author in the range is our own contributor
+(`_client.get_contributor()`). Deliberately strict, because a false
+positive silently swallows real incoming work: requires `known`, NOT
+`capped` (a capped walk hides authors past the cap), a non-empty author
+list, and a set contributor name matching every author (casefolded,
+stripped).
+**Known limit, logged when it bites:** two machines sharing ONE
+contributor name are indistinguishable here. Device names differ in
+practice; a shared name belongs to
+`project_identity_beyond_langcode.md`, not to a guess here.
+
+Fix legs, in likely order of payoff (leg 1 done; leg 2b superseded by
+the four branches above):
 
 1. **azt-side (one-liner): re-record the lift stat after the legacy
    fallback replace.** `submit()` returning `'fallback'`

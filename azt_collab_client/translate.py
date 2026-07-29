@@ -388,7 +388,14 @@ _HANDLERS = {
         'Collaborator invites are only supported for GitHub '
         'repositories.'), p),
 
-    S.BUSY:                   lambda p: _tr('Another sync is in progress. Try again in a moment.'),
+    # Says what is holding things up and for how long when the daemon
+    # reports it (0.55.133) — the params that decide whether a caller
+    # should retry quietly or tell the user. Falls back to the old
+    # sentence when a daemon predates them.
+    S.BUSY:                   lambda p: (
+        _fmt(_tr('Busy: {holder} ({held_s}s). Try again in a moment.'), p)
+        if p.get('holder') and p.get('held_s') is not None else
+        _tr('Another sync is in progress. Try again in a moment.')),
     S.CONFLICTS:              lambda p: (_fmt(_tr('Merge conflicts in {paths}'), p)
                                           if p.get('paths') else
                                           _tr('Merge conflicts; review the entries flagged azt-lift-conflict.')),

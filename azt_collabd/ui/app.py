@@ -21,6 +21,7 @@ import datetime
 import os
 import sys
 import threading
+import time
 import webbrowser
 
 from kivy.app import App
@@ -77,6 +78,19 @@ _tr = _client_i18n._
 # presplash_hold 45 s watchdog.
 _CRED_RETRY_MAX = 6
 _CRED_RETRY_INTERVAL_S = 0.8
+# The one gate that replaced five ladders (0.55.105). Generous on
+# purpose: this waits on a BACKGROUND thread, so the only cost of a long
+# bound is that a genuinely-dead daemon takes this long to be reported —
+# whereas expiring early is what silently blanked a user's own name. A
+# cold ``:provider`` import on a slow handset can take tens of seconds,
+# and being killed under memory pressure can add a respawn on top.
+_CREDS_WAIT_MAX_S = 10.0
+_CREDS_WAIT_POLL_S = 1.0
+_CREDS_WAIT_POLL_MAX_S = 8.0
+# Only one credentials wait at a time, process-wide (0.55.110). Screen
+# rebuilds create fresh SettingsScreen objects that each call refresh(),
+# so per-instance state cannot prevent the pile-up.
+_creds_fetch_gate = threading.Semaphore(1)
 
 
 def _show_share_repo_qr_popup(url, langcode, font_name='Roboto'):
@@ -659,6 +673,32 @@ KV_TEMPLATE = '''
                     valign: 'top'
                     text_size: self.width, None
                     font_size: sp(11)
+                # Present only while this app is driving ANOTHER device —
+                # the Android path, where a second window is impossible.
+                # Collapsed to zero height otherwise.
+                #
+                # Kept after I proposed dropping it (0.55.129). Kent:
+                # *"better than leave android non-functional."* The
+                # earlier decision against retargeting was made when two
+                # windows were the alternative; on Android the
+                # alternative is nothing at all, so the mode stays and
+                # the banner + this exit are what keep it legible.
+                NavBtn:
+                    id: back_to_local_btn
+                    # "Back to this device" (0.55.127) was ambiguous in the
+                    # one place it mattered: you are looking at ONE
+                    # device's settings while holding ANOTHER, so "this
+                    # device" could mean either. Kent: *"makes no sense if
+                    # I'm looking at the grantee. 'return to Admin
+                    # settings' would be better."* — the device you are
+                    # holding is the one doing the administering, so name
+                    # it by its role rather than by proximity.
+                    text: _('Return to admin settings')
+                    size_hint_y: None
+                    height: 0
+                    opacity: 0
+                    disabled: True
+                    on_press: root.back_to_local()
                 # Cache images — daemon-side CAWL prefetch policy.
                 # Default is one image per CAWL line (the preferred
                 # ``__`` variant); peers can still on-demand-fetch
@@ -1230,13 +1270,31 @@ class SettingsScreen(Screen):
         # on Kivy >= 2.3, which raises a confusing
         # "'super' object has no attribute '__getattr__'" from
         # ObservableDict when a key is missing.
+        # Which instance is being entered (0.55.106) — pair this with the
+        # ``screen=`` id on the contributor-rendered line. Two different
+        # ids across a session means the value is being written to a
+        # screen the user is not looking at.
+        print(f'[settings] on_enter screen=0x{id(self):x}',
+              file=sys.stderr, flush=True)
+
         def _ready(*_):
             # Fresh retry budget per screen entry so a visit while the
             # daemon is down still re-polls (and, at startup, holds the
             # splash until the daemon answers). The presplash release
             # itself lives in refresh(), gated on the daemon actually
             # answering — see the comment there.
+            self._sync_remote_banner()
             self._credentials_retry_count = 0
+            # BOTH ladders, not just the fast one (0.55.104). This block
+            # has always said "fresh retry budget per screen entry", but
+            # only reset the 4.8 s ladder — ``_cred_backfill_count`` (the
+            # 60 s slow ladder that actually fills the name field on a
+            # cold Android start) was left spent for the life of the
+            # screen object. Once it ran out, no screen entry and no app
+            # resume ever asked again, and the field stayed blank with
+            # nothing in the log. Field 2026-07-29: four devices,
+            # contributor set on all of them, field empty, no complaint.
+            self._cred_backfill_count = 0
             self._build_lang_selector()
             self.refresh()
             self._start_cawl_cache_poll()
@@ -1320,6 +1378,36 @@ class SettingsScreen(Screen):
         # thread. So a short interval buys responsiveness at ~zero cost.
         self._peer_sync_event = Clock.schedule_interval(
             lambda _dt: self._tick_peer_sync(), 5.0)
+
+    _CONTRIB_HEAL_INTERVAL_S = 30.0
+
+    def _heal_blank_contributor(self):
+        """Re-arm the credentials ladder while the name field is empty and
+        the daemon is answering (0.55.103, restored 0.55.115).
+
+        Cheap and NON-BLOCKING — it only resets a counter and schedules a
+        Clock callback. That is the whole reason it is right and the
+        0.55.105/112 blocking waits were wrong: on Android an RPC has no
+        enforceable timeout, so anything that *waits* can hang, while
+        anything that *re-schedules* cannot.
+
+        No-op unless the widget exists, is empty, and isn't focused (never
+        repaint under someone typing), and at most once per
+        ``_CONTRIB_HEAL_INTERVAL_S`` so a genuinely-unset name doesn't
+        re-poll forever."""
+        inp = self.ids.get('contributor_input')
+        if inp is None or inp.focus or (inp.text or '').strip():
+            return
+        now = time.monotonic()
+        last = getattr(self, '_contrib_heal_at', 0.0)
+        if now - last < self._CONTRIB_HEAL_INTERVAL_S:
+            return
+        self._contrib_heal_at = now
+        print('[settings] "Your name" is empty and the daemon is '
+              'answering — re-arming the credentials ladder',
+              file=sys.stderr, flush=True)
+        self._cred_backfill_count = 0
+        self._schedule_credentials_backfill()
 
     def _update_backup_line(self, text):
         """Replace just the ``GitHub backup:`` line in the current-project
@@ -1430,6 +1518,35 @@ class SettingsScreen(Screen):
                     self._render_peer_sync(rows_out, current)
                 if backup_line:
                     self._update_backup_line(backup_line)
+                # Keep the remote banner + "Back to this device" honest
+                # (0.55.129). These were only synced from ``on_enter``,
+                # which does not re-fire when the retarget happens from a
+                # popup over the screen you are already on — so Kent
+                # retargeted and *"after clicking through, I don't SEE a
+                # back to my device button"*. It was there, collapsed,
+                # with nothing to re-measure it. Riding the existing poll
+                # means it appears within one tick of any retarget, and
+                # disappears within one tick of leaving.
+                try:
+                    self._sync_remote_banner()
+                except Exception:
+                    pass
+                # RESTORED (0.55.115). I deleted this in 0.55.105 and
+                # replaced it with a blocking wait, which was strictly
+                # worse: a blocking loop can hang forever on Android
+                # (advisory timeouts), while this cannot — it only re-arms
+                # a Clock-driven ladder.
+                #
+                # Both halves are needed. One non-blocking call per
+                # attempt, and a retry that NEVER expires while the field
+                # is empty: field 2026-07-29 measured **4m19s** from
+                # ``on_enter`` to the daemon's answer on a saturated
+                # phone, where the old ladder gave up after 60 s.
+                if lan_state is not None:
+                    try:
+                        self._heal_blank_contributor()
+                    except Exception:
+                        pass
                 if lan_state is None:
                     return
                 on = bool(lan_state.get('on'))
@@ -1590,6 +1707,160 @@ class SettingsScreen(Screen):
             base += f' · {note}'
         return base
 
+    def _sync_remote_banner(self):
+        """Keep the "driving another device" indicator honest (0.55.127).
+
+        On Android the retarget happens IN this process, so there is no
+        second window and no title bar to carry the fact. Without a
+        permanent on-screen marker plus a way back, you cannot tell whose
+        settings you are changing — which is exactly the objection that
+        made retargeting the wrong answer on desktop. Here it is the only
+        possible mechanism, so the marker is not optional.
+
+        Renders into the LAN status line, which is already the screen's
+        one-line state surface."""
+        try:
+            from azt_collab_client import transports as _t
+            label = _t.remote_peer_label()
+        except Exception:
+            label = ''
+        btn = self.ids.get('back_to_local_btn')
+        # RE-READ THE SCREEN WHEN THE TARGET CHANGES (0.55.132). Setting
+        # the transport does not repaint anything, so after retargeting the
+        # page still showed THIS device's values — Kent: *"the button
+        # doesn't seem to do anything, but it does produce a lot of log."*
+        # The log was the relay working; the screen simply never asked
+        # again. Refresh once per transition, not per tick.
+        prev = getattr(self, '_remote_label_seen', None)
+        if prev != label:
+            self._remote_label_seen = label
+            Clock.schedule_once(lambda _dt: self.refresh(), 0)
+        # The indicator goes in the SUBTITLE, not the LAN status line: that
+        # line is rewritten from ``lan_state`` later in this same tick, so
+        # a banner written there was clobbered within milliseconds.
+        app = App.get_running_app()
+        if not label:
+            if btn is not None:
+                btn.height = 0
+                btn.opacity = 0
+                btn.disabled = True
+            if app is not None and getattr(app, 'subtitle', '').startswith(
+                    'EDITING'):
+                app.subtitle = _tr('Settings')
+            return
+        if app is not None:
+            app.subtitle = _tr('EDITING {device}').format(device=label)
+        if btn is not None:
+            btn.height = dp(44)
+            btn.opacity = 1
+            btn.disabled = False
+
+    def back_to_local(self):
+        """Stop driving another device; return to this one's settings."""
+        try:
+            from azt_collab_client import transports as _t
+            _t.clear_remote_peer()
+        except Exception as ex:
+            self._lan_msg(f'{ex!r}')
+            return
+        self._lan_msg(_tr('Back to admin settings'))
+        self._sync_remote_banner()
+        self.refresh()
+
+    def _lan_msg(self, text):
+        """Write one line to the LAN status label. Silent no-op before the
+        screen is built, so a background callback landing early can't
+        raise into Kivy's clock."""
+        lbl = self.ids.get('lan_status_label')
+        if lbl is not None:
+            lbl.text = str(text or '')
+
+    def _toggle_peer_admin(self, peer_id, allow, btn):
+        """Grant or revoke this peer's permission to change OUR settings
+        (0.55.118). Off the UI thread — it writes peers.json."""
+        btn.disabled = True
+        btn.text = _tr('…')
+
+        def _work():
+            from azt_collab_client import lan_set_admin
+            resp = lan_set_admin(peer_id, allow) or {}
+
+            def _land(_dt):
+                btn.disabled = False
+                ok = bool(resp.get('ok'))
+                if not ok:
+                    btn.text = _tr('Allow')
+                    self._lan_msg(_tr(
+                        'Could not change permission: {err}').format(
+                            err=str(resp.get('error', '?'))[:60]))
+                    return
+                now_on = bool(resp.get('admin'))
+                btn.text = _tr('Allowed') if now_on else _tr('Allow')
+                # Say what it MEANS, not that a flag flipped — this is
+                # the one gesture whose consequence a user must
+                # understand, and it is not obvious from a word.
+                self._lan_msg(
+                    _tr('{device} may now change this device\'s settings')
+                    .format(device=peer_id[:8]) if now_on
+                    else _tr('{device} can no longer change settings here')
+                    .format(device=peer_id[:8]))
+                self._peer_admin_rendered = set()   # force re-render
+            Clock.schedule_once(_land, 0)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _open_remote_settings(self, peer_id, btn):
+        """Launch a SECOND settings window driving *peer_id* (0.55.118).
+
+        A separate process, target fixed at startup — so neither window
+        can ever be ambiguous about which machine it is changing. Desktop
+        only: spawning a second Kivy Activity is not a thing on Android,
+        and on a phone the operator is holding the device anyway."""
+        from azt_collab_client._platform import platform as _plat
+        if _plat == 'android':
+            self._lan_msg(_tr(
+                'Opening another device\'s settings works from a computer, '
+                'not from a phone'))
+            return
+        btn.disabled = True
+
+        def _work():
+            import subprocess
+            from azt_collab_client._spawn import build_spawn_env
+            msg = ''
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, '-m', 'azt_collabd', 'ui',
+                     '--peer', str(peer_id)],
+                    env=build_spawn_env(),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
+                # It refuses fast (exit 2) when the peer hasn't granted us
+                # or can't be reached, so a short wait turns a window that
+                # silently never appears into a message that says why.
+                try:
+                    _out, _err = proc.communicate(timeout=6)
+                    if proc.returncode not in (None, 0):
+                        msg = (_err or b'').decode(
+                            'utf-8', 'replace').strip().splitlines()[-1:]
+                        msg = msg[0] if msg else _tr('refused')
+                except subprocess.TimeoutExpired:
+                    pass          # still running ⇒ the window opened
+            except Exception as ex:
+                msg = repr(ex)
+
+            def _land(_dt):
+                btn.disabled = False
+                if msg:
+                    self._lan_msg(_tr(
+                        'Could not open that device: {why}').format(
+                            why=str(msg)[:120]))
+                else:
+                    self._lan_msg(_tr(
+                        'Opened a second window for that device — its '
+                        'title says REMOTE'))
+            Clock.schedule_once(_land, 0)
+        threading.Thread(target=_work, daemon=True).start()
+
     def _render_peer_sync(self, rows, current_langcode):
         from kivy.uix.label import Label
         from azt_collab_client.ui import theme as _theme
@@ -1631,6 +1902,12 @@ class SettingsScreen(Screen):
             retry.bind(on_release=lambda _b, pid=peer_id:
                        self._retry_peer(pid, _b))
             line.add_widget(retry)
+            # (0.55.118 put "Allow" / "Settings" buttons here; MOVED to
+            # the per-peer Manage popup in 0.55.120. This board is a
+            # status readout — nobody comes here to change what a device
+            # may do — and the guard that kept one pair of buttons per
+            # peer was never cleared, so they vanished after the first
+            # 5 s repaint and were effectively invisible anyway.)
             box.add_widget(line)
         # The current-project lines live INSIDE the gated actions row,
         # whose height is set explicitly — grow it to fit them.
@@ -1985,10 +2262,92 @@ class SettingsScreen(Screen):
         into one ``try`` was a real bug — any exception skipped the
         button update and left "Connect to GitHub" on screen even when
         credentials were confirmed."""
+        # WAIT FOR AN ANSWER HERE, ONCE — don't hand "couldn't ask"
+        # upstairs and rely on ladders to fix it later (0.55.105).
+        #
+        # Kent 2026-07-29: *"contributor has been a stable field for
+        # months; why is it causing so many problems now?"* Because of
+        # 0.55.25. This RPC used to run ON the UI thread and blocked
+        # 36–77 s, which accidentally made it correct: it landed long
+        # after ``:provider`` finished importing, so it always got a real
+        # answer. Moving it off-thread made it fast, and fast means it now
+        # fires ~1 s after the screen appears — into a window where the
+        # daemon does not exist yet.
+        #
+        # Every version since compensated with another timer. There were
+        # FIVE for this one field: the 4.8 s retry ladder, the 60 s
+        # backfill ladder, the presplash hold, a 5 s poll self-heal
+        # (0.55.103) and a resume re-arm (0.55.104) — none aware of the
+        # others, each able to expire on its own, and the three faults
+        # fixed today were all in that machinery rather than in the race
+        # itself.
+        #
+        # One gate replaces them: this thread is already off the UI
+        # thread, so it can simply WAIT for the transport to come up.
+        # Nothing is painted from an unreachable answer, so there is no
+        # empty to overwrite and nothing to schedule a fix for.
+        # SINGLE-FLIGHT + BACKOFF (0.55.110). As first written (0.55.105)
+        # this polled every 1 s for up to 120 s with no guard against
+        # concurrent waits. Compose that with a screen rebuild — each new
+        # ``SettingsScreen.on_enter`` starts another one — and a rebuild
+        # LOOP (see picker_app._check_language_change) and you get many
+        # threads each hammering ``get_credentials_status`` once a second.
+        # On Android every one of those is a binder call into
+        # ``:provider``. Kent 2026-07-29: *"the lang button does seem to be
+        # broken now… makes UI nonresponsive. Wasn't true this morning."*
+        # It wasn't, because this loop didn't exist this morning. My fix
+        # for a blank field created a way to saturate the daemon.
+        if not _creds_fetch_gate.acquire(blocking=False):
+            print('[settings] a credentials fetch is already waiting — '
+                  'not starting a second (they would race for the same '
+                  'answer and multiply RPCs into the daemon)',
+                  file=sys.stderr, flush=True)
+            # Return the "couldn't ask" SHAPE, not None: ``_rpc_then``
+            # always hands our return value to ``_apply_credentials_state``,
+            # and None there would raise on the first ``.get``. The
+            # unreachable path already does the right thing — hold the
+            # existing field text, blank nothing — and the in-flight
+            # fetch will deliver the real answer.
+            return {'status': {'unreachable': True}, 'status_err': None,
+                    'online': False}
         try:
-            status, status_err = get_credentials_status(), None
-        except Exception as ex:
-            status, status_err = {}, ex
+            # ONE CALL. NO POLLING LOOP. (0.55.114 — reverts 105 and 112.)
+            #
+            # I put an RPC in a retry loop, twice, and both were wrong for
+            # the same reason: ``transports/android_cp.py`` documents that
+            # ``timeout`` is **advisory**, because ``ContentResolver.call``
+            # has no timeout facility. A wedged binder call therefore
+            # blocks past any deadline I write, and the loop never exits.
+            #
+            # Field 2026-07-29, 0.55.113 boot on the phone that still had
+            # a blank field: NO ``creds applied`` line at all, and
+            # ``[presplash-hold] watchdog: release() not called within
+            # 45s``. ``release()`` fires from the apply, so the apply
+            # never ran — the worker was parked in my loop. The daemon had
+            # the value the whole time (``config.collab.contributor:
+            # 'Kent Phone'``).
+            #
+            # The load problem those loops were compensating for is fixed
+            # where it belongs: coalescing in the daemon (0.55.111/113) so
+            # a poll costs one computation, and single-flight here (0.55.110)
+            # so screens can't pile up. With those, one call is enough —
+            # and if it returns unreachable, the pre-existing retry
+            # ladders handle it, as they did before I touched this.
+            status, status_err = {}, None
+            # WAIT ON READINESS, NOT ON A DEADLINE (0.55.112).
+            #
+            # ``GET /v1/health`` is the one endpoint that needs no auth
+            # and does no git work, so polling IT during boot costs
+            # nothing — where retrying ``get_credentials_status`` hammers
+            # a daemon that is already too busy to answer (see 0.55.111:
+            # twenty threads walking the filesystem at once).
+            #
+            try:
+                status, status_err = get_credentials_status(), None
+            except Exception as ex:
+                status, status_err = {}, ex
+        finally:
+            _creds_fetch_gate.release()
         try:
             online = is_online()
         except Exception:
@@ -2198,7 +2557,55 @@ class SettingsScreen(Screen):
         # (Kent 2026-07-27). An EMPTY focused field holds nothing worth
         # protecting, so fill it; a non-empty focused one is still left
         # alone, which preserves the original intent.
-        contrib_input = self.ids.get('contributor_input')
+        # RE-TARGET IF THIS SCREEN HAS BEEN REPLACED (0.55.108).
+        #
+        # ``picker_app._check_language_change`` polls config.json's mtime
+        # and, when the persisted UI language differs from the running
+        # one, does ``sm.clear_widgets()`` and re-instantiates EVERY
+        # screen from its class. Our ``self`` is then a detached orphan:
+        # setting text on its widgets is invisible, because nothing on
+        # screen references them.
+        #
+        # That is the whole contributor bug. Field 2026-07-29, three
+        # French-locale phones: the log said *"contributor rendered: set
+        # 10 chars, widget now holds 10 chars"* while the field on screen
+        # was empty and select-all selected nothing — both true, of two
+        # different widgets. Kent's desktop is English, so the
+        # language-change branch never fires there and it looked fine.
+        #
+        # The trigger is a startup race: the picker applies
+        # ``language_pref()`` in ``build()``, but if the daemon isn't
+        # reachable yet that yields the default; when config becomes
+        # readable the real pref (fr) differs, and the rebuild fires —
+        # right around when our credentials answer lands. 0.55.105's wait
+        # widened that window, since the worker now holds ``self`` for up
+        # to 120 s.
+        #
+        # Resolve the LIVE screen by name and render into that instead.
+        _self = self
+        if self.manager is None:
+            live = None
+            try:
+                app = App.get_running_app()
+                sm = getattr(app, 'sm', None) or getattr(app, 'root', None)
+                if sm is not None and sm.has_screen(self.name):
+                    live = sm.get_screen(self.name)
+            except Exception:
+                live = None
+            if live is not None and live is not self:
+                print(f'[settings] this screen was replaced mid-fetch '
+                      f'(0x{id(self):x} → 0x{id(live):x}) — most likely a '
+                      f'UI-language rebuild. Rendering into the live '
+                      f'screen instead of the orphan',
+                      file=sys.stderr, flush=True)
+                _self = live
+            else:
+                print('[settings] this screen is detached and no live '
+                      'replacement was found — skipping the render rather '
+                      'than writing into an orphan nobody can see',
+                      file=sys.stderr, flush=True)
+                return
+        contrib_input = _self.ids.get('contributor_input')
         _incoming = status.get('contributor', '') or ''
         if contrib_input is None:
             # Silent until 0.55.37: a missing widget made this a no-op
@@ -2211,10 +2618,28 @@ class SettingsScreen(Screen):
         elif (not contrib_input.focus
                 or not (contrib_input.text or '').strip()):
             contrib_input.text = _incoming
+            # IDENTIFY THE INSTANCE (0.55.106). Three phones logged
+            # "widget now holds 10/11/14 chars" and all three showed an
+            # empty field — tap gave nothing, long-press select-all
+            # selected nothing, paste came back null. So the widget was
+            # populated and the widget on screen was empty, which can
+            # both be true only if they are DIFFERENT widgets. ``self.ids``
+            # is per-instance, so a second SettingsScreen (or a rebuild
+            # between the fetch starting and landing) sends the value to
+            # an object nobody is looking at.
+            #
+            # These ids settle it in one log read instead of another round
+            # of inference — compare against the ids printed by __init__
+            # and on_enter.
+            _parent_state = (
+                'yes' if contrib_input.parent
+                else 'NO — detached, nothing on screen shows this')
             print(f'[settings] contributor rendered: '
                   f'set {len(_incoming)} chars, widget now holds '
                   f'{len(contrib_input.text or "")} chars, '
-                  f'focus={contrib_input.focus}',
+                  f'focus={contrib_input.focus} '
+                  f'screen=0x{id(self):x} widget=0x{id(contrib_input):x} '
+                  f'parent={_parent_state}',
                   file=sys.stderr, flush=True)
             # Now that the daemon has answered, run — or undo — the
             # "you must set a name" prompt (0.55.46).
@@ -2288,6 +2713,20 @@ class SettingsScreen(Screen):
     def _schedule_credentials_backfill(self):
         n = getattr(self, '_cred_backfill_count', 0)
         if n >= self._CRED_BACKFILL_MAX:
+            # SAY SO (0.55.103). This used to return silently, so a
+            # spent budget was indistinguishable from a budget that never
+            # started — and the field simply stayed blank forever with
+            # nothing in the log to explain it. The slow self-heal in
+            # ``_tick_peer_sync`` re-arms this, so exhaustion is no longer
+            # terminal; it still deserves a line, because reaching it at
+            # all means the daemon was unreachable for a full minute
+            # after the screen appeared.
+            print(f'[settings] credentials backfill budget spent '
+                  f'({self._CRED_BACKFILL_MAX} tries × '
+                  f'{self._CRED_BACKFILL_INTERVAL_S:.0f}s) and the daemon '
+                  f'still had not answered. The 5s peer poll will re-arm '
+                  f'it while the name field is empty',
+                  file=sys.stderr, flush=True)
             return
         self._cred_backfill_count = n + 1
 
@@ -4936,6 +5375,8 @@ class CollabUIApp(App):
     helper subprocess (`python -m azt_collabd projects`); see
     azt_collabd/ui/picker_app.py."""
 
+    # Set in __init__ when this process is driving another device
+    # (0.55.117) — see the note there. Class default is the local case.
     title = 'A-Z+T Collab'
     subtitle = StringProperty('Settings')
     icon = StringProperty(_AZT_ICON)
@@ -4950,11 +5391,60 @@ class CollabUIApp(App):
     )
 
     def build(self):
-        theme.set_theme('Ocean')
+        # NAME THE MACHINE IN THE TITLE BAR when this process is driving
+        # another device (0.55.117), and give it a different theme so the
+        # two windows are distinguishable at a glance rather than by
+        # reading.
+        #
+        # Without an unmissable indicator you will eventually toggle
+        # work_offline on the wrong daemon and spend an hour confused —
+        # which is the whole reason the target is fixed for the life of
+        # the process instead of switchable.
+        remote_name = ''
+        try:
+            from azt_collab_client import transports as _t
+            if _t.is_remote():
+                remote_name = getattr(
+                    _t.pick_transport(), 'device_name', '') or 'peer'
+        except Exception:
+            remote_name = ''
+        if remote_name:
+            self.title = f'REMOTE — {remote_name}'
+            self.subtitle = _tr('Settings on {device}').format(
+                device=remote_name)
+            theme.set_theme('Forest')
+        else:
+            theme.set_theme('Ocean')
         self.font_name = register_charis()
         register_kv(self.font_name)
         self.sm = RootSM(transition=SlideTransition())
         return self.sm
+
+    def on_resume(self):
+        """Re-read daemon state after a resume (0.55.104, simplified in
+        0.55.105).
+
+        There was no resume hook at all, so backgrounding and returning —
+        the obvious "try again" gesture — did nothing: ``on_enter`` is a
+        screen TRANSITION hook and never fires for a screen you were
+        already on. Kent 2026-07-29: *"backgrounded and returned, and
+        still no contributor field."* No code path could have helped.
+
+        This is still worth doing after the 0.55.105 gate, for a different
+        reason than retry: on Android ``:provider`` may have been killed
+        under memory pressure while we were backgrounded, so daemon-side
+        state can genuinely have changed. It is now a plain refresh — no
+        budgets to re-arm, because there are none."""
+        try:
+            sm = getattr(self, 'root', None)
+            if sm is None or getattr(sm, 'current', '') != 'settings':
+                return
+            screen = sm.get_screen('settings')
+        except Exception:
+            return
+        print('[settings] app resumed — re-reading daemon state',
+              file=sys.stderr, flush=True)
+        Clock.schedule_once(lambda _dt: screen.refresh(), 0)
 
     def on_start(self):
         """Bind Android's hardware back button so it pops sub-screens

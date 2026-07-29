@@ -548,13 +548,56 @@ def _start_browse_zeroconf():
 
 
 def _stop_browse_zeroconf():
+    """Cancel the ServiceBrowser WITHOUT letting it wedge the caller
+    (0.55.100).
+
+    ``ServiceBrowser.cancel()`` joins the browser thread with no
+    timeout, and that thread can be blocked in our own ``_record``
+    waiting on ``_LOCK`` — held by whoever is mid-resolve. The join then
+    never returns, and since ``restart_browse`` is called from the
+    iface-watch loop, that loop stops ticking. The watchdog sees a
+    stalled loop and **restarts the whole daemon** at 600 s.
+
+    Field 2026-07-29, Idjop's Windows desktop: THREE daemon restarts in
+    six hours, every one of them this exact stack —
+
+        _iface_watcher_loop → restart_browse → stop_browse
+          → _stop_browse_zeroconf → browser.cancel() → _handle.join()
+
+    with the zeroconf browser thread parked in ``_record``'s ``with
+    _LOCK``. The network there flaps constantly (WiFi + hotspot), so
+    ``restart_browse`` fires every few seconds and only needs to lose
+    one race. Killing a busy daemon mid-merge is how in-flight work gets
+    interrupted, so this is not cosmetic.
+
+    Cancel on a throwaway thread and give it a bounded wait: if the
+    browser is wedged we leak one thread and move on, which is strictly
+    better than wedging the loop that watches the network — and the new
+    browser still comes up."""
     browser = _STATE.get('browse')
     if browser is None:
         return
+
+    def _cancel():
+        try:
+            browser.cancel()
+        except Exception:
+            pass
+
     try:
-        browser.cancel()
-    except Exception:
-        pass
+        t = threading.Thread(target=_cancel, name='zc-cancel', daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        if t.is_alive():
+            print('[lan-discovery] browser.cancel() did not return within '
+                  '5s — abandoning it (zeroconf thread is blocked, likely '
+                  'on our own discovery lock). Continuing so the '
+                  'iface-watch loop keeps ticking; a stuck cancel used to '
+                  'stall that loop until the watchdog restarted the daemon',
+                  file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-discovery] cancel-thread failed: {ex!r}',
+              file=sys.stderr, flush=True)
 
 
 # ── Android NsdManager path ────────────────────────────────────────────────

@@ -59,6 +59,12 @@ import sys
 import threading
 import time
 
+# How often the "not restarting, sync in flight" decision may repeat
+# (0.55.118). It fired every 30 s for the life of a push — ~300 copies in
+# one field log, burying the push progress the reader was after.
+_INFLIGHT_LOG_INTERVAL_S = 300.0
+_inflight_said_at = 0.0
+
 _thread = None
 _stop = None
 # Episode tracking: dump a traceback ONCE per stall, not every tick —
@@ -125,8 +131,20 @@ def _stall_report():
             bar = warn_s
         if age > bar:
             worst = max(worst, float(age))
+            # DON'T PRINT "~?s" (0.55.119). A loop that hasn't published
+            # its interval yet produced ``expected every ~?s``, which
+            # reads as a missing value where the sentence promised a
+            # number — and the number is the whole point of the
+            # comparison. Say which fact we have instead: the bar we
+            # actually judged against.
+            _exp = expect.get(name)
+            if _exp:
+                _how = f'expected every ~{_exp}s'
+            else:
+                _how = (f'this loop has not published an interval; '
+                        f'judged against the fixed {bar:.0f}s bar')
             lines.append(f'loop {name!r} last ticked {age:.0f}s ago '
-                         f'(expected every ~{expect.get(name, "?")}s)')
+                         f'({_how})')
     try:
         from .locks import held_snapshot
         held = held_snapshot()
@@ -279,11 +297,25 @@ def _loop():
         try:
             from . import sync_flight as _sf
             if _sf.in_flight():
-                print(f'[watchdog] stall persisted {worst:.0f}s but a '
-                      f'sync is IN FLIGHT — not restarting. A large '
-                      f'push legitimately holds the project lock for '
-                      f'minutes; killing it here is how a big history '
-                      f'never converges', file=sys.stderr, flush=True)
+                # SAY IT ONCE, THEN RARELY (0.55.118). This fired every
+                # 30 s for the whole life of a long push — field
+                # 2026-07-29 shows ~300 consecutive copies burying every
+                # real event in the log, including the push progress the
+                # reader was looking for. The decision it reports does
+                # not change between ticks, so repeating it adds nothing
+                # and costs the log's usefulness.
+                _now = time.time()
+                if (_now - globals().get('_inflight_said_at', 0.0)
+                        >= _INFLIGHT_LOG_INTERVAL_S):
+                    globals()['_inflight_said_at'] = _now
+                    print(f'[watchdog] stall persisted {worst:.0f}s but a '
+                          f'sync is IN FLIGHT — not restarting. A large '
+                          f'push legitimately holds the project lock for '
+                          f'minutes; killing it here is how a big history '
+                          f'never converges. (Repeats suppressed for '
+                          f'{int(_INFLIGHT_LOG_INTERVAL_S / 60)} min '
+                          f'while this stays true.)',
+                          file=sys.stderr, flush=True)
                 continue
         except Exception as ex:
             print(f'[watchdog] sync_flight check raised: {ex!r} — '

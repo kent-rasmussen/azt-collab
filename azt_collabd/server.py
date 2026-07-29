@@ -1985,6 +1985,128 @@ def _h_lan_set_static_endpoints(body):
     return 200, {"ok": True, "peer": entry}
 
 
+def _h_lan_relay(body):
+    """``POST /v1/lan/relay`` — make one signed admin call to a peer on
+    behalf of our own UI (0.55.127).
+
+    Body ``{peer_id, method, path, body}`` →
+    ``{ok, relayed}`` or ``{ok, relay_error}``.
+
+    Exists because the secrets are here, not in the UI: signing needs this
+    device's ed25519 private key and dialling needs the peer's pinned
+    fingerprint from ``peers.json``. On Android the UI is a different
+    process and cannot borrow either; on desktop it must not import this
+    package at all (client hard rule #3).
+
+    This is how Android drives another device's settings, since it cannot
+    spawn the second window desktop uses. Same channel, same three gates
+    at the far end — only the local hop differs.
+
+    Errors come back as ``relay_error`` STRINGS rather than as HTTP
+    failures, so the caller can show the peer's own explanation (which
+    gate refused, or which addresses were tried) instead of a generic
+    transport error."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id required"}
+    method = str((body or {}).get('method', '') or 'GET').upper()
+    path = str((body or {}).get('path', '') or '')
+    inner = (body or {}).get('body')
+    if not path:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "path required"}
+    try:
+        from . import lan_admin_client
+        tr = lan_admin_client.make_transport(peer_id)
+    except Exception as ex:
+        return 200, {"ok": True, "relay_error": str(ex)[:300]}
+    try:
+        out = tr.call(method, path, inner)
+        # A successful relay IS a confirmed grant (0.55.130) — record it so
+        # the UI's button appears without a separate probe.
+        _peers.set_they_admin_us(peer_id, True)
+        return 200, {"ok": True, "relayed": out}
+    except Exception as ex:
+        msg = str(ex)
+        if '403' in msg or 'admin grant' in msg:
+            _peers.set_they_admin_us(peer_id, False)
+        return 200, {"ok": True, "relay_error": msg[:300]}
+
+
+def _h_lan_can_admin(body):
+    """``POST /v1/lan/can_admin`` — may WE administer *peer_id*?
+    (0.55.123)
+
+    Body ``{peer_id}`` → ``{ok, allowed, detail}``.
+
+    The question cannot be answered from local state, and that is the
+    whole point. ``peers.json``'s ``admin`` flag records what WE granted
+    THEM; whether THEY granted US lives on their machine only. Kent:
+    *"why does 'open settings for this device' show up on the one who
+    granted? I'd think you'd want it on the grantee."* Exactly — and the
+    grantee has to ask.
+
+    So this makes one real admin call to that peer and reports what came
+    back. Probing rather than caching also means a revoked grant stops
+    showing the button on the next look, instead of after some sync."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id required"}
+    try:
+        from . import lan_admin_client
+        tr = lan_admin_client.make_transport(peer_id)
+    except Exception as ex:
+        # Not paired / no fingerprint / no address — a configuration
+        # fact, not a refusal. Distinguish it: "can't reach" and "not
+        # allowed" need different actions from the user.
+        return 200, {"ok": True, "allowed": False,
+                     "detail": str(ex)[:200], "reason": "unavailable"}
+    try:
+        tr.call('GET', '/v1/health', None, timeout=8)
+        # Remember it (0.55.129) so the UI can show the button without
+        # re-probing — and keep showing it while the device naps.
+        _peers.set_they_admin_us(peer_id, True)
+        return 200, {"ok": True, "allowed": True, "detail": ""}
+    except Exception as ex:
+        msg = str(ex)
+        reason = ('refused' if ('403' in msg or 'admin grant' in msg)
+                  else 'unavailable')
+        if reason == 'refused':
+            # An explicit no is the ONLY thing that clears the memory.
+            # Unreachable must not, or a sleeping phone would revoke
+            # itself.
+            _peers.set_they_admin_us(peer_id, False)
+        return 200, {"ok": True, "allowed": False,
+                     "detail": msg[:200], "reason": reason}
+
+
+def _h_lan_set_admin(body):
+    """``POST /v1/lan/set_admin`` — grant or revoke a paired peer's
+    permission to change our settings remotely (0.55.117).
+
+    Body: ``{peer_id, allowed}``. Response ``{ok, peer_id, admin}``.
+
+    Reachable over the LAN admin channel too (0.55.118) — a device you
+    have granted admin can grant another, or revoke one, which is what
+    admin means. Blocking that would have meant travelling to a machine
+    to authorise a second device for it. Privilege changes are logged on
+    both sides instead.
+
+    Pairing does not imply this. Pairing means "share dictionary data";
+    the field phones are all paired, and a lost phone must not be able to
+    reconfigure someone's desktop."""
+    peer_id = str((body or {}).get('peer_id', '') or '')
+    if not peer_id:
+        return 200, {"ok": False, "error": "bad_request",
+                     "detail": "peer_id required"}
+    allowed = bool((body or {}).get('allowed', True))
+    if not _peers.set_admin(peer_id, allowed):
+        return 200, {"ok": False, "error": "peer_unknown"}
+    return 200, {"ok": True, "peer_id": peer_id, "admin": allowed}
+
+
 def _h_lan_unpair(body):
     """Remove a peer from ``peers.json``. Companion to
     ``_h_lan_pair_accept``. Body: ``{peer_id}``. Response: typed
@@ -3633,6 +3755,28 @@ def _changes_since_payload(project, since_sha):
 
 
 def _h_project_status(langcode, _body, since_sha=''):
+    """Coalesced wrapper (0.55.113). See ``_h_project_status_impl``.
+
+    0.55.111 coalesced ``repo_status_summary`` — one of the expensive
+    calls in this handler — and left the others. The very next field dump
+    showed **ten** ``Dummy-*`` ContentProvider threads stacked in
+    ``_main_merged`` → ``_is_ancestor``, each walking history through pack
+    lookups, because that call is separate and was still unguarded.
+    ``lan_unshared`` / ``at_risk`` re-open the repo again besides.
+
+    Guarding one call inside a handler that makes several is the wrong
+    level. Coalescing the WHOLE handler covers every sub-call, including
+    ones added later, and one poll then costs one computation no matter
+    how many surfaces ask.
+
+    ``since_sha`` is part of the key: it changes the answer, so entries
+    for different values must not share a slot."""
+    return coalesce(f'project_status:{langcode}:{since_sha}', 3.0,
+                    lambda: _h_project_status_impl(langcode, _body,
+                                                   since_sha))
+
+
+def _h_project_status_impl(langcode, _body, since_sha=''):
     p = projects.get(langcode)
     if p is None:
         return 404, {"ok": False, "error": "project_not_found"}
@@ -3649,7 +3793,13 @@ def _h_project_status(langcode, _body, since_sha=''):
         print(f'[project_status] strip_lan_origin {langcode!r} '
               f'failed: {ex!r}',
               file=sys.stderr, flush=True)
-    summary = _repo_status(p.working_dir)
+    # Coalesced (0.55.111): this is the single most expensive read in the
+    # daemon — ``porcelain.status`` walks the working tree and resolves
+    # every untracked path — and it is polled by every open UI. 3 s is
+    # short enough that a user tapping Sync sees fresh numbers, long
+    # enough that a 5 s poll from three surfaces costs one walk.
+    summary = coalesce(f'repo_status:{p.working_dir}', 3.0,
+                       lambda: _repo_status(p.working_dir))
     branch, remote_url, n_changes, wan_unshared = ('', '', 0, 0)
     if summary is not None:
         branch, remote_url, n_changes, wan_unshared = summary
@@ -4451,8 +4601,31 @@ def _h_project_submit_file(langcode, body):
     # same filesystem (os.replace stays atomic) and inside the
     # whitelisted tree (no path smuggling), and must not BE the
     # target (a replace onto itself would no-op and then unlink).
-    if (not os.path.isfile(staged_real)
-            or os.path.dirname(staged_real) != os.path.dirname(target)
+    #
+    # SPLIT INTO TWO ANSWERS (0.55.116). These were one code, and they
+    # have OPPOSITE remedies:
+    #
+    # - the staged file is simply GONE. The overwhelmingly common cause
+    #   is a RETRY AFTER PARTIAL SUCCESS: the first attempt worked,
+    #   ``os.replace`` consumed the staged file, and the reply was lost
+    #   on the way back (field 2026-07-29, Windows: ``SERVICE_DROPPED
+    #   … [WinError 10054]`` immediately before this). The write already
+    #   landed; the caller should re-stage and retry, and a UI must NOT
+    #   report data loss. Retryable.
+    # - the path is bogus — not beside the target, or IS the target.
+    #   That is a caller bug and retrying cannot fix it. Permanent.
+    #
+    # One code for both meant a peer could not tell "your save probably
+    # already succeeded, re-stage to confirm" from "you passed a bad
+    # path", so it could only surface a scary error for both.
+    if not os.path.isfile(staged_real):
+        print(f'[submit_file] {langcode!r}: staged file is gone '
+              f'({staged_real!r}). Usually a retry after the FIRST '
+              f'attempt already succeeded and consumed it — the write '
+              f'has most likely landed. Re-stage and retry to confirm',
+              file=sys.stderr, flush=True)
+        return _reject(409, "staged_missing_retryable")
+    if (os.path.dirname(staged_real) != os.path.dirname(target)
             or staged_real == target):
         return _reject(400, "staged_rejected")
     rel_clean = '/'.join(rel.lstrip('/').split('/'))
@@ -4660,6 +4833,59 @@ def _h_cawl_prefetch(langcode, body):
                  "finished": state['finished']}
 
 
+_coalesce_lock = threading.Lock()
+_coalesce_state = {}        # key → {'lock', 'at', 'val'}
+
+
+def coalesce(key, ttl_s, fn):
+    """Run *fn* at most once per *ttl_s* per *key*, and never twice at
+    the same time (0.55.111).
+
+    Read-only status RPCs are POLLED by the UI every few seconds, and
+    each one did a full walk. With no single-flight and no cache,
+    concurrent identical calls each started their own walk, so load grew
+    with the number of callers instead of with the amount of work.
+
+    Field 2026-07-29, phone watchdog dump — twenty-odd threads, nearly
+    all in full filesystem or full-history walks at once:
+
+    - 3 × ``_h_project_status`` → ``porcelain.status`` →
+      ``get_untracked_paths``, which calls ``pathlib.resolve()`` once per
+      untracked path (1868 audio files in that project);
+    - 2 × ``_h_cawl_cache_status`` → ``os.walk`` of the image cache;
+    - 8+ jnius-attached ``Dummy-*`` threads parked in ``os._walk`` —
+      each a ContentProvider dispatch that arrived while the previous
+      identical one was still running;
+    - 6 × LAN ``upload-pack`` doing pack lookups.
+
+    The Activity's own RPCs queue behind all of that, which is what
+    "the UI is unresponsive" actually was.
+
+    A late caller BLOCKS on the in-flight computation and receives its
+    result, rather than starting a duplicate — that is the important
+    half. The TTL then keeps a 5 s poll from re-walking on every tick.
+
+    Falls back to calling *fn* directly on any bookkeeping error: this is
+    a performance helper and must never be the reason a status call
+    fails."""
+    try:
+        with _coalesce_lock:
+            slot = _coalesce_state.get(key)
+            if slot is None:
+                slot = {'lock': threading.Lock(), 'at': 0.0, 'val': None}
+                _coalesce_state[key] = slot
+        with slot['lock']:
+            now = _time.time()
+            if slot['at'] and (now - slot['at']) <= ttl_s:
+                return slot['val']
+            val = fn()
+            slot['val'] = val
+            slot['at'] = _time.time()
+            return val
+    except Exception:
+        return fn()
+
+
 def _h_cawl_cache_status(langcode, _body):
     """``GET /v1/projects/<lang>/cawl/cache_status`` — return cache
     progress for the image_repo backing this project.
@@ -4700,7 +4926,15 @@ def _h_cawl_cache_status(langcode, _body):
                      "cached": 0, "total": 0,
                      "offline": False, "circuit_open": False,
                      "finished": True}
-    status = _cawl.cache_status(repo)
+    # Coalesced (0.55.111). The docstring above claims the on-disk count
+    # is "memoised under a short TTL" — that memo evidently does not
+    # prevent concurrent walks, because the field dump caught TWO of these
+    # in ``_walk_image_count`` → ``os.walk`` simultaneously, alongside
+    # eight more anonymous threads in ``os._walk``. A memo that is
+    # consulted after the walk starts doesn't help; single-flight does.
+    # 5 s matches the peer poll interval named in the docstring.
+    status = coalesce(f'cawl_cache_status:{repo}', 5.0,
+                      lambda: _cawl.cache_status(repo))
     return 200, {"ok": True, "image_repo": repo, **status}
 
 
@@ -5740,6 +5974,12 @@ def dispatch(method, path, body):
             return _h_lan_unshare_project(body)
         if path == '/v1/lan/unpair':
             return _h_lan_unpair(body)
+        if path == '/v1/lan/set_admin':
+            return _h_lan_set_admin(body)
+        if path == '/v1/lan/can_admin':
+            return _h_lan_can_admin(body)
+        if path == '/v1/lan/relay':
+            return _h_lan_relay(body)
         if path == '/v1/lan/toggle':
             return _h_lan_set_toggle(body)
         if path == '/v1/lan/burst':

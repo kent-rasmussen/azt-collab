@@ -279,6 +279,118 @@ def peer_id_hex():
         return ''
 
 
+_NONCES = {}                    # nonce hex → issued-at monotonic
+_NONCE_TTL_S = 60.0
+_NONCE_MAX = 512
+
+
+def issue_nonce():
+    """Mint a single-use challenge nonce; return it as hex (0.55.101).
+
+    A signature alone would only prove the caller once held the key —
+    replayable by anyone who captured a previous request. The nonce makes
+    each proof fresh: we hand out a random value, the caller signs THAT,
+    and we spend it on verification.
+
+    Bounded two ways so a hostile or buggy peer can't grow this forever:
+    entries expire after ``_NONCE_TTL_S``, and the map is capped at
+    ``_NONCE_MAX`` (oldest dropped). Both matter — this is reachable by
+    anything that can open a socket to the listener, before any identity
+    check has happened."""
+    import secrets
+    import time as _t
+    nonce = secrets.token_hex(32)
+    now = _t.monotonic()
+    with _LOCK:
+        for k, at in list(_NONCES.items()):
+            if now - at > _NONCE_TTL_S:
+                _NONCES.pop(k, None)
+        while len(_NONCES) >= _NONCE_MAX:
+            oldest = min(_NONCES, key=lambda k: _NONCES[k])
+            _NONCES.pop(oldest, None)
+        _NONCES[nonce] = now
+    return nonce
+
+
+def spend_nonce(nonce_hex):
+    """Consume a nonce. True iff it was outstanding and unexpired
+    (0.55.101).
+
+    Single-use by construction — removed on the first successful spend,
+    so a replayed request fails even inside the TTL."""
+    import time as _t
+    key = str(nonce_hex or '')
+    with _LOCK:
+        at = _NONCES.pop(key, None)
+    if at is None:
+        return False
+    return (_t.monotonic() - at) <= _NONCE_TTL_S
+
+
+def sign_hex(message):
+    """Sign *message* (bytes) with this device's ed25519 private key;
+    return a hex signature, or ``''`` if we have no identity (0.55.101).
+
+    Half of the fix for LAN identity being **forgeable**. Until now a
+    caller merely stated its ``peer_id`` in the request body and the
+    listener looked it up in ``peers.json`` — no signature, no nonce, no
+    demonstration that it holds the private key. And ``peer_id`` is not
+    a secret: it is advertised over mDNS so peers can find each other,
+    so anything on the same network could read one and assert it. The
+    effective access control was *"be on this LAN and know a paired
+    peer_id."*
+
+    `lan_listener._handle_hello_bodyauth` has carried the TODO for this
+    since the body-auth path was written: *"a future-hardening pass
+    should add a signature so we can cryptographically verify the body
+    really came from the holder of that private key."*
+
+    Cheap to do properly, because **``peer_id`` IS the raw ed25519
+    public key** — verification needs no cert parsing, just
+    ``Ed25519PublicKey.from_public_bytes(bytes.fromhex(peer_id))``.
+    See ``verify_hex``."""
+    try:
+        info = ensure()
+    except RuntimeError:
+        return ''
+    try:
+        with open(info['key_path'], 'rb') as fh:
+            key = _load_pem_private_key(fh.read())
+        return key.sign(message).hex()
+    except Exception as ex:
+        print(f'[peer-id] sign failed: {ex!r}', file=sys.stderr, flush=True)
+        return ''
+
+
+def verify_hex(peer_id_hex_str, message, sig_hex):
+    """True iff *sig_hex* is a valid ed25519 signature over *message*
+    by the holder of the private key behind *peer_id_hex_str*
+    (0.55.101).
+
+    ``peer_id`` is the raw 32-byte ed25519 pubkey as 64 hex chars, so
+    this is a direct verify with no certificate involved.
+
+    Returns False on ANY problem — malformed hex, wrong length, bad
+    signature, missing ``cryptography``. **Never** raise: callers use
+    this as an authorization gate, and an exception escaping into a
+    request handler could turn a failed check into a 500 that some
+    outer ``except`` treats as something other than 'denied'."""
+    try:
+        raw = bytes.fromhex(str(peer_id_hex_str or ''))
+        if len(raw) != 32:
+            return False
+        sig = bytes.fromhex(str(sig_hex or ''))
+    except Exception:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        pub = ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        pub.verify(sig, message)
+        return True
+    except Exception:
+        return False
+
+
 def cert_fp_hex():
     """SHA-256 fingerprint of the X.509 cert (DER), hex. ``''`` on
     error."""

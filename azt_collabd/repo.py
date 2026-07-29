@@ -30,7 +30,38 @@ from . import settings as _settings
 
 
 def _busy_result(working_dir):
-    return Result().add(S.BUSY, working_dir=os.path.abspath(working_dir))
+    """``BUSY`` carrying WHAT holds the lock and for HOW LONG (0.55.133).
+
+    It used to carry only ``working_dir``, which told a peer nothing it
+    could act on — so ``azt`` routed it into the same branch as "server
+    unavailable" and told the user *"Collaboration server unavailable
+    (['BUSY']); saving directly to disk (legacy mode)"*. Kent: *"can we
+    distinguish between busy and dead? … what should the user do?"*
+    Trivially yes: BUSY is an ANSWER; a dead daemon cannot produce it.
+
+    The decision a peer has to make is retry-or-fall-back, and that turns
+    entirely on **duration**:
+
+    - a post-receive absorb holds it ~1 s, every ~40 s while peers push —
+      retry and the user never needs to know;
+    - a large merge or commit holds it for minutes — worth saying so.
+
+    ``held_s`` is what separates those, and ``holder`` lets the message name
+    the work ("absorbing a peer update on baf") instead of guessing. Both
+    are best-effort: a missing snapshot must not turn a lock timeout into an
+    error, so this degrades to the old shape."""
+    params = {'working_dir': os.path.abspath(working_dir)}
+    try:
+        from .locks import held_snapshot
+        key = os.path.basename(os.path.abspath(working_dir))
+        for row in held_snapshot():
+            if row.get('key') == key:
+                params['holder'] = str(row.get('holder', '') or '')
+                params['held_s'] = row.get('held_s')
+                break
+    except Exception:
+        pass
+    return Result().add(S.BUSY, **params)
 
 
 # Default per-call wall-clock budgets for dulwich network ops. Without
@@ -3527,6 +3558,11 @@ def _peer_sync_row(repo, head, langcode, peer_entry, count_limit):
         'peer_id': pid,
         'device_name': name,
         'langcode': langcode,
+        # Have WE granted this peer permission to change OUR settings
+        # (0.55.117)? Carried so the peer row can render its toggle
+        # without a second RPC. This is OUR grant to THEM — not whether
+        # they have granted us, which only they can answer.
+        'admin': bool(peer_entry.get('admin', False)),
         'to_send': to_send,
         'to_send_known': to_send_known,
         'capped': capped,
@@ -5870,15 +5906,39 @@ def _estimate_delta_size(repo, have_sha, want_sha):
                     pass
             if extra:
                 haves.extend(extra)
+                # Worded carefully (0.55.97): these are OFFERED as haves,
+                # and for normal refs that excludes their history. For
+                # the orphan ``azt-blob-seed-*`` refs it excludes nothing
+                # — ``MissingObjectFinder`` needs an ancestry path — so
+                # the old wording ("counting N … as already on the
+                # server") claimed an exclusion that wasn't happening.
+                # Those are handled by the explicit subtraction below,
+                # which reports its own count.
                 lift_merge.trace(
-                    f'[sync-trace] pack-size estimate: counting '
-                    f'{len(extra)} remote-tracking ref(s) as already '
-                    f'on the server (was: local base only)')
+                    f'[sync-trace] pack-size estimate: offering '
+                    f'{len(extra)} remote-tracking ref(s) as haves')
         except Exception as exc:
             lift_merge.trace(
                 f'[sync-trace] pack-size estimate: could not read '
                 f'remote-tracking refs ({exc!r}); estimating against '
                 f'the local base only — may overstate')
+        # ORPHAN HAVES CONTRIBUTE NOTHING — SUBTRACT THEIR CONTENTS
+        # DIRECTLY (0.55.97).
+        #
+        # 0.55.80 added remote-tracking refs as ``haves`` and logged
+        # "counting N remote-tracking ref(s) as already on the server".
+        # For the ``azt-blob-seed-*`` refs that statement was FALSE: they
+        # are orphan commits (synthetic, parentless, unconnected to the
+        # main graph) and ``MissingObjectFinder`` reasons over commit
+        # ancestry, so they excluded nothing. Same defect 0.55.96 fixed
+        # in ``_enumerate_new_blobs``; I fixed it there and left it here.
+        #
+        # It matters more here, because this number drives the oversize
+        # bail and the pre-seed decision. Field 2026-07-29: the estimate
+        # read **11.0 GB** while 976 seed refs were confirmed on the
+        # server — counting bytes github already held, and thereby
+        # triggering a pre-seed cascade to re-send them.
+        seeded = _seeded_object_shas(repo)      # cached (0.55.98)
         finder = MissingObjectFinder(
             repo.object_store,
             haves=haves,
@@ -5886,12 +5946,20 @@ def _estimate_delta_size(repo, have_sha, want_sha):
         )
         count = 0
         total_bytes = 0
+        skipped = 0
         for sha, _hint in finder:
+            if sha in seeded:
+                skipped += 1
+                continue
             count += 1
             try:
                 total_bytes += repo.object_store[sha].raw_length()
             except Exception:
                 pass
+        if skipped:
+            lift_merge.trace(
+                f'[sync-trace] pack-size estimate: {skipped} object(s) '
+                f'excluded as already seeded on the server')
         return (count, total_bytes)
     except Exception as exc:
         lift_merge.trace(
@@ -6071,6 +6139,177 @@ _PRESEED_OVERHEAD_PER_COMMIT = 300  # commit obj + empty tree skeleton
 _PRESEED_FILL_RATIO = 0.7  # conservative — leaves headroom for compression variance
 
 
+_seeded_cache = {}          # project path → (ref_count, frozenset)
+_seeded_cache_lock = threading.Lock()
+
+
+def _seeded_object_shas(repo):
+    """Every object sha reachable from this repo's
+    ``refs/remotes/origin/azt-blob-seed-*`` refs — i.e. what the server
+    already holds via prior pre-seed runs (0.55.98).
+
+    **Cached, because it was being recomputed per chunk attempt.** Both
+    the estimator and the blob enumeration need this set, and each
+    computed it independently on every unit: 976 seed refs, one tree walk
+    each. Field 2026-07-29 timestamps put that at **16 seconds per
+    estimate** (09:01:51.9 → 09:02:08.1), repeated for every attempt —
+    minutes per pass recomputing an answer that only changes when we seed
+    something new.
+
+    Invalidated on seed-ref count change, which is exactly when a new
+    seed lands. Cheap to check (a ref listing, no tree walks) and can
+    only err toward recomputing."""
+    try:
+        refs = [r for r in repo.refs.allkeys()
+                if r.startswith(_PRESEED_TRACK_PREFIX)]
+    except Exception:
+        return frozenset()
+    key = str(getattr(repo, 'path', '') or '')
+    with _seeded_cache_lock:
+        hit = _seeded_cache.get(key)
+        if hit is not None and hit[0] == len(refs):
+            return hit[1]
+    seeded = set()
+    for ref in refs:
+        try:
+            commit = repo[repo.refs[ref]]
+            seeded.add(commit.tree)
+            for entry in repo.object_store.iter_tree_contents(commit.tree):
+                seeded.add(entry.sha)
+        except Exception:
+            continue
+    out = frozenset(seeded)
+    with _seeded_cache_lock:
+        _seeded_cache[key] = (len(refs), out)
+    return out
+
+
+def _consolidate_seed_refs(repo, remote_url, username, token):
+    """Fold accumulated per-batch seed refs into ONE chain commit
+    (0.55.137).
+
+    Extracted from ``_preseed_oversize_blobs`` (0.55.118), where it could
+    only run when a unit needed pre-seeding — so on a run where every unit
+    pushed cleanly it never ran at all, while the refs it exists to remove
+    were adding ~57 s to each of those clean pushes.
+
+    Cheap when there is nothing to do: one ref listing, no network. The push
+    only carries a tree and a commit, because every blob it names is already
+    on the server.
+
+    Threshold rather than "any": folding two refs into a chain of one is
+    churn. The cost is per-push ref-advertisement, so it only matters once
+    the list is long."""
+    # ``Tree`` / ``Commit`` are imported LOCALLY in the other seed
+    # functions, so this extracted one needs its own (0.55.138) — it
+    # shipped in 0.55.137 raising ``NameError: name 'Tree' is not
+    # defined``, which the caller's ``except`` turned into a logged skip.
+    from dulwich import porcelain
+    from dulwich.objects import Commit, Tree
+    # ``iter_tree_contents`` too (0.55.144). Without it the coverage walk
+    # below raised ``NameError`` on every commit, was swallowed by its
+    # per-commit ``except … continue``, and reported ``the chain covers 0
+    # blob(s)`` while the sweep — which does import it — correctly saw 71.
+    # Third missing-import-hidden-by-a-broad-except in this file today.
+    from dulwich.object_store import iter_tree_contents
+    chain_suffix = _PRESEED_REF_PREFIX.encode() + b'chain'
+    chain_tracking = b'refs/remotes/origin/' + chain_suffix
+    legacy = [r for r in repo.refs.allkeys()
+              if r.startswith(_PRESEED_TRACK_PREFIX)
+              and r != chain_tracking]
+    if len(legacy) < 25:
+        return
+
+    # EXTEND THE CHAIN TO COVER WHAT IT DOESN'T YET (0.55.143).
+    #
+    # The chain started life partway through, so it holds only the batches
+    # seeded SINCE chaining began — field 2026-07-29: ``preseed-sweep: 70
+    # blob(s) held by the seed chain`` out of 2296 seeded. The other ~2226
+    # exist solely in the 1000 legacy per-batch refs, so deleting those
+    # would orphan them and the sweep rightly refuses.
+    #
+    # 0.55.118's fold-everything migration only ran when there was NO
+    # chain, and by then one existed; 0.55.137 then made this function
+    # stand down whenever a chain existed. Between them, those blobs could
+    # never be covered and the 1000 refs could never go — which is the
+    # ~60 s tax on every small push.
+    #
+    # So: chain ONE more commit on top of the current tip whose tree names
+    # every seeded blob the chain doesn't already reach. Extending, not
+    # replacing — the tip becomes the parent, so nothing already banked is
+    # lost, and pre-seed keeps extending from the new tip afterwards.
+    chain_tip = repo.refs.get(chain_tracking) if hasattr(
+        repo.refs, 'get') else None
+    if chain_tip is None:
+        try:
+            chain_tip = repo.refs[chain_tracking]
+        except KeyError:
+            chain_tip = None
+    covered = set()
+    if chain_tip:
+        _seen, _stack = set(), [chain_tip]
+        while _stack:
+            _s = _stack.pop()
+            if _s in _seen:
+                continue
+            _seen.add(_s)
+            try:
+                _c = repo.object_store[_s]
+                for e in iter_tree_contents(repo.object_store, _c.tree):
+                    covered.add(e.sha)
+                _stack.extend(_c.parents or [])
+            except Exception:
+                continue
+    keep = []
+    for sha in sorted(_seeded_object_shas(repo)):
+        if sha in covered:
+            continue
+        try:
+            if repo.object_store[sha].type_name == b'blob':
+                keep.append(sha)
+        except Exception:
+            continue
+    if not keep:
+        return
+    lift_merge.trace(
+        f'[sync-trace] seed-refs: {len(legacy)} per-batch ref(s) are '
+        f'advertised on every push; the chain covers {len(covered)} blob(s) '
+        f'but not {len(keep)} more — extending it so the sweep can drop '
+        f'those refs')
+    tree = Tree()
+    for sha in keep:
+        tree.add(sha, 0o100644, sha)
+    repo.object_store.add_object(tree)
+    commit = Commit()
+    commit.tree = tree.id
+    commit.parents = [chain_tip] if chain_tip else []
+    commit.author = b'AZT blob-seed <noreply@aztcollab.invalid>'
+    commit.committer = commit.author
+    commit.author_time = 0
+    commit.commit_time = 0
+    commit.author_timezone = 0
+    commit.commit_timezone = 0
+    commit.encoding = b'UTF-8'
+    commit.message = b'azt-collab pre-seed chain coverage'
+    repo.object_store.add_object(commit)
+    tmp = b'refs/azt-collab/chain_tmp'
+    try:
+        repo.refs[tmp] = commit.id
+        with _socket_timeout(_PUSH_TIMEOUT_S):
+            porcelain.push(repo, remote_url,
+                           b'+' + tmp + b':refs/heads/' + chain_suffix,
+                           username=username, password=token)
+        repo.refs[chain_tracking] = commit.id
+        lift_merge.trace(
+            '[sync-trace] seed-refs: chain base landed; the per-batch refs '
+            'are now redundant and the next sweep can delete them')
+    finally:
+        try:
+            del repo.refs[tmp]
+        except KeyError:
+            pass
+
+
 def _enumerate_new_blobs(repo, chunk_base_sha, target_sha):
     """Return list of ``(sha, size)`` for every blob reachable from
     *target_sha* but not from *chunk_base_sha* OR from any local
@@ -6108,17 +6347,7 @@ def _enumerate_new_blobs(repo, chunk_base_sha, target_sha):
         # over a handful of entries — and it answers the actual question
         # ("which blobs are already up") rather than an ancestry question
         # that has no meaning for orphan refs.
-        seeded = set()
-        for ref in list(repo.refs.allkeys()):
-            if not ref.startswith(_PRESEED_TRACK_PREFIX):
-                continue
-            try:
-                commit = repo[repo.refs[ref]]
-                for entry in repo.object_store.iter_tree_contents(
-                        commit.tree):
-                    seeded.add(entry.sha)
-            except Exception:
-                continue
+        seeded = _seeded_object_shas(repo)      # cached (0.55.98)
         if seeded:
             lift_merge.trace(
                 f'[sync-trace] preseed: {len(seeded)} blob(s) already '
@@ -6259,6 +6488,111 @@ def _preseed_oversize_blobs(
         except KeyError:
             pass
 
+    # ONE CHAINED SEED REF, NOT ONE PER BATCH (0.55.118).
+    #
+    # Every ``git-receive-pack`` starts with the server advertising its
+    # refs, and a ref-per-batch scheme makes that advertisement grow with
+    # every batch we land. Field 2026-07-29, after 2241 seeds had
+    # accumulated on ``nml``:
+    #
+    #     batch 1/376:  23,330 bytes → 50 s
+    #     batch 3/376:  12,546 bytes → 59 s
+    #     batch 5/376:   6,416 bytes → 57 s
+    #
+    # Six kilobytes taking a minute. The payload was irrelevant; the
+    # negotiation was the whole cost. 376 batches × ~50 s ≈ five hours of
+    # pure overhead, worsening with every seed added — and the 408s from
+    # github are consistent with requests whose negotiation plus upload
+    # ran past its limit. The mechanism designed to make a big history
+    # converge had become the reason it couldn't.
+    #
+    # Chaining fixes it without changing what reachability means: each
+    # synthetic commit takes the previous one as its PARENT, so a single
+    # ref keeps every seeded blob alive through ancestry exactly as N refs
+    # did. The advertisement stops growing.
+    #
+    # Named per project rather than per batch, and resumable: if the ref
+    # already exists locally we continue the chain from it, so a restart
+    # doesn't fork a second chain.
+    chain_suffix = _PRESEED_REF_PREFIX.encode() + b'chain'
+    chain_server_ref = b'refs/heads/' + chain_suffix
+    chain_tracking_ref = b'refs/remotes/origin/' + chain_suffix
+    try:
+        chain_parent = repo.refs[chain_tracking_ref]
+    except KeyError:
+        chain_parent = None
+    if chain_parent is None:
+        # MIGRATE THE PER-BATCH REFS INTO THE CHAIN'S FIRST COMMIT
+        # (0.55.118). Chaining stops the advertisement growing, but does
+        # nothing about ground already lost: nml had 2241 per-batch refs
+        # by the time this was diagnosed, and they are only swept once
+        # ``main`` covers them — hours away.
+        #
+        # One commit whose tree lists every already-seeded blob makes all
+        # of those refs redundant immediately: the blobs stay reachable
+        # through the chain, so ``_sweep_orphan_preseed_refs`` can delete
+        # the old refs on its next pass. The push itself is tiny — every
+        # blob is already on the server, so only the tree and commit
+        # travel.
+        _legacy = sorted(_seeded_object_shas(repo))
+        _legacy_blobs = []
+        for _sha in _legacy:
+            try:
+                if repo.object_store[_sha].type_name == b'blob':
+                    _legacy_blobs.append(_sha)
+            except Exception:
+                continue
+        if _legacy_blobs:
+            lift_merge.trace(
+                f'[sync-trace] preseed: folding {len(_legacy_blobs)} '
+                f'already-seeded blob(s) from the old per-batch refs into '
+                f'ONE chain commit — those refs made every push pay for a '
+                f'growing ref advertisement (6 KB batches were taking '
+                f'~50 s); once this lands the sweep can delete them')
+            try:
+                _mtree = Tree()
+                for _sha in _legacy_blobs:
+                    _mtree.add(_sha, 0o100644, _sha)
+                repo.object_store.add_object(_mtree)
+                _mc = Commit()
+                _mc.tree = _mtree.id
+                _mc.parents = []
+                _mc.author = b'AZT blob-seed <noreply@aztcollab.invalid>'
+                _mc.committer = _mc.author
+                _mc.author_time = 0
+                _mc.commit_time = 0
+                _mc.author_timezone = 0
+                _mc.commit_timezone = 0
+                _mc.encoding = b'UTF-8'
+                _mc.message = b'azt-collab pre-seed chain base'
+                repo.object_store.add_object(_mc)
+                _cleanup_temp_ref()
+                repo.refs[TEMP_REF] = _mc.id
+                with _socket_timeout(_PUSH_TIMEOUT_S):
+                    porcelain.push(
+                        repo, remote_url,
+                        b'+' + TEMP_REF + b':' + chain_server_ref,
+                        username=username, password=token)
+                repo.refs[chain_tracking_ref] = _mc.id
+                chain_parent = _mc.id
+                lift_merge.trace(
+                    '[sync-trace] preseed: chain base landed; the old '
+                    'per-batch refs are now redundant')
+            except Exception as _ex:
+                # Non-fatal: without the base we simply start a fresh
+                # chain and the old refs get swept the slow way.
+                lift_merge.trace(
+                    f'[sync-trace] preseed: chain-base push failed '
+                    f'({_ex!r}) — continuing with a fresh chain; the old '
+                    f'refs will be swept when main catches up instead')
+            finally:
+                _cleanup_temp_ref()
+    if chain_parent:
+        lift_merge.trace(
+            f'[sync-trace] preseed: continuing the existing seed chain '
+            f'from {chain_parent[:8].decode()} — one ref advanced per '
+            f'batch, so the server ref advertisement stays small')
+
     for batch_i, batch in enumerate(batches):
         # Synthesise tree: filename = blob SHA (deterministic,
         # collision-free).
@@ -6271,7 +6605,11 @@ def _preseed_oversize_blobs(
         # produces the same commit SHA → same side-ref name.
         commit = Commit()
         commit.tree = tree.id
-        commit.parents = []
+        # Chain onto the previous seed commit (0.55.118) so ONE ref keeps
+        # every seeded blob reachable. Still fully deterministic: fixed
+        # author/timestamps mean the same batch sequence yields the same
+        # commit SHAs, so a re-run is idempotent rather than duplicative.
+        commit.parents = [chain_parent] if chain_parent else []
         commit.author = b'AZT blob-seed <noreply@aztcollab.invalid>'
         commit.committer = commit.author
         commit.author_time = 0
@@ -6285,13 +6623,20 @@ def _preseed_oversize_blobs(
         # 16 hex chars from the synthetic commit SHA gives 2**64
         # name space — collision-free at any plausible scale and
         # keeps the github branch list tidy.
-        suffix = _PRESEED_REF_PREFIX.encode() + commit.id[:16]
-        server_ref = b'refs/heads/' + suffix
-        tracking_ref = b'refs/remotes/origin/' + suffix
+        # One ref for the whole chain (0.55.118) — was
+        # ``azt-blob-seed-<sha16>`` per batch, which is what grew the
+        # advertisement. Force-update, because advancing a chain is a
+        # fast-forward only when the parent is what we think it is; a
+        # non-FF here would mean our local chain diverged from the
+        # server's, and the seeds it would "lose" are all reachable from
+        # the new tip anyway.
+        suffix = chain_suffix
+        server_ref = chain_server_ref
+        tracking_ref = chain_tracking_ref
 
         _cleanup_temp_ref()
         repo.refs[TEMP_REF] = commit.id
-        refspec = TEMP_REF + b':' + server_ref
+        refspec = b'+' + TEMP_REF + b':' + server_ref
 
         batch_blob_bytes = sum(
             repo.object_store[sha].raw_length() for sha in batch)
@@ -6352,6 +6697,11 @@ def _preseed_oversize_blobs(
                 lift_merge.trace(
                     f'[sync-trace] preseed: tracking ref update '
                     f'failed (non-fatal): {ex!r}')
+            # Advance the chain (0.55.118). Only after the push landed —
+            # if we advanced on a failed batch the next commit would
+            # parent an object the server doesn't have, and every
+            # subsequent push would carry that gap forward.
+            chain_parent = commit.id
         except Exception as exc:
             _cleanup_temp_ref()
             lift_merge.trace(
@@ -6423,8 +6773,59 @@ def _sweep_orphan_preseed_refs(
             f'failed (skipping sweep): {exc!r}')
         return
 
+    # A BLOB HELD BY THE CHAIN IS ALSO SAFE (0.55.137).
+    #
+    # This only ever accepted "reachable from origin/<branch>", so per-batch
+    # refs survived until main caught up — hours or days on a big history.
+    # Meanwhile every push pays for advertising them: field 2026-07-29,
+    # 1004 refs, ~57 s to push 970 bytes, roughly 16 hours of pure
+    # negotiation across the remaining units.
+    #
+    # 0.55.118 folded them into one chain commit and I claimed that made
+    # them "immediately deletable". It did not — this test never knew about
+    # the chain. Reachability from the chain is exactly as good: the blob
+    # stays on the server either way, which is the only thing a seed ref is
+    # for.
+    chain_blobs = set()
+    chain_ref = b'refs/remotes/origin/' + \
+        _PRESEED_REF_PREFIX.encode() + b'chain'
+    try:
+        if chain_ref in repo.refs:
+            # WALK THE CHAIN'S HISTORY, NOT JUST ITS TIP (0.55.138).
+            #
+            # Each chain commit's tree holds only ITS OWN batch — the rest
+            # are in ancestors, which is the entire point of chaining. So
+            # walking the tip's tree found one batch and reported
+            # ``1 blob(s) held by the seed chain``, leaving all 1004 legacy
+            # refs undeletable. The blobs were on the server the whole
+            # time; the accounting only looked at the last commit.
+            _seen = set()
+            _stack = [repo.refs[chain_ref]]
+            while _stack:
+                _sha = _stack.pop()
+                if _sha in _seen:
+                    continue
+                _seen.add(_sha)
+                _c = repo.object_store[_sha]
+                for entry in iter_tree_contents(
+                        repo.object_store, _c.tree):
+                    chain_blobs.add(entry.sha)
+                _stack.extend(_c.parents or [])
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: chain walk failed '
+            f'({exc!r}) — falling back to main-only coverage')
+    if chain_blobs:
+        main_blobs |= chain_blobs
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: {len(chain_blobs)} blob(s) held '
+            f'by the seed chain also count as covered')
+
     deletable = []
     for tracking_ref in candidates:
+        # Never delete the chain itself — it is what keeps the rest alive.
+        if tracking_ref == chain_ref:
+            continue
         try:
             side_commit_sha = repo.refs[tracking_ref]
             side_commit = repo.object_store[side_commit_sha]
@@ -6828,6 +7229,25 @@ def _push_chunked_to_ref(
         f'[sync-trace] topic-push begin ref={topic_ref_name!r} '
         f'target={target_label} '
         f'server_topic_tip={_sha_str(server_topic_tip)[:8] if server_topic_tip else "(none)"!r}')
+
+    # CONSOLIDATE SEED REFS HERE, NOT ONLY INSIDE PRE-SEED (0.55.137).
+    #
+    # 0.55.118 put the fold-into-one-chain migration inside
+    # ``_preseed_oversize_blobs``, which only runs when a unit is too big to
+    # push directly. Field 2026-07-29: every unit was pushing fine
+    # (``chunk OK``), so pre-seed never ran, so the 1004 accumulated refs
+    # were never folded — while costing ~57 s of ref negotiation on every
+    # one of those successful pushes.
+    #
+    # The cost is paid per PUSH, so the cleanup belongs where every push
+    # passes. Best-effort and only at depth 0, so it happens once per run
+    # rather than once per recursion level.
+    if _side_depth == 0:
+        try:
+            _consolidate_seed_refs(repo, remote_url, username, token)
+        except Exception as exc:
+            lift_merge.trace(
+                f'[sync-trace] seed-ref consolidation skipped: {exc!r}')
 
     # 2. Already done? Nothing to push.
     if server_topic_tip == target_sha:

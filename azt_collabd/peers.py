@@ -159,6 +159,33 @@ def _normalize_entry(entry):
             if isinstance(s, str)],
         'paired_at': str(entry.get('paired_at', '') or ''),
         'last_seen_at': str(entry.get('last_seen_at', '') or ''),
+        # May this peer CHANGE OUR SETTINGS remotely? (0.55.117)
+        #
+        # Deliberately NOT implied by pairing. Pairing means "share
+        # dictionary data with this device", and the field phones are all
+        # paired — a lost phone must not carry the power to reconfigure
+        # someone's desktop. This is a separate, explicit grant, given
+        # once by a person physically holding the machine.
+        #
+        # Default False, and ``record_pair`` must PRESERVE it: re-pairing
+        # a device that already has the grant must not silently revoke
+        # it, or remote access "just stops working" with no visible
+        # cause.
+        'admin': bool(entry.get('admin', False)),
+        # Has THIS peer ever confirmed that WE may change ITS settings?
+        # (0.55.127)
+        #
+        # The mirror of ``admin``, and it must be remembered rather than
+        # re-derived: only that peer holds the grant, so the sole way to
+        # learn it is to ask, and asking fails whenever the device is
+        # merely asleep. Kent: *"can we not hide it until at least one OK
+        # ping on the permission?"* — so once seen, it sticks, and the
+        # "Open settings" button stays put instead of appearing and
+        # disappearing with reachability.
+        #
+        # Cleared only by an explicit refusal (reachable, and it said no),
+        # never by a failure to reach.
+        'they_admin_us': bool(entry.get('they_admin_us', False)),
         # Do we have EVIDENCE the other side also holds this pairing?
         # (0.54.97) Set when our hello reached them (they recorded us)
         # or when their hello reached us (they clearly have us).
@@ -297,6 +324,72 @@ def set_pair_confirmed(peer_id, confirmed=True):
     return True
 
 
+def set_admin(peer_id, allowed=True):
+    """Grant or revoke this peer's permission to change our settings
+    remotely (0.55.117). Returns False for an unknown peer.
+
+    Only ever called behind a gesture on THIS machine — the grant means
+    "I am standing here and I want that device to be able to do this."
+    There is no remote path to set it, deliberately: a peer must not be
+    able to grant itself admin, and the whole scheme collapses if it can.
+
+    Logged on every change, both directions. A silent privilege change is
+    not something anyone should have to discover from behaviour."""
+    with _LOCK:
+        data = _load_raw()
+        peers = data.get('peers') or {}
+        entry = peers.get(str(peer_id))
+        if entry is None:
+            print(f'[peers] set_admin({str(peer_id)[:8]!r}, {bool(allowed)}) '
+                  f'— unknown peer, nothing changed',
+                  file=sys.stderr, flush=True)
+            return False
+        was = bool(entry.get('admin', False))
+        if was == bool(allowed):
+            return True
+        entry['admin'] = bool(allowed)
+        peers[str(peer_id)] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    name = str(entry.get('device_name', '') or '?')
+    print(f'[peers] remote-settings grant for {str(peer_id)[:8]!r} '
+          f'({name}): {was} → {bool(allowed)}',
+          file=sys.stderr, flush=True)
+    _invalidate_sync_board()
+    return True
+
+
+def set_they_admin_us(peer_id, allowed):
+    """Remember whether this peer lets US change ITS settings (0.55.129).
+
+    Sticky by design. Only the peer holds the grant, so the sole way to
+    learn it is to ask — and asking fails whenever the device is asleep or
+    its address has gone stale. Re-deriving it per look therefore made the
+    button flicker; Kent: *"can we not hide it until at least one OK ping
+    on the permission?"*
+
+    So: set on the first success and kept, cleared ONLY by an explicit
+    refusal (reachable, and it said no). Never cleared by a failure to
+    reach — that is absence of evidence, not evidence of absence."""
+    with _LOCK:
+        data = _load_raw()
+        peers = data.get('peers') or {}
+        entry = peers.get(str(peer_id))
+        if entry is None:
+            return False
+        if bool(entry.get('they_admin_us', False)) == bool(allowed):
+            return True
+        entry['they_admin_us'] = bool(allowed)
+        peers[str(peer_id)] = entry
+        data['peers'] = peers
+        _save_raw(data)
+    print(f'[peers] {str(peer_id)[:8]!r} '
+          f'{"grants" if allowed else "no longer grants"} us remote '
+          f'settings', file=sys.stderr, flush=True)
+    _invalidate_sync_board()
+    return True
+
+
 def add_unpair_tombstone(peer_id):
     """Remember that the USER deliberately unpaired *peer_id*
     (0.54.97).
@@ -380,6 +473,19 @@ def record_pair(peer_id, fp, device_name, endpoint='', endpoints=None):
             # knows whether the other side was told (0.54.97).
             'pair_confirmed': bool(existing.get('pair_confirmed',
                                                 False)),
+            # PRESERVED ACROSS RE-PAIR (0.55.117). This function rebuilds
+            # the entry from scratch, so anything not named here is lost.
+            # A remote-settings grant is given once, by hand, on the
+            # machine itself; if re-pairing dropped it, remote access
+            # would stop working with nothing to indicate why and no
+            # obvious way to restore it short of walking back to the
+            # device — the exact situation the feature exists to avoid.
+            'admin': bool(existing.get('admin', False)),
+            # Also preserved (0.55.130): re-pairing must not forget that
+            # this peer grants US remote settings, or the "Open settings"
+            # button vanishes with no way to bring it back except a
+            # successful call it can no longer offer.
+            'they_admin_us': bool(existing.get('they_admin_us', False)),
         }
         peers[str(peer_id)] = entry
         data['peers'] = peers

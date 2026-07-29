@@ -621,6 +621,7 @@ class _DynamicBackend:
             raise NotGitRepository(
                 f'project {langcode!r} repo failed to open') from ex
         _warn_if_advertising_unservable_head(langcode, repo)
+        _hide_unservable_refs(langcode, repo)
         return repo
 
 
@@ -703,6 +704,174 @@ def _peer_id_from_cert_der(cert_der):
 def _cert_fp_from_der(cert_der):
     import hashlib
     return hashlib.sha256(cert_der).hexdigest()
+
+
+def _admin_canonical_request(nonce, method, path, body):
+    """The exact bytes an admin request is signed over (0.55.117).
+
+    Mirrored in ``azt_collab_client/transports/lan_admin.py``, which
+    cannot import this module (client hard rule #3). Named rather than
+    inlined so the two copies can be compared directly —
+    ``lan_admin.self_check()`` does exactly that, because drift here
+    surfaces only as a 403 that is indistinguishable from a missing admin
+    grant. If you change this, change that."""
+    import json as _j
+    return _j.dumps(
+        {'nonce': nonce, 'method': method, 'path': path, 'body': body},
+        sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+
+def _handle_challenge(environ, start_response):
+    """Hand out a single-use nonce for signed requests (0.55.102).
+
+    Deliberately unauthenticated — it must be, since it is the first step
+    of authenticating. Cheap and bounded on purpose: ``issue_nonce``
+    expires entries after 60 s and caps the table, because this is
+    reachable by anything that can open a socket to the listener."""
+    from . import peer_id as _pid
+    return _json_response(start_response, '200 OK',
+                          {'ok': True, 'nonce': _pid.issue_nonce()})
+
+
+def _handle_admin(environ, start_response):
+    """Run one local RPC on behalf of a peer that has been granted
+    admin (0.55.102).
+
+    **One endpoint carries every RPC.** Body is an envelope —
+    ``{peer_id, nonce, sig, method, path, body}`` — dispatched into the
+    ordinary local dispatch table, so the operator's existing settings UI
+    works unmodified against a remote daemon. Kent, on my first proposal
+    to forward a whitelist of specific config calls: *"if it's all the
+    same, I'd rather have the same functions, just to keep it simple."*
+    Fewer moving parts, and no per-endpoint work as the API grows.
+
+    Three gates, in order, all of which must pass:
+
+    1. **The nonce is spent** — single-use, so a captured request cannot
+       be replayed even within its 60 s life.
+    2. **The signature verifies** against ``peer_id``, which IS the raw
+       ed25519 pubkey. This is the part the old body-auth path lacked
+       entirely: it checked only that the caller *named* a paired peer,
+       and peer_id is public (mDNS-advertised), so anyone on the network
+       could satisfy it.
+    3. **That peer holds an explicit admin grant** — a separate per-peer
+       flag, NOT implied by pairing. Pairing means "share dictionary
+       data"; the phones are paired too, and a lost phone must not carry
+       the power to change settings on someone's desktop.
+
+    The signature covers the nonce **and** the method+path+body, so a
+    valid signature can't be lifted off one request and re-used to
+    authorize a different one."""
+    import json as _json
+    from . import peer_id as _pid
+    from . import peers as _peers
+
+    payload, err = _read_json_body(environ)
+    if payload is None:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': err})
+    peer = str(payload.get('peer_id', '') or '')
+    nonce = str(payload.get('nonce', '') or '')
+    sig = str(payload.get('sig', '') or '')
+    rpc_method = str(payload.get('method', '') or 'GET').upper()
+    rpc_path = str(payload.get('path', '') or '')
+    rpc_body = payload.get('body')
+
+    if not _pid.spend_nonce(nonce):
+        print(f'[lan-admin] {peer[:8]!r}: refused — nonce not outstanding '
+              f'(expired, already spent, or never issued by us). Fetch a '
+              f'fresh one from /v1/lan/challenge per request',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'bad nonce'})
+
+    # Sign over nonce + the request it authorizes, so a captured
+    # signature can't be replayed against a DIFFERENT call.
+    try:
+        canon = _admin_canonical_request(
+            nonce, rpc_method, rpc_path, rpc_body)
+    except Exception as ex:
+        return _json_response(start_response, '400 Bad Request',
+                              {'ok': False, 'error': f'uncanonicalizable: {ex!r}'})
+
+    if not _pid.verify_hex(peer, canon, sig):
+        print(f'[lan-admin] {peer[:8]!r}: refused — signature does not '
+              f'verify against that peer_id for this exact request. Either '
+              f'the caller does not hold the private key, or it signed '
+              f'different bytes than it sent',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'bad signature'})
+
+    entry = _peers.get_peer(peer) or {}
+    if not entry:
+        print(f'[lan-admin] {peer[:8]!r}: refused — signature is VALID but '
+              f'this peer is not paired with us at all',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'not paired'})
+    if not bool(entry.get('admin')):
+        print(f'[lan-admin] {peer[:8]!r} ({entry.get("device_name") or "?"}): '
+              f'refused {rpc_method} {rpc_path!r} — identity proven, but no '
+              f'admin grant. Pairing alone does NOT grant this; someone must '
+              f'enable "allow this device to change my settings" for it here',
+              file=sys.stderr, flush=True)
+        return _json_response(start_response, '403 Forbidden',
+                              {'ok': False, 'error': 'no admin grant'})
+
+    # EVERY RPC, INCLUDING THE ONES THAT CHANGE GRANTS (0.55.118).
+    #
+    # 0.55.117 blocked ``set_admin`` / ``unpair`` / ``pair_accept`` here.
+    # I added that on my own and justified it with "a peer could grant
+    # itself admin permanently" — which is meaningless: a peer that has
+    # admin doesn't need to re-grant itself, and the grant has no expiry
+    # to refresh. Kent: *"this is security policy written by a lawyer,
+    # not me."*
+    #
+    # What the block actually cost: you could not grant a second device
+    # access to a remote machine without travelling to that machine —
+    # most of the point of the feature. What it actually prevented: a
+    # device you already trusted delegating to a third device, or
+    # revoking your own access. Both are simply what admin MEANS; the
+    # decision was made when the grant was given, by hand, on the
+    # machine.
+    #
+    # So: no denylist. Privilege changes are LOGGED loudly instead —
+    # visible after the fact beats unavailable by policy.
+    _PRIVILEGED = ('/v1/lan/set_admin', '/v1/lan/unpair',
+                   '/v1/lan/pair_accept', '/v1/credentials')
+    _is_priv = any(rpc_path.startswith(p) for p in _PRIVILEGED)
+    # SAY WHICH DIRECTION (0.55.135). This read
+    # ``[lan-admin] '3a0285ec' (Kent Phone): GET '/v1/projects'`` — which
+    # could equally mean "we asked the phone" or "the phone asked us".
+    # Kent, reading the tablet's log: *"am I looking at the settings of the
+    # phone (admin) or the tablet (grantee)?"* The answer was in the line
+    # and unreadable from it.
+    #
+    # This side always SERVES, so say so, and name what is being changed:
+    # THIS device.
+    print(f'[lan-admin] serving{" PRIVILEGED" if _is_priv else ""} '
+          f'request FROM {entry.get("device_name") or "?"} '
+          f'({peer[:8]}) — it is changing THIS device: '
+          f'{rpc_method} {rpc_path!r}', file=sys.stderr, flush=True)
+    try:
+        # The ordinary local dispatch table — same code path the loopback
+        # server uses, so a remote caller gets identical behaviour to a
+        # local one. It returns an int status; the WSGI layer wants a
+        # status line.
+        from .server import dispatch as _dispatch
+        code, resp = _dispatch(rpc_method, rpc_path, rpc_body)
+        status = {200: '200 OK', 400: '400 Bad Request',
+                  401: '401 Unauthorized', 403: '403 Forbidden',
+                  404: '404 Not Found',
+                  500: '500 Internal Server Error'}.get(
+                      int(code or 200), f'{int(code or 200)} Status')
+    except Exception as ex:
+        print(f'[lan-admin] {peer[:8]!r}: {rpc_method} {rpc_path!r} raised: '
+              f'{ex!r}', file=sys.stderr, flush=True)
+        return _json_response(start_response, '500 Internal Server Error',
+                              {'ok': False, 'error': repr(ex)})
+    return _json_response(start_response, status, resp)
 
 
 def _handle_hello_bodyauth(environ, start_response):
@@ -1834,6 +2003,16 @@ def _peer_acl_middleware(app):
         # claim lives in the body. They self-validate by checking
         # the body's ``peer_id``/``fp`` match each other (the
         # peer_id IS the ed25519 pubkey).
+        # Challenge + admin (0.55.102). STRICT identity: nonce +
+        # ed25519 signature, no unsigned fallback. Safe to be strict
+        # from the first line because admin is NEW — no existing client
+        # speaks it, so there is nothing to stay compatible with. The
+        # signalling endpoints below keep accepting unsigned callers so
+        # a staged APK rollout doesn't cut off peers still on old code.
+        if method == 'GET' and path_info == '/v1/lan/challenge':
+            return _handle_challenge(environ, start_response)
+        if method == 'POST' and path_info == '/v1/lan/admin':
+            return _handle_admin(environ, start_response)
         if method == 'POST' and path_info == '/v1/lan/hello':
             return _handle_hello_bodyauth(environ, start_response)
         if method == 'POST' and path_info == '/v1/lan/share_offer':
@@ -2312,6 +2491,77 @@ def _note_reset_hard_failure(langcode, ex):
         print(f'[data-quality] reset-blocked langcode={langcode!r} '
               f'failures={count} detail={detail} — retrying in '
               f'{wait:.0f}s', file=sys.stderr, flush=True)
+
+
+_unservable_refs_logged = {}     # {langcode: frozenset of dropped names}
+
+
+def _hide_unservable_refs(langcode, repo):
+    """Omit refs we cannot serve from this repo's advertisement
+    (0.55.99).
+
+    **One bad ref poisons the whole fetch.** A peer reads
+    ``info/refs``, asks for everything advertised, and dulwich's
+    ``determine_wants`` raises ``GitProtocolError: Client wants invalid
+    object`` for the first sha we don't actually hold — so the peer gets
+    NOTHING, including the refs we could have served perfectly well.
+
+    Field 2026-07-29, Idjop's desktop, third distinct sha in two days
+    (``7315ccfa`` → ``303950c4`` → ``594127cd``): the aztobt2-ui phone
+    could not fetch ``nml`` at all, though only one ref was broken. Since
+    that machine keeps minting new unservable refs, "wait for it to be
+    repaired" is not a strategy — a damaged repo has to stay useful for
+    the parts that are intact, or LAN convergence stops for everyone who
+    talks to it.
+
+    ``HEAD`` is never filtered: if HEAD itself is unservable the repo is
+    beyond partial rescue, and dropping it would break the protocol
+    rather than degrade it. 0.55.63's warning already names that case.
+
+    Membership-only test (no reachability walk) — this runs on every
+    served request, and the failure it prevents is exactly a sha the
+    store does not contain."""
+    try:
+        original = repo.get_refs
+    except Exception:
+        return
+
+    def _filtered():
+        refs = original()
+        try:
+            keep, dropped = {}, []
+            for name, sha in (refs or {}).items():
+                if name == b'HEAD' or not sha:
+                    keep[name] = sha
+                    continue
+                try:
+                    if sha in repo.object_store:
+                        keep[name] = sha
+                    else:
+                        dropped.append(name)
+                except Exception:
+                    keep[name] = sha        # can't tell → keep offering
+            if dropped:
+                marker = frozenset(dropped)
+                if _unservable_refs_logged.get(langcode) != marker:
+                    _unservable_refs_logged[langcode] = marker
+                    names = sorted(
+                        n.decode('utf-8', 'replace') for n in dropped)
+                    print(f'[data-quality] hiding-unservable-refs '
+                          f'langcode={langcode!r} count={len(dropped)} '
+                          f'{names[:6]!r} — their commit objects are not '
+                          f'in our store, so advertising them makes every '
+                          f'peer fetch fail outright ("Client wants '
+                          f'invalid object"). Serving the rest instead',
+                          file=sys.stderr, flush=True)
+            return keep
+        except Exception:
+            return refs                     # never break the advertisement
+
+    try:
+        repo.get_refs = _filtered
+    except Exception:
+        pass
 
 
 _unservable_head_logged = {}     # {langcode: last head reported}

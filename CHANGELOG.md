@@ -9,6 +9,1406 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.144 — a third missing import hidden by a broad `except`
+
+`seed-refs: … the chain covers 0 blob(s) but not 1295 more` — while the sweep,
+eighteen seconds earlier, correctly reported 71.
+
+The coverage walk calls `iter_tree_contents` and I never imported it in that
+function, so every commit raised `NameError`, was caught by the walk's
+per-commit `except … continue`, and coverage came out zero.
+
+Harmless in effect — extending with a superset is still correct, it just carried
+1295 blobs where ~1224 would have done — but that is the **third** time today a
+missing import in this file surfaced as a wrong number rather than a crash
+(0.55.137's `Tree`, 0.55.141's `_said`, this). The common factor is a broad
+`except` around code that can fail for reasons the handler was not written for.
+
+## 0.55.143 — extend the chain to cover the legacy refs (the actual unlock)
+
+`preseed-sweep: 70 blob(s) held by the seed chain also count as covered` — on
+0.55.138, out of **2296** seeded.
+
+So the ancestry walk works (70 > 1), and the chain simply doesn't hold them: it
+began partway through, so it only contains batches seeded *since* chaining
+started. The other ~2226 exist solely in the 1000 legacy per-batch refs, and
+deleting those would orphan them — the sweep was right to refuse.
+
+Between two of my own changes, this could never resolve:
+
+- 0.55.118's fold-everything migration ran only when there was **no** chain, and
+  by the time it mattered one existed;
+- 0.55.137 then made the consolidation stand down **whenever** a chain existed,
+  to avoid force-pushing over it.
+
+Both were locally reasonable and together they guaranteed the 1000 refs would
+stay forever — which is the ~60 s tax on every small push, roughly half the
+remaining wall-clock on `nml`.
+
+Now it **extends** rather than replaces: one commit chained onto the current tip
+whose tree names every seeded blob the chain doesn't already reach. Nothing
+banked is lost, pre-seed keeps extending from the new tip, and the sweep can then
+drop the legacy refs on its next pass.
+
+Expected on the next run: `the chain covers 70 blob(s) but not ~2226 more —
+extending it`, then a sweep that deletes ~1000 refs, then `offering` in single
+digits and small pushes at about a second.
+
+## 0.55.141 — that log line would have fired every 6 seconds
+
+Kent: *"will I see this each time I open that page"* — you would have seen it
+ten times a minute. The probe repeats every 6 s while the Manage popup is open,
+and 0.55.140 logged on every unsuccessful tick. I moved noise off the screen and
+straight into the log.
+
+Now logged only when the answer CHANGES. A steady `refused` is the same fact
+restated; the transition is the information. Same rule as the watchdog's
+in-flight line (0.55.118).
+
+Also caught before it shipped: the suppression referenced `_said` without
+defining it — another `NameError`, of the same kind as 0.55.137's missing `Tree`
+import. Defined in the enclosing scope.
+
+## 0.55.140 — don't explain a non-event on screen; log it
+
+Kent, on 0.55.138's hint: *"Makes NO sense. where would this go? the button
+doesn't show, and shouldn't, without permission. there is no way to ask a peer
+for permission, nor to try the button that doesn't exist. why would anyone expect
+an answer in this case?"*
+
+Correct. A device you never granted has no button, that is unremarkable, and a
+line explaining the absence would appear on **every peer you will never want to
+control** — text about a non-event, leading nowhere, since no "request
+permission" flow exists.
+
+My stated reason ("a hidden control with no explanation is unreadable") was
+about my own confusion while testing, not a user's need. Removed.
+
+The case that IS confusing — a pair you DID grant where the button still doesn't
+appear — is diagnosis, so the probe's answer goes to the log:
+
+```
+[lan-admin-client] no remote-settings button for 841d43a8: refused (…)
+```
+
+which distinguishes "not granted" from "couldn't reach it" without putting
+either in front of someone who didn't ask.
+
+## 0.55.139 — remote-settings controls move below "Save manual IPs"
+
+Kent: *"allow this device should be after save manual IPs, not above it."*
+
+Sharing and addressing govern a device's ordinary participation. Permission to
+reconfigure this machine is a different order of thing, and belongs with
+diagnostics and Forget rather than interrupting the list of what a peer may
+sync. The three widgets are created where their logic lives and added after the
+addressing block.
+
+Also: Kent had already granted the desktop before I offered the per-pair
+explanation — *"per pair: of course."* So the hint added in 0.55.138 is still
+worth having (a hidden control with no reason is unreadable), but it was not the
+diagnosis here. If the button is still absent on a genuinely granted pair, the
+suspects are the probe's answer (`refused` vs `unavailable`, now displayed) and
+the canonical-signing check, which has never been run.
+
+## 0.55.138 — the chain walk only looked at its tip; and say why the button is missing
+
+### Why "Open settings for this device" never appeared
+
+Kent, on the desktop: *"I don't even see the open settings button appear, even
+after leaving and returning."*
+
+Grants are **per pair and directional**. Allowing the phone on the tablet grants
+the phone — it does nothing for the desktop, which needs its own Allow on the
+tablet. So the probe was answering `refused`, correctly, and the UI said nothing
+at all.
+
+A hidden control with no explanation is indistinguishable from a broken feature,
+and the probe already knew the answer and discarded it. One line now appears —
+only when there is something true to say, zero-height otherwise, so it is not
+another section:
+
+- refused → *"That device has not allowed THIS one to change its settings
+  (allow it there, for this device)"*
+- unreachable → *"That device is not reachable just now"*
+
+### The chain walk
+
+
+
+0.55.137 taught the sweep to count blobs held by the seed chain, and the field
+log shows why that changed nothing:
+
+```
+preseed-sweep: 1 blob(s) held by the seed chain also count as covered
+… pack-size estimate: offering 1004 remote-tracking ref(s) as haves
+```
+
+**One** blob. Because it walked the chain **tip's tree**, and each chain commit's
+tree holds only its own batch — the rest are in ancestors, which is the whole
+point of chaining. The blobs were on the server all along; the accounting only
+consulted the last commit. So the 1004 legacy refs stayed undeletable and every
+push kept paying for them.
+
+Now it walks the chain's ancestry, unioning every commit's tree.
+
+Also fixed: `_consolidate_seed_refs` shipped raising `NameError: name 'Tree' is
+not defined` — `Tree`/`Commit` are imported locally in the neighbouring seed
+functions, and the extracted one had no import of its own. The caller's `except`
+turned that into a logged skip, so it looked like a decision rather than a
+crash. It is a no-op in this situation anyway (a chain already exists, and it
+now stands down deliberately), but a function that fails on its first line is
+not the same as one that declines.
+
+## 0.55.137 — let the sweep delete seed refs the CHAIN covers
+
+`nml` was pushing ~1 KB units in ~60 s while advertising **1005** seed refs on
+every `git-receive-pack`. 0.55.118 chained new seeds onto one ref — and the log
+confirms that working (`continuing the existing seed chain from 9408d441`) — but
+the 1005 legacy per-batch refs were never removed, so every push still paid for
+them.
+
+Because `_sweep_orphan_preseed_refs` only ever accepted **"all blobs reachable
+from `origin/<branch>`"**, and main is hundreds of commits behind. My 0.55.118
+note claimed folding them into the chain made them "immediately deletable";
+that was false — this test had no idea the chain existed.
+
+Reachability from the chain now counts, which is exactly as safe: the blob stays
+on the server either way, and that is the only thing a seed ref is for. The
+chain ref itself is never a deletion candidate.
+
+Two corrections to what I said while diagnosing this:
+
+- **It is not all overhead.** Several of those units are genuinely 15.8 MB and
+  take ~65 s — about 240 KB/s, a healthy rate. Only the ~1 KB units are paying
+  ~60 s for nothing.
+- **The consolidation had run.** I claimed it never did, and added
+  `_consolidate_seed_refs` at topic-push entry on that basis. With a chain
+  already present it now stands down immediately: writing a fresh parentless
+  base would force-push away the history that pre-seed is actively extending.
+  It remains only for the case of legacy refs with no chain at all.
+
+## 0.55.136 — "Return to admin settings"
+
+Kent: *"'back to this device' is there, but makes no sense if I'm looking at the
+grantee. 'return to Admin settings' would be better."*
+
+Right, and ambiguous in precisely the situation it exists for: you are looking
+at one device's settings while holding another, so "this device" can mean
+either. The device in your hand is the one doing the administering, so it is
+named by its role rather than by proximity — button and confirmation text both.
+
+## 0.55.135 — say which device a remote-settings line is about
+
+Kent, reading the tablet's log: *"am I looking at the settings of the phone
+(admin) or the tablet (grantee)?"*
+
+The answer was in the line and unreadable from it:
+
+```
+[lan-admin] '3a0285ec' (Kent Phone — moto g power 5G - 2023): GET '/v1/projects'
+```
+
+That names the caller, but nothing says whether the caller is us or them — it
+reads equally as "we asked the phone" and "the phone asked us". In a feature
+whose entire risk is editing the wrong machine, an ambiguous direction is the
+worst possible ambiguity.
+
+Both sides now state it, and they only ever appear on their own side:
+
+```
+[lan-admin-client] WE are changing kent tablet (841d43a8) — not this device.
+[lan-admin] serving request FROM Kent Phone (3a0285ec) — it is changing THIS device: GET '/v1/projects'
+```
+
+### Noted, not fixed: the relayed poll rate
+
+That same log shows `/v1/lan/pending` arriving up to **eight times a second**.
+The pending-decisions watcher polls locally on a short interval, and a remote
+session turns every one of those into a signed, pinned LAN round trip. It works,
+but it is a lot of radio and CPU for a screen nobody is interacting with. The
+fix belongs with the watcher's interval rather than here, so it is flagged rather
+than patched.
+
+## 0.55.134 — notice a grant made while the popup is already open
+
+Kent, on 0.55.132: *"I still do see a button show up after setting it … (after I
+went out and came back it did, but not on just polling)."*
+
+Exactly the limit of 0.55.131's bootstrap: it probed **once at popup build
+time**, so a grant made on the other device afterwards had nothing watching for
+it. Closing and reopening a screen to see a permission you just granted is
+silly.
+
+Now a 6 s timer while the popup is open, **reveal-only** so nothing can
+flicker, stopping the instant it succeeds — the daemon persists the grant, so
+one success is the last probe that peer ever needs. Cancelled on dismiss, so a
+closed popup leaves no timer running.
+
+Only armed when the sticky flag is absent: a peer already known to grant us is
+shown immediately and never probed at all.
+
+## 0.55.133 — BUSY now says what holds the lock, and for how long
+
+From Kent's question about *"Collaboration server unavailable (['BUSY']);
+saving directly to disk (legacy mode) until it returns"* — *"can we distinguish
+between busy and dead? will this come back? what should the user do?"*
+
+Yes trivially, yes on its own, and nothing. **`BUSY` is an answer**: the request
+arrived, the project lock was held, and the daemon said so. A dead daemon cannot
+produce it — that is `SERVER_UNAVAILABLE`. Conflating them loses the one
+distinction that decides what to do next.
+
+But the daemon gave a peer nothing to act on: `BUSY` carried only
+`working_dir`. The decision is retry-or-fall-back, and that turns entirely on
+**duration** —
+
+- a post-receive absorb holds the lock ~1 s, every ~40 s while peers are
+  pushing: retry, and the user never needs to know;
+- a large merge or commit holds it for minutes: worth saying so.
+
+So `_busy_result` now attaches `holder` and `held_s` from
+`locks.held_snapshot()` (which already existed for the watchdog), and the
+translation uses them: `Busy: commit_repo baf (94s). Try again in a moment.`
+Best-effort — a missing snapshot degrades to the old sentence rather than
+turning a lock timeout into an error.
+
+The peer half is `azt/agenda/busy_is_not_unavailable.md`: retry brief holds
+instead of switching to legacy mode, never word `BUSY` as "unavailable", and —
+the priority — **never leave the user with no UI**, which is what it actually
+did in the field. A save that can't reach the daemon must still hand control
+back; a frozen window is worse than an unsaved file. Suspect a synchronous RPC
+on the UI thread against `rpc.call`'s 300 s default.
+
+## 0.55.132 — the retarget worked; nothing repainted, and it logged per call
+
+Kent: *"the button doesn't seem to do anything, but it does produce a lot of
+log."* Both halves were the same missing piece — the relay **was** working.
+
+**Nothing repainted.** Setting the transport doesn't redraw anything, so the
+page kept showing this device's values while every RPC underneath went to the
+tablet. `_sync_remote_banner` now refreshes the screen once per *transition*
+(not per tick) when the target changes.
+
+**The indicator was clobbered.** It wrote into `lan_status_label`, which the
+LAN-toggle rendering overwrites a few lines later in the same tick — so it
+appeared and vanished within milliseconds. It now sets the window subtitle
+(`EDITING <device>`), which nothing else touches, and restores `Settings` on
+the way back.
+
+**~30 log lines in twelve seconds.** `/v1/lan/relay` called `make_transport`
+for every relayed RPC, and a remote settings screen polls several endpoints
+every 5 s across several threads. Each call built a fresh SSL context and
+urllib3 pool manager — a TLS handshake per RPC, no connection reuse — and
+logged a line. Now cached per peer, keyed on fingerprint **and** address list so
+a re-pair or a new mDNS address rebuilds instead of being served stale.
+
+## 0.55.131 — 0.55.130's sticky flag could never be set
+
+Kent: *"how long should that take to appear?"* — **never**, as 0.55.130 shipped.
+
+The sticky `they_admin_us` flag is set by a successful admin call. The only way
+to make one from the UI is the "Open settings for this device" button. The button
+is hidden until the flag is set. A closed loop, and I wrote the caveat about
+ordering in the same breath without following it through to "so there is no
+first success".
+
+Fixed with a bootstrap probe on popup open that can **only reveal, never
+hide**:
+
+- flag already set → button shows immediately, no probe, no wait;
+- flag unset → one background `can_admin` call; on success the button appears
+  (~1–2 s on a LAN) and the daemon persists the flag, so every later visit is
+  instant;
+- unreachable or refused → stays hidden, silently. Nothing ever disappears, so
+  0.55.123's flicker cannot come back.
+
+The reveal-only rule is what lets a probe and stickiness coexist: probing gives
+the first yes a way to arrive, stickiness stops reachability from taking it
+away.
+
+## 0.55.130 — the relay recursed into itself; the button now waits for a yes
+
+**`RecursionError`.** `RelayTransport._relay` called `rpc.call`, which calls
+`pick_transport()`, which — once this process is targeted at a peer — returns
+the relay itself. Straight back in, until the stack ran out.
+
+The relay's entire job is to hand a request to the **local** daemon, so it must
+say local explicitly. New `transports.pick_local()`, cached separately so a
+retarget doesn't invalidate it. (Same shape of mistake as asking for "the
+current thing" inside the implementation of the current thing.)
+
+**The button showed everywhere.** Kent: *"I can still see a settings button on
+every screen, even when unuseful."* 0.55.125 made it unconditional, which put it
+on peers that had granted nothing — so I overshot in the other direction from
+0.55.123's flicker.
+
+The version he'd actually asked for two steps earlier: *"can we not hide it
+until at least one OK ping on the permission?"* Hidden until confirmed once,
+then **sticky**. `they_admin_us` in `peers.json` is that memory — set on the
+first successful admin call or relay, cleared **only** by an explicit refusal,
+never by a device merely being asleep. Preserved across re-pair, like `admin`.
+No probe on popup open, so nothing flickers and nothing costs a round trip.
+
+**"Back to this device" restored.** I removed it on the grounds that we'd
+decided against retargeting; Kent weighed it against the alternative — *"better
+than leave android non-functional"* — and it stays. The original objection
+assumed two windows were available; on Android they aren't. Also fixed: it was
+only synced from `on_enter`, which doesn't re-fire when the retarget happens
+from a popup over the current screen, so it sat collapsed and invisible
+(*"after clicking through, I don't SEE a back to my device button"*). It now
+rides the existing 5 s poll.
+
+## 0.55.127 — Android→Android works; and the `Errno 13` was my bug
+
+Kent, testing phone→tablet: *"clicked settings on the phone (for the tablet),
+and got {Errno 13] Permission denied: " (nothing more)"*.
+
+**Two bugs and one missing mechanism.**
+
+`platform` in `azt_collab_client/_platform.py` is a **function**, not a string
+like Kivy's. I wrote `from .._platform import platform as _plat` then
+`if _plat == 'android'` — function-vs-string, never true. So the Android guard
+never fired, a subprocess spawn ran on Android, and the user got a bare
+`Errno 13` that says nothing about the real reason.
+
+And the guard was going to refuse anyway, which would have made Android→Android
+simply unsupported. **A second Kivy process cannot exist on Android**, so the
+desktop answer — two windows side by side — has no equivalent there. The only
+possible mechanism is retargeting the running app.
+
+Kent vetoed retargeting for desktop (*"I'm likely to get confused at some
+point"*) and was right: there, two windows are strictly clearer. On a phone
+there is no second window, so retargeting is all there is, and the confusion
+has to be answered rather than avoided:
+
+- a confirm naming the device before anything changes;
+- `EDITING <device> — not this device` on the status line for as long as it
+  lasts;
+- a **"Back to this device"** button, present only while remote, because
+  otherwise the only exit is killing the app.
+
+Desktop keeps its process-fixed target and has no "back" — a window there is
+local or remote for life.
+
+### The relay, and why it exists
+
+Signing a remote admin call needs this device's ed25519 private key; dialling
+needs the peer's pinned fingerprint from `peers.json`. Both are daemon-side. On
+Android the UI is a different process and cannot borrow them even in principle,
+and on desktop it must not import `azt_collabd` at all (client hard rule #3).
+
+So `POST /v1/lan/relay`: the UI asks its OWN daemon to make the signed, pinned
+call. Failures come back as `relay_error` strings so the peer's own explanation
+survives — which gate refused, or which addresses were tried — instead of
+collapsing into a generic transport error.
+
+### Platform matrix, since it was asked
+
+The grant, the crypto and the transport are platform-independent: **any** OS can
+be the controlled machine, and any can be the controlling one. Only the
+presentation on the controlling machine differs — second window on desktop,
+in-place retarget on Android.
+
+## 0.55.126 — bound the whole address sweep, not each address
+
+Kent: *"And it will dial other addresses, if the first doesn't take?"*
+
+It does — mDNS-learned first, then manual ones, skipping each that fails to
+connect, stopping early only on a real HTTP reply like 403 (a decision, and
+identical from every address).
+
+Which is exactly why the total needed a ceiling. Connect timeout is 5 s **per
+address**, and a peer can easily carry six recorded addresses — Kent Phone had
+exactly six in the field. A sweep of stale ones therefore burns ~30 s, past the
+launcher's 8 s grant probe and past the button's 15 s wait, so the button would
+report "opened" for a process about to exit 2. Answering his question surfaced
+the bug.
+
+`_dial` now stops when the overall budget is spent, and the failure names how
+many addresses it **never reached** rather than implying the list was
+exhausted — reporting only the ones tried would misstate what was checked.
+
+## 0.55.125 — always offer "Open settings for this device"
+
+Three versions of hiding logic, all wrong, and Kent cut through it: *"refused
+doesn't exist. it's granted and available, or not"* and *"weird if the button
+comes and goes."*
+
+- 0.55.122 gated it on `peer['admin']` — the **granter's** flag, so it showed
+  on the machine that couldn't use it.
+- 0.55.123 gated it on a probe, so a peer merely asleep looked like one that
+  had never granted anything.
+- 0.55.124 showed it on `unavailable` but still hid it on `refused` — a
+  distinction that doesn't exist from where the user sits.
+
+From a user's seat there is one question: does the action work? The only way to
+know is to try, and the launcher already exits with the exact reason including
+what to tap on the other device. So the button is unconditional. No probe on
+popup open, no network call, nothing that appears and disappears.
+
+Kent's other observation supports it: *"We won't need mDNS to dial."* Correct —
+`make_transport` dials the peer's **stored** endpoints plus any manual ones, so
+discovery is only needed to *learn* or *refresh* an address, never to use one.
+That is why the field logs are full of `address is likely stale (recorded on a
+previous network)`: the dial works, the address had gone bad. So a failed probe
+is weak evidence — a minute later the phone wakes and the same address answers
+— and hiding on it would also hide the one case that is otherwise unreachable
+forever: a device that never announces on a tether and is reachable only by
+manual IP.
+
+`lan_can_admin` remains for callers that genuinely want to pre-check; its
+docstring now records that the UI deliberately doesn't.
+
+## 0.55.124 — "unavailable" is not "no"
+
+Kent: *"any chance we could make settings with 'unavailable'? anything at
+all?"*
+
+0.55.123 revealed the open button only when the probe said **yes**, which meant
+a peer that happened to be unreachable at that instant — asleep, mid-network
+change, stale address — looked identical to a peer that had never granted
+anything. The feature disappeared for a reason that had nothing to do with
+permission.
+
+Now only `refused` (reachable, and it said no) hides it. `unavailable` shows the
+button, labelled `Open settings for this device (not reachable now)` so a later
+failure isn't a surprise, without claiming it will or won't work. If it still
+can't get through, the launcher's own probe gives the specific reason — that
+path already explains itself.
+
+Same principle as elsewhere in this session: an absence of information must not
+be rendered as information.
+
+## 0.55.123 — the open button belongs on the grantee, and no colour coding
+
+Kent: *"why does 'open settings for this device' show up on the one who
+granted? I'd think you'd want it on the grantee."*
+
+Correct, and I built the inverse. 0.55.122 gated that button on
+`peer['admin']` — which records what **we** granted **them**, so it appeared on
+the machine doing the granting, where it is useless, and stayed hidden on the
+machine that could actually use it.
+
+The grantee cannot answer this locally: whether they granted us lives on
+**their** machine. So it asks. New `POST /v1/lan/can_admin` makes one real
+admin call and reports back, and the popup probes off the UI thread, starting
+collapsed and revealing the button only if the answer is yes. Probing rather
+than caching also means a revoked grant stops offering the button on the next
+look, rather than after some later sync.
+
+The reply distinguishes **`refused`** (reachable, no grant) from
+**`unavailable`** (couldn't ask) — different problems, different actions, so
+they aren't merged into one falsy answer.
+
+### No colour coding
+
+Green-for-granted against the blue stack was *"dizzying"*. Colour was also
+carrying meaning the words can carry alone, so both states now use the normal
+button colour and the label does the work:
+
+- `Allow this device to change my settings`
+- `STOP letting this device change my settings`
+
+Capitals rather than red — it reads as the reversal it is without implying
+danger.
+
+## 0.55.122 — two buttons, no section
+
+Kent, on 0.55.120's layout: *"this is too complex … how about: above 'get
+diagnostics for device', 'allow this device to change my settings'? Then IF
+this device has that set, another button that says 'Open settings for this
+device'"* — and *"No extra section, just a couple more buttons to ignore if you
+don't understand them."*
+
+Gone: the bold header, the grey subtitle, the two-button row. In their place,
+two ordinary full-width buttons in the stack that already holds Save manual
+IPs / Get diagnostics / Forget:
+
+- **"Allow this device to change my settings"** → becomes **"Stop letting this
+  device change my settings"** when set, and turns green. The label is a
+  sentence because it now carries the entire meaning on its own — there is no
+  header or subtitle left to explain it.
+- **"Open settings for this device"**, present only while the grant is set,
+  collapsed to zero height otherwise so it returns on toggle without
+  rebuilding the popup.
+
+Worth noting the asymmetry that button hides: it keys on OUR grant to THEM,
+which is not the same as their grant to US — only they hold that. It's the
+honest signal available locally, and 0.55.121's probe checks the real one and
+explains itself if refused.
+
+## 0.55.121 — refuse before opening a window that can't do anything
+
+Kent: *"click on check settings, and it opens up the box — never having set
+allowed"*, then *"it doesn't seem to do anything, but the forest UI loads."*
+
+Both are the same hole. `make_transport` established that the peer is paired,
+has a pinned fingerprint and has an address — none of which is the **grant**,
+which only that peer holds. So the window opened and every control inside it
+was refused one at a time, showing empty fields.
+
+**A window that opens and then refuses everything is worse than a refusal**:
+it looks like the feature works and the other machine is broken.
+
+`--peer` now makes one real admin call (`GET /v1/health` — trivial locally, but
+through this channel it still traverses all three gates) before starting Kivy,
+and on 403 exits 2 saying exactly what to do:
+
+> `<device>` has not allowed this device to change its settings. On THAT
+> device: Settings → its peer list → this device → Manage → "Let this device
+> change my settings".
+
+The launcher button surfaces that sentence in a popup rather than truncating it
+into a 40-character label — the actionable half was the part being thrown away.
+Its wait is now 15 s, above the 8 s probe, so it can no longer report "opened"
+for a process about to exit.
+
+## 0.55.120 — put the remote-settings controls where someone would look
+
+Kent, on 0.55.118: *"I don't see 'allow' … nor in the detail of the page"* —
+and then *"don't see them there, either"* about the sync rows I had actually
+edited.
+
+**Two mistakes, one visible and one not.**
+
+Wrong surface: I put the grant on the sync-board rows at the bottom of the
+settings page. That board is a status readout — nobody goes there to change
+what a device may do. The place is the per-peer **Manage** popup, which
+already owns "which projects do I share with this device" and Unpair.
+
+And they wouldn't have shown reliably anyway: the guard that kept one pair of
+buttons per peer (`_peer_admin_rendered`) was never cleared, and the board
+repaints every 5 s — so they appeared on the first paint and were suppressed on
+every one after.
+
+Now in the Manage popup, as its own section with its own words:
+
+- **"Let this device change my settings"** → `Allowed` / `Not allowed`.
+  Deliberately separate from project sharing, because sharing is about DATA
+  and this is about CONTROL: every field phone is paired and shares projects,
+  and a lost one must not be able to reconfigure a desktop. On failure it says
+  `Failed — try again` rather than flipping the label, since a permission
+  control that misreports its own state is worse than one that's hard to find.
+- **"Open its settings"** → spawns the `--peer` window. Always offered, since
+  only the other device knows whether it granted us; a refusal explains itself
+  instead of being pre-emptively hidden. Waits ~6 s so `exit 2` becomes a
+  sentence rather than a window that never appears. Spawned, not imported —
+  the client may not import `azt_collabd`.
+
+Also documented on `lan_list_peers` that it must pass entries through
+unmodified: selecting fields there would have made `admin` silently absent in
+the UI while the daemon reported it correctly — a failure mode this codebase
+has produced before.
+
+## 0.55.119 — the watcher loop starved itself for the length of a push
+
+Field 2026-07-29, desktop: `[watchdog] STALL DETECTED loop 'watcher' last
+ticked 150s ago`, with that thread parked in `ssl.write` inside a pre-seed
+batch. Healthy work, reported as a stall — and `threads=4 fds=125`, so nothing
+was actually wrong.
+
+But the starvation underneath was real. `_drain_pending_push` runs the whole
+push **synchronously** — chunked Phase A, side-ref banking, pre-seed batches —
+which on a big history is hours. Called inline from `_watcher_loop`, that loop
+cannot tick for the duration, so everything else it owes is starved:
+connectivity re-probing, the LAN post-receive reset drain, the 10-minute
+ahead-of-github sweep, and its own heartbeat. The watchdog declined to restart
+only because `sync_flight` reported a push in flight; the protection worked and
+the underlying stall was still genuine.
+
+Now spawned on a `wan-drain` thread. `_wan_inflight` (0.55.83) already prevents
+a second push per project, so a tick arriving while the previous drain is still
+running finds the project in flight and skips it — spawning cannot double-push.
+
+### And a log line that promised a number it didn't have
+
+`loop 'watcher' last ticked 150s ago (expected every ~?s)` — the interval is
+the whole point of that comparison, and `~?s` is a hole where the sentence
+said there would be a value. A loop that hasn't published its interval yet now
+says so, and names the fixed bar it was judged against instead.
+
+## 0.55.118 — seed refs were the bottleneck; settings-at-a-distance UI
+
+### One chained seed ref, not one per batch
+
+Every `git-receive-pack` begins with the server advertising its refs, so a
+ref-per-batch scheme makes that advertisement grow with every batch that
+lands. Field 2026-07-29, after 2241 seeds had accumulated on `nml`:
+
+```
+batch 1/376:  23,330 bytes → 50 s
+batch 3/376:  12,546 bytes → 59 s
+batch 5/376:   6,416 bytes → 57 s
+```
+
+**Six kilobytes taking a minute.** The payload was irrelevant; negotiation was
+the entire cost — 376 batches × ~50 s ≈ five hours of pure overhead, worsening
+with every seed added, and the `408`s from github are consistent with requests
+whose negotiation plus upload ran past its limit. The mechanism built to make a
+big history converge had become the reason it couldn't.
+
+Each synthetic commit now takes the previous as its **parent**, so one ref
+keeps every seeded blob reachable through ancestry exactly as N refs did, and
+the advertisement stops growing. Still deterministic, and resumable — an
+existing chain is continued rather than forked.
+
+**Plus a migration for ground already lost:** on first run the 2241 existing
+per-batch refs are folded into one chain-base commit whose tree lists every
+already-seeded blob. The push is tiny (those blobs are already on the server —
+only a tree and a commit travel), and it makes the old refs immediately
+redundant so `_sweep_orphan_preseed_refs` can delete them on its next pass
+rather than waiting for `main` to catch up.
+
+### The watchdog said the same thing 300 times
+
+`stall persisted … but a sync is IN FLIGHT` fired every 30 s for the life of a
+push, burying the push progress a reader was looking for. The decision doesn't
+change between ticks. Now once per 5 minutes, and it says that repeats are
+suppressed.
+
+### Settings at a distance: UI
+
+- **"Allow" / "Allowed"** per peer — grants that device permission to change
+  THIS device's settings. The gesture performed while holding a machine at
+  setup; green when granted. Confirms in words that say what it *means*, not
+  that a flag flipped.
+- **"Settings"** per peer — launches a second window driving that peer
+  (`--peer`), desktop only. Waits ~6 s so a refusal becomes a message instead
+  of a window that silently never appears.
+- Both render once per peer rather than once per (peer, project) row.
+
+### Reverted 0.55.117's escalation guard
+
+I blocked `set_admin` / `unpair` / `pair_accept` on the admin channel, on my
+own initiative, and justified it with "a peer could grant itself admin
+permanently" — which is meaningless: a peer that has admin needn't re-grant
+itself, and the grant has no expiry. Kent: *"please don't decide against what
+I've asked without talking to me… this is security policy written by a lawyer,
+not me."*
+
+The cost was real — you could not authorise a second device for a remote
+machine without travelling to it, which is most of the point. What it
+prevented was a trusted device delegating to another, or revoking your grant:
+both are simply what admin means, decided when the grant was given by hand.
+Privileged calls are now **logged** as `[lan-admin] PRIVILEGED …` instead of
+refused. Visible after the fact beats unavailable by policy.
+
+## 0.55.117 — settings at a distance: the grant, the transport, the launch
+
+Completes phases 2–4 of `agenda/remote_settings_over_lan.md` on top of
+0.55.101 (crypto) and 0.55.102 (the `/v1/lan/admin` endpoint).
+
+**The grant.** `peers.json` entries gain `admin`, default False, set only by
+`peers.set_admin()` behind a gesture on the machine being administered.
+Pairing does **not** imply it: pairing means "share dictionary data", every
+field phone is paired, and a lost phone must not be able to reconfigure
+someone's desktop. `record_pair` now preserves it — that function rebuilds the
+entry from scratch, so an unlisted field is silently dropped, and a re-pair
+that revoked remote access would look like "it just stopped working" with no
+way to restore it short of walking back to the device.
+
+**Privilege-escalation guard.** `/v1/lan/admin` dispatches into the ordinary
+table, which contains the endpoints that manage grants and pairings. Those are
+now refused remotely — `set_admin`, `unpair`, `pair_accept`. A denylist, not an
+allowlist, so a new *settings* endpoint needs no change here; the tradeoff is
+that a new *dangerous* endpoint must be added, hence the reasoning is written
+out rather than left as a bare tuple.
+
+**The transport.** `azt_collab_client/transports/lan_admin.py` builds the
+envelope and nothing else; signing and the TLS dial are injected by
+`azt_collabd/lan_admin_client.py`. Two reasons: the client may not import
+`azt_collabd` (hard rule #3), and the dial must be the **fingerprint-pinned**
+one `lan_push` already uses.
+
+I first wrote it with `CERT_NONE` and no pinning — weaker than the code beside
+it, for nothing. `lan_push` warns that urllib3 skips pinning on a falsy
+fingerprint (0.54.64), so a peer with no recorded `fp` is now **refused**
+rather than dialled unverified.
+
+The canonical signed form is factored into
+`lan_listener._admin_canonical_request` and mirrored in the client, with
+`lan_admin.self_check()` comparing them byte-for-byte — drift there surfaces
+only as a 403 indistinguishable from a missing grant.
+
+**The launch.** `python -m azt_collabd ui --peer <peer_id>`. Fixed for the life
+of the process (`transports.target_peer`, no un-target), so no window is ever
+ambiguous about which machine it changes — Kent, on retargeting a running UI:
+*"I'm likely to get confused at some point. Can we not start another ui?"* It
+**exits 2** rather than falling back to local: a window claiming to drive
+Ndemli while editing this machine would be worse than no window.
+
+Remote windows title themselves `REMOTE — <device>` and use the Forest theme,
+so the two are distinguishable at a glance rather than by reading.
+
+**Not done:** the peer-row grant toggle and launch button (the `admin` flag is
+now carried on `lan_peer_sync` rows so the toggle can render), and the
+signalling endpoints still accept unsigned callers so a staged APK rollout
+doesn't cut off older peers. **Nothing here is field-tested** — the first real
+exercise of the admin channel is the first `--peer` run.
+
+## 0.55.116 — "staged_rejected" hid a probably-already-succeeded save
+
+Field 2026-07-29, Windows desktop, in this order:
+
+```
+SERVICE_WEDGED (pid 1564 running but not answering /v1/health)
+SERVICE_DROPPED (daemon alive but dropped the call: [WinError 10054]) — retrying
+… SERVER_ERROR (safe, may catch up) detail: staged_rejected
+```
+
+`submit_file` rejected three different situations with one code. Two of them
+have **opposite remedies**:
+
+- **the staged file is gone.** Almost always a retry after partial success —
+  the first attempt worked, `os.replace` consumed the staged file, and the
+  reply was lost coming back (note the `WinError 10054` immediately before).
+  **The write has already landed.** Retryable, and a UI must not report data
+  loss.
+- **the path is bogus** (not beside the target, or IS the target). A caller
+  bug; retrying cannot help. Permanent.
+
+One code meant a peer could only surface a scary error for both — correct data
+with an alarming message, which is the worst combination. Now
+`409 staged_missing_retryable` versus `400 staged_rejected`, and the daemon
+logs which one and why.
+
+Kent: *"can we do it for them? I don't want people to figure this out
+themselves."* This is the daemon half — the peer can now auto-re-stage on 409
+instead of asking a linguist to interpret it.
+
+### Not doing: auto-restart on SERVICE_WEDGED
+
+The same instinct applied to `SERVICE_WEDGED` would be actively harmful, and
+today proved it. That message means "running but not answering `/v1/health`" —
+which is exactly what a daemon looks like when it is **busy with real work**:
+this morning a config read took **4m19s** on a saturated phone (0.55.115), and
+a watchdog that killed it would have destroyed a merge and a push mid-flight.
+"Not answering" and "wedged" are not the same state, and we cannot currently
+tell them apart from outside. Fix the saturation (0.55.111/113) rather than
+add a killer.
+
+## 0.55.115 — it was latency; restore the non-blocking retry
+
+The phone finished and the field filled. Same screen, parented, correct value:
+
+```
+13:35:43.743  on_enter screen=0x6db8cacc90
+13:40:02.684  creds applied: unreachable=False contributor=10 chars
+13:40:02.685  contributor rendered … screen=0x6db8cacc90 widget=… parent=yes
+```
+
+**4 minutes 19 seconds** from screen entry to the daemon's answer. No orphan,
+no rebuild, no duplicate widget, no wrong host — every theory I built today was
+unnecessary. The daemon was saturated (see 0.55.111/113) and a config read took
+four minutes; the field renders correctly the moment it arrives.
+
+That measurement also shows 0.55.114 alone would regress it: one call returns
+`unreachable` immediately, the old ladder retries for 60 s, gives up, and the
+field stays blank forever — the original bug. **The loop was wrong AND giving
+up was wrong.**
+
+So the shape that is actually correct, and it is what 0.55.103 had before I
+replaced it:
+
+- **one non-blocking call per attempt** — on Android an RPC has no enforceable
+  timeout (`ContentResolver.call` ignores it), so anything that *waits* can
+  hang;
+- **a retry that never expires while the field is empty** — re-armed from the
+  existing 5 s poll, which only resets a counter and schedules a Clock
+  callback, so it cannot hang;
+- **and the daemon not taking four minutes** — the actual fix, 0.55.111/113.
+
+`_heal_blank_contributor` is restored verbatim in intent. I deleted a correct
+fix, replaced it with a blocking wait, then reverted the wait and had to put
+the original back.
+
+## 0.55.114 — revert my retry loops; they were the hang
+
+**The blank field on that phone was my fault, from this morning.** The 0.55.113
+boot log says it plainly:
+
+```
+[diag] config.collab.contributor: 'Kent Phone'      ← daemon HAS it
+[settings] on_enter screen=0x6db8cacc90
+…no `creds applied` line at all…
+[presplash-hold] watchdog: release() not called within 45s
+```
+
+`release()` fires from the credentials apply, so the apply never ran — the
+worker was parked inside the loop I added. The daemon held the value the whole
+time.
+
+Why both loops (0.55.105's deadline, 0.55.112's health gate) were wrong for
+the same reason: `transports/android_cp.py` documents that `timeout` is
+**advisory**, because `ContentResolver.call` has no timeout facility. A wedged
+binder call blocks past any deadline in Python, so "poll until ready, bounded
+by 10 s" is not bounded at all. I wrote that twice, the second time
+specifically to fix the first.
+
+Back to one call. If it returns unreachable, the pre-existing retry ladders
+handle it — as they did before I touched this.
+
+The load problem those loops were compensating for is fixed where it belongs:
+coalescing in the daemon (0.55.111/113) so a poll costs one computation, and
+single-flight in the UI (0.55.110) so screens can't pile up.
+
+Also visible in that log, pre-existing and unrelated: `nml` on that device is
+stuck in the `dcf320a8…` missing-tree loop — `reset-blocked-missing-object`,
+`tree-rebuild-mismatch`, `heal-failed … needs the scratch-clone repair`. It
+retries on a widening backoff and will not self-heal.
+
+## 0.55.113 — coalesce the whole handler, not one call inside it
+
+0.55.111 guarded `repo_status_summary`. The very next field dump showed **ten**
+`Dummy-*` ContentProvider threads stacked in
+
+```
+_h_project_status → _main_merged → _is_ancestor → pack lookups
+```
+
+`_main_merged` is a *second* expensive call in that same handler and was still
+unguarded, and `lan_unshared` / `at_risk` re-open the repo again besides. I
+fixed one of several and shipped it as though the handler were covered.
+
+Guarding one call inside a handler that makes several is the wrong level.
+`_h_project_status` is now a coalescing wrapper around
+`_h_project_status_impl`, so one poll costs one computation regardless of how
+many surfaces ask and regardless of what the handler grows to call later.
+`since_sha` is part of the key, since it changes the answer.
+
+Also in this dump, unrelated and left alone: `lan-bind-sweep` blocked in an
+SSL read inside `_fetch_peer_objects_inner`, and the stall the watchdog
+actually reported was the 15 s `watcher` loop starved for 120 s — a symptom of
+the same thread pile-up rather than a separate fault.
+
+## 0.55.112 — wait on readiness, not on a deadline
+
+Kent, from the one phone where the contributor field works: *"it appears as
+soon as the listener responds."*
+
+That is the diagnosis. The listener bind is one of the last steps of daemon
+startup, so "listener responds" means "the daemon finished booting" — and the
+field fills the moment the daemon can answer. **It was never a field bug; it
+was a readiness symptom.** On the other phones the daemon can't get there
+inside the wait window, because it is re-walking 1868 files per poll (0.55.111).
+
+So the wait now polls `GET /v1/health` until the daemon answers, then makes
+the credentials call once. Health needs no auth and does no git work, so
+polling it during boot costs nothing — where retrying
+`get_credentials_status()` pounds a daemon that is already too busy to reply.
+A slow phone then waits exactly as long as it needs instead of racing a
+10-second guess.
+
+Not gated on the listener itself, though that is what the symptom tracks: LAN
+sync can be switched off entirely, and the name field must not depend on it.
+Health is the honest signal for the same edge.
+
+## 0.55.111 — coalesce the two status walks the UI polls
+
+Field 2026-07-29, phone watchdog dump — twenty-odd threads, nearly all in a
+full filesystem or full-history walk **at the same time**:
+
+| Doing what | Threads |
+|---|---|
+| `_h_project_status` → `porcelain.status` → `get_untracked_paths` (a `pathlib.resolve()` per untracked path, 1868 audio files) | 3 |
+| `_h_cawl_cache_status` → `_walk_image_count` → `os.walk` | 2 |
+| `_h_lan_peer_sync` → `_count_commits_ahead` | 1 |
+| LAN `upload-pack` → `_collect_ancestors` / `_update_pack_cache` | 6 |
+| jnius `Dummy-*` threads parked in `os._walk` | 8+ |
+
+Those read-only RPCs are **polled** by every open UI, and each poll started
+its own walk. With no single-flight, load grew with the number of callers
+rather than with the amount of work, and the Activity's own RPCs queued behind
+all of it — which is what "the UI is unresponsive" actually was.
+
+New `server.coalesce(key, ttl_s, fn)`: a late caller **blocks on the in-flight
+computation and gets its result** instead of starting a duplicate (the
+important half), and a TTL keeps a 5 s poll from re-walking every tick. Falls
+back to calling `fn` directly on any bookkeeping error — a performance helper
+must never be why a status call fails.
+
+Applied to `repo_status_summary` (3 s) and `cawl_cache_status` (5 s).
+`lan_peer_sync_rows` already caches.
+
+Note on the CAWL one: its docstring says the on-disk count is "memoised under
+a short TTL", yet two of them were walking concurrently. A memo consulted
+*after* the walk begins doesn't prevent duplicate walks; single-flight does.
+
+## 0.55.110 — undo my own regression: the credentials wait was a hammer
+
+0.55.105's gate polled `get_credentials_status()` **every 1 s for up to 120 s
+with no single-flight guard**. Each `SettingsScreen.on_enter` starts one, and
+screen rebuilds create fresh screens — so waits pile up, every one of them a
+binder call into `:provider` once a second. Kent: *"the lang button does seem
+to be broken now… makes UI nonresponsive. Wasn't true this morning."* It
+wasn't, because that loop didn't exist this morning. **My fix for a blank
+field created a way to saturate the daemon.**
+
+- **Single-flight** (`_creds_fetch_gate`, process-wide — per-instance state
+  can't help when rebuilds make new instances). A second caller returns the
+  "couldn't ask" shape, which holds existing text and blanks nothing, and
+  lets the in-flight fetch deliver the real answer.
+- **Backoff** 1 s → 2 → 4 → 8, so a daemon that is slow to start isn't also
+  being pounded while it starts.
+- **Bound cut 120 s → 10 s.** Field evidence: `on_enter` at 12:56:05.8, daemon
+  start 0.3 s later, and **no `contributor rendered` line at all** — where
+  07-28 logged one on every launch. The long wait converted "renders into the
+  wrong widget" into "may not render at all". Ten seconds keeps the property
+  that matters (never paint an unreachable answer as an empty value) without
+  parking the screen.
+
+Ruled out today, for the record: stale p4a bundle (`daemon_version: 0.55.108`
+confirmed on-device), duplicate KV rule (only one field on the page), and
+"set but not repainted" (`hint_text` visible ⇒ `text` is genuinely empty).
+
+## 0.55.109 — an unloadable language preference rebuilt every screen, forever
+
+The mechanism behind the contributor field, and it answers "why since
+yesterday".
+
+`set_language()` returns the language it **actually applied**, falling back to
+`'en'` when the catalog can't be loaded. `_check_language_change` ignored that
+return value:
+
+1. `config.json` says `fr`; the catalog fails to load on Android →
+   `current_language()` is `en`.
+2. Next `config.json` write (they are frequent): `persisted != current` →
+   `sm.clear_widgets()` and every screen rebuilt.
+3. `set_language('fr')` fails again → still `en`. **Nothing converges.**
+
+So every config write destroyed all rendered state. The contributor value was
+fetched and written correctly — the log proved that from the first paste — and
+then the screen holding it was thrown away, leaving a fresh empty field.
+Consistent with every observation: one field on the page, `hint_text` visible
+(so `text` really is empty), the populated widget out of the tree, and desktop
+unaffected because its catalog loads.
+
+And the timeline: **tapping a language button is all it takes to start this**,
+and the UI still shows English afterwards — so nothing about the device looks
+French, which is exactly what Kent said when I asserted the phones were.
+
+Fixed: honour the return value. If the applied language differs from the
+requested one, record it, log once, and stop retrying — retrying on every
+config write can only destroy state, never succeed. Rebuild only when the
+language genuinely changed *and* was honoured.
+
+Note what remains: the French catalog apparently doesn't load on Android. That
+is a separate defect this no longer amplifies into UI destruction, but it means
+those devices silently cannot switch language. Worth its own item.
+
+## 0.55.108 — the contributor field: a screen rebuild threw the value away
+
+**Cause found.** `picker_app._check_language_change` polls `config.json`'s
+mtime and, when the persisted UI language differs from the running one, does
+`sm.clear_widgets()` and re-instantiates **every screen from its class**. The
+`SettingsScreen` that had just rendered the contributor becomes a detached
+orphan; the one on screen is brand new and empty.
+
+Every fact fits, including the ones that killed the earlier theories:
+
+- the log truthfully said *"set 10 chars, widget now holds 10 chars"* — of the
+  orphan's widget;
+- the field on screen was empty, and select-all selected nothing, because that
+  is a different widget that never received anything;
+- only ONE name field on the page (no duplicate KV rule);
+- **desktop was fine and all three phones were not** — the phones are
+  French-locale, Kent's desktop is English, so the language-change branch
+  never fires there.
+
+The trigger is a startup race: `build()` applies `language_pref()`, but if the
+daemon isn't reachable yet that yields the default; when config becomes
+readable the real preference (fr) differs and the rebuild fires — right around
+when the credentials answer lands. **0.55.105's wait made this worse**, since
+the worker now holds `self` for up to 120 s, so the value is guaranteed to
+arrive at a screen that may already be gone.
+
+Two fixes:
+
+- `_apply_credentials_state` detects a detached `self` (`self.manager is
+  None`), resolves the live screen by name from the ScreenManager, and renders
+  into that. If no replacement exists it skips rather than writing into an
+  orphan.
+- The rebuild now **logs that it is happening**, naming both languages and
+  saying that rendered state is discarded. It ran with no trace at all, which
+  is why the render looked like a success and the destruction was invisible.
+
+Three earlier attempts (0.55.103, .104, .105) were aimed at the data path,
+which the log had already proven healthy. The tell I ignored: *"widget now
+holds 10 chars"* and an empty field can only both be true of two different
+widgets — that was visible from the first log paste.
+
+## 0.55.107 — fix the SyntaxError in 0.55.106's new log line
+
+A nested string literal split across two lines inside an f-string:
+
+```
+f'parent={"yes" if contrib_input.parent else "NO — "
+          "detached, nothing on screen shows this"}',
+SyntaxError: unterminated string literal
+```
+
+Implicit concatenation doesn't apply inside an f-string expression. The
+conditional is computed before the f-string now.
+
+This broke the UI at import, so 0.55.106 could not run at all. A diagnostic
+that prevents the program starting is worse than the bug it was added to
+measure.
+
+## 0.55.106 — instrument the contributor field instead of guessing again
+
+The log settled what three versions of inference could not: on three phones the
+value **was** delivered —
+
+```
+creds applied: unreachable=False contributor=10 chars … err=None
+contributor rendered: set 10 chars, widget now holds 10 chars, focus=False
+```
+
+— and the field was empty in the hand: tap showed nothing, long-press
+select-all selected nothing, paste returned null. Both facts can hold at once
+only if the populated widget and the visible widget are **different objects**.
+`self.ids` is per-instance, so a second `SettingsScreen` — or a rebuild
+between the fetch starting and landing — writes to something nobody is
+looking at.
+
+Note the 0.55.105 gate *widens* that window: waiting up to 120 s for a real
+answer means more time in which the screen could be replaced underneath the
+worker. If this is the cause, that needs the value re-applied to whatever
+screen is current when the answer arrives, not to the captured `self`.
+
+Rather than ship a fourth speculative fix, three log points:
+
+- `on_enter screen=0x…` — which instance is entered.
+- `contributor rendered: … screen=0x… widget=0x…` — which instance and widget
+  received the text.
+- `parent=yes|NO — detached, nothing on screen shows this` — whether that
+  widget is even in the tree.
+
+Two different `screen=` ids in one session, or `parent=NO`, and the cause is
+proven rather than assumed.
+
+**Score so far, plainly:** the data path was never broken. 0.55.103 and
+0.55.104 fixed genuine defects in the retry machinery but were not this bug,
+and were shipped on inference. 0.55.105 is worth keeping as a simplification
+(five overlapping timers → one gate) but also was not the fix.
+
+## 0.55.105 — one gate replaces five ladders
+
+Kent: *"Are we overthinking this? contributor has been a stable field for
+months; why is it causing so many problems now?"* Yes, and the code's own
+comment names the cause.
+
+**0.55.25 made this RPC fast, and fast made it wrong.** It used to run on the
+UI thread and block 36–77 s, which accidentally made it correct: the answer
+landed long after `:provider` finished importing, so it always got real data.
+Moving it off-thread means it now fires ~1 s after the screen appears — into a
+window where the daemon does not yet exist.
+
+Every version since compensated with another timer. Five of them, for one
+field: the 4.8 s retry ladder, the 60 s backfill ladder, the presplash hold, a
+5 s poll self-heal (0.55.103), a resume re-arm (0.55.104). None aware of the
+others, each able to expire independently. **All three faults fixed earlier
+today were in that machinery, not in the race.** That is the smell.
+
+The gate: `_fetch_creds_and_online` is already on a background thread, so it
+simply **waits for the transport to come up** — poll `get_credentials_status()`
+until the answer is not the `unreachable` fallback, up to 120 s. Nothing is
+ever painted from "couldn't ask", so there is no empty field to overwrite and
+nothing downstream to schedule a fix for.
+
+Generous bound on purpose: waiting costs nothing on a background thread, while
+expiring early is what silently blanked a user's own name. A cold `:provider`
+import on a slow handset can take tens of seconds, plus a respawn if it was
+killed under memory pressure.
+
+Removed: `_heal_blank_contributor` (0.55.103) and the resume re-arm's budget
+juggling (0.55.104). `on_resume` stays as a plain refresh — still worthwhile,
+but now because daemon state can genuinely change while backgrounded, not as
+another retry.
+
+Net: three mechanisms deleted, one added, and the race that caused all of it
+is gone rather than papered over.
+
+## 0.55.104 — the two things that made a spent budget permanent
+
+0.55.103 stopped the give-up being silent and added a self-heal. Kent tested
+on 0.55.102 — *"backgrounded and returned, and still no contributor field, nor
+complaint"* — and that test found two more holes, both of which had to be
+closed before any retry could reach the daemon.
+
+**`on_enter` reset only one of the two ladders.** The block is commented
+"Fresh retry budget per screen entry" and resets `_credentials_retry_count`
+(the 4.8 s ladder) — but not `_cred_backfill_count`, the 60 s ladder that
+actually fills the name field on a cold Android start. Once spent, no screen
+entry ever restored it for the life of the screen object.
+
+**There was no `on_resume` hook at all.** `on_enter` is a screen *transition*
+hook; returning to a screen you were already on never fires it. So
+backgrounding and returning — the obvious "try again" gesture — had no code
+path by which it could have helped. A resume is also exactly when the answer
+may have changed: on Android `:provider` may have been killed under memory
+pressure while backgrounded and respawned on the way back.
+
+Both fixed: `on_enter` re-arms both budgets, and a new `on_resume` re-arms
+them and refreshes if settings is the current screen.
+
+Three separate faults kept one field blank — silent exhaustion (0.55.103), a
+counter missed by the reset, and a missing lifecycle hook. Each alone would
+have been survivable; together they made a transient daemon-unreachable
+window permanent for the session.
+
+## 0.55.103 — "Your name" stayed blank because the retry ladder gave up silently
+
+Field 2026-07-29: four responsive Android devices with
+**"Your name (appears in commits)" empty and no complaint** — while
+`peers.json` proved the contributor was set on every one of them (the stored
+device names are `"<contributor> — <device>"` composites, and their commits
+are attributed).
+
+The cause:
+
+```python
+def _schedule_credentials_backfill(self):
+    n = getattr(self, '_cred_backfill_count', 0)
+    if n >= self._CRED_BACKFILL_MAX:
+        return          # ← no log, no further attempt
+```
+
+`_CRED_BACKFILL_MAX` × 3 s = **60 seconds**, then nothing. On a phone where
+`:provider` isn't reachable inside that minute — cold spawn, memory pressure,
+or the daemon killed and not yet relaunched — the field stayed blank for the
+rest of the session. No prompt, because the daemon never said "unset"; no log
+line, because the give-up was silent. Both halves had to be wrong for this to
+be invisible.
+
+- **Exhaustion now logs**, naming the budget it spent and what will re-arm it.
+- **A slow self-heal on the existing 5 s peer poll** re-arms the ladder while
+  the field is empty and the daemon is demonstrably answering (same
+  `lan_state` liveness witness the peer table uses). Guarded on
+  widget-exists / empty / not-focused, and rate-limited to 30 s so a
+  genuinely-unset name doesn't re-poll for the life of the session.
+
+Same shape as 0.55.90, and the same lesson: a bounded one-shot ladder is
+right for the fast path, but something unbounded and cheap has to run
+afterwards, or a slow device loses the value permanently. **A silent give-up
+is indistinguishable from never having tried.**
+
+## 0.55.102 — the admin channel (server side)
+
+Two endpoints on the LAN listener:
+
+- `GET /v1/lan/challenge` → a single-use nonce. Unauthenticated by
+  necessity — it is step one of authenticating — and bounded (60 s TTL,
+  capped table) because anything that can open a socket can reach it.
+- `POST /v1/lan/admin` → **one endpoint carrying every RPC.** The body is an
+  envelope (`{peer_id, nonce, sig, method, path, body}`) dispatched into the
+  ordinary local `dispatch()`, so the operator's existing settings UI works
+  unmodified against a remote daemon. Kent, on my first proposal to forward a
+  whitelist of specific config calls: *"if it's all the same, I'd rather have
+  the same functions, just to keep it simple."*
+
+**Strict from the first line, with no compatibility path — and that is safe,**
+because admin is new: no existing client speaks it, so there is nothing to
+stay compatible with. I had flagged a rollout hazard here; it applies only to
+the *signalling* endpoints, which keep accepting unsigned callers so a staged
+APK rollout doesn't cut off peers still on old code. Kent's plan (one phone
+first, confirm, then distribute) is safe either way.
+
+Three gates, all required:
+
+1. **Nonce spent** — single-use, so a captured request cannot be replayed
+   even inside its 60 s life.
+2. **Signature verifies** against `peer_id`, which IS the raw ed25519 pubkey.
+   This is what the old body-auth path lacked: it checked only that the
+   caller *named* a paired peer, and peer_id is mDNS-advertised, so anyone on
+   the network could satisfy it.
+3. **Explicit per-peer admin grant** — NOT implied by pairing. Pairing means
+   "share dictionary data"; the phones are paired too, and a lost phone must
+   not carry power over someone's desktop settings.
+
+The signature covers the nonce **and** method+path+body, so a valid signature
+cannot be lifted off one request to authorize a different one.
+
+Every refusal logs which gate failed and what to do about it — "identity
+proven, but no admin grant" is a different problem from "signature does not
+verify", and they have opposite remedies.
+
+Still to come: the `admin` flag + grant toggle (nothing can pass gate 3 yet),
+the client-side LAN transport, `--peer` launch, and the peer-row button.
+
+## 0.55.101 — LAN identity can be proved, not just asserted (phase 1)
+
+First phase of remote-settings-over-LAN
+(`agenda/remote_settings_over_lan.md`), and a security fix that stands on
+its own.
+
+**LAN identity was forgeable.** A caller stated its `peer_id` in the request
+body; the listener length-checked it and looked it up in `peers.json`. No
+signature, no nonce, no demonstration of holding the private key — and
+`peer_id` is not a secret, since it is advertised over mDNS so peers can
+find each other. Effective access control: *be on this LAN and know a paired
+peer_id.* `_handle_hello_bodyauth` has carried the TODO since it was
+written.
+
+Tolerable for opportunistic data sync — the FF check and merge guards bound
+the damage — but **settings-write on someone else's machine must not ride on
+it**, which is why this lands before any of the remote-UI work.
+
+Cheap to fix properly because **`peer_id` IS the raw ed25519 public key**:
+verification needs no certificate parsing.
+
+`peer_id.py` gains:
+
+- `sign_hex(message)` — sign with this device's private key.
+- `verify_hex(peer_id, message, sig)` — direct ed25519 verify. Returns
+  False on any fault and **never raises**: it is an authorization gate, and
+  an exception escaping into a handler could turn a failed check into
+  something an outer `except` reads as other than "denied".
+- `issue_nonce()` / `spend_nonce()` — single-use challenge, 60 s TTL, map
+  capped at 512 with oldest-dropped. Bounded because this is reachable by
+  anything that can open a socket, *before* any identity check.
+
+A signature alone would only prove the caller once held the key — replayable
+from a captured request. The nonce makes each proof fresh; spending it on
+verification makes replay fail even inside the TTL.
+
+Not yet wired into the handlers — that is the next commit, and until then
+nothing behaves differently.
+
+## 0.55.100 — `browser.cancel()` was restarting the daemon every ten minutes
+
+Idjop's Windows desktop restarted **three times in six hours**, every one the
+same stack:
+
+```
+_iface_watcher_loop → restart_browse → stop_browse
+  → _stop_browse_zeroconf → browser.cancel() → _handle.join()
+```
+
+with the zeroconf browser thread parked in our own `_record` at `with _LOCK`.
+
+`ServiceBrowser.cancel()` joins the browser thread with **no timeout**. If that
+thread is waiting on `_LOCK` — held by whoever is mid-resolve — the join never
+returns. `restart_browse` runs on the iface-watch loop, so the loop stops
+ticking, and at 600 s the watchdog restarts the daemon. That machine's network
+flaps constantly (WiFi + hotspot), firing `restart_browse` every few seconds;
+it only had to lose one race.
+
+Not cosmetic: killing a busy daemon mid-merge is exactly how in-flight work
+gets interrupted, and the restarts were landing on a machine already
+struggling.
+
+Cancel now runs on a throwaway thread with a 5 s bounded wait. A wedged
+browser leaks one thread and we continue — strictly better than stalling the
+loop that watches the network — and the replacement browser still binds.
+
+### Also in this log: the corruption source is a Windows PermissionError
+
+Three lines name it:
+
+```
+[submit_file] 'nml' raised: PermissionError(13, 'Accès refusé')
+[lan-merge] three-way merge raised: PermissionError(13, 'Accès refusé')
+[peers] failed to load '…peers.json': PermissionError(13, 'Permission denied')
+```
+
+Six distinct unservable shas appear in that one log (`431635b9`, `594127cd`,
+`775c0359`, `b39d40d8`, `1e619eac`, `c1bc2e3d`) — each the head immediately
+after a successful `COMMITTED_LOCAL`. So it is not one damaged ref: **the ref
+advances and the objects do not survive**, repeatedly. Classic Windows
+antivirus-vs-git — the scanner locks or quarantines the freshly written loose
+object before anything reads it back.
+
+Fix is an AV exclusion for `C:\Users\OBT\AppData\Local\azt`, not code.
+0.55.99 keeps such a repo partially servable in the meantime.
+
+## 0.55.99 — a damaged repo serves what it can, instead of nothing
+
+**One bad ref poisons the entire fetch.** A peer reads `info/refs`, asks for
+everything advertised, and dulwich's `determine_wants` raises
+`GitProtocolError: Client wants invalid object` on the first sha we don't
+actually hold — so the peer receives **nothing**, including every ref we could
+have served perfectly.
+
+Field 2026-07-29, Idjop's desktop, third distinct sha in two days
+(`7315ccfa` → `303950c4` → `594127cd`): the aztobt2-ui phone could not fetch
+`nml` at all, though only one ref was broken. That machine keeps minting new
+unservable refs, so "wait until it's repaired" isn't a strategy — a damaged
+repo has to stay useful for its intact parts, or LAN convergence stops for
+everyone who talks to it.
+
+`_hide_unservable_refs` omits refs whose commit object isn't in the store.
+Membership test only, no reachability walk — it runs per served request, and
+the failure it prevents is precisely a sha the store doesn't contain. Logs the
+dropped names once per changed set.
+
+`HEAD` is never filtered: if HEAD itself is unservable the repo is beyond
+partial rescue, and dropping it would break the protocol rather than degrade
+it — 0.55.63's warning already names that case.
+
+Note also that 0.55.63 only inspected `HEAD` and `refs/heads/main`, so a
+broken **side** or **topic** ref went entirely unnamed. This covers all of
+them.
+
+## 0.55.98 — nobody should have to toggle it; and stop recomputing the seed set
+
+### The ahead-of-github check now runs periodically
+
+Kent, on being told the server runs itself: *"Well, I still had to toggle it
+online…"* He did, and that toggle was the only thing that started the run.
+
+0.55.69 restricted the ahead-of-github check to the nudge path because it
+walks history and the tick runs every 15 s. Correct about the cost, wrong
+about the consequence: **LAN-received work never sets `pending_push`**, so a
+daemon nobody touches never discovers it is behind. That defeats the entire
+goal — a server left with a team, getting data online unattended.
+
+Now on a 10-minute cadence: a device left alone converges within the hour, and
+the walk is negligible at that rate. Says so when it runs, so the reason a
+push started is never a mystery.
+
+### The seeded-object set is cached
+
+The estimate runs per chunk attempt by design, but it re-walked all 976 seed
+refs' trees every single time — and both the estimator and the blob
+enumeration did it independently. Field timestamps put that at **16 seconds
+per estimate** (09:01:51.9 → 09:02:08.1), repeated for every attempt: minutes
+per pass recomputing an answer that changes only when a new seed lands.
+
+`_seeded_object_shas` caches it, invalidated on seed-ref count change — which
+is exactly when a new seed appears. Cheap to check (a ref listing, no tree
+walks) and can only err toward recomputing.
+
+## 0.55.97 — the pack-size estimate had the same orphan bug
+
+0.55.96 fixed the blob enumeration and 0.55.96's own field run proved it:
+
+```
+preseed: 1259 blob(s) already seeded on the server will be skipped
+preseed: nothing to seed (all referenced blobs already reachable from server refs)
+```
+
+But the **estimate** still reported `16,971,899 bytes` for that same unit —
+the one whose blobs pre-seed had just confirmed were all on the server. Same
+defect, one layer up: 0.55.80 offers remote-tracking refs to
+`MissingObjectFinder` as `haves`, and the orphan `azt-blob-seed-*` commits
+exclude nothing because the finder needs an ancestry path. I fixed it in the
+enumeration and left it in the estimator.
+
+It matters because this number drives the oversize bail: it triggered a
+pre-seed pass with nothing to do, then granted an 849 s timeout for a push
+that should be trivial. Field: **11.0 GB** estimated with 976 seed refs
+confirmed present.
+
+Now the seeded object set (trees and their contents) is subtracted explicitly,
+same as `_enumerate_new_blobs`, and it reports how many it excluded.
+
+Also reworded the log line. *"counting N remote-tracking ref(s) as already on
+the server"* asserted an exclusion that wasn't happening for orphan refs — it
+now says "offering N … as haves", which is what the code actually does, and
+the real exclusion reports itself separately.
+
 ## 0.55.96 — every pre-seed pass was re-uploading all prior work
 
 **This is why the batch totals inflated instead of shrinking (548 → 817).**

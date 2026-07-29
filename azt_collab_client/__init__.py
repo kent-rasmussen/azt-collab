@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.96"
+__version__ = "0.55.144"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -1026,8 +1026,12 @@ def lan_list_peers():
     """Return the daemon's paired-peers list as a list of dicts
     (``peer_id``, ``device_name``, ``fp``, ``endpoints``,
     ``static_endpoints``, ``shared_projects``, ``paired_at``,
-    ``last_seen_at``). Empty list on transport failure or no
-    peers."""
+    ``last_seen_at``, ``admin``). Empty list on transport failure or no
+    peers.
+
+    Entries pass through unmodified — this wrapper must not select fields,
+    or a newly added one (``admin``, 0.55.117) is silently absent in the
+    UI while the daemon reports it correctly."""
     try:
         resp = call('GET', '/v1/lan/peers')
     except ServerUnavailable:
@@ -1990,6 +1994,51 @@ def lan_unpair(peer_id):
             'SERVER_ERROR',
             {'error': resp.get('error', 'unknown')})])
     return Result.from_dict(resp.get('result') or {})
+
+
+def lan_can_admin(peer_id):
+    """May WE change *peer_id*'s settings? (0.55.123)
+
+    Returns ``{'ok', 'allowed', 'reason', 'detail'}``. ``reason`` is
+    ``'refused'`` (reachable, no grant) or ``'unavailable'`` (can't ask).
+
+    **Not used by the UI, by design (0.55.125).** Three attempts at hiding
+    the "Open settings" button on this answer all misled: gated on the
+    wrong side's flag, then hidden when merely unreachable, then a control
+    that appeared and disappeared. From a user's seat the distinction
+    doesn't exist — either the action works or it doesn't — so the UI
+    offers it unconditionally and lets the attempt report the reason.
+    Kept for callers that genuinely want to pre-check.
+
+    Unanswerable from local state on purpose: ``peers.json``'s ``admin``
+    flag is what WE grant THEM. Whether THEY grant US is only on their
+    machine, so the daemon makes one real admin call to find out."""
+    try:
+        resp = call('POST', '/v1/lan/can_admin', {'peer_id': peer_id})
+    except ServerUnavailable as ex:
+        return {'ok': False, 'allowed': False, 'reason': 'unavailable',
+                'detail': str(ex)}
+    return resp or {'ok': False, 'allowed': False,
+                    'reason': 'unavailable', 'detail': 'empty_response'}
+
+
+def lan_set_admin(peer_id, allowed=True):
+    """Grant or revoke a paired peer's permission to change THIS device's
+    settings remotely (0.55.117).
+
+    Pairing does not imply this — pairing shares dictionary data, and a
+    lost phone must not be able to reconfigure someone's desktop. The
+    grant is a separate, deliberate act performed on the machine being
+    administered, which is why there is no way to request it remotely.
+
+    Returns ``{'ok': bool, 'admin': bool}``; ``ok`` False with
+    ``error='peer_unknown'`` if the peer isn't paired. Never raises."""
+    try:
+        resp = call('POST', '/v1/lan/set_admin',
+                    {'peer_id': peer_id, 'allowed': bool(allowed)})
+    except ServerUnavailable as ex:
+        return {'ok': False, 'error': str(ex)}
+    return resp or {'ok': False, 'error': 'empty_response'}
 
 
 def lan_pair_accept(payload):
@@ -3513,6 +3562,7 @@ __all__ = [
     'service_health', 'lan_pair_qr',
     'lan_pair_qr_keepalive', 'lan_pair_qr_close', 'lan_pair_accept',
     'lan_share_project', 'lan_unshare_project', 'lan_unpair',
+    'lan_set_admin', 'lan_can_admin',
     'lan_toggle', 'lan_set_toggle', 'lan_set_static_endpoints',
     'lan_clone', 'lan_clone_progress', 'lan_pending',
     'lan_accept_offer',
