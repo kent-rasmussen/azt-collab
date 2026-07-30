@@ -9,6 +9,167 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.156 — learn the address from the peer that is already talking to us
+
+Field 2026-07-30, two machines both on `172.16.133.x`:
+
+```
+can_admin 3a0285ec: NOT allowed — no address answered for 3a0285ec —
+  tried 2 of 7, 5 not tried (time budget spent): 192.168.31.179:38141 …
+[lan-admin] '3a0285ec' … refused GET '/v1/health' — identity proven
+```
+
+Seven recorded endpoints, most from previous networks, and the 8 s dial budget
+spent on two of them. The address that would have worked was among the five never
+reached — while the peer was connecting to us, repeatedly, throughout.
+
+`_handle_admin` now records the arrival address, **above the grant check**. The
+signature has already verified at that point, so the source host provably belongs
+to that peer whether or not the call is authorised; refusing the RPC is no reason
+to discard the one piece of reachability evidence that is hard to come by.
+`_note_inbound_endpoint` takes `deliver=False` for this path — the address should
+be learned, but an admin request is not a sync trigger and the toggle may be off
+entirely.
+
+Promotion puts it at the head of the list the dialler reads first, so the next
+`can_admin` tries the address that just worked instead of a subnet nobody is on.
+It also re-keys the admin transport cache, which is keyed on `(fp, endpoints)`.
+
+Not done here: the challenge endpoint is unauthenticated, so it can't promote on
+an unverified `peer_id` claim without letting a caller poison the head of the
+list. Pinning would make a poisoned address fail harmlessly, but it would still
+burn budget — so only the signed path teaches us anything.
+
+## 0.55.155 — LAN off no longer means unreachable forever
+
+The admin channel rides on the LAN listener, so switching `lan.allow_sync` off
+tore down the only remote way to switch it back on. Physical access became the
+sole recovery — for any device, whether or not the user understood that when they
+tapped it. On machines being left behind in the field, that is one tap from
+permanent unsupportability.
+
+When the toggle is off and **a peer holds a remote-settings grant**, the listener
+now stays bound serving exactly two paths — `/v1/lan/challenge` and
+`/v1/lan/admin` — and returns `403 lan_sync_off` for everything else: no git
+smart-protocol, no hello, no share offers, no diagnostics pull. Since
+`_handle_admin` tunnels into `server.dispatch`, `POST /v1/lan/toggle` reaches the
+daemon through it and `apply_toggle` promotes the door back to a full listener in
+place, no restart.
+
+What stays off is everything that costs anything: no mDNS advertise, no browse,
+no bind sweep, no FGS, no WifiLock. The door is a bound TCP socket and nothing
+else, so reachability depends on the peer having a recorded address — the
+`lan_listener_port` memo means the previous one is usually still right, and
+static endpoints cover fixed machines.
+
+This is the inbound counterpart of a rule the outbound side has had since
+0.55.68 — Kent's correction, 2026-07-30: `_https_post_to_peer`'s `force` already
+bypasses the toggle for deliberate user gestures (QR pair, cable), so "off" never
+meant "no packets", it meant "no automatic sync". An admin grant is a stronger
+gesture than the ones `force` honours: made in advance, by the device's own user,
+naming one specific peer. I had justified the design with "otherwise off wouldn't
+be off", which was already false when I wrote it.
+
+Gated on a granted peer existing, and **fails closed** — if the peer registry
+can't be read we don't bind, because a socket opened on a guess is worse than a
+device needing local attention.
+
+**Desktop only, deliberately.** On Android the listener needs the FGS to survive
+doze, and releasing the FGS and WifiLocks is the entire point of the toggle, so a
+bound socket there would be a promise the OS breaks within minutes. Phones need
+the pre-apply warning on the toggle instead — not yet built, and the only honest
+protection available to them.
+
+## 0.55.154 — a helper whose docstring lied about its return
+
+0.55.153's new line kept printing on every re-offer:
+
+```
+share-offer from '80570dd9' for 'nml': recording that they share it with us
+```
+
+announcing a recording that had happened once, minutes earlier.
+`_set_entry_list` returns `True` when the value is **already** in the wanted
+state (`peers.py:551`) while its docstring said *"Returns True when the file
+changed."* I read the docstring instead of the four lines under it, and gated a
+change-announcement on a success-flag.
+
+- `add_their_shared_project` now compares before and after, so it returns True
+  only when it actually added something.
+- `_set_entry_list`'s docstring says what it really means, and says explicitly
+  that callers needing change-detection must compare themselves — because two
+  other callers (`add_declined_share`, `set_share_confirmed`) rely on the
+  success semantics and must not be changed.
+
+Same defect family as everything else in this arc, one layer further in: not a
+log line placed before its gate, but a log line trusting a **comment** about
+whether the gate had passed.
+
+Separately, the repeated offers are the peer's own `unconfirmed_shares` heal
+re-offering `nml` because it has no evidence we share it back yet. That stops
+once a delivery to them succeeds; it is not caused by anything on this side.
+
+## 0.55.153 — the proof was filed where the gate never looks
+
+0.55.152's re-ask worked: hello sent, `auto-reverse-recorded`, answer received —
+and the answer was `[]`. Then 66 ms later:
+
+```
+10:57:13,197  skipping 'nml' — ONE-SIDED SHARE … (their grants: [])
+10:57:13,263  share-offer from '80570dd9' for 'nml'
+```
+
+The peer was **actively offering us the project** while its hello manifest
+claimed it shared nothing. `send_share_offer` is only issued for projects in the
+sender's own allowlist, so the grant was real; two channels carried the same
+fact and the gate consulted the empty one.
+
+And the code already knew. `lan_listener.py:1573`, since 0.54.98: *"Their offer
+proves this project IS in their allowlist for us."* It recorded that into
+`shares_confirmed` — which the one-sided-share gate does not read. The gate reads
+`their_shared_projects`, written only by the hello manifest. A correct
+observation, written down in the wrong place, for two months.
+
+- `peers.add_their_shared_project` records a single grant additively, and the
+  share-offer handler now calls it. An offer outranks a manifest that omits the
+  project.
+- `set_their_shared_projects` will no longer let a manifest **silently retract**
+  anything in `shares_confirmed`. It replaces the whole list, so without this
+  the next empty hello would undo what the offer just recorded. Retraction keeps
+  its own channel — `share_unshared`, a user gesture, which clears both fields.
+- The hello now logs what the peer actually reported. Without it there is no way
+  to separate "they told us nothing" from "we failed to record what they told
+  us", which is what made this invisible for a day.
+
+The bias is deliberate and stated: erring this way costs at most a refused peek;
+erring the other way cost 4705 commits sitting on one machine.
+
+## 0.55.152 — re-ask before refusing on a cached "they share nothing"
+
+The grant was visibly in place. Peer `80570dd9`'s own settings page listed `nml`
+as **Shared** with this device, and this side went on logging:
+
+```
+skipping 'nml' — ONE-SIDED SHARE … (their grants: []). Not dialing.
+```
+
+`their_shared_projects` is written **only** by the hello exchange, and hello
+fires on mDNS *arrival*. The peer granted the share while already on the
+network — no arrival transition, so no hello, so no refresh. Two daemons can sit
+on the same LAN indefinitely, one of them refusing to dial on an answer the other
+has already changed. Getting out of it required a human to notice and trigger
+discovery by hand, which is exactly the handholding this whole arc exists to
+remove.
+
+`sweep_peer` now says hello to re-ask before acting on that cache, throttled to
+once per 5 minutes per peer. Narrowly scoped to the one combination that is both
+actionable and cheap to be wrong about: **they share nothing while we share
+something with them.** A stale non-empty list costs one refused peek; a stale
+empty one costs the entire collaboration in both directions.
+
+Pairs with 0.55.148's reciprocal grant — that stops the state from being created,
+this one recovers from it where it already exists.
+
 ## 0.55.151 — the seed refs outlive the work they existed for
 
 nml fully converged, and github's branch list still showed three AZT branches:

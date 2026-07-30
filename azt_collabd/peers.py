@@ -537,8 +537,13 @@ def set_shared_projects(peer_id, langcodes):
 
 
 def _set_entry_list(peer_id, key, langcode, present):
-    """Add/remove *langcode* in a per-peer list field. Returns True
-    when the file changed."""
+    """Add/remove *langcode* in a per-peer list field.
+
+    Returns True on SUCCESS — including when the value was already in the
+    wanted state and nothing was written. It does **not** mean "the file
+    changed"; the docstring said so until 0.55.154 and a caller believed it,
+    logging "recording that they share it with us" on every no-op offer.
+    Callers that need change-detection must compare before and after."""
     with _LOCK:
         data = _load_raw()
         peers = data.get('peers') or {}
@@ -787,6 +792,26 @@ def set_their_shared_projects(peer_id, langcodes):
             return False
         entry = dict(peers[peer_id] or {})
         before = entry.get('their_shared_projects')
+        # A MANIFEST CANNOT SILENTLY RETRACT A PROJECT THEY OFFERED US
+        # (0.55.153). ``shares_confirmed`` holds projects this peer has
+        # actively offered — an act they only perform for projects in their
+        # own allowlist. A hello that omits one is therefore contradicted by
+        # direct evidence, and since this setter REPLACES the list, letting
+        # the omission win would undo what the offer recorded on the very
+        # next handshake.
+        #
+        # Retraction has its own channel: ``share_unshared``, a user gesture,
+        # which clears both fields. Erring this way costs at most a refused
+        # peek; erring the other way costs the collaboration (peer 80570dd9,
+        # 4705 commits).
+        _confirmed = {str(x) for x in (entry.get('shares_confirmed') or [])
+                      if isinstance(x, str) and x}
+        _kept = sorted(_confirmed - set(clean))
+        if _kept:
+            print(f'[peers] {peer_id[:8]!r} hello omitted {_kept!r}, but they '
+                  f'have offered those to us — keeping them; only an explicit '
+                  f'unshare removes a grant', file=sys.stderr, flush=True)
+            clean = sorted(set(clean) | _confirmed)
         if isinstance(before, list) and sorted(before) == clean:
             return True                     # no change; skip the write
         entry['their_shared_projects'] = clean
@@ -797,6 +822,31 @@ def set_their_shared_projects(peer_id, langcodes):
           f'(was {before!r})', file=sys.stderr, flush=True)
     _invalidate_sync_board()
     return True
+
+
+def add_their_shared_project(peer_id, langcode):
+    """Record ONE project *peer_id* shares with us, additively (0.55.153).
+
+    ``set_their_shared_projects`` replaces the whole list and is right for the
+    hello manifest, which is a complete statement. This is for evidence that
+    arrives one project at a time — chiefly a share-offer from them, which
+    proves that project is in their allowlist for us, since that is the only
+    thing that makes them send one.
+
+    Field 2026-07-30: peer 80570dd9 offered 'nml' every sweep while its hello
+    manifest reported ``[]``, and the one-sided-share gate — which reads
+    ``their_shared_projects`` — kept refusing to dial. The proof was being
+    recorded in ``shares_confirmed``, which that gate never consults.
+
+    Returns True only when this call ADDED it, so the caller can log a
+    recording that actually took place. ``_set_entry_list`` alone can't answer
+    that — it returns True for already-present too."""
+    entry = get_peer(peer_id)
+    if entry is None:
+        return False
+    already = str(langcode) in (entry.get('their_shared_projects') or [])
+    ok = _set_entry_list(peer_id, 'their_shared_projects', langcode, True)
+    return bool(ok) and not already
 
 
 def reciprocate_shares(peer_id, their_langcodes):

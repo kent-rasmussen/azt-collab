@@ -193,3 +193,39 @@ ambient status. Recorder could reuse it for its reload toast.
 
 Owner: desktop team asks; daemon implements at their cadence.
 Desktop wires up on sight of `commits_since` in the client.
+
+### ASK: a bounded timeout on `submit_file` — 300 s is indistinguishable from a hang
+
+Field 2026-07-29 (Kent, desktop azt): a save hit a held `project_lock` and the
+app was left with **no usable interface** for minutes. `rpc.call` defaults to
+`timeout=300` (`rpc.py:19`) and `submit_file(langcode, rel_path, staged_path,
+base_sha, message='')` (`__init__.py:3105`) exposes no timeout, so a peer has no
+way to bound it. A save is on the editor's UI thread by nature — whole-file
+serialize then submit — so an unbounded RPC there reads exactly like a freeze,
+and the user can't even choose what to do next.
+
+azt has done what it can on its side (1.13.x): BUSY is now retried 3× 0.7 s and
+never reported as "server unavailable". That covers the common one-second absorb.
+It cannot cover a minutes-long hold, because it cannot make the call return.
+
+Ask:
+1. A `timeout=` argument on `submit_file` (and ideally on the other
+   write-path wrappers), passed through to `rpc.call`. A peer that would rather
+   fail in 10 s and fall back to disk should be able to say so.
+2. Or, if a per-call argument is unwelcome, a module-level default a peer can
+   lower once at startup.
+3. Either way, please keep the BUSY answer distinguishable from a timeout — the
+   two want different peer behaviour (retry vs. fall back).
+
+Same shape as the first item in this queue (blocking RPC on the Kivy main
+thread, popup only dismissed after it returns): a timeout argument helps both,
+and neither peer can fix it alone.
+
+Owner: desktop team asks; daemon/client implements at their cadence. Desktop
+lowers its save timeout on sight of the argument.
+
+NOTE for whoever grooms this queue: the "commit metadata since a sha" ASK above
+looks SATISFIED — daemon 0.54.92 shipped `changes_since`
+(`{known, count, capped, authors}` + `bot_count`) and desktop azt renders it in
+`CollabSession.changes_summary`. Per this file's own rule it should probably be
+deleted; left in place because it isn't the desktop team's to delete.

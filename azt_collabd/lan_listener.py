@@ -810,6 +810,18 @@ def _handle_admin(environ, start_response):
               file=sys.stderr, flush=True)
         return _json_response(start_response, '403 Forbidden',
                               {'ok': False, 'error': 'not paired'})
+    # LEARN THE ADDRESS FROM A PROVEN REQUEST, EVEN A REFUSED ONE (0.55.156).
+    #
+    # Placed above the grant check on purpose: the signature has verified, so
+    # the source host provably belongs to this peer regardless of whether the
+    # call is authorised. Refusing the RPC is no reason to throw away the one
+    # piece of reachability evidence that is hard to come by.
+    #
+    # Field 2026-07-30: both machines were on 172.16.133.x while this side
+    # dialled 192.168.31.179 and spent its whole 8 s budget on
+    # ``2 of 7, 5 not tried`` — the working address was among the five it
+    # never reached, and the peer was connecting to us throughout.
+    _note_inbound_endpoint(peer, environ, payload, deliver=False)
     if not bool(entry.get('admin')):
         print(f'[lan-admin] {peer[:8]!r} ({entry.get("device_name") or "?"}): '
               f'refused {rpc_method} {rpc_path!r} — identity proven, but no '
@@ -1076,7 +1088,7 @@ def _json_response(start_response, status_line, body_dict):
 
 
 def _note_inbound_endpoint(peer_id, environ, payload=None,
-                           langcode=''):
+                           langcode='', deliver=True):
     """Promote the address this request ARRIVED from to the head of
     the peer's endpoint list (0.54.99).
 
@@ -1105,7 +1117,11 @@ def _note_inbound_endpoint(peer_id, environ, payload=None,
         if not port.isdigit():
             return
         _peers.promote_endpoint(peer_id, f'{host}:{port}')
-        _reverse_deliver(peer_id, langcode=langcode)
+        # ``deliver=False`` for the admin channel (0.55.156): we want the
+        # address learned, but an admin request is not a sync trigger and the
+        # toggle may be off entirely.
+        if deliver:
+            _reverse_deliver(peer_id, langcode=langcode)
     except Exception as ex:
         print(f'[lan-listener] endpoint promote raised: {ex!r}',
               file=sys.stderr, flush=True)
@@ -1576,6 +1592,29 @@ def _handle_share_offer(environ, start_response, peer_id,
         _peers.set_share_confirmed(peer_id, langcode, True)
     except Exception:
         pass
+    # RECORD THE PROOF WHERE THE GATE LOOKS (0.55.153).
+    #
+    # The line above has said "their offer proves this project IS in their
+    # allowlist for us" since 0.54.98 — and wrote it to ``shares_confirmed``,
+    # which the one-sided-share gate does not read. That gate reads
+    # ``their_shared_projects``, written only by the hello manifest.
+    #
+    # Field 2026-07-30, peer 80570dd9: it offered 'nml' on every sweep while
+    # its hello manifest reported ``[]``, so we refused to dial a peer that
+    # was actively telling us it shares the project — and its 4705 commits
+    # stayed on one machine. Two channels carried the same fact; the gate
+    # consulted only the one that was empty.
+    try:
+        if _peers.add_their_shared_project(peer_id, langcode):
+            print(f'[lan-listener] share-offer from {peer_id[:8]!r} for '
+                  f'{langcode!r}: recording that they share it with us — an '
+                  f'offer is only sent for projects in their allowlist, so '
+                  f'this outranks a hello manifest that omitted it',
+                  file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[lan-listener] share-offer from {peer_id[:8]!r}: could not '
+              f'record their grant of {langcode!r} ({ex!r}) — we may keep '
+              f'refusing to dial them for it', file=sys.stderr, flush=True)
     # Scoped to the project they just named (0.55.5): they told us
     # which one they care about, and we now hold an address that
     # provably reaches them.
@@ -2003,6 +2042,19 @@ def _peer_acl_middleware(app):
         # peers can be cryptographically identified per-request.
         method = environ.get('REQUEST_METHOD')
         path_info = environ.get('PATH_INFO', '')
+        # ADMIN-ONLY DOOR (0.55.155). When ``lan.allow_sync`` is off we may
+        # still be bound, serving nothing but the remote-settings channel,
+        # so a device whose user switched LAN off can be switched back on
+        # remotely. Everything else is refused here — no git smart-protocol,
+        # no hello, no share offers, no diagnostics pull. "Off" still means
+        # no sync; it stops meaning "unreachable forever".
+        if _STATE.get('admin_only') and path_info not in (
+                '/v1/lan/challenge', '/v1/lan/admin'):
+            return _json_response(
+                start_response, '403 Forbidden',
+                {'ok': False, 'error': 'lan_sync_off',
+                 'detail': 'LAN sync is off on this device; only the '
+                           'remote-settings channel is served'})
         # Signalling endpoints accept unpaired callers; identity
         # claim lives in the body. They self-validate by checking
         # the body's ``peer_id``/``fp`` match each other (the
@@ -3847,6 +3899,38 @@ def stop():
     print('[lan-listener] stopped', file=sys.stderr, flush=True)
 
 
+def _admin_door_wanted():
+    """True when LAN sync is off but we should still answer the admin channel.
+
+    **Desktop only, deliberately.** On Android the listener needs the
+    foreground service to survive doze, and the whole point of the toggle is
+    to release the FGS and the WifiLocks — so a bound socket there would be a
+    promise the OS will break within minutes. Phones get the pre-apply warning
+    on the toggle instead; that is the only honest protection available to
+    them (Kent 2026-07-30: "linux and windows only is OK").
+
+    Requires a peer we have granted admin. Nobody authorised, no socket."""
+    try:
+        if (os.environ.get('ANDROID_ARGUMENT')
+                or os.environ.get('ANDROID_BOOTLOGO')):
+            return False
+    except Exception:
+        pass
+    try:
+        from . import peers as _peers
+        for entry in (_peers.list_peers() or []):
+            if entry.get('admin'):
+                return True
+    except Exception as ex:
+        # Fail CLOSED: if we can't read the grants we don't know anyone
+        # authorised this, and a socket bound on a guess is worse than a
+        # device that needs local attention.
+        print(f'[lan-listener] admin-door check could not read peers '
+              f'({ex!r}) — not binding the admin channel',
+              file=sys.stderr, flush=True)
+    return False
+
+
 def apply_toggle():
     """Reconcile the listener lifecycle with the union of:
       - ``lan.autodiscovery`` (continuous-on policy bit), and
@@ -3878,15 +3962,70 @@ def apply_toggle():
     autodiscovery = _settings.lan_autodiscovery()
     burst_armed = (_lan_fgs.snapshot().get('ref_discovery', 0) > 0)
     desired = autodiscovery or burst_armed
-    if desired and not is_running():
-        def _fail(step, ex):
-            # Same per-step attribution as before, plus a typed copy
-            # the toggle RPC can hand the UI so the user sees WHICH
-            # step failed instead of "see the daemon log" (0.54.75).
-            print(f'[lan-listener] {step} failed: {ex!r}',
+
+    def _fail(step, ex):
+        # Same per-step attribution as before, plus a typed copy
+        # the toggle RPC can hand the UI so the user sees WHICH
+        # step failed instead of "see the daemon log" (0.54.75).
+        print(f'[lan-listener] {step} failed: {ex!r}',
+              file=sys.stderr, flush=True)
+        with _LOCK:
+            _STATE['bind_error'] = f'{step}: {ex!r}'[:200]
+
+    # ADMIN-ONLY DOOR (0.55.155). The admin channel rides on this listener,
+    # so switching LAN sync off removed the only remote way to switch it back
+    # on — physical access became the sole recovery, for any device, whether
+    # or not the user understood that when they tapped it.
+    #
+    # This is the inbound counterpart of a principle the outbound side has
+    # had since 0.55.68: ``_https_post_to_peer``'s ``force`` bypasses the
+    # toggle for deliberate user gestures (QR pair, cable). An admin grant is
+    # a stronger gesture than those — made in advance, by this device's own
+    # user, naming one specific peer.
+    #
+    # Gated on a granted peer existing, so no socket is bound on a device
+    # where nobody authorised one.
+    admin_only = (not desired) and _admin_door_wanted()
+    want_listener = desired or admin_only
+    # ``is_running()`` can't tell the two modes apart, so a mode flip has to
+    # rebind explicitly rather than short-circuit on "already running".
+    if is_running() and bool(_STATE.get('admin_only')) != admin_only:
+        print(f'[lan-listener] switching to '
+              f'{"admin-only" if admin_only else "full"} mode — rebinding',
+              file=sys.stderr, flush=True)
+        try:
+            _lan_discovery.stop_browse()
+            _lan_discovery.stop_advertise()
+        except Exception as ex:
+            print(f'[lan-listener] discovery stop raised: {ex!r}',
                   file=sys.stderr, flush=True)
-            with _LOCK:
-                _STATE['bind_error'] = f'{step}: {ex!r}'[:200]
+        stop()
+        if admin_only:
+            _lan_fgs.stop_fgs()
+            _lan_fgs.release_wifi_locks()
+    if admin_only and not is_running():
+        # No WifiLock, no FGS, no advertise, no browse, no bind sweep. Those
+        # are where the radio and battery cost lives, and they stay off — the
+        # door is a bound TCP socket and nothing else. Reachability therefore
+        # depends on the peer having a recorded address; the port memo means
+        # the previous one is usually still correct.
+        with _LOCK:
+            _STATE['admin_only'] = True
+        try:
+            bound = start()
+        except Exception as ex:
+            _fail('admin-door bind', ex)
+            return
+        with _LOCK:
+            _STATE['bind_error'] = ''
+        print(f'[lan-listener] LAN sync is off, but a peer holds a '
+              f'remote-settings grant — serving the admin channel only on '
+              f'{bound[0]}:{bound[1]} (no sync, no discovery, no radio '
+              f'locks)', file=sys.stderr, flush=True)
+        return
+    if desired and not is_running():
+        with _LOCK:
+            _STATE['admin_only'] = False
         try:
             _lan_fgs.acquire_wifi_locks()
         except Exception as ex:
@@ -3948,7 +4087,7 @@ def apply_toggle():
         import threading as _t_mod
         _t_mod.Thread(target=_listener_bind_sweep, daemon=True,
                       name='lan-bind-sweep').start()
-    elif not desired and is_running():
+    elif not want_listener and is_running():
         try:
             _lan_discovery.stop_browse()
             _lan_discovery.stop_advertise()
@@ -3958,3 +4097,5 @@ def apply_toggle():
         stop()
         _lan_fgs.stop_fgs()
         _lan_fgs.release_wifi_locks()
+        with _LOCK:
+            _STATE['admin_only'] = False

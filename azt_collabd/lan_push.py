@@ -1988,6 +1988,14 @@ def hello_to_peer(host, port, expected_fp, device_name='',
         if isinstance(theirs, list) and their_pid:
             try:
                 _theirs = [str(x) for x in theirs if isinstance(x, str)]
+                # SAY WHAT THEY ACTUALLY REPORTED (0.55.153). Without this
+                # there is no way to tell "they told us nothing" from "we
+                # failed to record what they told us" — the exact ambiguity
+                # that made peer 80570dd9's empty manifest undiagnosable
+                # while it was simultaneously offering us the project.
+                print(f'[lan-hello] {their_pid[:8]!r} reports sharing '
+                      f'{sorted(_theirs)!r} with us',
+                      file=sys.stderr, flush=True)
                 _peers.set_their_shared_projects(their_pid, _theirs)
                 # Same reciprocal heal as the listener side (0.55.148);
                 # both halves of the hello exchange record the manifest,
@@ -2438,6 +2446,36 @@ _sweep_gate_lock = threading.Lock()
 _SWEEP_DEBOUNCE_S = 8.0
 
 
+# Re-ask a peer what they share with us at most this often (0.55.152). One
+# hello is a single small TLS round trip, but the skip path it guards runs on
+# every sweep, so it needs a floor.
+_MANIFEST_REFRESH_MIN_INTERVAL_S = 300.0
+_manifest_refresh_at = {}       # peer_id → monotonic time of last hello
+
+
+def _refresh_their_manifest(peer_id, entry):
+    """Say hello so the peer re-sends its ``shared_with_you`` manifest.
+
+    The hello response handler records it (and, since 0.55.148, reciprocates),
+    so this function's only job is to make the round trip happen. Returns True
+    if the hello was delivered.
+
+    Exists because the manifest is otherwise written only on mDNS arrival: a
+    peer that grants us a project while already on the network produces no
+    arrival, so nothing re-asks and the stale "they share nothing" stands
+    indefinitely."""
+    from . import store as _store_mod
+    ep = _resolve_endpoint(entry)
+    if ep is None:
+        print(f'[lan-sweep] {peer_id[:8]!r}: no reachable address to re-ask '
+              f'for their share list', file=sys.stderr, flush=True)
+        return False
+    host, port = ep
+    return bool(hello_to_peer(
+        host, int(port), entry.get('fp', ''),
+        _store_mod.get_device_name(), langcode='', peer_id_hint=peer_id))
+
+
 def sweep_peer(peer_id, exclude_langcode=''):
     """Push every shared project with *peer_id* where the peer
     isn't already at our HEAD. Used by:
@@ -2560,6 +2598,37 @@ def sweep_peer(peer_id, exclude_langcode=''):
     # ``None`` = never told (pre-0.55.50 peer, or no hello yet) → behave
     # exactly as before. A list, INCLUDING an empty one, is an answer.
     theirs = _their_shared_projects(peer_id, entry)
+    # REFRESH A MANIFEST THAT SAYS "NOTHING" BEFORE ACTING ON IT (0.55.152).
+    #
+    # ``their_shared_projects`` is only written by the hello exchange, and
+    # hello fires on mDNS *arrival*. So a peer who grants us a project while
+    # already present produces no arrival transition, no hello, and no
+    # refresh — and we go on refusing to dial on a cached empty list for as
+    # long as both daemons stay up. Field 2026-07-30: the grant was visibly
+    # in place on peer 80570dd9 (its own settings page listed 'nml' as
+    # Shared) while this side kept logging ``their grants: []`` and skipping.
+    #
+    # Only when the cache says they share NOTHING while we share something
+    # with them — the one combination that is both actionable and cheap to
+    # be wrong about. A stale non-empty list costs a refused peek; a stale
+    # empty one costs the entire collaboration.
+    if shared and isinstance(theirs, list) and not theirs:
+        _now = _time_mod.monotonic()
+        _last = _manifest_refresh_at.get(peer_id, 0.0)
+        if (_now - _last) >= _MANIFEST_REFRESH_MIN_INTERVAL_S:
+            _manifest_refresh_at[peer_id] = _now
+            print(f'[lan-sweep] {peer_id[:8]!r}: cached manifest says they '
+                  f'share nothing while we share {sorted(shared)!r} — '
+                  f'saying hello to re-ask before skipping',
+                  file=sys.stderr, flush=True)
+            try:
+                _refresh_their_manifest(peer_id, entry)
+                entry = _peers.get_peer(peer_id) or entry
+                theirs = _their_shared_projects(peer_id, entry)
+            except Exception as ex:
+                print(f'[lan-sweep] {peer_id[:8]!r}: manifest refresh '
+                      f'raised: {ex!r} — proceeding on the cached answer',
+                      file=sys.stderr, flush=True)
     out = {}
     for langcode in shared:
         if langcode == exclude_langcode:
