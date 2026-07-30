@@ -1987,9 +1987,13 @@ def hello_to_peer(host, port, expected_fp, device_name='',
         their_pid = str(decoded.get('peer_id', '') or '')
         if isinstance(theirs, list) and their_pid:
             try:
-                _peers.set_their_shared_projects(
-                    their_pid,
-                    [str(x) for x in theirs if isinstance(x, str)])
+                _theirs = [str(x) for x in theirs if isinstance(x, str)]
+                _peers.set_their_shared_projects(their_pid, _theirs)
+                # Same reciprocal heal as the listener side (0.55.148);
+                # both halves of the hello exchange record the manifest,
+                # so both must act on it or the fix depends on which
+                # device happened to dial first.
+                _peers.reciprocate_shares(their_pid, _theirs)
             except Exception as ex:
                 print(f'[lan-hello] recording their manifest raised: '
                       f'{ex!r}', file=sys.stderr, flush=True)

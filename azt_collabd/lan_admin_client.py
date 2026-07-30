@@ -146,6 +146,32 @@ def _build_transport(peer_id):
                         body=json.dumps(payload).encode('utf-8'),
                         headers={'Content-Type': 'application/json'})
                 raw = resp.data.decode('utf-8') or '{}'
+                if resp.status == 404 and 'not supported' in raw:
+                    # VERSION SKEW, not a refusal (0.55.145). This exact
+                    # sentence is dulwich's ``HTTPGitApplication`` 404 —
+                    # OUR route table didn't match, so the request fell
+                    # through to the git backend, which rejected it. That
+                    # only happens when the peer's daemon predates the
+                    # endpoint we just asked for.
+                    #
+                    # Worth its own branch because the raw form cost a
+                    # field evening: the grant was in place, TLS and
+                    # pinning were fine, the canonical form matched, and
+                    # the target even LOGGED the incoming GET before
+                    # 404ing it. Every local check said yes. A fleet
+                    # updates one device at a time, so this will recur —
+                    # say which side is behind.
+                    # Say what is KNOWN (the route is absent), not which of
+                    # the two causes it is. Both produce this byte-for-byte:
+                    # older code, OR a stale server process still holding
+                    # the port while the restarted one took an ephemeral.
+                    # Claiming "too old" would have been wrong in the field
+                    # case that prompted this — that peer reported 0.55.144.
+                    raise RuntimeError(
+                        f"that device's collaboration server has no "
+                        f"remote-settings endpoint — it is running older "
+                        f"code, or an old server process is still holding "
+                        f"the port (asked {ep} for {path})")
                 if resp.status >= 400:
                     # An ANSWER, not a transport failure: the peer is
                     # reachable and declined. Stop trying other addresses

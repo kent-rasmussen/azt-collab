@@ -799,6 +799,53 @@ def set_their_shared_projects(peer_id, langcodes):
     return True
 
 
+def reciprocate_shares(peer_id, their_langcodes):
+    """Grant back every project *peer_id* shares with us that we hold.
+
+    The retroactive half of "accepting a share grants it back" (0.55.148).
+    The accept-time grant only fires on future accepts; every peer that
+    already accepted is stuck one-sided forever, which is precisely the
+    state that stranded 4705 commits on peer 80570dd9.
+
+    Symmetric and self-healing: each side learns the other's manifest on
+    the hello exchange both already make, so as soon as both daemons run
+    this code the grant completes itself with no user action on either
+    machine. Scoped strictly to projects we ALREADY have registered — this
+    grants access to nothing new, it only stops refusing to serve back a
+    project we are demonstrably collaborating on.
+
+    Returns the list of langcodes newly granted (empty when nothing
+    changed, which is the steady state).
+    """
+    if not peer_id or not isinstance(their_langcodes, list):
+        return []
+    entry = get_peer(peer_id)
+    if entry is None:
+        return []
+    already = set(entry.get('shared_projects') or [])
+    try:
+        from . import projects as _projects
+        have = {p.langcode for p in (_projects.list_all() or [])}
+    except Exception as ex:
+        print(f'[peers] reciprocate_shares({peer_id[:8]}): could not read '
+              f'the project registry ({ex!r}) — not granting anything back',
+              file=sys.stderr, flush=True)
+        return []
+    added = []
+    for langcode in their_langcodes:
+        code = str(langcode or '')
+        if not code or code in already or code not in have:
+            continue
+        if add_shared_project(peer_id, code) is not None:
+            added.append(code)
+    if added:
+        print(f'[peers] reciprocate_shares({peer_id[:8]}): they share '
+              f'{added!r} with us and we hold those, so we now share them '
+              f'back — otherwise their work on those projects can never '
+              f'reach us', file=sys.stderr, flush=True)
+    return added
+
+
 def their_shared_projects(peer_id):
     """What *peer_id* shares with us, or ``None`` if never told."""
     entry = get_peer(peer_id)

@@ -1671,7 +1671,16 @@ def _manage_peer_popup(peer, on_refresh, font_name='Roboto'):
             try:
                 from .. import lan_can_admin
                 res = lan_can_admin(pid) or {}
-            except Exception:
+            except Exception as ex:
+                # NEVER SWALLOW THIS (0.55.145). ``except Exception:
+                # return`` here is why an evening went into finding why a
+                # button never appeared: the grant persisted, the challenge
+                # was served, the canonical form matched — and the actual
+                # failure was thrown away without a word, in the one place
+                # that knew it.
+                print(f'[lan-admin-ui] permission probe for '
+                      f'{str(pid)[:8]} raised: {ex!r}',
+                      file=sys.stderr, flush=True)
                 return
             if res.get('allowed'):
                 Clock.schedule_once(

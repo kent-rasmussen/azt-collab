@@ -1012,9 +1012,13 @@ def _handle_hello_bodyauth(environ, start_response):
     try:
         claimed = payload.get('shared_with_you')
         if isinstance(claimed, list):
-            _peers.set_their_shared_projects(
-                actual_peer_id,
-                [str(x) for x in claimed if isinstance(x, str)])
+            _claimed = [str(x) for x in claimed if isinstance(x, str)]
+            _peers.set_their_shared_projects(actual_peer_id, _claimed)
+            # Grant back what they share with us and we already hold
+            # (0.55.148) — the retroactive half of the accept-time rule,
+            # so peers that accepted before that shipped stop being
+            # one-sided without anyone having to notice and fix it.
+            _peers.reciprocate_shares(actual_peer_id, _claimed)
     except Exception as ex:
         print(f'[lan-listener] hello: recording caller manifest '
               f'raised: {ex!r}', file=sys.stderr, flush=True)

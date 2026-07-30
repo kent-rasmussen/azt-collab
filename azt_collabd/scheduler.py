@@ -954,6 +954,19 @@ def _watcher_loop():
         # each tick turns health into "the working loops are alive N s
         # ago" rather than "the socket accepted".
         heartbeat('watcher')
+        # Repository maintenance (0.55.147). On its OWN thread: a repack is
+        # minutes of CPU on a large project, and this loop also drives
+        # connectivity + the push drain — blocking it would stall syncing
+        # behind housekeeping. ``due()`` is a clock check so we don't spawn
+        # a thread every tick.
+        try:
+            from . import maintenance as _maintenance
+            if _maintenance.due():
+                threading.Thread(target=_maintenance.sweep,
+                                 name='maintenance', daemon=True).start()
+        except Exception as ex:
+            print(f'[maintenance] sweep spawn raised: {ex!r}',
+                  file=sys.stderr, flush=True)
         try:
             online = _has_internet()
         except Exception:

@@ -1671,6 +1671,45 @@ def _h_lan_accept_offer(body):
         S.LAN_PROJECT_CLONED, S.LAN_PROJECT_REOPENED)
     if delivered:
         _pending.remove(decision_id)
+        # ACCEPTING A SHARE GRANTS IT BACK (0.55.148).
+        #
+        # Without this, accepting is one-way: we clone their project, work
+        # in it, and never serve it back — because our ``shared_projects``
+        # for them stays empty. Their daemon then hits the one-sided-share
+        # gate (``lan_push.py:2575``) and stops dialing us entirely, so
+        # neither push nor peek happens and our commits are stranded on
+        # local disk with no way for the collaboration to notice.
+        #
+        # Field 2026-07-30, peer 80570dd9 (BACKTRAN-OBT-NDEMLI): accepted
+        # 'nml', accumulated 4705 unshared commits, and every sweep from
+        # the offering side read
+        # ``ONE-SIDED SHARE … they do not share it with us (their grants:
+        # [])`` — correct behaviour, catastrophic outcome. The data existed
+        # on exactly one machine, and that machine left.
+        #
+        # Accepting someone's project IS agreeing to collaborate on it with
+        # them; a grant that only runs one way isn't a safety property, it's
+        # a data-loss mechanism. The reciprocal grant is scoped to this one
+        # peer and this one project — it grants nothing else to anyone.
+        _peer_id = str(params.get('peer_id', '') or '')
+        _langcode = str(params.get('langcode', '') or '')
+        if _peer_id and _langcode:
+            try:
+                entry = _peers.add_shared_project(_peer_id, _langcode)
+                _now_shares = ((entry or {}).get('shared_projects')
+                               if entry else None)
+                print(f'[server] accept_offer: granted {_langcode!r} back '
+                      f'to {_peer_id[:8]!r} — accepting a project means '
+                      f'serving it back, or their work never reaches us '
+                      f'(we now share: {_now_shares!r})',
+                      file=sys.stderr, flush=True)
+            except Exception as ex:
+                # Say it. A silent failure here recreates exactly the
+                # stranded-peer state this exists to prevent.
+                print(f'[server] accept_offer: could NOT grant '
+                      f'{_langcode!r} back to {_peer_id[:8]!r} ({ex!r}) — '
+                      f'they will not be able to send us their work on '
+                      f'this project', file=sys.stderr, flush=True)
         # Passive clone: do NOT touch last_project on share-offer
         # accept. The project lands in the registry; the user
         # explicitly opens it later via the picker. See
@@ -2020,6 +2059,8 @@ def _h_lan_relay(body):
         from . import lan_admin_client
         tr = lan_admin_client.make_transport(peer_id)
     except Exception as ex:
+        print(f'[lan-admin-client] relay to {peer_id[:8]} could not build a '
+              f'transport: {ex}', file=sys.stderr, flush=True)
         return 200, {"ok": True, "relay_error": str(ex)[:300]}
     try:
         out = tr.call(method, path, inner)
@@ -2068,11 +2109,30 @@ def _h_lan_can_admin(body):
         # Remember it (0.55.129) so the UI can show the button without
         # re-probing — and keep showing it while the device naps.
         _peers.set_they_admin_us(peer_id, True)
+        print(f'[lan-admin-client] can_admin {peer_id[:8]}: ALLOWED',
+              file=sys.stderr, flush=True)
         return 200, {"ok": True, "allowed": True, "detail": ""}
     except Exception as ex:
         msg = str(ex)
-        reason = ('refused' if ('403' in msg or 'admin grant' in msg)
-                  else 'unavailable')
+        # LOG IT HERE, IN THE DAEMON (0.55.145). This answer was returned
+        # to the UI and logged there — to the UI PROCESS's stderr, which on
+        # desktop is a terminal nobody is capturing, not the daemon log
+        # file that actually gets read. So the one line explaining why the
+        # button never appeared was computed every 6 s and written where it
+        # could not be seen. Kent spent an evening on that.
+        print(f'[lan-admin-client] can_admin {peer_id[:8]}: NOT allowed '
+              f'— {msg[:300]}', file=sys.stderr, flush=True)
+        if 'no remote-settings endpoint' in msg:
+            # A THIRD answer (0.55.145). "unavailable" sent the field
+            # diagnosis at the network for an evening — the peer was
+            # reachable, answering, and even logging our request; it just
+            # had no such route. Reachability and permission were both
+            # fine, so neither existing word fit.
+            reason = 'no_endpoint'
+        elif '403' in msg or 'admin grant' in msg:
+            reason = 'refused'
+        else:
+            reason = 'unavailable'
         if reason == 'refused':
             # An explicit no is the ONLY thing that clears the memory.
             # Unreachable must not, or a sleeping phone would revoke

@@ -351,7 +351,13 @@ def sign_hex(message):
     See ``verify_hex``."""
     try:
         info = ensure()
-    except RuntimeError:
+    except RuntimeError as ex:
+        # Was a SILENT ''. The caller reads empty as "no identity" and
+        # raises before posting, so a failure here looked identical to a
+        # network problem — and grepping for the sign-failure line found
+        # nothing because this path never wrote one (0.55.145).
+        print(f'[peer-id] cannot sign: no LAN identity ({ex})',
+              file=sys.stderr, flush=True)
         return ''
     try:
         with open(info['key_path'], 'rb') as fh:

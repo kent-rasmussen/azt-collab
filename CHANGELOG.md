@@ -9,6 +9,360 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.151 — the seed refs outlive the work they existed for
+
+nml fully converged, and github's branch list still showed three AZT branches:
+`azt-side-c6858018` and `azt-side-efd0db3a` (both **0 ahead** of main) and
+`azt-blob-seed-chain` (**76 ahead**). Two different bugs.
+
+**Server refs with no local mirror were invisible.** `_sweep_orphan_preseed_refs`
+builds its candidate list from local `refs/remotes/origin/azt-*` tracking refs,
+so as soon as a mirror goes — a prune, a delete whose local half succeeded and
+remote half didn't, a fresh clone — the server-side ref can never be swept
+again. It now also lists the server's refs and considers any matching one whose
+commit we still hold locally. Deletion still requires *proof* of coverage from
+local objects; a ref we can't verify is left alone, because unverifiable is not
+the same as unneeded.
+
+**The chain was immortal by construction.** The exemption was mine — written so
+pre-seeding always had somewhere to extend from — and it had no exit. Once main
+holds every blob the chain does, the chain's only job is already being done by
+main, so it is retired and deleted; a later pre-seed just starts a fresh one.
+That required keeping main's own coverage separate from the union with the chain,
+or the test would trivially pass against itself.
+
+Both refs are harmless to storage (their blobs are shared with main) but they sit
+in every collaborator's branch list forever and each one is advertised on every
+push — which is the cost that made 1000 of them a 57 s tax per push in the first
+place.
+
+## 0.55.150 — the repack sweep was a permanent no-op
+
+First sweep in the field, nml: `loose 2441 → 2431 object(s), 6.1 → 6.1 MB`. Ten
+objects, no bytes — while printing *"this is what lets pushes ship deltas
+instead of whole files."*
+
+`git repack -a -d` packs objects **reachable from refs**. Those 2431 are
+unreachable debris from topic-ref churn, temp refs and failed pushes; repack
+cannot pack them and will not delete them — only a prune would, and pruning
+automatically is a separate risk decision I'm not making silently. So the raw
+count stayed permanently above the trigger and the sweep would have repacked
+every 30 minutes for the life of the daemon, achieving nothing, announcing
+value each time.
+
+- Thresholds are now measured **above the floor** each project settled at after
+  its last repack, so re-firing requires genuine new accumulation. A count that
+  *drops* clears the floor, so an external prune or a replaced repo doesn't
+  leave us parked under a stale high-water mark.
+- When most objects stay loose, say why in words: unreachable from any ref, not
+  a failure, and not retried until new ones accumulate. The two numbers alone
+  read as "nothing needed doing" to anyone not counting closely.
+
+Same defect class as everything else in this arc — a line asserting a value the
+code had not established.
+
+## 0.55.149 — compute the delta at push time (thin pack)
+
+`_push_thin` replaces `porcelain.push` for the topic-push chunk path: each blob
+is delta-compressed **at push time** against a base the remote already
+advertises, which is what real `git push` does and what dulwich does not.
+
+Repacking (0.55.147) only gave an intermittent win, and the reason is
+structural: `git repack` chooses delta bases by its own sort — largest first —
+so for a file that grows, the *newest* version becomes the base and older
+versions delta against it. Those chains are useless for an incremental push
+because the base isn't on the server yet. Two consecutive nml commits, identical
+in shape:
+
+```
+1 of 4 object(s) will ship as reusable deltas … 266,194 bytes
+1 of 4 object(s) will ship as reusable deltas … 16,147,229 bytes
+```
+
+Two orders of magnitude apart, purely on which direction git happened to point
+that blob. Computing against what the remote actually advertises removes the
+lottery. It is also the **only** option on Android, which has no git binary and
+can never repack — the gap `maintenance.py` left open.
+
+How it stays safe:
+
+- **Bases are proven, not guessed.** The `path → blob` map is built by walking
+  the trees of the commits the remote handed us as `have`, so membership is
+  itself the proof the server holds that object. No reachability inference.
+- **Deltas that don't earn their place are discarded** — under 10% saving and
+  the whole object goes, rather than lengthening the delta chain for nothing.
+- **The new path is never the only path.** Any exception falls back to
+  `porcelain.push` for the identical refspec. `receive-pack` is atomic, so a
+  failed thin push applied nothing and the retry is clean.
+- Objects are filtered to those readable from the store *before* counting, so
+  the count handed to the pack writer always matches what the generator yields.
+
+Reports what it actually sent, after the fact — `N blob(s) delta'd at push time,
+M reused from local packs, K sent whole — X MB not transferred` — because the
+counts don't exist until the generator has been consumed.
+
+Note the estimator still prices these at whole-object size: it accounts for
+*stored* reusable deltas (0.55.147) but cannot know what the push-time delta
+will be. So `sync.commit_pack_byte_budget` must be raised for multi-commit
+chunks to survive the pre-shrink gate, even though the pack that results is
+small. Making the estimate delta-aware in the same way is the obvious follow-up.
+
+## 0.55.148 — maintenance never ran; Windows git
+
+`projects.load()` does not exist — the registry API is `list_all()`, returning
+`[Project]`, not a dict. So 0.55.147's sweep was an `AttributeError` on every
+tick: `sweep: could not read the project registry`. It logged, which is the only
+reason it took one tick rather than a release to find.
+
+### Accepting a share now grants it back
+
+Peer `80570dd9` (BACKTRAN-OBT-NDEMLI) accepted `nml`, worked in it, accumulated
+**4705 unshared commits** — and every sweep from this side read:
+
+```
+ONE-SIDED SHARE. We share it with them; they do not share it with us
+(their grants: []). Not dialing.
+```
+
+Correct behaviour by the 0.55.50 rule, and a data-loss mechanism in practice.
+Accepting a share never granted one back, so the acceptor's daemon served
+nothing; the offering side then stopped dialing entirely — no push *and* no
+peek — and the work sat on exactly one machine. That machine then left the site.
+
+Two changes, both scoped to the specific peer and the specific project, granting
+access to nothing new:
+
+- **On accept** (`_h_lan_accept_offer`): grant the project back to the offering
+  peer. Accepting someone's project is agreeing to collaborate on it with them
+  (Kent, explicitly, 2026-07-30) — and if that turns out not to be wanted, the
+  peer can unshare afterwards, which is a gesture that already exists.
+- **Retroactively, from the hello manifest** (`peers.reciprocate_shares`, called
+  from both sides of the exchange): grant back every project they share with us
+  that we already hold. The accept-time rule only fires on *future* accepts, so
+  without this every already-accepted peer stays one-sided forever. Because both
+  halves of the hello record the manifest, both act on it — otherwise the heal
+  would depend on which device happened to dial first.
+
+Restricted to projects already in our registry, so it can only stop refusing to
+serve something we are demonstrably collaborating on.
+
+Windows, from field questions:
+
+- **Git Bash-only installs.** `shutil.which('git')` finds `git.exe` when the
+  installer's default "Git from the command line and also from 3rd-party
+  software" was chosen. The "Use Git from Git Bash only" option leaves git
+  installed and perfectly usable but invisible to a normal Windows Python — the
+  daemon does not run inside Git Bash. Now probes the standard install paths
+  (`C:\Program Files\Git\cmd\git.exe`, the x86 and `bin` variants, and
+  `%LOCALAPPDATA%\Programs\Git`) before concluding there is no git.
+- **No console flash.** `CREATE_NO_WINDOW`, so a background daemon doesn't pop a
+  black window on every repack. That reads as a malfunction to whoever is
+  looking at the screen.
+
+### Field note on what repacking does and doesn't buy
+
+`git repack` chooses delta bases by its own sort — largest first — so for a file
+that grows, the *newest* version tends to become the base and older versions
+delta against it. Those deltas are useless for an incremental push: the base is
+not on the server yet. Observed directly, two consecutive commits:
+
+```
+1 of 4 object(s) will ship as reusable deltas … 266,194 bytes
+1 of 4 object(s) will ship as reusable deltas … 16,147,229 bytes
+```
+
+Same shape, two orders of magnitude apart, purely on which direction git happened
+to point that blob's delta. This is why real `git push` computes a **thin pack**
+at push time, with bases restricted to what the remote advertises, rather than
+relying on stored chains. dulwich does not do that, and until it does, repacking
+gives an intermittent win rather than a reliable one.
+
+## 0.55.147 — send deltas, and keep sending them
+
+Two halves of one problem: a six-line edit to a 16 MB `nml.lift` was costing a
+full 16 MB push, 239 times over.
+
+### Why it was happening
+
+Git stores whole blobs. The saving comes from delta compression, and dulwich
+already knows how — `PackBasedObjectStore.generate_pack_data` calls
+`generate_unpacked_objects(..., other_haves=remote_has)`, and
+`find_reusable_deltas` (`pack.py:3238`) reuses a delta whose base is in the pack
+**or already on the remote**. So even one commit per push should ship as a small
+delta against the version sent last time.
+
+The word is *reusable*: it reuses deltas that already exist in local **pack
+files**. Fresh commits are **loose** objects, which carry no deltas, so there was
+nothing to reuse and every object fell through to `full_unpacked_object`. Packing
+the repo isn't housekeeping here — it is what makes the push small. `git repack
+-adf` on nml: 22399 objects, **15805 deltas**, and per-unit push time went
+66 s → ~18 s.
+
+### `maintenance.py` — scheduled repack
+
+New module, swept from the scheduler's watcher loop on its own thread (a repack
+is minutes of CPU; the loop also drives connectivity and the push drain).
+Triggers on loose-object **count ≥ 40 or bytes ≥ 100 MB** — two thresholds
+because the two shapes differ: ordinary commit churn is many small objects,
+while a handful of edits to a 16 MB LIFT is few enormous ones and would never
+trip a count-only rule. Holds `project_lock` with a 5 s bound, so a project
+mid-push defers to the next sweep instead of blocking anything.
+
+**It shells out to `git`, and cannot use dulwich.** `PackBasedObjectStore.add_objects`
+(`object_store.py:1576`) writes `full_unpacked_object` for every object — no
+deltification — so a dulwich repack would *destroy* the deltas it was meant to
+create; `repack` also "keeps all objects in memory," an OOM on a multi-GB
+project; and `pack_objects_to_data` defaults `deltify=False` with the upstream
+note that the Python implementation is "much too slow." Guarded on
+`shutil.which('git')`: no git means one logged line and no action.
+
+**Android is not covered** — no git binary. Recorded in the module docstring as
+a known gap rather than left to look solved. The fix there is thin-delta
+generation inside the push path, which is surgery on the code carrying user data
+and wants its own release.
+
+### The estimator was pricing deltas as whole objects
+
+`_estimate_delta_size` summed `raw_length()` for every object. With deltas now
+real, that is not a harmless overstatement — the number gates chunk sizing:
+
+```
+topic-push pre-shrink chunk_n 50→1 (est 1,240,081,629 > budget 3,145,728)
+```
+
+Fifty commits of small edits, correctly deltifiable into one modest pack, were
+sized at 1.24 GB and sent one at a time — paying per-push overhead 190 times.
+`_reusable_delta_sizes` now asks `find_reusable_deltas` the same question the
+push will ask, and counts those objects at their delta size.
+
+Conservative in every failure mode: an object we can't confidently identify or
+size is simply absent from the map and falls back to its whole-object size, and
+any exception abandons the refinement entirely. Wrong-but-large is the old
+behaviour; wrong-but-small would under-size a pack and risk a receive-pack
+timeout on a weak link. Capped at 5000 objects, since the estimate is a gate,
+not the work.
+
+## 0.55.146 — the "already on the server" set was mostly empty
+
+`_seeded_object_shas` is the set subtracted from every pack estimate to mean
+"the server already holds this." It read **one commit per seed ref** — correct
+only while every seed ref was a lone orphan commit. Chaining (0.55.118) turned
+one of those refs into a *history*, and from that release on the function saw
+only the chain's newest batch.
+
+Everything downstream inherited it: `_enumerate_new_blobs` and
+`_estimate_delta_size` treated banked blobs as new, re-seeded them, and padded
+every pack — on a project whose whole problem is pack size over a weak link.
+Same family as the orphan-refs-as-`haves` bug that grew a 548-batch push to
+817: a subtraction set that silently omits most of its contents, so the push
+keeps re-sending work already delivered.
+
+Two fixes:
+
+- Walk **ancestry** from every seed ref, not the tip commit.
+- Key the cache on `(ref, sha)` pairs instead of the ref **count**. Advancing
+  the chain tip changes no count, so the one operation that adds coverage never
+  invalidated the cache. Still just a ref listing — no tree walks.
+
+Also switched to the module-level `iter_tree_contents`: the
+`object_store.iter_tree_contents` method form is gone in newer dulwich, and
+because this walk swallows per-object failures, its absence would have returned
+an **empty** set — no subtraction at all, every blob re-seeded, no error. That
+is the fourth missing-import-hidden-by-a-broad-except in this file in two days,
+and the only one that would have been invisible rather than merely wrong.
+
+### The chain push was failing in silence
+
+Field evidence, same session: `seed-refs: … extending it so the sweep can drop
+those refs` at 19:23:30 and **no `chain base landed` line after it**. The `try`
+had a `finally` that cleaned up the temp ref and no `except` that said anything,
+so the caller's broad `except` recorded a skip. The only visible symptom was a
+remote ref count that kept *rising* — 941 → 1004 — while every push paid ~57 s
+to advertise refs that consolidation had already announced it was removing.
+Invariant #15's corollary exactly: an unconditional intent line beside a silent
+failure reads as success. It now names the exception and restates what the
+failure costs.
+
+**Field result (nml, 2026-07-29).** On .143 the line read `the chain covers 0
+blob(s)`; on .146, `covers 71` — matching what the sweep independently reported,
+which is the check that the walk is now complete. The chain push then landed
+(20:35 → 20:53; slower than the tree+commit payload suggests, because it still
+had to advertise the 1000 refs one last time), `preseed-sweep` went from 71 to
+**1365 blob(s) held by the seed chain**, and deleted **1000/1001** per-batch
+refs. The ~57 s advertisement cost that had been on every push since 0.55.118
+is gone.
+
+### Consolidation retries from inside the unit loop
+
+The depth-0 entry gate was insufficient. The grind happens inside **one**
+`_topic_push` call's unit loop — hours of `topic-push[d1] … remaining=145…136`
+under a single invocation — so an attempt that failed at entry never ran again,
+and 136 further pushes each paid the tax it exists to remove. `_maybe_consolidate_seed_refs`
+now runs from inside the loop, depth-agnostic, throttled to once per 10 min
+(the corrected ancestry walk costs ~16 s at this ref count and its cache is
+invalidated by the very event that occurs here, so per-unit would be real
+overhead against a ~77 s unit).
+
+## 0.55.145 — put the reason where the log actually is
+
+`self_check()` returns `canonical form matches`, diagnostics-pull works over the
+same LAN to the same peer, the grant persisted on Idjop's machine, and the
+challenge was served — yet no button, and `grep "sign failed"` finds nothing.
+
+Every one of those is a *ruled-out* cause, and the actual answer was being
+computed every 6 seconds and written where it could not be read: the probe's
+outcome went to the **UI process's** stderr, which on desktop is a terminal
+nobody is capturing, not the daemon log file that gets grepped.
+
+Four fixes, all about making the failure sayable:
+
+- `_h_lan_can_admin` now logs its own outcome, in the daemon:
+  `can_admin 841d43a8: ALLOWED` / `NOT allowed — <reason>`.
+- The relay logs a transport it could not build.
+- `peer_id.sign_hex` had a **silent** `return ''` when `ensure()` raised, so a
+  missing identity looked exactly like a network failure — and explains why
+  grepping for `sign failed` found nothing even if signing was the problem. It
+  says so now.
+- The UI probe's `except Exception: return` logs the exception instead of
+  discarding it.
+
+That is five places in one feature where the cause existed and was thrown away.
+The pattern is consistent enough to be worth stating: **a broad `except` around
+a call that can fail for unknown reasons will eventually be the reason a bug
+takes hours instead of minutes.**
+
+With the reason visible, the answer was not signing at all:
+
+```
+no remote-settings button for 80570dd9: unavailable
+  (challenge failed: RuntimeError('HTTP 404 from 10.191.129.91:55870:
+   Sorry, that method is not supported'))
+```
+
+`Sorry, that method is not supported` is **dulwich's** `HTTPGitApplication`
+404 — so the request got past our route table and fell through to the git
+backend. The grant, the fingerprint pinning, the canonical form and `sign_hex`
+were all fine; the peer even logged the incoming GET before rejecting it.
+
+The route is the **first** test in the dispatch chain (`lan_listener.py:2012`),
+unconditional, ahead of everything including the git fallthrough — so a current
+listener cannot 404 it. Two things produce this byte-for-byte: the peer runs
+older code, **or a stale server process is still holding the port** while the
+restarted one took an ephemeral (peers keep dialling the cached number and reach
+the old code). The field peer here reported `daemon_version: 0.55.144`, so "too
+old" would have been the wrong sentence — `can_admin` returns
+`reason='no_endpoint'` and the message states only what is known, naming both
+causes. A third answer was needed either way: "unavailable" and "refused" were
+both false about a peer that was reachable *and* permitted.
+
+The UI lines that finally showed this carried **no timestamps**, so they
+couldn't be ordered against the peer's own log — which is the same
+invisible-sink defect. The daemon-side line added above fixes that too: it lands
+in the timestamped rotating log rather than a bare terminal.
+
+Also unbroken by this: **"unavailable" sent the diagnosis at the network for an
+evening**, over a peer that was reachable and answering the whole time.
+
 ## 0.55.144 — a third missing import hidden by a broad `except`
 
 `seed-refs: … the chain covers 0 blob(s) but not 1295 more` — while the sweep,

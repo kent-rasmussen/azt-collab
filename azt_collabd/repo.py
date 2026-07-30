@@ -5731,6 +5731,153 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     return ordered[min(n, len(ordered)) - 1]
 
 
+def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
+    """Push *refspec* as a **thin pack** — blobs delta'd, at push time,
+    against bases the remote already advertises (0.55.149).
+
+    Why this and not repacking. `git repack` picks delta bases by its own
+    sort (largest first), so for a file that grows the *newest* version tends
+    to become the base and older versions delta against it. Those chains are
+    useless for an incremental push: the base isn't on the server yet. Field
+    2026-07-30, two consecutive nml commits of identical shape —
+    ``266,194 bytes`` then ``16,147,229 bytes`` — differing only in which way
+    git happened to point that blob's delta. Real ``git push`` doesn't rely
+    on stored chains; it computes a thin pack against what the remote
+    advertises. dulwich's ``porcelain.push`` does neither, so a six-line edit
+    to a 16 MB LIFT ships 16 MB.
+
+    It also covers **Android**, which has no git binary and therefore can
+    never repack — the gap left open in ``maintenance.py``.
+
+    Bases come only from walking the trees of the commits the remote gave us
+    as ``have``, so every base is on the server by construction — no
+    reachability guess. Deltas that don't save at least 10% are discarded and
+    the whole object is sent, because a delta that barely helps costs CPU on
+    both ends and lengthens the delta chain for nothing.
+    """
+    from dulwich.client import get_transport_and_path
+    from dulwich.object_store import MissingObjectFinder, iter_tree_contents
+    from dulwich.objects import hex_to_sha
+    from dulwich.pack import (
+        REF_DELTA, UnpackedObject, create_delta, find_reusable_deltas,
+        full_unpacked_object,
+    )
+
+    lhs, _sep, rhs = bytes(refspec).partition(b':')
+    if lhs.startswith(b'+'):
+        lhs = lhs[1:]
+    if not lhs or not rhs:
+        raise ValueError(f'thin push needs a non-delete refspec, got '
+                         f'{refspec!r}')
+    new_sha = repo.refs[lhs]
+
+    def update_refs(refs):
+        out = dict(refs or {})
+        out[rhs] = new_sha
+        return out
+
+    stats = {'reused': 0, 'computed': 0, 'full': 0, 'saved': 0}
+
+    def generate_pack_data(have, want, ofs_delta=True, progress=None):
+        store = repo.object_store
+        finder = MissingObjectFinder(store, haves=have, wants=want)
+        try:
+            remote_has = set(finder.get_remote_has() or ())
+        except Exception:
+            remote_has = set()
+        todo = dict(finder)
+        # Only objects we can actually read. The count handed to the pack
+        # writer must match what the generator yields exactly, so filter
+        # first rather than skipping mid-stream.
+        ids = [sha for sha in todo if sha in store]
+
+        reused = []
+        reused_shas = set()
+        try:
+            for unpacked in find_reusable_deltas(
+                    store, set(ids), other_haves=remote_has):
+                hexsha = None
+                try:
+                    raw = bytes(unpacked.sha())
+                    if len(raw) == 20:
+                        import binascii
+                        hexsha = binascii.hexlify(raw)
+                    elif len(raw) == 40:
+                        hexsha = raw
+                except Exception:
+                    hexsha = None
+                if hexsha and hexsha in todo and hexsha not in reused_shas:
+                    reused_shas.add(hexsha)
+                    reused.append(unpacked)
+        except Exception:
+            reused, reused_shas = [], set()
+
+        # path → blob sha, from the trees of the commits the REMOTE has.
+        # Built by walking those trees, so membership here IS proof the
+        # server holds the object.
+        base_by_path = {}
+        for hsha in (have or []):
+            try:
+                tree = getattr(store[hsha], 'tree', None)
+                if tree is None:
+                    continue
+                for entry in iter_tree_contents(store, tree):
+                    base_by_path.setdefault(entry.path, entry.sha)
+            except Exception:
+                continue
+
+        def _emit():
+            for unpacked in reused:
+                stats['reused'] += 1
+                yield unpacked
+            for sha in ids:
+                if sha in reused_shas:
+                    continue
+                obj = store[sha]
+                if obj.type_name == b'blob':
+                    hint = todo.get(sha)
+                    path = None
+                    if isinstance(hint, tuple) and len(hint) > 1:
+                        path = hint[1]
+                    base_sha = base_by_path.get(path) if path else None
+                    if base_sha and base_sha != sha:
+                        try:
+                            target_raw = obj.as_raw_string()
+                            base_raw = store[base_sha].as_raw_string()
+                            delta = b''.join(
+                                create_delta(base_raw, target_raw))
+                            if len(delta) < len(target_raw) * 0.9:
+                                stats['computed'] += 1
+                                stats['saved'] += len(target_raw) - len(delta)
+                                yield UnpackedObject(
+                                    REF_DELTA,
+                                    delta_base=hex_to_sha(base_sha),
+                                    decomp_chunks=[delta],
+                                    sha=obj.sha().digest())
+                                continue
+                        except Exception:
+                            pass
+                stats['full'] += 1
+                yield full_unpacked_object(obj)
+
+        return len(ids), _emit()
+
+    client, path = get_transport_and_path(
+        remote_url, username=username, password=token)
+    progress = None
+    if errstream is not None:
+        progress = errstream.write
+    client.send_pack(path, update_refs, generate_pack_data,
+                     progress=progress)
+    # Report AFTER the push, describing what was actually sent — the counts
+    # aren't known until the generator has been consumed.
+    lift_merge.trace(
+        f'[sync-trace] thin push: {stats["computed"]} blob(s) delta\'d at '
+        f'push time, {stats["reused"]} reused from local packs, '
+        f'{stats["full"]} sent whole — {stats["saved"] / (1024 * 1024):.1f} '
+        f'MB not transferred')
+
+
 class _PushProgressStream:
     """File-like sink for ``porcelain.push(errstream=…)`` that surfaces
     the remote's sideband progress instead of discarding it (0.55.79).
@@ -5855,6 +6002,86 @@ def _check_large_files_in_commit(repo, commit_sha, threshold_bytes):
         return []
 
 
+# Above this, skip the delta-aware refinement: ``find_reusable_deltas``
+# reads pack index entries per id, and the estimate is a gate, not the
+# work itself. Falls back to whole-object sizes, i.e. pre-0.55.147
+# behaviour — an overestimate, never an underestimate.
+_DELTA_ESTIMATE_MAX_OBJECTS = 5000
+
+
+def _reusable_delta_sizes(repo, shas, remote_has):
+    """``{sha: delta_bytes}`` for objects that will ship as reused deltas.
+
+    Why this exists (0.55.147): the estimate summed ``raw_length()`` for
+    every object, i.e. the size of the whole blob. But dulwich's push reuses
+    deltas already stored in local packs, including against bases the remote
+    already holds (``pack.py:3238``) — so a 16 MB LIFT blob whose previous
+    version is on the server goes over the wire as a few KB.
+
+    Estimating those at 16 MB each is not a harmless overstatement: this
+    number gates chunk sizing. Field 2026-07-30, `nml`: ``pre-shrink chunk_n
+    50→1 (est 1,240,081,629 > budget 3,145,728)`` — 50 commits of small
+    edits, correctly deltifiable into one modest pack, were sized as 1.24 GB
+    and pushed one at a time instead, paying per-push overhead 190 times.
+
+    Deliberately conservative in every failure mode: any object we can't
+    confidently identify or size is simply absent from the returned map, and
+    the caller falls back to its whole-object size. Wrong-but-large keeps the
+    old behaviour; wrong-but-small would under-size a pack and risk a
+    receive-pack timeout on a weak link.
+    """
+    out = {}
+    if not shas or len(shas) > _DELTA_ESTIMATE_MAX_OBJECTS:
+        return out
+    try:
+        import binascii
+        from dulwich.pack import find_reusable_deltas
+    except Exception:
+        return out
+
+    def _hexsha(unpacked):
+        """Hex sha of an UnpackedObject, or None if we can't be sure.
+
+        ``UnpackedObject.sha()`` returns a binary ``RawObjectID`` and, for
+        delta entries, only works when the cached ``_sha`` was populated by
+        the iterator. Both are internals, so this stays defensive rather than
+        asserting a shape — an unrecognised return means 'treat as a full
+        object', which is the safe direction."""
+        try:
+            raw = bytes(unpacked.sha())
+        except Exception:
+            return None
+        if len(raw) == 20:
+            return binascii.hexlify(raw)
+        if len(raw) == 40:
+            return raw
+        return None
+
+    wanted = set(shas)
+    try:
+        for unpacked in find_reusable_deltas(
+                repo.object_store, wanted,
+                other_haves=(remote_has or set())):
+            hexsha = _hexsha(unpacked)
+            if hexsha is None or hexsha not in wanted:
+                continue
+            size = getattr(unpacked, 'decomp_len', None)
+            if not size:
+                try:
+                    size = sum(len(c) for c in (unpacked.comp_chunks or []))
+                except Exception:
+                    size = None
+            if size:
+                out[hexsha] = int(size)
+    except Exception as exc:
+        lift_merge.trace(
+            f'[sync-trace] pack-size estimate: delta-aware refinement '
+            f'unavailable ({type(exc).__name__}: {str(exc)[:120]}) — '
+            f'falling back to whole-object sizes, which overstates')
+        return {}
+    return out
+
+
 def _estimate_delta_size(repo, have_sha, want_sha):
     """Walk the missing-objects set for a ``(have_sha → want_sha)``
     delta and return ``(object_count, raw_bytes)``.
@@ -5944,22 +6171,42 @@ def _estimate_delta_size(repo, have_sha, want_sha):
             haves=haves,
             wants=[want_sha],
         )
-        count = 0
-        total_bytes = 0
+        # Grab this BEFORE consuming the finder — dulwich's own
+        # ``PackBasedObjectStore.generate_pack_data`` does the same, in the
+        # same order.
+        try:
+            remote_has = finder.get_remote_has()
+        except Exception:
+            remote_has = set()
+        wanted = []
         skipped = 0
         for sha, _hint in finder:
             if sha in seeded:
                 skipped += 1
                 continue
-            count += 1
-            try:
-                total_bytes += repo.object_store[sha].raw_length()
-            except Exception:
-                pass
+            wanted.append(sha)
         if skipped:
             lift_merge.trace(
                 f'[sync-trace] pack-size estimate: {skipped} object(s) '
                 f'excluded as already seeded on the server')
+        delta_bytes = _reusable_delta_sizes(repo, wanted, remote_has)
+        count = 0
+        total_bytes = 0
+        for sha in wanted:
+            count += 1
+            hit = delta_bytes.get(sha)
+            if hit is not None:
+                total_bytes += hit
+                continue
+            try:
+                total_bytes += repo.object_store[sha].raw_length()
+            except Exception:
+                pass
+        if delta_bytes:
+            lift_merge.trace(
+                f'[sync-trace] pack-size estimate: {len(delta_bytes)} of '
+                f'{count} object(s) will ship as reusable deltas, counted '
+                f'at delta size rather than whole-object size')
         return (count, total_bytes)
     except Exception as exc:
         lift_merge.trace(
@@ -6139,7 +6386,7 @@ _PRESEED_OVERHEAD_PER_COMMIT = 300  # commit obj + empty tree skeleton
 _PRESEED_FILL_RATIO = 0.7  # conservative — leaves headroom for compression variance
 
 
-_seeded_cache = {}          # project path → (ref_count, frozenset)
+_seeded_cache = {}          # project path → (((ref, sha), …), frozenset)
 _seeded_cache_lock = threading.Lock()
 
 
@@ -6156,32 +6403,103 @@ def _seeded_object_shas(repo):
     minutes per pass recomputing an answer that only changes when we seed
     something new.
 
-    Invalidated on seed-ref count change, which is exactly when a new
-    seed lands. Cheap to check (a ref listing, no tree walks) and can
-    only err toward recomputing."""
+    **Walks ANCESTRY, not just each ref's tip (0.55.146).** This read one
+    commit per ref, which was complete only while every seed ref was a lone
+    orphan commit. Chaining (0.55.118) turned one of them into a *history*,
+    and from then on this function saw only the chain's newest batch — so
+    blobs demonstrably banked on the server looked new to
+    ``_enumerate_new_blobs`` and ``_estimate_delta_size``, got re-seeded, and
+    padded every pack. Same family as the orphan-refs-as-``haves`` bug that
+    grew a 548-batch push to 817: a subtraction set that silently omits most
+    of what it should hold, so the push keeps re-sending banked work.
+
+    **Cache signature is (ref, sha) pairs, not the ref count.** Advancing the
+    chain tip changes no count, so a count-keyed cache never invalidated on
+    the one operation that adds coverage. Reading the pairs is still a ref
+    listing — no tree walks — and can only err toward recomputing."""
     try:
         refs = [r for r in repo.refs.allkeys()
                 if r.startswith(_PRESEED_TRACK_PREFIX)]
     except Exception:
         return frozenset()
+    # Module-level function, not ``object_store.iter_tree_contents`` — the
+    # method form is gone in newer dulwich, and because the walk below
+    # swallows per-object failures, its absence would have made this return
+    # an EMPTY set: no subtraction at all, every blob re-seeded, silently.
+    from dulwich.object_store import iter_tree_contents
     key = str(getattr(repo, 'path', '') or '')
+    try:
+        sig = tuple(sorted((r, repo.refs[r]) for r in refs))
+    except Exception:
+        sig = (len(refs),)
     with _seeded_cache_lock:
         hit = _seeded_cache.get(key)
-        if hit is not None and hit[0] == len(refs):
+        if hit is not None and hit[0] == sig:
             return hit[1]
     seeded = set()
+    seen = set()
+    stack = []
     for ref in refs:
         try:
-            commit = repo[repo.refs[ref]]
+            stack.append(repo.refs[ref])
+        except Exception:
+            continue
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        try:
+            commit = repo.object_store[sha]
             seeded.add(commit.tree)
-            for entry in repo.object_store.iter_tree_contents(commit.tree):
+            for entry in iter_tree_contents(repo.object_store, commit.tree):
                 seeded.add(entry.sha)
+            stack.extend(commit.parents or [])
         except Exception:
             continue
     out = frozenset(seeded)
     with _seeded_cache_lock:
-        _seeded_cache[key] = (len(refs), out)
+        _seeded_cache[key] = (sig, out)
     return out
+
+
+_consolidate_attempt_lock = threading.Lock()
+_consolidate_last_attempt = {}      # project path → monotonic seconds
+_CONSOLIDATE_RETRY_S = 600.0
+
+
+def _maybe_consolidate_seed_refs(repo, remote_url, username, token):
+    """Throttled, **depth-agnostic** retry of ``_consolidate_seed_refs``
+    (0.55.146).
+
+    The depth-0 entry call is not enough. The long grind happens inside ONE
+    ``_topic_push`` invocation's unit loop — field 2026-07-29: hours of
+    ``topic-push[d1] … remaining=145…136``, all within a single call at
+    ``d1``. So an attempt that fails at entry (as the 19:23:30 one did) never
+    retries, and the refs it exists to remove keep taxing every push in that
+    loop. Meanwhile new batches keep ADDING refs: 941 → 1004 during the same
+    session.
+
+    Throttled rather than per-unit because the corrected
+    ``_seeded_object_shas`` walks the ancestry of every seed ref (~16 s at
+    this ref count) and its cache is invalidated by exactly the event that
+    happens here — a new seed landing. Once per 10 minutes puts the cost
+    near zero against a ~77 s unit while still retrying within one unit of
+    becoming possible."""
+    key = str(getattr(repo, 'path', '') or '')
+    now = time.monotonic()
+    with _consolidate_attempt_lock:
+        last = _consolidate_last_attempt.get(key)
+        if last is not None and (now - last) < _CONSOLIDATE_RETRY_S:
+            return
+        _consolidate_last_attempt[key] = now
+    try:
+        _consolidate_seed_refs(repo, remote_url, username, token)
+    except Exception as exc:
+        # The function itself now traces its own failure in detail; this is
+        # the backstop so a raise on the way in can't be silent either.
+        lift_merge.trace(
+            f'[sync-trace] seed-ref consolidation retry failed: {exc!r}')
 
 
 def _consolidate_seed_refs(repo, remote_url, username, token):
@@ -6303,6 +6621,23 @@ def _consolidate_seed_refs(repo, remote_url, username, token):
         lift_merge.trace(
             '[sync-trace] seed-refs: chain base landed; the per-batch refs '
             'are now redundant and the next sweep can delete them')
+    except Exception as ex:
+        # SAY THAT IT FAILED (0.55.146). As shipped, the trace above
+        # announced "extending it so the sweep can drop those refs" and
+        # then — on failure — printed nothing at all, while the caller's
+        # broad ``except`` recorded a skip. Field 2026-07-29: the 19:23:30
+        # attempt failed exactly this way, and the only evidence was a
+        # remote ref count that kept RISING (941 → 1004) while every push
+        # paid ~57 s to advertise them.
+        #
+        # Invariant #15's corollary: an unconditional intent line beside a
+        # silent failure reads as success.
+        lift_merge.trace(
+            f'[sync-trace] seed-refs: chain base did NOT land '
+            f'({type(ex).__name__}: {str(ex)[:200]}) — the {len(legacy)} '
+            f'per-batch refs stay, and every push keeps paying to '
+            f'advertise them')
+        raise
     finally:
         try:
             del repo.refs[tmp]
@@ -6815,16 +7150,40 @@ def _sweep_orphan_preseed_refs(
         lift_merge.trace(
             f'[sync-trace] preseed-sweep: chain walk failed '
             f'({exc!r}) — falling back to main-only coverage')
+    # Keep main's own coverage separate BEFORE the union below — deciding
+    # whether the chain itself is still needed requires knowing what main
+    # holds without the chain's help (0.55.151).
+    main_only_blobs = set(main_blobs)
     if chain_blobs:
         main_blobs |= chain_blobs
         lift_merge.trace(
             f'[sync-trace] preseed-sweep: {len(chain_blobs)} blob(s) held '
             f'by the seed chain also count as covered')
 
+    # THE CHAIN IS NOT PERMANENT (0.55.151).
+    #
+    # The exemption below was written so pre-seeding always had somewhere to
+    # extend from, which made it immortal: field 2026-07-30, nml fully
+    # converged and github still listed ``azt-blob-seed-chain`` at 76 commits
+    # ahead of main — 76 synthetic commits and a branch in everyone's branch
+    # list, permanently, for a project with nothing left to seed.
+    #
+    # Once main holds every blob the chain does, the chain has no remaining
+    # purpose: its whole job is keeping blobs on the server, and main is doing
+    # that. Deleting it costs nothing — the next pre-seed simply starts a new
+    # chain from scratch.
+    chain_retired = False
+    if chain_blobs and not (chain_blobs - main_only_blobs):
+        chain_retired = True
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: main now holds all '
+            f'{len(chain_blobs)} chain blob(s) — retiring the seed chain; '
+            f'a later pre-seed starts a fresh one')
+
     deletable = []
     for tracking_ref in candidates:
-        # Never delete the chain itself — it is what keeps the rest alive.
-        if tracking_ref == chain_ref:
+        if tracking_ref == chain_ref and not chain_retired:
+            # Still load-bearing: it is what keeps the rest alive.
             continue
         try:
             side_commit_sha = repo.refs[tracking_ref]
@@ -6838,6 +7197,52 @@ def _sweep_orphan_preseed_refs(
                     break
             if all_in_main:
                 deletable.append(tracking_ref)
+        except Exception:
+            continue
+
+    # SERVER REFS WITH NO LOCAL MIRROR (0.55.151).
+    #
+    # ``candidates`` is built from local tracking refs, so the moment a
+    # mirror goes — a prune, a delete whose local half succeeded and remote
+    # half didn't, a fresh clone — the server-side ref becomes invisible here
+    # and survives forever. Field 2026-07-30: nml fully converged, and github
+    # still listed ``azt-side-c6858018`` and ``azt-side-efd0db3a``, both
+    # reported as 0 commits ahead of main.
+    #
+    # Only ever deletes what we can PROVE is covered from local objects. A
+    # ref whose commit we don't hold is left alone — unverifiable is not the
+    # same as unneeded.
+    try:
+        from dulwich.client import get_transport_and_path
+        _client, _path = get_transport_and_path(
+            wan_url(remote_url), username=username, password=token)
+        _server_refs = _client.get_refs(_path) or {}
+    except Exception as exc:
+        _server_refs = {}
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: could not list server refs '
+            f'({type(exc).__name__}: {str(exc)[:120]}) — sweeping only refs '
+            f'we still mirror locally')
+    _known = set(candidates)
+    _seed_prefix = _PRESEED_REF_PREFIX.encode()
+    for _ref_name, _sha in (_server_refs or {}).items():
+        if not _ref_name.startswith(b'refs/heads/'):
+            continue
+        _suffix = _ref_name[len(b'refs/heads/'):]
+        if not (_suffix.startswith(_seed_prefix)
+                or _suffix.startswith(b'azt-side-')):
+            continue
+        _tracking = b'refs/remotes/origin/' + _suffix
+        if _tracking in _known or _tracking in deletable:
+            continue
+        if _tracking == chain_ref and not chain_retired:
+            continue
+        try:
+            _commit = repo.object_store[_sha]
+            if all(entry.sha in main_blobs
+                   for entry in iter_tree_contents(
+                       repo.object_store, _commit.tree)):
+                deletable.append(_tracking)
         except Exception:
             continue
 
@@ -7335,6 +7740,13 @@ def _push_chunked_to_ref(
     chunk_n = initial_n
 
     while consecutive_failures < MAX_CONSECUTIVE_FAILURES:
+        # Retry consolidation from INSIDE the loop (0.55.146), throttled to
+        # once per 10 min. The depth-0 entry call above fires once per
+        # recursion level; this grind lives inside a single call, so without
+        # this a failed attempt is not retried for the hours the loop runs —
+        # while every iteration pays ~57 s to advertise the refs it would
+        # have removed.
+        _maybe_consolidate_seed_refs(repo, remote_url, username, token)
         # Refresh chunk_base each iteration in case a previous
         # chunk advanced the server-side ref. Our local mirror is
         # updated below on each successful push.
@@ -7545,18 +7957,34 @@ def _push_chunked_to_ref(
             # completing, or a sideband emit — and lapses into silence
             # otherwise. A blank line means "no recent evidence", which
             # is true; a confident count during a stall would not be.
+            _stream = _PushProgressStream(
+                label=f'topic-push {label}',
+                project_dir=project_dir)
             with _socket_timeout(_chunk_timeout):
-                porcelain.push(
-                    repo, remote_url, refspec,
-                    username=username, password=token,
-                    # Surface the remote's sideband progress instead of
-                    # discarding it (0.55.79) — this is the call that can
-                    # run for hours, and it was the one with no liveness
-                    # signal at all.
-                    errstream=_PushProgressStream(
-                        label=f'topic-push {label}',
-                        project_dir=project_dir),
-                )
+                # THIN PACK FIRST (0.55.149), falling back to porcelain on
+                # any failure. This is the call that carries user data, so
+                # the new path is never the only path: receive-pack is
+                # atomic, so a thin push that fails applied nothing and the
+                # fallback retries the identical refspec safely.
+                try:
+                    _push_thin(repo, remote_url, refspec,
+                               username, token, errstream=_stream)
+                except Exception as _thin_exc:
+                    lift_merge.trace(
+                        f'[sync-trace] thin push failed '
+                        f'({type(_thin_exc).__name__}: '
+                        f'{str(_thin_exc)[:160]}) — retrying this chunk the '
+                        f'old way; nothing was applied, receive-pack is '
+                        f'atomic')
+                    porcelain.push(
+                        repo, remote_url, refspec,
+                        username=username, password=token,
+                        # Surface the remote's sideband progress instead of
+                        # discarding it (0.55.79) — this is the call that
+                        # can run for hours, and it was the one with no
+                        # liveness signal at all.
+                        errstream=_stream,
+                    )
             lift_merge.trace(
                 f'[sync-trace] topic-push chunk OK '
                 f'(advanced to {label})')
