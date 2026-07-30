@@ -78,9 +78,28 @@ def _build_transport(peer_id):
 
     entry = _peers.get_peer(str(peer_id))
     if entry is None:
+        # SHOW BOTH SIDES OF THE MISMATCH (0.55.157).
+        #
+        # Field 2026-07-30: a phone displayed the remote-settings button for
+        # the desktop — which requires a paired entry to render — and then
+        # this raised on the click. Both cannot be true of the same id, so the
+        # id being passed is not the id that is stored, and the 8-character
+        # prefix in this message was not enough to see how they differ
+        # (length, case, a truncated id, a discovery-list id that was never
+        # paired). Print what we were given and what we hold.
+        try:
+            known = [str(e.get('peer_id', ''))
+                     for e in (_peers.list_peers() or [])]
+        except Exception:
+            known = []
+        _asked = str(peer_id)
+        print(f'[lan-admin-client] no paired entry for {_asked!r} '
+              f'(len={len(_asked)}); paired ids are '
+              f'{[(k[:12], len(k)) for k in known]!r}',
+              file=sys.stderr, flush=True)
         raise RuntimeError(
-            f'{str(peer_id)[:8]} is not a paired peer — pair with it '
-            f'first (QR), then grant remote settings on that device')
+            f'{_asked[:8]} is not a paired peer on THIS device — pair with '
+            f'it first (QR), then grant remote settings on that device')
     expected_fp = str(entry.get('fp', '') or '')
     if not expected_fp:
         # Do NOT fall back to an unpinned dial. urllib3 skips pinning on
@@ -130,6 +149,28 @@ def _build_transport(peer_id):
             ctx, expected_fp, connect=5, read=max(10, int(timeout)))
         errors = []
         skipped = 0
+        # ROUTABLE ADDRESSES FIRST (0.55.157). The budget below is an overall
+        # deadline, so a peer carrying seven recorded endpoints — most from
+        # previous networks — spends it on whichever happen to be first.
+        # Field 2026-07-30: ``tried 2 of 7, 5 not tried (time budget spent)``
+        # while both machines sat on the same subnet; the address that would
+        # have answered was among the five never reached. The kernel can tell
+        # us which ones it has any path to, for free and without sending a
+        # packet, so ask before spending five seconds finding out.
+        try:
+            _routable, _unroutable = [], []
+            for _ep in endpoints:
+                _host = str(_ep).rsplit(':', 1)[0]
+                (_routable if _lan_push.has_route(_host)
+                 else _unroutable).append(_ep)
+            if _routable and _unroutable:
+                endpoints = _routable + _unroutable
+                lift_trace = (f'[lan-admin-client] dial order: '
+                              f'{len(_routable)} routable first, '
+                              f'{len(_unroutable)} with no local route last')
+                print(lift_trace, file=sys.stderr, flush=True)
+        except Exception:
+            pass
         for ep in endpoints:
             if _t.monotonic() >= deadline:
                 # Say how many we never got to. Reporting only the

@@ -9,6 +9,30 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.157 — routable addresses first; name the id mismatch
+
+**Dial order.** The admin dial's budget is an overall deadline, so a peer with
+seven recorded endpoints spends it on whichever happen to be first — `tried 2 of
+7, 5 not tried (time budget spent)` while both machines were on the same subnet.
+`lan_push.has_route` (boolean form of the existing `_route_hint` UDP-connect
+probe: no packet sent, works on Windows) now orders candidates so addresses the
+kernel has any path to are tried before ones it doesn't. 0.55.156's promotion
+covers the case where the peer is already talking to us; this covers the case
+where it isn't.
+
+**The id mismatch.** A phone displayed the remote-settings button for the desktop
+— which requires a paired entry to render at all — and then `make_transport`
+raised *"is not a paired peer"* on the click. Both cannot be true of the same id,
+so the id being passed is not the id that is stored. The message printed only an
+8-character prefix, which cannot show how they differ: length, case, a truncated
+value, or a discovery-list id that was never paired.
+
+It now logs the id it was given with its length, alongside every paired id and
+length, before raising. Not a fix — the cause is still unknown, and this is what
+makes the next click say which of those it is. The message also says "on THIS
+device", since the misleading part was that it reads as a statement about the
+remote.
+
 ## 0.55.156 — learn the address from the peer that is already talking to us
 
 Field 2026-07-30, two machines both on `172.16.133.x`:

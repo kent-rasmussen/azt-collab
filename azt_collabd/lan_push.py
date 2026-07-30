@@ -47,6 +47,26 @@ from .locks import LockTimeout, project_lock
 # was observed in the field to recover stale NsdManager state.
 # Counter goes back to 0 after restart so we don't restart in a
 # tight loop.
+def has_route(host):
+    """True when the kernel has a route to *host* (0.55.157).
+
+    Boolean form of ``_route_hint``'s probe, for ORDERING dial candidates
+    rather than explaining a failure after the fact. Same UDP-connect trick:
+    no packet is sent, it just asks the routing table, and it works on Windows
+    where interface enumeration doesn't."""
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.settimeout(0.5)
+            probe.connect((host, 9))        # discard port; no packet sent
+            local = probe.getsockname()[0]
+        finally:
+            probe.close()
+    except Exception:
+        return False
+    return bool(local) and not str(local).startswith('127.')
+
+
 def _route_hint(host):
     """`` [no route from any local address]`` or `` [would route from
     <ip>]`` — appended to a dial-failure line so "the peer is on a
