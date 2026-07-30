@@ -1120,25 +1120,40 @@ def _retarget_this_app(peer_id, device_name, font_name='Roboto'):
     from .. import transports as _t
 
     def _go(*_a):
-        try:
-            # The daemon owns the pinned dial + signing; ask IT to verify
-            # the grant first so a refusal is a sentence, not a screen of
-            # empty fields.
-            from .. import lan_can_admin
-            res = lan_can_admin(peer_id) or {}
-            if not res.get('allowed'):
-                _show_info_popup(
-                    _tr('Cannot open that device'),
-                    str(res.get('detail')
-                        or _tr('That device has not allowed this one to '
-                               'change its settings.')),
-                    font_name=font_name)
+        # OFF THE MAIN THREAD (0.55.159). ``lan_can_admin`` asks the local
+        # daemon to dial the peer — a network round trip over a list of
+        # addresses. Called straight from a button handler it blocks Kivy for
+        # the whole dial, and UI RPCs carry a 300 s default timeout, so the
+        # app simply stops. Field 2026-07-30: a phone froze on this exact tap
+        # and had to be force-stopped; the tap that froze it was "open that
+        # device's settings", i.e. the feature's entry point.
+        #
+        # Every UI touch goes back through ``Clock`` — ``_show_info_popup``
+        # and ``target_remote_peer`` both change what is on screen, and doing
+        # that from a worker thread is its own crash.
+        def _work():
+            try:
+                from .. import lan_can_admin
+                res = lan_can_admin(peer_id) or {}
+            except Exception as ex:
+                Clock.schedule_once(
+                    lambda _dt, _e=ex: _show_info_popup(
+                        _tr('Cannot open that device'), str(_e),
+                        font_name=font_name), 0)
                 return
-            _t.target_remote_peer(peer_id)
-        except Exception as ex:
-            _show_info_popup(_tr('Cannot open that device'),
-                             str(ex), font_name=font_name)
-            return
+            if not res.get('allowed'):
+                detail = str(res.get('detail')
+                             or _tr('That device has not allowed this one '
+                                    'to change its settings.'))
+                Clock.schedule_once(
+                    lambda _dt, _d=detail: _show_info_popup(
+                        _tr('Cannot open that device'), _d,
+                        font_name=font_name), 0)
+                return
+            Clock.schedule_once(
+                lambda _dt: _t.target_remote_peer(peer_id), 0)
+        threading.Thread(target=_work, daemon=True,
+                         name='lan-admin-open').start()
     # NO CONFIRM (0.55.128). There was a "Change settings on X instead of
     # this device? / Yes, edit that device" step here. Kent: *"what's with
     # the 'yes, edit that device?'"* — fair: it existed to make an

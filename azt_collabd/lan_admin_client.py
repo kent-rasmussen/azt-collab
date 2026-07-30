@@ -21,6 +21,26 @@ import sys
 from . import peer_id as _peer_id
 from . import peers as _peers
 
+# Most addresses we will attempt in one dial (0.55.158). Field 2026-07-30: a
+# phone held THIRTY-TWO recorded endpoints for one peer — every address that
+# machine has ever had, on every network, never pruned. At a 5 s connect
+# timeout the overall budget covers two or three, so beyond a handful the
+# extra entries only decide which few get tried. Capping makes the attempt
+# set small and deterministic; pruning the list is the real fix and belongs
+# in ``peers``.
+_DIAL_CANDIDATE_CAP = 6
+
+# Hard ceiling on how long we keep STARTING new dial attempts, regardless of
+# the RPC's own timeout (0.55.159). A request may legitimately need minutes;
+# locating the peer must not. Without this a UI call's 300 s default became
+# the address-walking budget and froze a phone's UI outright.
+_DIAL_START_DEADLINE_S = 12.0
+
+# peer_id → last (routable, unroutable) counts we logged. Every RPC costs two
+# dials, so an unconditional line here floods: it printed ten times a second
+# on the phone that surfaced the 32-endpoint problem, and buried it.
+_order_logged = {}
+
 
 def _endpoints_for(entry):
     """Addresses to try, mDNS-learned first then static (the hotspot-host
@@ -139,7 +159,21 @@ def _build_transport(peer_id):
         total needs a ceiling.
         """
         import time as _t
-        deadline = _t.monotonic() + max(8.0, float(timeout))
+        # FINDING the peer is bounded independently of how long the REQUEST
+        # may legitimately take (0.55.159).
+        #
+        # This was ``max(8.0, float(timeout))``, and UI RPCs carry the client
+        # default of 300 s — so one retargeted call could spend five minutes
+        # walking dead addresses. Field 2026-07-30: a phone's UI froze solid
+        # while administering a desktop, with 32 recorded endpoints to chew
+        # through.
+        #
+        # Safe to cap: the deadline is only tested before STARTING an attempt,
+        # never during one, so a slow-but-live request is not cut short. What
+        # it bounds is how long we keep trying addresses that aren't
+        # answering, which is not something any RPC's timeout should control.
+        deadline = _t.monotonic() + min(max(8.0, float(timeout)),
+                                        _DIAL_START_DEADLINE_S)
         # Same context builder the data channel uses — it loads OUR
         # client cert/key so the peer sees a cert at all, and leaves
         # chain validation off because pinning is done by fingerprint on
@@ -157,21 +191,48 @@ def _build_transport(peer_id):
         # have answered was among the five never reached. The kernel can tell
         # us which ones it has any path to, for free and without sending a
         # packet, so ask before spending five seconds finding out.
+        #
+        # NOTE: a SEPARATE local name. Assigning to ``endpoints`` here makes
+        # it local to ``_dial`` and the closure read below raises
+        # ``UnboundLocalError`` — which is exactly what 0.55.157 shipped, and
+        # it broke every admin dial rather than just failing to reorder.
+        ordered = list(endpoints)
         try:
             _routable, _unroutable = [], []
-            for _ep in endpoints:
+            for _ep in ordered:
                 _host = str(_ep).rsplit(':', 1)[0]
                 (_routable if _lan_push.has_route(_host)
                  else _unroutable).append(_ep)
             if _routable and _unroutable:
-                endpoints = _routable + _unroutable
-                lift_trace = (f'[lan-admin-client] dial order: '
-                              f'{len(_routable)} routable first, '
-                              f'{len(_unroutable)} with no local route last')
-                print(lift_trace, file=sys.stderr, flush=True)
+                ordered = _routable + _unroutable
+            # ONCE PER ORDERING CHANGE, NOT PER DIAL (0.55.158). Field
+            # 2026-07-30: this printed ten times a second on a phone. Every
+            # RPC makes two dials, so a per-dial line is a per-keystroke
+            # line — and it buried the fact that the peer had THIRTY-TWO
+            # recorded endpoints, which is the actual problem.
+            _sig = (len(_routable), len(_unroutable))
+            if _order_logged.get(str(peer_id)) != _sig:
+                _order_logged[str(peer_id)] = _sig
+                print(f'[lan-admin-client] {str(peer_id)[:8]}: '
+                      f'{len(_routable)} routable address(es) first, '
+                      f'{len(_unroutable)} with no local route last',
+                      file=sys.stderr, flush=True)
+                if len(ordered) > _DIAL_CANDIDATE_CAP:
+                    print(f'[lan-admin-client] {str(peer_id)[:8]}: '
+                          f'{len(ordered)} recorded addresses is far more '
+                          f'than can be tried in one budget — dialling the '
+                          f'first {_DIAL_CANDIDATE_CAP} routable ones. Stale '
+                          f'endpoints from past networks are never pruned; '
+                          f'that is the bug behind a slow dial',
+                          file=sys.stderr, flush=True)
+            # Cap what we actually attempt. Without this the deadline is
+            # spent on whichever addresses sort first and the reachable one
+            # may never be reached — capping at least makes the attempt set
+            # deterministic and small enough to finish.
+            ordered = ordered[:_DIAL_CANDIDATE_CAP]
         except Exception:
-            pass
-        for ep in endpoints:
+            ordered = list(endpoints)
+        for ep in ordered:
             if _t.monotonic() >= deadline:
                 # Say how many we never got to. Reporting only the
                 # addresses tried would imply the list was exhausted.

@@ -1610,6 +1610,25 @@ class SettingsScreen(Screen):
                     self._refresh_lan_buttons()
                     self._refresh_lan_status()
             Clock.schedule_once(_land, 0)
+            # WORK-OFFLINE ON THE SAME TICK (0.55.160).
+            #
+            # Kent 2026-07-30: *"the toggle is working. in fact, this one
+            # updates on the other client. Work_offline doesn't, but LAN_sync
+            # is immediately visible on the other UI."* Exactly right, and it
+            # was an inconsistency rather than a design: this tick re-read
+            # ``lan_toggle`` every 5 s while ``work_offline`` was read once,
+            # in ``refresh()``, on screen entry.
+            #
+            # It matters more now than when only one UI existed: with remote
+            # settings there are routinely two UIs on one daemon, and a
+            # toggle that silently disagrees between them is how someone
+            # ends up flipping the wrong device. I previously told Kent the
+            # UI isn't sensitive to changes it didn't make — half true, and
+            # the wrong half.
+            try:
+                self._refresh_work_offline_state()
+            except Exception:
+                pass
         threading.Thread(target=_work, daemon=True).start()
 
     def _fmt_as_of(self, iso):

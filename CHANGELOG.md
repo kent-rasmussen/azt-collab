@@ -9,6 +9,83 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.160 — work-offline now refreshes like LAN sync does
+
+Kent, 2026-07-30: *"this one updates on the other client. Work_offline doesn't,
+but LAN_sync is immediately visible on the other UI."*
+
+Correct, and it was an inconsistency rather than a design. The 5 s board tick
+re-read `lan_toggle` on every pass; `work_offline` was read once, in `refresh()`,
+on screen entry. So two UIs on one daemon agreed about one toggle and silently
+disagreed about the other.
+
+That mattered little when a daemon had one UI. With remote settings there are
+routinely two, and a toggle that disagrees between them is how someone flips the
+wrong device. I had told Kent the UI isn't sensitive to changes it didn't make —
+half true, and the wrong half.
+
+`_refresh_work_offline_state()` now runs on the same tick. It goes through
+`_rpc_then`, so it stays off the UI thread, and the handler was already
+idempotent.
+
+Still open, from the same observation: on Android the retarget isn't visible if
+you're sitting on a sub-page — Kent was looking at the remote device's settings
+and couldn't tell. His suggestion is to return to the main page on retarget,
+where the contributor field differs and makes it obvious. Not done here; it needs
+the picker's screen-manager API, and I'd rather read that than guess at it in a
+build I can't run.
+
+## 0.55.159 — the entry point froze the app
+
+Tapping "Open settings for this device" locked a phone solid; it had to be
+force-stopped, and the admin settings never opened. The tap that froze it is the
+feature's entry point, so on Android the feature was unusable from the outside
+regardless of everything working underneath.
+
+Two independent causes, both mine:
+
+- **`_go` ran on Kivy's main thread** (`lan_popups.py:1122`). It calls
+  `lan_can_admin`, which asks the local daemon to dial the peer — a network
+  round trip across an address list — straight from a button handler. It now
+  runs on a worker, with every UI touch (`_show_info_popup`,
+  `target_remote_peer`) marshalled back through `Clock`, since changing the
+  screen from a worker thread is its own crash.
+- **The dial budget was the RPC's timeout.** `_dial` used
+  `max(8.0, float(timeout))` and UI RPCs carry the client default of **300 s**,
+  so locating a peer could take five minutes — with 32 recorded endpoints, it
+  did. Now capped at 12 s by `_DIAL_START_DEADLINE_S`. Safe, because the
+  deadline is only tested before *starting* an attempt, never during one: a
+  slow-but-live request isn't cut short. How long we keep trying addresses that
+  aren't answering is not something an RPC's timeout should govern.
+
+Not addressed: after the tap there is now up to 12 s of nothing visible before
+the screen changes. Better than frozen, still not good — it wants a
+"connecting…" state, which is UI work rather than a fix.
+
+## 0.55.158 — my own log line flooded the phone; 32 endpoints per peer
+
+The dial-order line from 0.55.157 printed **ten times a second** on a phone.
+Every RPC costs two dials (challenge + admin), so an unconditional line there is
+a per-keystroke line. It now prints only when the routable/unroutable split
+changes for a peer.
+
+Worse, the flood buried what it had just revealed: `27 routable first, 5 with no
+local route last` — **thirty-two recorded endpoints for one peer.** Every address
+that machine has ever had, on every network it has ever joined, never pruned. At
+a 5 s connect timeout the overall budget covers two or three, so past a handful
+the extra entries only change which few get tried.
+
+- Attempts are capped at 6 candidates, so the set is small and deterministic
+  instead of "whatever sorted first before the clock ran out".
+- When the list is over the cap, one line says so and names stale-endpoint
+  accumulation as the underlying bug — pruning belongs in `peers` and isn't done
+  here.
+
+Also clarified by this run: the `not paired` refusal is **not** coming from
+`make_transport`. That raise happens before `_dial` is defined, and the dial-order
+line printed — so the entry was found locally, and the refusal is the *target*
+daemon's `_handle_admin`. Diagnosis moves to the desktop's log.
+
 ## 0.55.157 — routable addresses first; name the id mismatch
 
 **Dial order.** The admin dial's budget is an overall deadline, so a peer with
@@ -19,6 +96,13 @@ probe: no packet sent, works on Windows) now orders candidates so addresses the
 kernel has any path to are tried before ones it doesn't. 0.55.156's promotion
 covers the case where the peer is already talking to us; this covers the case
 where it isn't.
+
+Shipped broken and fixed in place: assigning to `endpoints` inside `_dial` made
+it a local, so the closure read raised `UnboundLocalError: 'endpoints'` and
+**every** admin dial failed rather than merely failing to reorder. The reorder
+now uses a separate `ordered` name. A bad optimisation should degrade to the old
+behaviour, not to no behaviour — the `except` was there for that and couldn't
+help, because the error was in the read, not the probe.
 
 **The id mismatch.** A phone displayed the remote-settings button for the desktop
 — which requires a paired entry to render at all — and then `make_transport`
