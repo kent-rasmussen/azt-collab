@@ -5834,9 +5834,13 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                 if sha in reused_shas:
                     continue
                 obj = store[sha]
+                # Bound BEFORE the branch: it was assigned only inside the
+                # blob case, so the first non-blob object reaching the
+                # chain-recording below raised ``NameError`` on a name that
+                # merely looked in scope. Third instance of that shape today.
+                path = None
                 if obj.type_name == b'blob':
                     hint = todo.get(sha)
-                    path = None
                     if isinstance(hint, tuple) and len(hint) > 1:
                         path = hint[1]
                     base_sha = base_by_path.get(path) if path else None
@@ -5849,6 +5853,12 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                             if len(delta) < len(target_raw) * 0.9:
                                 stats['computed'] += 1
                                 stats['saved'] += len(target_raw) - len(delta)
+                                # This version becomes the base for the NEXT
+                                # one of the same path in this pack — the
+                                # delta branch must record it too, or a
+                                # three-commit push chains only once.
+                                if path:
+                                    base_by_path[path] = sha
                                 yield UnpackedObject(
                                     REF_DELTA,
                                     delta_base=hex_to_sha(base_sha),
@@ -5857,6 +5867,17 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                                 continue
                         except Exception:
                             pass
+                # CHAIN WITHIN THE PACK (0.55.165). A multi-commit push
+                # carries several versions of the same file, and only the
+                # FIRST can delta against the remote's copy — the rest have
+                # their natural base in this same pack. Recording each blob
+                # we emit lets version N delta against N-1, so three commits
+                # touching a 16 MB LIFT cost one blob plus two deltas rather
+                # than three blobs. Legal because a REF_DELTA base may live
+                # in the pack as well as on the remote, and we only ever
+                # name one we have already emitted.
+                if obj.type_name == b'blob' and path:
+                    base_by_path[path] = sha
                 stats['full'] += 1
                 yield full_unpacked_object(obj)
 
@@ -5871,11 +5892,21 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                      progress=progress)
     # Report AFTER the push, describing what was actually sent — the counts
     # aren't known until the generator has been consumed.
+    # ADAPTIVE UNITS (0.55.166). ``0.0 MB not transferred`` was printed for
+    # every small push — a 265 KB JSON delta rounds to nothing in MB — and
+    # reads as "the delta path achieved zero" when it saved most of the
+    # payload. A metadata-only push (commit + tree, no blobs) legitimately
+    # saves nothing, and the two must not look identical.
+    _saved = int(stats['saved'])
+    _saved_txt = (f'{_saved / (1024 * 1024):.1f} MB'
+                  if _saved >= 1024 * 1024 else f'{_saved / 1024:.1f} KB')
+    _tail = (' — no blobs in this push, so nothing to delta'
+             if not stats['computed'] and not stats['reused']
+             else f' — {_saved_txt} not transferred')
     lift_merge.trace(
         f'[sync-trace] thin push: {stats["computed"]} blob(s) delta\'d at '
         f'push time, {stats["reused"]} reused from local packs, '
-        f'{stats["full"]} sent whole — {stats["saved"] / (1024 * 1024):.1f} '
-        f'MB not transferred')
+        f'{stats["full"]} sent whole{_tail}')
 
 
 class _PushProgressStream:
@@ -8999,11 +9030,31 @@ def _push_step_locked(repo, project_dir, username, token, remote_url, result):
             refspec = _enc(f'{TEMP_REF.decode()}:refs/heads/{branch}')
         try:
             with _socket_timeout(_PUSH_TIMEOUT_S):
-                porcelain.push(
-                    repo, remote_url, refspec,
-                    username=username, password=token,
-                    errstream=io.BytesIO(),
-                )
+                # THIN PACK HERE TOO (0.55.165). ``direct-push`` is the route
+                # every ORDINARY sync takes — local simply ahead of the
+                # remote — so wiring the delta path only into topic-push
+                # (0.55.149) meant it never ran: both of the day's real
+                # pushes went through here and shipped whole 16 MB blobs for
+                # six-line edits. Catch-up pushes are the rare case; this is
+                # the one the team pays every day.
+                #
+                # Same guard as the topic-push site: any failure falls back
+                # to ``porcelain.push`` for the identical refspec, and
+                # receive-pack is atomic so a failed thin attempt applied
+                # nothing.
+                try:
+                    _push_thin(repo, remote_url, refspec, username, token)
+                except Exception as _thin_exc:
+                    lift_merge.trace(
+                        f'[sync-trace] thin push failed '
+                        f'({type(_thin_exc).__name__}: '
+                        f'{str(_thin_exc)[:160]}) — retrying the old way; '
+                        f'nothing was applied, receive-pack is atomic')
+                    porcelain.push(
+                        repo, remote_url, refspec,
+                        username=username, password=token,
+                        errstream=io.BytesIO(),
+                    )
             lift_merge.trace(
                 f'[sync-trace] push done (advanced {chunk_n} commits)')
             # Advance the local mirror to the SHA we just pushed.

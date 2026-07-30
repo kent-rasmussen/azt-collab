@@ -9,6 +9,62 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.166 — thin pack VERIFIED; make its own line readable
+
+**Verified in the field, 2026-07-30**, on both routes:
+
+```
+topic-push  thin push: 2 blob(s) delta'd at push time, 0 reused … 15.7 MB not transferred
+direct-push thin push: 3 blob(s) delta'd at push time, 1 reused … 15.4 MB not transferred
+```
+
+The `0 reused from local packs` in most of them is the finding that matters:
+essentially every delta was computed **at push time**, not taken from the
+repack. `git repack` points its chains the wrong way for incremental pushes
+(largest-as-base, so the newest version becomes the base), so stored deltas are
+close to useless here. Repacking still earned its place by shedding loose-object
+bloat, but thin-pack is what makes pushes small — and it is the only mechanism
+that can ever work on Android, which has no git binary to repack with.
+
+Per-unit time settled at ~11 s, unchanged from before the payload shrank. What
+remains is negotiation plus GitHub's receive-pack processing: the floor for this
+link, and not something further compression will move.
+
+Log fix: `0.0 MB not transferred` was printed for every small push — a 265 KB
+JSON delta rounds to nothing in MB — reading as "achieved zero" when it had
+saved most of the payload. Units are now adaptive, and a metadata-only push
+(commit + tree, no blobs) says *"no blobs in this push, so nothing to delta"*
+instead of being indistinguishable from a delta path that failed.
+
+## 0.55.165 — thin pack on the route ordinary syncs actually take
+
+0.55.149 wired the push-time delta path into topic-push only, and topic-push is
+for **diverged** history. Both of the day's real pushes logged `route:
+direct-push` — local simply ahead of the remote — so `_push_thin` never
+executed once, and six-line edits shipped whole 16 MB blobs. Catch-up pushes are
+the rare case; direct-push is the one a team pays every day.
+
+Now wired there too, with the same guard: any failure falls back to
+`porcelain.push` on the identical refspec, and receive-pack's atomicity means a
+failed thin attempt applied nothing.
+
+**Delta chaining within the pack.** A multi-commit push carries several versions
+of one file, and only the first can delta against the remote's copy — the rest
+have their natural base in the same pack. Each emitted blob is now recorded as
+the base for the next of that path, so three commits touching a 16 MB LIFT cost
+one blob plus two deltas instead of three blobs. Legal because a `REF_DELTA`
+base may live in the pack as well as on the remote, and we only ever name one
+already emitted.
+
+Two scoping bugs caught before shipping rather than after: `path` was bound only
+inside the blob branch, so the first non-blob object would have raised
+`NameError` on a name that merely looked in scope — the same shape as
+0.55.157's `UnboundLocalError` — and the delta branch returned without recording
+its base, which would have chained exactly once and then stopped.
+
+Testing this needs no volume, only one commit: edit a line in a large LIFT and
+watch for `thin push: 1 blob(s) delta'd at push time … N MB not transferred`.
+
 ## 0.55.164 — Share diagnostics does something on desktop
 
 There is no share sheet outside Android — `share_files` returns early on any

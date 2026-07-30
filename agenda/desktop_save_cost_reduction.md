@@ -24,6 +24,69 @@
 - **Waiting on:** Nothing (Phase 0 needs the spurious-prompts fixes
   deployed on the slow machine first)
 
+## RE-WEIGHTED 2026-07-30 (Kent) — Phase 2's premise was WRONG
+
+**The misreading:** Phase 2 called dirty-flag skip "likely the single biggest win"
+on the strength of "azt autosaves unchanged content routinely". Kent: *"sure they
+can [both be true]. autosaving is through maybewrite. 'routinely' here does not
+mean 'more often than changes are made', but rather 'triggered by each change'."*
+So `maybewrite` IS the autosave, fired per change, and the content genuinely
+differs on every save. There is little or nothing to skip — **dirty-skip is not
+the win.** Phase 2's serializer-cost half stands; its skip half does not.
+
+**The actual problem, in Kent's words:** *"the LIFT file is easily 16MB, and the
+whole thing is written when only a single line of text has changed."* Four
+O(file) passes per one-line change:
+
+1. `xmlfns.indent(self.nodes)` — full-tree reindent, mutating every element
+   (`azt/io_put/lift.py:1225`);
+2. `ElementTree.write` to the `.part` sibling — serialize + write 16 MB;
+3. `submit_file` hands the daemon the whole 16 MB;
+4. daemon: `_stage_all` (~3050-file walk), LIFT blob rehash, commit.
+
+**So Phase 3 (surgical entry submit) is the main event, not Phase 2.** Phase 1
+(stage only the submitted path) stays a cheap complement worth doing regardless.
+
+### Precision: stop at per-entry (decided 2026-07-30)
+Kent asked what finer precision would cost — often only
+`entry/sense/citation/form`, or a form's annotation, has changed. Answer: several
+times the work of per-entry, for almost nothing.
+
+- After per-entry the payload is no longer the bottleneck. The daemon must still
+  splice and write a coherent 16 MB file and git must hash a 16 MB blob — a floor
+  identical for a 2 KB entry or a 100 B form. Entry→form optimises ~0.01% of the
+  original cost, sitting behind fixed costs that don't move.
+- Per-field work is in ADDRESSING and MERGE, not the write: a path like
+  `sense[2]/citation/form[@lang='baf']` must survive a peer reordering senses
+  between base and HEAD (positional addressing is what the 2026-07-10 duplicate-form
+  fix had to remove), and field-level edits against a moved base need conflict
+  rules per field type. azt-side tracking grows from dirty guids to
+  (guid, path, lang, name).
+- It doesn't win the concurrency argument either: the daemon's merge takes the
+  entry as its unit but descends into forms/langs within it, so entry-level
+  submission already survives a peer editing a different field of the same entry.
+- If a specific field ever needs it, `lift_surgery.py` is the precedent for adding
+  one case at a time (as `set_audio`/`set_illustration` were) rather than
+  generalising the write path.
+
+Kent: *"I'll take your recommendation, and we can look at more precision later, if
+we decide it might help at that point."*
+
+### Interaction with the git/delta work (asked 2026-07-30): NONE
+Per-entry submission changes only the azt→daemon wire. What gets COMMITTED is
+identical — same working file, same blob, same history — and git's delta
+compression operates on committed objects, not on the wire format. So none of the
+recent push/delta/chunk-ordering work is affected either way.
+
+The distinction to keep: **wire granularity** buys azt latency/CPU;
+**storage granularity** is what would touch deltas. Today every save adds a fresh
+~16 MB blob; they delta well against each other (consecutive versions differ by one
+entry), but COMPUTING those deltas over 16 MB blobs is exactly what packing and
+pushing spend CPU on, and dulwich is not C git. Per-entry submission does not
+reduce that at all; the parked entry-per-file option would (one small blob per
+change, other files' blobs untouched). If object churn per save later proves to be
+the constraint, the lever is storage layout — not finer RPCs.
+
 ## Plans
 
 ### Phase 0 — measure before building (gate for everything below)
