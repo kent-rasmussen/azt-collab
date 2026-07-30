@@ -699,7 +699,28 @@ def share_diagnostics_action(on_error=None):
     from ..translate import tr as _tr
     from ..transports.android_cp import CANONICAL_AUTHORITY
 
-    bundle = prepare_share_bundle()
+    # On a host with no share sheet, staging IS the deliverable, so keep the
+    # archive instead of letting the 1 h prune take it (0.55.164). Kent
+    # 2026-07-30: *"It would be nice to have the same behavior as get logs
+    # from the peer page: put it in $AZT_HOME/.shares"* — which is where it
+    # already goes; what it lacked was surviving, and being told where.
+    from .._platform import on_android as _on_android
+    _no_share_sheet = not _on_android()
+    bundle = prepare_share_bundle(keep=_no_share_sheet)
+    if _no_share_sheet and bundle and (bundle.get('items') or []):
+        try:
+            import os as _os
+            from ..paths import azt_home as _azt_home
+            _rel = str((bundle['items'][0] or {}).get('uri_path') or '')
+            # ``_shares/<token>/<name>`` on the wire; ``.shares`` on disk.
+            if _rel.startswith('_shares/'):
+                _rel = '.shares/' + _rel[len('_shares/'):]
+            _path = _os.path.join(_azt_home(), *_rel.split('/'))
+            if on_error is not None:
+                on_error(_tr('Diagnostics saved: {path}').format(path=_path))
+            return True
+        except Exception:
+            pass        # fall through to the generic non-Android report
 
     if bundle is None:
         return share_text(

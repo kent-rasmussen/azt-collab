@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.162"
+__version__ = "0.55.164"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -3263,7 +3263,7 @@ def get_daemon_log():
     }
 
 
-def prepare_share_bundle():
+def prepare_share_bundle(keep=False):
     """Stage the diagnostic snapshot + per-day daemon logs into
     ``$AZT_HOME/.shares/<token>/`` on the daemon side and return
     ``{'token': str, 'items': [{'display_name': str,
@@ -3287,10 +3287,16 @@ def prepare_share_bundle():
     list if both the snapshot and the log-file copy failed
     (shouldn't happen in practice — the snapshot generator is
     near-bulletproof).
+
+    ``keep=True`` exempts the staged bundle from that TTL (0.55.164), for
+    hosts where nothing is going to consume it promptly — desktop has no
+    share sheet, so the archive would otherwise be written, never sent, and
+    swept an hour later. Same durability the peer-diagnostics pull gets.
     """
     try:
         resp = call('POST',
-                    '/v1/diagnostics/prepare_share_bundle', {})
+                    '/v1/diagnostics/prepare_share_bundle',
+                    {'keep': bool(keep)})
     except ServerUnavailable:
         return None
     if not resp.get('ok'):
@@ -3418,6 +3424,17 @@ def update_self():
     try:
         resp = call('POST', '/v1/admin/update_self', {})
     except ServerUnavailable as ex:
+        # A 404 here is not unreachability — it is a daemon that answered and
+        # has no such endpoint, i.e. one older than 0.55.161. Saying "no
+        # daemon reachable" about a server that just replied sends the user
+        # to look at the network (field 2026-07-30: the message read
+        # ``no daemon reachable: … HTTP 404 … "not_found"`` over a working
+        # link). Bootstrap is inherent: the endpoint that enables remote
+        # update is the thing that is missing, so that machine needs one
+        # local update and every later one can be remote.
+        _txt = str(ex)
+        if 'not_found' in _txt or '404' in _txt:
+            return 'TOO_OLD', _txt
         return 'FAILED', f'no daemon reachable: {ex}'
     except Exception as ex:
         return 'FAILED', str(ex)

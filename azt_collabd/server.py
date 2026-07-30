@@ -5088,8 +5088,19 @@ def _carried_bundle_items(exclude_slug=''):
             sub = os.path.join(root, name)
             if not os.path.isdir(sub):
                 continue
-            if not os.path.exists(os.path.join(sub, '.keep')):
+            _marker = os.path.join(sub, '.keep')
+            if not os.path.exists(_marker):
                 continue          # not a carried bundle
+            # A LOCAL keep is not a carried bundle (0.55.164). Desktop marks
+            # its own staged archive ``.keep`` so it survives the prune;
+            # treating that as carried would embed each local bundle inside
+            # the next one, compounding every time the button is pressed.
+            try:
+                with open(_marker) as _fh:
+                    if _fh.read(16).strip().startswith('local'):
+                        continue
+            except OSError:
+                pass
             for fn in os.listdir(sub):
                 if fn == '.keep' or fn.endswith('.part'):
                     continue
@@ -5253,6 +5264,32 @@ def stage_diagnostics_bundle(exclude_slug=''):
         'display_name': archive_name,
         'uri_path': f'_shares/{token}/{archive_name}',
     }]
+
+    # KEEP IT ON DISK WHEN NOBODY IS GOING TO CONSUME IT (0.55.164).
+    #
+    # The 1 h prune assumes a share sheet is already open and the file will be
+    # read within minutes. On desktop there is no share sheet at all —
+    # ``share_files`` returns early on non-Android — so the staged archive was
+    # written, never sent, and swept an hour later. Kent asked for the
+    # peer-page behaviour: leave it in ``$AZT_HOME/.shares`` so it can be
+    # attached by hand.
+    #
+    # The marker content matters. ``.keep`` also means "a bundle CARRIED from
+    # a paired peer", and carried bundles get embedded into future archives —
+    # so an unqualified marker here would nest each local bundle inside the
+    # next one. Writing ``local`` lets ``_carried_bundle_items`` skip it.
+    if bool((body or {}).get('keep')):
+        try:
+            with open(os.path.join(dest_dir, '.keep'), 'w') as fh:
+                fh.write('local\n')
+            print(f'[share-bundle] marked keep (local): {archive_path!r} — '
+                  f'no share sheet on this platform, so it stays for manual '
+                  f'attachment instead of being pruned in an hour',
+                  file=sys.stderr, flush=True)
+        except OSError as ex:
+            print(f'[share-bundle] could not mark keep: {ex!r} — the bundle '
+                  f'will be pruned in an hour',
+                  file=sys.stderr, flush=True)
 
     archive_bytes = 0
     try:

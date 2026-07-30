@@ -9,6 +9,54 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.164 — Share diagnostics does something on desktop
+
+There is no share sheet outside Android — `share_files` returns early on any
+other platform (`share.py:364`). So on desktop the daemon staged the archive,
+nothing consumed it, and the 1 h prune removed it. The button appeared to work
+and left nothing behind.
+
+Kent asked for the peer-page behaviour: leave it in `$AZT_HOME/.shares`. That is
+already where it goes; what it lacked was *surviving*, and saying where.
+
+- `prepare_share_bundle(keep=True)` marks the token directory `.keep`, the same
+  marker that exempts a peer-pulled bundle from the prune. The non-Android
+  branch sets it, since on those hosts staging is the whole deliverable.
+- The status line now reads `Diagnostics saved: <path>` with the real on-disk
+  path, instead of describing a share that didn't happen. Note `_shares/` on the
+  wire vs `.shares/` on disk — the provider path shape and the directory name
+  differ, and the translation between them belongs at exactly one place.
+
+One trap avoided: `.keep` *also* means "a bundle carried from a paired peer", and
+carried bundles are embedded into future archives. An unqualified marker here
+would nest each local bundle inside the next one, compounding on every press. The
+marker now contains `local`, and `_carried_bundle_items` skips those.
+
+## 0.55.163 — "no daemon reachable" about a daemon that answered
+
+Field, immediately after 0.55.162 shipped:
+
+```
+Update failed: no daemon reachable: peer 80570dd9:
+  RuntimeError('HTTP 404 from 10.191.129.91:55870: {"ok": false, "error": "not_found"}')
+```
+
+The link was fine and the remote daemon replied — it simply has no
+`/v1/admin/update_self`, being older than 0.55.161. The wrapper mapped every
+`ServerUnavailable` to "no daemon reachable", which sends the user to look at the
+network for a version problem. Now returns `TOO_OLD`, and the UI says *"That
+device is too old to update remotely — update it once on that computer."*
+
+The bootstrap is inherent and worth stating plainly: the endpoint that makes
+remote update possible is the thing a too-old daemon is missing. One update at
+that machine's own keyboard, and every update after it can be remote. There is no
+boot-time self-update to route around it — `git_pull_self` has exactly two
+callers, the settings UI and the new endpoint.
+
+Which also means I still cannot explain how a colleague's daemon reached 0.55.156
+during a remote session. The mechanism I proposed (a startup self-update) does not
+exist. Recording the gap rather than closing it with a guess.
+
 ## 0.55.162 — don't break the local update to fix the remote one
 
 0.55.161 routed Update through an RPC, which fixes the retargeted case and

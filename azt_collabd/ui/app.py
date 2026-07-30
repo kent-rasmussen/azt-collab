@@ -5653,6 +5653,10 @@ class CollabUIApp(App):
                                       'so it cannot self-update.'),
                 'NO_GIT': _tr('git is not installed on this computer.'),
                 'TIMEOUT': _tr('Update timed out.'),
+                # Terse and actionable: the one thing the user can do is
+                # update that machine at its own keyboard once.
+                'TOO_OLD': _tr('That device is too old to update remotely '
+                               '— update it once on that computer.'),
             }
             if code in msgs:
                 text = msgs[code]
