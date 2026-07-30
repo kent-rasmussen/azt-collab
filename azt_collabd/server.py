@@ -5278,7 +5278,13 @@ def stage_diagnostics_bundle(exclude_slug=''):
     # a paired peer", and carried bundles get embedded into future archives —
     # so an unqualified marker here would nest each local bundle inside the
     # next one. Writing ``local`` lets ``_carried_bundle_items`` skip it.
-    if bool((body or {}).get('keep')):
+    # ``_body``, not ``body`` — the parameter is underscore-prefixed because
+    # nothing used it until 0.55.164, which then referenced the un-prefixed
+    # name and made every call raise ``NameError``. The wrapper turns that
+    # into ``None``, the UI falls through to its text fallback, and the
+    # symptom is "Sharing is only available on Android" — on both platforms,
+    # for a feature that had nothing to do with platform.
+    if bool((_body or {}).get('keep')):
         try:
             with open(os.path.join(dest_dir, '.keep'), 'w') as fh:
                 fh.write('local\n')

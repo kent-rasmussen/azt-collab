@@ -9,6 +9,54 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.168 — 0.55.164 broke Share diagnostics on every platform
+
+`_h_prepare_share_bundle(_body)` — underscore-prefixed, because nothing used the
+parameter. 0.55.164 added a `keep` check that referenced `body`, so **every**
+call raised `NameError`. The client wrapper turns a non-OK response into `None`,
+`share_diagnostics_action` falls through to its text fallback, and the message
+the user sees is *"Sharing is only available on Android."*
+
+Which is how a one-word mistake produced a symptom that named the wrong cause on
+the wrong axis: a platform message, on desktop, for a bug that had nothing to do
+with platform and had broken Android too. I then spent a round explaining the
+difference between the `Share` and `Share diagnostics` buttons — correct, and
+irrelevant.
+
+Two lessons worth keeping over the fix itself:
+
+- An underscore-prefixed parameter is a promise that the body is unused. Adding
+  a use means renaming it, and Python will not tell you — the reference resolves
+  to a global that doesn't exist, at call time, inside a handler whose failure is
+  already converted to a polite `None`.
+- The wrapper's `return None` on a non-OK response is what hid it. `None` means
+  "no bundle" and is indistinguishable from "the daemon exploded". Worth a typed
+  distinction, since the same shape will hide the next one.
+
+## 0.55.167 — say what was in the pack that got refused
+
+Field, 2026-07-30, one push in roughly twenty-five:
+
+```
+thin push failed (SendPackError: b'unpack index-pack failed')
+  — retrying this chunk the old way; nothing was applied
+```
+
+The fallback did its job and the chunk went through. But the stats line only ran
+on the success path, so a rejection reported the exception and nothing about the
+pack that provoked it — no way to tell an unlucky object from a chaining bug,
+which want different fixes.
+
+On rejection it now logs computed / reused / whole counts and the deepest
+same-path delta chain in that pack. `chain_max` exists because in-pack chaining
+(0.55.165) is the newest and least-exercised part of this path: legal, but the
+first thing to suspect if a server ever declines to resolve one.
+
+Route context also settled what 0.55.166 claimed on thinner evidence:
+`route: direct-push` at 17:44–17:47 produced no thin push (0.55.164 was running),
+while the 18:09 block did. **Both routes are now genuinely verified**, rather than
+inferred from which lines happened to be in a paste.
+
 ## 0.55.166 — thin pack VERIFIED; make its own line readable
 
 **Verified in the field, 2026-07-30**, on both routes:

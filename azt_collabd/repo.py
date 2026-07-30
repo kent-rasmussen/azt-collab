@@ -5776,7 +5776,12 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
         out[rhs] = new_sha
         return out
 
-    stats = {'reused': 0, 'computed': 0, 'full': 0, 'saved': 0}
+    # ``chain_max`` tracks how many times one path has been re-based within a
+    # single pack (0.55.167). In-pack chaining is legal, but a long chain is
+    # the first thing to suspect if the server ever refuses to resolve one.
+    stats = {'reused': 0, 'computed': 0, 'full': 0, 'saved': 0,
+             'chain_max': 0}
+    chain_depth = {}
 
     def generate_pack_data(have, want, ofs_delta=True, progress=None):
         store = repo.object_store
@@ -5859,6 +5864,11 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                                 # three-commit push chains only once.
                                 if path:
                                     base_by_path[path] = sha
+                                    chain_depth[path] = (
+                                        chain_depth.get(path, 0) + 1)
+                                    stats['chain_max'] = max(
+                                        stats['chain_max'],
+                                        chain_depth[path])
                                 yield UnpackedObject(
                                     REF_DELTA,
                                     delta_base=hex_to_sha(base_sha),
@@ -5888,8 +5898,23 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
     progress = None
     if errstream is not None:
         progress = errstream.write
-    client.send_pack(path, update_refs, generate_pack_data,
-                     progress=progress)
+    try:
+        client.send_pack(path, update_refs, generate_pack_data,
+                         progress=progress)
+    except Exception:
+        # SAY WHAT WE SENT WHEN IT IS REFUSED (0.55.167). The stats line
+        # below only ran on success, so a rejection told us the exception and
+        # nothing about the pack that caused it. Field 2026-07-30: one
+        # ``SendPackError: unpack index-pack failed`` in ~25 pushes — the
+        # fallback covered it, and there was no way to tell whether the pack
+        # held one delta or a deep chain, which is the difference between an
+        # unlucky object and a chaining bug.
+        lift_merge.trace(
+            f'[sync-trace] thin push REJECTED with '
+            f'{stats["computed"]} computed delta(s), {stats["reused"]} '
+            f'reused, {stats["full"]} whole; deepest same-path chain '
+            f'{stats.get("chain_max", 0)}')
+        raise
     # Report AFTER the push, describing what was actually sent — the counts
     # aren't known until the generator has been consumed.
     # ADAPTIVE UNITS (0.55.166). ``0.0 MB not transferred`` was printed for
