@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.160"
+__version__ = "0.55.162"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -3400,6 +3400,33 @@ def get_diagnostic_snapshot():
     return str(resp.get('text') or '')
 
 
+def update_self():
+    """Ask the daemon to fast-forward its OWN git checkout (0.55.161).
+
+    Returns ``(code, detail)`` — `self_update`'s codes, untranslated:
+    ``UPDATED`` / ``UP_TO_DATE`` / ``NOT_A_CHECKOUT`` / ``NO_GIT`` /
+    ``TIMEOUT`` / ``FAILED``. Transport failure comes back as
+    ``('FAILED', <reason>)`` so a caller in a button handler needs no
+    try/except, per the query-shaped-wrapper rule.
+
+    Goes through ``call()``, so it updates whichever daemon this process is
+    pointed at — including a remote one under remote settings. That is the
+    entire point: the desktop Update button used to import ``self_update``
+    in-process and pull the LOCAL checkout while the page said it was editing
+    another device. It does NOT restart; the caller decides, and
+    ``restart_server()`` follows the same transport."""
+    try:
+        resp = call('POST', '/v1/admin/update_self', {})
+    except ServerUnavailable as ex:
+        return 'FAILED', f'no daemon reachable: {ex}'
+    except Exception as ex:
+        return 'FAILED', str(ex)
+    if not isinstance(resp, dict):
+        return 'FAILED', 'malformed response'
+    return (str(resp.get('code', '') or 'FAILED'),
+            str(resp.get('detail', '') or ''))
+
+
 def restart_server():
     """Ask the daemon to restart itself.
 
@@ -3596,6 +3623,7 @@ __all__ = [
     'prepare_share_bundle',
     'get_diagnostic_snapshot',
     'restart_server',
+    'update_self',
     'cawl_index', 'cawl_cache_status', 'cawl_prefetch',
     'set_cawl_image_repo', 'set_repo_slug', 'forget_project',
     'record_project_sync_time', 'grant_collaborator',

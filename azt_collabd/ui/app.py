@@ -5583,11 +5583,50 @@ class CollabUIApp(App):
         self._set_update_msg(_tr('Updating…'))
 
         def _work():
+            # THROUGH THE RPC, NOT IN-PROCESS (0.55.161). This imported
+            # ``self_update`` directly and pulled whichever checkout the UI
+            # was running from — while the ``restart_server()`` below goes
+            # through ``pick_transport()`` and DOES follow the remote
+            # retarget. So with the page reading ``EDITING <their device>``,
+            # Update pulled this machine and restarted theirs: two halves of
+            # one action aimed at two different computers.
+            #
+            # Routing it makes "update" mean the same device as everything
+            # else on the page, and makes updating a field install over the
+            # remote-settings tunnel possible at all.
             try:
-                from azt_collabd import self_update
-                code, detail = self_update.git_pull_self()
+                from azt_collab_client import update_self as _upd
+                code, detail = _upd()
             except Exception as ex:
                 code, detail = 'FAILED', str(ex)
+            # FALL BACK IN-PROCESS WHEN WE ARE THE TARGET (0.55.162).
+            #
+            # Routing through the RPC fixes the remote case but breaks a local
+            # one: a UI on new code against a daemon too old to know
+            # ``/v1/admin/update_self`` gets a 404, and the user is told the
+            # update failed when the in-process pull would have worked. On
+            # desktop the UI and the daemon are separate processes and drift
+            # routinely, so that combination is ordinary, not exotic.
+            #
+            # Only when NOT retargeted — falling back locally while the page
+            # says it is editing another device would recreate exactly the
+            # wrong-machine bug this change exists to remove.
+            if code == 'FAILED':
+                try:
+                    from azt_collab_client import transports as _tr
+                    _remote = bool(_tr.is_remote())
+                except Exception:
+                    _remote = False
+                if not _remote:
+                    try:
+                        from azt_collabd import self_update
+                        code, detail = self_update.git_pull_self()
+                        print('[settings] update_self RPC unavailable '
+                              f'({detail!r} was the RPC error); pulled this '
+                              f'checkout in-process instead → {code}',
+                              flush=True)
+                    except Exception as ex:
+                        code, detail = 'FAILED', str(ex)
             # On a real update, auto-restart the daemon so the new code
             # is actually live — an "update" is a deliberate act and
             # there's no case where the user updates but wants to keep

@@ -9,6 +9,52 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.162 — don't break the local update to fix the remote one
+
+0.55.161 routed Update through an RPC, which fixes the retargeted case and
+introduces a local regression: a UI on new code against a daemon too old to know
+`/v1/admin/update_self` gets a 404 and reports "Update failed" — where the old
+in-process pull would have worked. On desktop the UI and the daemon are separate
+processes that drift routinely, so that pairing is ordinary rather than exotic,
+and pressing Update is exactly when someone is trying to escape a version skew.
+
+Falls back to the in-process pull **only when not retargeted**. Doing it while the
+page reads `EDITING <their device>` would recreate the wrong-machine bug 0.55.161
+exists to remove, so the fallback is gated on `transports.is_remote()` being
+false, and it logs that it took that route.
+
+Written after Kent asked whether 0.55.161 was a real fix or tweaks to manage a
+situation I'd misread. The defect was real — `git_pull_self` pulls `repo_root()`
+of the calling process, which under `ui --peer <id>` is the local machine — but I
+had not thought about the old-daemon case, because I was reasoning about a field
+outcome I had wrong.
+
+## 0.55.161 — Update now updates the device the page says it's editing
+
+The desktop Update button worked — on the wrong machine. `_desktop_git_update`
+imported `self_update` and pulled **in the UI's own process**, so it
+fast-forwarded whichever checkout the UI was running from. The
+`restart_server()` immediately after it goes through `pick_transport()` and
+*does* honour the remote retarget. So with the page reading `EDITING <their
+device>`, Update pulled the local machine and restarted the remote one — two
+halves of one action aimed at two different computers.
+
+New `POST /v1/admin/update_self` runs the fast-forward in the daemon and returns
+`self_update`'s own codes (`UPDATED` / `UP_TO_DATE` / `NOT_A_CHECKOUT` /
+`NO_GIT` / `TIMEOUT` / `FAILED`) with no strings, so the caller translates.
+Client wrapper `update_self()` returns `(code, detail)` and never raises.
+Deliberately does not restart — the caller decides, and it already has a restart
+that follows the same transport.
+
+Beyond fixing the mismatch, this is what makes updating a field install over the
+remote-settings tunnel possible at all: the difference between maintaining these
+machines from one seat and needing hands on each keyboard. Kent was updating a
+colleague's desktop by hand while sitting next to a working tunnel to it.
+
+Peers on an older daemon return 404 for the new path, which surfaces as
+`('FAILED', …)` — so a new UI against an old daemon says the update failed rather
+than silently updating the wrong computer.
+
 ## 0.55.160 — work-offline now refreshes like LAN sync does
 
 Kent, 2026-07-30: *"this one updates on the other client. Work_offline doesn't,

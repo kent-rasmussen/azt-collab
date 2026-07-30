@@ -5670,6 +5670,43 @@ def _h_get_daemon_log_files(_body):
                  "enabled": True}
 
 
+def _h_admin_update_self(_body):
+    """``POST /v1/admin/update_self`` — fast-forward THIS daemon's own git
+    checkout (0.55.161).
+
+    Returns ``{ok: True, code, detail}`` where ``code`` is `self_update`'s
+    own: ``UPDATED`` / ``UP_TO_DATE`` / ``NOT_A_CHECKOUT`` / ``NO_GIT`` /
+    ``TIMEOUT`` / ``FAILED``. No strings — the caller translates, per the
+    structured-Result rule.
+
+    Exists because the desktop Update button did this **in the UI's own
+    process** by importing ``self_update`` directly, so it pulled whichever
+    checkout the UI was running from. The `Restart server` that follows it
+    goes through ``pick_transport()`` and DOES honour the remote retarget —
+    so with the page reading ``EDITING <their device>``, Update pulled the
+    local machine and restarted the remote one. Two halves of one action
+    pointing at two different computers.
+
+    Routing it through an RPC makes "update" mean the same device the rest of
+    the page means, and makes updating a field machine over the remote-settings
+    tunnel possible at all — which is the difference between maintaining these
+    installs remotely and needing hands on each keyboard.
+
+    Deliberately does NOT restart: the caller decides, and it already has a
+    restart call that follows the same transport."""
+    try:
+        from . import self_update
+        code, detail = self_update.git_pull_self()
+    except Exception as ex:
+        print(f'[azt_collabd] /v1/admin/update_self raised: {ex!r}',
+              file=sys.stderr, flush=True)
+        return 200, {"ok": True, "code": "FAILED", "detail": str(ex)[:300]}
+    print(f'[azt_collabd] /v1/admin/update_self: {code} '
+          f'({str(detail or "")[:200]})', file=sys.stderr, flush=True)
+    return 200, {"ok": True, "code": str(code or ''),
+                 "detail": str(detail or '')[:300]}
+
+
 def _h_admin_restart(_body):
     """``POST /v1/admin/restart`` — restart the daemon process.
 
@@ -6094,6 +6131,8 @@ def dispatch(method, path, body):
             return _h_prepare_share_bundle(body)
         if path == '/v1/admin/restart':
             return _h_admin_restart(body)
+        if path == '/v1/admin/update_self':
+            return _h_admin_update_self(body)
         if path == '/v1/sync/nudge':
             return _h_sync_nudge(body)
         if path == '/v1/recent/last_project':
