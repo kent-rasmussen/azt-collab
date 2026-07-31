@@ -9,6 +9,26 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.191 — withdraw the untested Windows daemon lock
+
+0.55.189's `msvcrt.locking` guard is reverted, without ever having been
+deployed. It is very likely correct. It is also untested on the only platform it
+affects, and the failure mode of a wrong lock primitive is a daemon that never
+starts — on machines nobody can reach, with no remote channel left, since the
+admin channel needs the daemon. Wrong risk to take the night before a 17-day
+absence.
+
+It was also not the fix. All 14 duplicate daemons came from one process's spawn
+storm, which is 0.55.190 — client-side, and unable to prevent a daemon starting.
+
+The daemon-side guard is still worth having as a backstop, and should be ported
+from azt's existing single-instance module rather than invented here: Kent wrote
+that one because this is hard on Windows, and its failure modes are already
+known. Recorded in `agenda/daemon_needs_real_single_instance_guard.md`.
+
+**0.55.191 is the deployable version.** It contains 0.55.190's spawn fix and
+nothing that can stop a daemon from coming up.
+
 ## 0.55.190 — one settings UI spawned fourteen daemons
 
 Field 2026-07-31, Windows: 16 python processes after launching one collab UI —

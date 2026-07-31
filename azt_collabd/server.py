@@ -255,35 +255,24 @@ def _acquire_server_lock(lock_path):
         # topic ref, each with its own ``_wan_inflight`` so none of
         # them could see the others.
         #
-        # ``msvcrt.locking`` is the real thing on Windows: mandatory,
-        # per-byte-range, released on close or process exit.
+        # WITHDRAWN BEFORE SHIPPING (0.55.191). 0.55.189 added an
+        # ``msvcrt.locking`` guard here. It is very likely correct, and
+        # it is untested on the one platform it affects — and the
+        # failure mode of a wrong lock primitive is a daemon that never
+        # starts, on machines nobody can reach. That is a worse outcome
+        # than the duplicates it prevents.
         #
-        # DELIBERATELY FAIL OPEN on anything that isn't a clean
-        # "someone else holds it". A daemon that refuses to start
-        # because its lock primitive misbehaved is worse than the
-        # duplicate it was preventing — these are field machines with
-        # no one to diagnose them.
-        try:
-            import msvcrt as _msvcrt
-        except Exception:
-            return fd
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
-        except OSError:
-            os.close(fd)
-            return None
-        except Exception as ex:
-            print(f'[azt_collabd] single-instance lock unavailable on '
-                  f'this platform ({ex!r}) — continuing WITHOUT it; a '
-                  f'second daemon on this $AZT_HOME is possible',
-                  file=sys.stderr, flush=True)
-            return fd
-        try:
-            os.lseek(fd, 1, os.SEEK_SET)
-            os.write(fd, f'{os.getpid()}\n'.encode())
-        except OSError:
-            pass
+        # It is also not the fix that matters. The 14 duplicate daemons
+        # observed 2026-07-31 all came from ONE process's spawn storm
+        # (per-instance spawn lock + cooldown, reset on every
+        # ``transports.reset()`` — fixed client-side in 0.55.190).
+        # A daemon-side lock is the backstop for spawns this one
+        # process cannot see; it is worth having, but it should be
+        # ported from azt's proven single-instance module rather than
+        # invented here, and landed with someone watching the daemon
+        # come up.
+        #
+        # See agenda/daemon_needs_real_single_instance_guard.md.
         return fd
     try:
         _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
