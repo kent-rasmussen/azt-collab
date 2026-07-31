@@ -5057,7 +5057,7 @@ _SHARE_BUNDLE_TTL_S = 3600  # 1 hour
 _SHARE_BUNDLE_FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
 
 
-def _h_prepare_share_bundle(_body):
+def _h_prepare_share_bundle(body):
     """``POST /v1/diagnostics/prepare_share_bundle`` — stage the
     snapshot + per-day daemon logs at
     ``$AZT_HOME/.shares/<token>/<filename>`` so the picker /
@@ -5090,9 +5090,18 @@ def _h_prepare_share_bundle(_body):
     read the file until the message is actually sent — minutes
     later. 1h is enough for plausible compose-and-send flows.
 
+    ``{"keep": true}`` exempts the bundle from the 1 h sweep
+    (0.55.182). The client has sent this since 0.55.164 for hosts
+    with no share sheet — on desktop, staging IS the deliverable, so
+    a bundle that is written, never sent, and swept an hour later is
+    the whole feature failing quietly. The flag was accepted on the
+    wire and dropped here: the parameter was named ``_body`` and
+    never read.
+
     Since 0.52.13."""
     try:
-        staged = stage_diagnostics_bundle()
+        staged = stage_diagnostics_bundle(
+            keep=bool((body or {}).get('keep', False)))
     except OSError:
         return 500, {"ok": False, "error": "share_write_failed"}
     return 200, {"ok": True, "token": staged['token'],
@@ -5191,7 +5200,7 @@ def _carried_bundle_items(exclude_slug=''):
     return items
 
 
-def stage_diagnostics_bundle(exclude_slug=''):
+def stage_diagnostics_bundle(exclude_slug='', keep=False):
     """Collect + stage one diagnostics archive; the shared body of
     ``_h_prepare_share_bundle`` (local Share-diagnostics button) and
     the LAN listener's ``/v1/lan/diagnostics_pull`` route (a paired
@@ -5251,6 +5260,22 @@ def stage_diagnostics_bundle(exclude_slug=''):
     token = secrets.token_hex(16)
     bundle_dir = os.path.join(shares_root, token)
     os.makedirs(bundle_dir, exist_ok=True)
+
+    # ``keep`` writes the same marker the sweep above already honours
+    # for peer-pulled bundles (0.55.182). Written BEFORE the archive,
+    # so a bundle is never briefly sweepable between creation and
+    # marking. Failure to write it is logged, not raised: losing the
+    # exemption costs an hour of retention, losing the bundle costs
+    # the diagnostic.
+    if keep:
+        try:
+            with open(os.path.join(bundle_dir, '.keep'), 'w') as _kf:
+                _kf.write('')
+        except OSError as ex:
+            print(f'[share-bundle] could not mark {token[:8]} as kept '
+                  f'({ex!r}) — it will be swept in '
+                  f'{int(_SHARE_BUNDLE_TTL_S)}s',
+                  file=sys.stderr, flush=True)
 
     # Single gzipped-tar archive. The container FORMAT (tar.gz + name +
     # MIME) is the suite-shared helper ``azt_collab_client.diagnostics``

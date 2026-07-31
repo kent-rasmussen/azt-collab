@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.177"
+__version__ = "0.55.182"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -3248,13 +3248,24 @@ def get_daemon_log():
     useful for the settings UI to seed its button label without
     a separate getter call. Empty ``log`` (with ``bytes=0``)
     when the toggle hasn't been enabled / no output accumulated
-    yet. Returns ``None`` on transport failure."""
+    yet.
+
+    Never returns ``None`` (0.55.181). Both failure modes return the
+    same shape with ``error`` set to the reason — the transport's own
+    text, or the daemon's. This is the call the "View diagnostics"
+    button makes, and it is frequently pointed at a PEER over the LAN
+    admin transport, where the exception text ("challenge failed",
+    "reachable but too old for remote settings") is the entire
+    diagnosis. Collapsing it to ``None`` is what made the share path
+    unfixable for most of 2026-07-31."""
     try:
         resp = call('GET', '/v1/logging/daemon_log')
-    except ServerUnavailable:
-        return None
+    except ServerUnavailable as ex:
+        return {'log': '', 'log_path': '', 'bytes': 0,
+                'enabled': False, 'error': str(ex)}
     if not resp.get('ok'):
-        return None
+        return {'log': '', 'log_path': '', 'bytes': 0, 'enabled': False,
+                'error': str(resp.get('error') or 'unknown')}
     return {
         'log': resp.get('log') or '',
         'log_path': resp.get('log_path') or '',
@@ -3283,10 +3294,19 @@ def prepare_share_bundle(keep=False):
     the URI in a compose draft and don't read until send time —
     minutes after the chooser closes.
 
-    Returns ``None`` on transport failure; an empty ``items``
-    list if both the snapshot and the log-file copy failed
-    (shouldn't happen in practice — the snapshot generator is
-    near-bulletproof).
+    Returns ``None`` **only** when the daemon could not be reached.
+    A daemon that answers ``{ok: False, error: …}`` returns a dict
+    carrying that ``error`` and an empty ``items`` list, because
+    "unreachable" and "refused, and here is why" have opposite
+    remedies and the caller must be able to tell them apart. Until
+    0.55.179 both returned ``None``, so a daemon the caller was
+    demonstrably talking to — the settings UI was live against it —
+    reported "Could not reach the AZT Collab daemon", and the reason
+    it actually gave was discarded at this line.
+
+    Also an empty ``items`` list if both the snapshot and the
+    log-file copy failed (shouldn't happen in practice — the
+    snapshot generator is near-bulletproof).
 
     ``keep=True`` exempts the staged bundle from that TTL (0.55.164), for
     hosts where nothing is going to consume it promptly — desktop has no
@@ -3297,10 +3317,25 @@ def prepare_share_bundle(keep=False):
         resp = call('POST',
                     '/v1/diagnostics/prepare_share_bundle',
                     {'keep': bool(keep)})
-    except ServerUnavailable:
-        return None
+    except ServerUnavailable as ex:
+        # KEEP THE REASON (0.55.180). ``ServerUnavailable`` from the LAN
+        # admin transport is specific — "challenge failed: …", "issued
+        # no challenge — reachable but too old", the dial's own error —
+        # and returning bare None threw all of it away, leaving the
+        # caller to print "confirm the AZT Collaboration app is
+        # installed" about a peer whose version and port it was
+        # displaying at that moment. Field 2026-07-31.
+        import sys as _sys
+        print(f'[azt_collab_client] prepare_share_bundle: transport '
+              f'failed: {ex}', file=_sys.stderr, flush=True)
+        return {'token': '', 'items': [], 'error': str(ex),
+                'unreachable': True}
     if not resp.get('ok'):
-        return None
+        import sys as _sys
+        err = str(resp.get('error') or 'unknown')
+        print(f'[azt_collab_client] prepare_share_bundle refused by '
+              f'the daemon: {err}', file=_sys.stderr, flush=True)
+        return {'token': '', 'items': [], 'error': err}
     items = []
     for entry in resp.get('items') or []:
         items.append({

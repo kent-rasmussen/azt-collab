@@ -67,6 +67,12 @@ from azt_collab_client import (
 )
 from azt_collab_client._debug import first_try_log
 
+# Tail shown by the "View diagnostics" popup. The daemon already caps
+# its reply at ~256 KB; a single Kivy Label given that much text locks
+# the UI while it lays out, and a diagnostic must not become the next
+# hang. The full file stays on the daemon's disk, named in the title.
+_LOG_VIEW_LINES = 400
+
 
 _tr = _client_i18n._
 
@@ -840,11 +846,27 @@ KV_TEMPLATE = '''
                     text: _('Restart server')
                     normal_color: T.SURFACE
                     on_press: root.restart_server()
-                RecBtn:
-                    id: share_diagnostics_btn
-                    text: _('Share diagnostics')
-                    normal_color: T.SURFACE
-                    on_press: root.share_diagnostics()
+                # Two diagnostics actions on one row, half-width each,
+                # matching the Share/Update row above. View reads the
+                # log of WHICHEVER daemon this window is pointed at:
+                # the local one over loopback, or a peer's over the LAN
+                # admin transport when retargeted — no per-endpoint
+                # work for the remote case, which is the whole design
+                # of LanAdminTransport.
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(10)
+                    RecBtn:
+                        id: share_diagnostics_btn
+                        text: _('Share diagnostics')
+                        normal_color: T.SURFACE
+                        on_press: root.share_diagnostics()
+                    RecBtn:
+                        id: view_diagnostics_btn
+                        text: _('View diagnostics')
+                        normal_color: T.SURFACE
+                        on_press: root.view_diagnostics()
                 BodyLabel:
                     id: service_status
                     text: ''
@@ -3702,6 +3724,101 @@ class SettingsScreen(Screen):
             if status is not None:
                 status.text = msg
         share_diagnostics_action(on_error=_on_err)
+
+    def view_diagnostics(self):
+        """Show the daemon log for whichever daemon this window is
+        pointed at (0.55.181).
+
+        Local window → loopback → this machine's daemon. Retargeted
+        window → ``LanAdminTransport`` → the peer's daemon. The button
+        needs no knowledge of which: every RPC in a retargeted process
+        already goes to the peer, which is the point of that transport.
+
+        Why this exists at all: getting a peer's log previously required
+        ``Share diagnostics``, which stages a tar.gz and dispatches an
+        Android share sheet — machinery a desktop has none of, and which
+        failed opaquely all of 2026-07-31. Reading the log needs none of
+        it.
+
+        The fetch runs on a worker thread: it is a network round trip
+        against a peer over TLS, and the daemon may take a moment to
+        read and truncate a large file. Only the display is marshalled
+        back onto the Kivy thread.
+        """
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+        from kivy.uix.popup import Popup
+        from kivy.uix.scrollview import ScrollView
+        from azt_collab_client import get_daemon_log
+        from azt_collab_client.translate import tr as _tr
+
+        status = self.ids.get('service_status')
+        if status is not None:
+            status.text = _tr('Reading the log…')
+
+        def _say(msg):
+            if status is not None:
+                status.text = msg
+
+        def _show(res):
+            _say('')
+            res = res or {}
+            err = res.get('error')
+            if err:
+                _say(_tr('Could not read the log: {error}').format(
+                    error=err))
+                return
+            text = res.get('log') or ''
+            path = res.get('log_path') or ''
+            if not text.strip():
+                _say(_tr('The log is empty ({path}).').format(
+                    path=path or '?'))
+                return
+            # Only the tail is rendered. The daemon already caps its
+            # reply at ~256 KB, but handing that to a single Kivy
+            # Label locks the UI while it lays out — a diagnostic must
+            # not become the next hang. The full file stays on the
+            # daemon's disk and the popup title names it.
+            lines = text.splitlines()
+            shown = lines[-_LOG_VIEW_LINES:]
+            clipped = len(lines) - len(shown)
+            body_text = '\n'.join(shown)
+            if clipped > 0:
+                body_text = (
+                    _tr('… {n} earlier lines not shown …').format(
+                        n=clipped) + '\n\n' + body_text)
+            body = Label(text=body_text, size_hint_y=None,
+                         halign='left', valign='top', font_size=sp(11))
+            body.bind(width=lambda w, val: setattr(
+                w, 'text_size', (val, None)))
+            body.bind(texture_size=lambda w, val: setattr(
+                w, 'height', val[1]))
+            scroller = ScrollView()
+            scroller.add_widget(body)
+            root_box = BoxLayout(orientation='vertical', spacing=dp(8),
+                                 padding=dp(8))
+            root_box.add_widget(scroller)
+            closer = Button(text=_tr('Close'), size_hint_y=None,
+                            height=dp(44))
+            root_box.add_widget(closer)
+            popup = Popup(title=path or _tr('Daemon log'),
+                          content=root_box,
+                          size_hint=(0.95, 0.95))
+            closer.bind(on_release=popup.dismiss)
+            popup.open()
+            # Newest output is what a diagnosis needs first.
+            Clock.schedule_once(
+                lambda _dt: setattr(scroller, 'scroll_y', 0), 0)
+
+        def _work():
+            try:
+                res = get_daemon_log()
+            except Exception as ex:      # never raise off a worker
+                res = {'error': repr(ex)}
+            Clock.schedule_once(lambda _dt: _show(res), 0)
+
+        threading.Thread(target=_work, daemon=True,
+                         name='view-diagnostics').start()
 
     def restart_server(self):
         """Ask the daemon to restart itself. The settings UI lives in

@@ -722,13 +722,35 @@ def share_diagnostics_action(on_error=None):
         except Exception:
             pass        # fall through to the generic non-Android report
 
+    def _fallback(msg):
+        """Report a failure the way this host can actually report it.
+
+        Both fallbacks below used to call ``share_text``, which on a
+        host with no share sheet refuses with its OWN message —
+        'Sharing is only available on Android.' — discarding the one
+        we passed it. So on desktop, "the daemon is unreachable" and
+        "nothing has been staged yet" both surfaced as a platform
+        complaint: wrong, and unactionable. 0.55.164 fixed the success
+        path here and left these two (0.55.178).
+        """
+        if _no_share_sheet:
+            if on_error is not None:
+                on_error(msg)
+            return False
+        return share_text(text=msg, on_error=on_error)
+
     if bundle is None:
-        return share_text(
-            text=_tr(
-                'Could not reach the AZT Collab daemon. '
-                'Please confirm the AZT Collaboration app is '
-                'installed and re-open this app.'),
-            on_error=on_error)
+        return _fallback(_tr(
+            'Could not reach the AZT Collab daemon. '
+            'Please confirm the AZT Collaboration app is '
+            'installed and re-open this app.'))
+
+    # The daemon answered and refused. Distinct from unreachable, and
+    # the remedies are opposite — say which (0.55.179).
+    if bundle.get('error'):
+        return _fallback(
+            _tr('The daemon could not prepare diagnostics: {error}')
+            .format(error=bundle['error']))
 
     items = []
     for entry in bundle.get('items') or []:
@@ -747,12 +769,10 @@ def share_diagnostics_action(on_error=None):
         })
 
     if not items:
-        return share_text(
-            text=_tr(
-                'No diagnostics available yet. Reproduce the '
-                'issue first, then tap Share diagnostics '
-                'again.'),
-            on_error=on_error)
+        return _fallback(_tr(
+            'No diagnostics available yet. Reproduce the '
+            'issue first, then tap Share diagnostics '
+            'again.'))
 
     # Diagnostic bundle is a gzipped tar (``.tar.gz``) since 0.52.22
     # (was ``.zip`` 0.52.19–0.52.21; a field email server silently

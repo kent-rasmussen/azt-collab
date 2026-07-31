@@ -9,6 +9,115 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.182 — `keep` was accepted on the wire and dropped on arrival
+
+`Share diagnostics` / `View diagnostics` now sit side by side on one row,
+matching the Share/Update row above, rather than stacked.
+
+The substantive fix is behind them. `_h_prepare_share_bundle`'s parameter was
+named `_body` and never read, so the `keep` flag the client has sent since
+0.55.164 was accepted on the wire and discarded. On a host with no share sheet
+staging IS the deliverable — the desktop path reports "Diagnostics saved:
+&lt;path&gt;" and then the sweep deleted that file an hour later. The feature
+worked for exactly one hour, silently, which is why it read as working.
+
+`stage_diagnostics_bundle` takes `keep` and writes the `.keep` marker the sweep
+has always honoured for peer-pulled bundles. Written before the archive, so a
+bundle is never briefly sweepable between creation and marking; a failure to
+write it is logged rather than raised, since losing the exemption costs an hour
+and losing the bundle costs the diagnostic.
+
+## 0.55.181 — "View diagnostics": read the log instead of shipping it
+
+New button beside `Share diagnostics` in the settings screen. It calls
+`get_daemon_log()` and shows the tail in a scrollable popup titled with the log's
+path on disk.
+
+The point is which daemon it reads. In the local window that is loopback to this
+machine; in a retargeted (`--peer`) window it is the peer's, over
+`LanAdminTransport`, with no per-endpoint work — every RPC in a retargeted
+process already goes to the peer, which is exactly what that transport was built
+for.
+
+Getting a peer's log previously required `Share diagnostics`: stage a tar.gz,
+build ContentProvider URIs, dispatch an Android share sheet. A desktop has none
+of that machinery, and on 2026-07-31 it failed opaquely for a full day. Reading
+a log needs none of it.
+
+- Fetch runs on a worker thread — it is a TLS round trip to a peer, and the
+  daemon may take a moment on a large file. Only the display is marshalled back.
+- Renders the last 400 lines. The daemon caps its reply at ~256 KB, but handing
+  that to one Kivy `Label` locks the UI while it lays out; a diagnostic must not
+  become the next hang. The count of hidden lines is stated, and the title names
+  the full file.
+- Opens scrolled to the bottom — newest output is what a diagnosis wants first.
+- `get_daemon_log` no longer returns `None`. Both failure modes return the usual
+  shape with `error` set to the transport's or the daemon's own reason, so a
+  failure here reports what happened rather than repeating the day's pattern.
+  No in-repo callers existed, so nothing depended on the old contract.
+
+## 0.55.180 — the transport's reason survives too
+
+0.55.179 stopped `prepare_share_bundle` discarding a daemon's `ok: False`
+reason. The `ServerUnavailable` path still discarded its own.
+
+That path matters most over the LAN admin transport, where the exception text is
+the whole diagnosis: `challenge failed: …`, `issued no challenge — reachable but
+too old for remote settings`, or the pinned dial's error. All of it collapsed to
+`None`, whose only wording is "Could not reach the AZT Collab daemon. Please
+confirm the AZT Collaboration app is installed" — printed, field 2026-07-31,
+inside a REMOTE settings window that was at that moment displaying the peer's
+version, listening address and pid.
+
+Transport failure now returns `{'token': '', 'items': [], 'error': <reason>,
+'unreachable': True}` and logs the reason. `share_diagnostics_action` already
+surfaces `error`, so the next attempt names the actual fault instead of
+recommending an install check.
+
+Does not fix the underlying failure to collect a peer's diagnostics — makes it
+say what it is.
+
+## 0.55.179 — "Could not reach the daemon", from inside a live daemon session
+
+Field 2026-07-31: `Could not reach the AZT Collab daemon` while driving that
+same daemon's settings UI. Kent: *"so obviously I can reach it."*
+
+`prepare_share_bundle` collapsed two conditions into one value:
+
+```python
+except ServerUnavailable:
+    return None
+if not resp.get('ok'):
+    return None          # ← the daemon ANSWERED, and said why
+```
+
+The caller has exactly one wording for `None`, and it is the transport one. So a
+daemon that replied `{ok: False, error: …}` — reachable, responsive, and
+explicit about its reason — was reported as unreachable, with the reason
+discarded at that line. One value standing in for two answers with opposite
+remedies; invariant #15 in return-value form.
+
+`None` now means unreachable and nothing else. A refusal returns
+`{'token': '', 'items': [], 'error': <daemon's reason>}`, the reason is printed
+to stderr for the log, and `share_diagnostics_action` surfaces it as "The daemon
+could not prepare diagnostics: …".
+
+Note this does not fix the refusal itself — it makes the daemon's existing
+answer visible. What that answer is, is now the next thing to look at.
+
+## 0.55.178 — "Sharing is only available on Android" on a desktop diagnostics share
+
+0.55.164 taught `share_diagnostics_action` to keep the bundle and report its
+path on a host with no share sheet. That covered the success path only. Both
+failure paths still called `share_text`, which refuses on desktop with its own
+message — `'Sharing is only available on Android.'` (`share.py:237`) — throwing
+away the message it was handed.
+
+So on desktop, "could not reach the daemon" and "nothing staged yet" both
+surfaced as a platform complaint: wrong, and giving the user nothing to act on.
+They now report the actual reason through `on_error`, and return False, since
+nothing was dispatched.
+
 ## 0.55.177 — on Windows, `_pid_alive` could not report a dead daemon
 
 Field 2026-07-31, Windows desktop: `server.json` stamped 19:28 the previous
