@@ -9,6 +9,118 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.190 — one settings UI spawned fourteen daemons
+
+Field 2026-07-31, Windows: 16 python processes after launching one collab UI —
+**2 with `ui` on the command line, 14 bare `-m azt_collabd`.**
+
+The spawn lock and the cooldown were per-transport-instance:
+
+```python
+def __init__(self):
+    self._spawn_lock = threading.Lock()
+    self._last_failed_spawn = 0.0
+```
+
+`rpc.call` handles `ServerUnavailable` by calling `transports.reset()`, which
+constructs a **new** `LoopbackTransport`. So every failed call got a fresh lock
+— serialising against nobody — and a cooldown reset to zero. A UI firing its
+start-up RPCs concurrently therefore had each one independently decide no daemon
+was reachable and launch its own, multiplied by `_MAX_ATTEMPTS = 3`.
+
+Both are now module-level. One process makes one spawn attempt at a time and
+honours one cooldown, however many transport objects it churns through.
+
+This is the cure; 0.55.189's daemon-side lock is the backstop. They fix
+different halves: this stops one process from starting a storm, that stops
+unrelated processes from co-existing. Neither alone is enough, and the
+client-side half is the safer of the two — it cannot prevent a daemon from
+starting.
+
+It also explains the rest of the evening on that machine. Fourteen daemons
+mmap'ing the same packs is what refused the `git repack` rename; fourteen
+calling `os.replace` on `wan_state.json` is what killed a push thread; fourteen
+estimators on one disk is what made a 22 KB push look like a hang. Every
+"contention" diagnosis today named the wrong contender.
+
+## 0.55.189 — Windows had no single-instance lock at all
+
+Three daemons were running on one Cameroon machine, proven by three
+`STALL DETECTED (first detection)` dumps inside the same second, each with its
+own `MainThread` (20664 / 4124 / 6768) and its own `wan-drain`.
+
+`_acquire_server_lock` said so in its own docstring: *"On platforms without
+fcntl (Windows), returns the fd without real locking (first-come wins by
+server.json existence instead)."* That fallback does not exist —
+`_spawn_server` deletes `server.json` before spawning, and the client's
+liveness gate was itself broken on Windows until 0.55.177. So nothing had ever
+limited a Windows machine to one daemon per `$AZT_HOME`.
+
+This reframes most of 2026-07-31 on that machine:
+
+- **The `git repack` rename failure** was other *daemons* holding the packs
+  mmap'd, not a status poll. 0.55.185 diagnosed the mechanism correctly and the
+  culprit wrongly.
+- **`wan_state.json` `PermissionError`** (0.55.188) was three processes calling
+  `os.replace` on one file.
+- **Duplicate estimates, and `already in flight` six times in a millisecond** —
+  each process has its own `_wan_inflight`, so none could see the others.
+- Three estimators scanning the same pack, competing for the same disk.
+
+`msvcrt.locking` is the real primitive on Windows: mandatory, byte-range,
+released on close or process exit.
+
+**Fails open on anything that isn't a clean "someone else holds it".** A daemon
+that refuses to start because its lock primitive misbehaved is worse than the
+duplicate it was preventing — these are field machines with nobody to diagnose
+them. Only `OSError` means contention; anything else logs and continues
+unlocked.
+
+**Untested.** Written the night before a 17-day absence, on a path that decides
+whether the daemon starts at all. Do not deploy to a field machine without
+watching it come up first.
+
+## 0.55.188 — a bookkeeping write must not be able to kill a push
+
+```
+Exception in thread wan-drain:
+  … _attempt_push → wan_backoff.mark_push_started → _save
+  PermissionError: [WinError 5] Accès refusé:
+    '.wan_state.blzrtbbk.tmp' -> 'wan_state.json'
+```
+
+`_save` re-raised, and `mark_push_started` is the first thing `_attempt_push`
+does — so a failed state write killed the whole push thread before it touched
+the network, leaving `_wan_inflight` and the escalation counters describing a
+push that no longer existed.
+
+Third Windows `os.replace`-over-an-open-file failure of the day, after the pack
+rename. Python's `open()` doesn't grant delete/rename sharing there, so **any**
+concurrent reader blocks it — including this daemon's own status polls, which
+read this state on every `project_status`. The more closely a machine was being
+watched, the more often its pushes died.
+
+Now: retry the replace five times with a short backoff (the contending reader
+closes in milliseconds), and on final failure log and return instead of raising.
+Losing a state update costs one unnecessary push attempt later; killing the
+thread costs the push.
+
+### Open, and larger — recorded here because it was found the same hour
+
+The chunk planner does not converge on `baf`:
+
+```
+pack-size estimate: … wire 142,896 vs raw 286,925,610 bytes
+topic-push pre-shrink chunk_n 50→10 (raw 286,925,610 > ceiling 62,914,560)
+… re-estimate: same 178 objects, same raw
+topic-push pre-shrink chunk_n 50→10   ← repeatedly
+```
+
+The gate tests **raw** against the whole-pack fallback ceiling, shrinks, and the
+re-estimate returns an unchanged object set and unchanged raw — so it shrinks
+again from 50, forever, while `remaining` stays at 905. It is declining to send
+143 KB because a fallback that may never happen would be 287 MB. Not fixed here.
+
 ## 0.55.187 — prune the refs github doesn't have, instead of asking it to delete them
 
 0.55.186 made the failing sweep cheap. This makes it stop failing.

@@ -32,6 +32,27 @@ _MAX_ATTEMPTS = 3
 # minutes until the wedged daemon was SIGTERMed).
 _SPAWN_COOLDOWN_S = 60.0
 
+# PER-PROCESS, NOT PER-TRANSPORT-INSTANCE (0.55.190).
+#
+# These were `self._spawn_lock` / `self._last_failed_spawn`, created in
+# `LoopbackTransport.__init__`. `rpc.call` handles `ServerUnavailable`
+# by calling `transports.reset()`, which constructs a NEW transport —
+# so every failed call produced a fresh lock (no serialisation with
+# anyone) and a cooldown reset to zero (no rate limit). Concurrent
+# start-up RPCs therefore each spawned their own daemon, multiplied by
+# `_MAX_ATTEMPTS`.
+#
+# Field 2026-07-31, Windows: **one settings UI produced sixteen python
+# processes.** The daemon side had no single-instance lock there
+# either (0.55.189), so all of them lived — and then fought over the
+# packs, `wan_state.json`, and the same topic ref.
+#
+# Module scope is the correct lifetime: one process should make one
+# spawn attempt at a time and honour one cooldown, regardless of how
+# many transport objects it churns through.
+_SPAWN_LOCK = threading.Lock()
+_last_failed_spawn = 0.0
+
 # Cap on $AZT_HOME/spawn_boot_trace.txt before it rolls to .1 (one
 # generation kept). Small: this holds only what a daemon says before
 # its own log tee takes over, which is a handful of lines per spawn.
@@ -56,8 +77,9 @@ class LoopbackTransport(Transport):
     name = 'loopback'
 
     def __init__(self):
-        self._spawn_lock = threading.Lock()
-        self._last_failed_spawn = 0.0
+        # Spawn serialisation and the cooldown are MODULE-level, not
+        # per-instance (0.55.190) — see ``_SPAWN_LOCK``.
+        pass
 
     # ── public Transport API ────────────────────────────────────────
 
@@ -346,9 +368,10 @@ class LoopbackTransport(Transport):
         spending it on "alive but slow" destroys the one thing it was
         good for. Truthiness is unchanged, so existing
         ``if self._spawn_server():`` callers keep working."""
+        global _last_failed_spawn
         if not self._autospawn_enabled():
             return ''
-        with self._spawn_lock:
+        with _SPAWN_LOCK:
             info = None
             try:
                 info = self._read_server_info()
@@ -409,7 +432,7 @@ class LoopbackTransport(Transport):
             # wedged-but-alive daemon still holds server.lock) will
             # fail again immediately; don't burn a process per poll.
             now = time.time()
-            if now - self._last_failed_spawn < _SPAWN_COOLDOWN_S:
+            if now - _last_failed_spawn < _SPAWN_COOLDOWN_S:
                 return False
             try:
                 os.remove(server_info_path())
@@ -481,10 +504,10 @@ class LoopbackTransport(Transport):
                           f' — {_spawn_exit_reason(rc)}. See '
                           f'{self._boot_trace_path()!r} for its output.',
                           file=sys.stderr, flush=True)
-                    self._last_failed_spawn = time.time()
+                    _last_failed_spawn = time.time()
                     return ''
                 time.sleep(0.1)
-            self._last_failed_spawn = time.time()
+            _last_failed_spawn = time.time()
             print(f'[azt_collab_client] spawned daemon did not bind '
                   f'within {_SPAWN_WAIT}s (still running, pid '
                   f'{proc.pid}) — see {self._boot_trace_path()!r}',

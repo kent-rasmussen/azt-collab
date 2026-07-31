@@ -237,6 +237,53 @@ def _acquire_server_lock(lock_path):
     try:
         import fcntl as _fcntl
     except ImportError:
+        # WINDOWS HAD NO LOCK AT ALL UNTIL 0.55.189.
+        #
+        # This returned the fd unlocked, and the docstring's claimed
+        # fallback — "first-come wins by server.json existence" — was
+        # not a fallback: ``_spawn_server`` DELETES server.json before
+        # spawning, and the client-side liveness gate was broken on
+        # Windows besides. So nothing prevented a second, third, Nth
+        # daemon per $AZT_HOME.
+        #
+        # Field 2026-07-31: three daemons on one machine, proven by
+        # three watchdog dumps in the same second with three distinct
+        # MainThreads. They fought over wan_state.json (the
+        # ``os.replace`` PermissionError that killed a push thread),
+        # over the packs — which is what actually refused the
+        # ``git repack`` rename, not a status poll — and over the same
+        # topic ref, each with its own ``_wan_inflight`` so none of
+        # them could see the others.
+        #
+        # ``msvcrt.locking`` is the real thing on Windows: mandatory,
+        # per-byte-range, released on close or process exit.
+        #
+        # DELIBERATELY FAIL OPEN on anything that isn't a clean
+        # "someone else holds it". A daemon that refuses to start
+        # because its lock primitive misbehaved is worse than the
+        # duplicate it was preventing — these are field machines with
+        # no one to diagnose them.
+        try:
+            import msvcrt as _msvcrt
+        except Exception:
+            return fd
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+        except Exception as ex:
+            print(f'[azt_collabd] single-instance lock unavailable on '
+                  f'this platform ({ex!r}) — continuing WITHOUT it; a '
+                  f'second daemon on this $AZT_HOME is possible',
+                  file=sys.stderr, flush=True)
+            return fd
+        try:
+            os.lseek(fd, 1, os.SEEK_SET)
+            os.write(fd, f'{os.getpid()}\n'.encode())
+        except OSError:
+            pass
         return fd
     try:
         _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)

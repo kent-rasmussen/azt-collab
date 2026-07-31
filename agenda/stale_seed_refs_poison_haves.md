@@ -28,7 +28,79 @@ only drops the local tracking ref *after* a successful server-side
 delete, and that delete can never succeed against a ref that is
 already gone.
 
-## The hypothesis this makes (NOT yet confirmed)
+## CONFIRMED IN THE FIELD — 2026-07-31 21:23, NUBACA, 0.55.187
+
+The prune shipped and the numbers moved the same evening:
+
+## THE PRUNE MADE IT WORSE — REVERSE BEFORE BUILDING ANYTHING ELSE HERE
+
+**Result 2026-07-31 21:23–21:44: twenty minutes inside
+`_estimate_delta_size` with no output, then abandoned.** Compare
+19:51, with 40 haves: the estimate completed promptly and reported
+`18 push-time delta(s) + 121 reusable, of 188 object(s)`. With 2
+haves it never finished.
+
+**The premise was wrong.** Those tracking refs were not poisoning the
+push. A `have` tells the estimator what it does not need to send, and
+github evidently still held those objects even though the branches
+were deleted — deleting a branch does not immediately remove its
+objects, and the seed chain references many of them. Removing 38
+haves did not remove lies; it removed knowledge, and enlarged the
+object set from 188 to whatever 905 commits imply.
+
+Note the corroborating number that was visible all along and I did not
+weigh: `preseed-sweep: 54 blob(s) held by the seed chain also count as
+covered` on `baf` — only 54, against 1422 on `nml`. On this project
+the chain was covering almost nothing, so the individual seed refs
+were carrying the coverage. That is exactly why pruning them hurt here
+and would likely not have hurt on `nml`.
+
+**Not undoable by reverting the code.** The 38 tracking refs are gone
+locally and cannot be re-fetched, because the branches really are
+absent from github. Recovery, if wanted, is from
+`.git/logs/refs/remotes/origin/…` reflogs, or by rebuilding coverage
+into the seed chain.
+
+**So `unpack index-pack failed` remains unexplained**, and `chain_max`
+goes back on the table.
+
+### What this item should become
+
+Not "prune stale refs". The real question is: **what does the server
+actually still hold, and how do we know?** A branch's absence is not
+evidence its objects are absent. Any future work here needs a way to
+verify object presence rather than infer it from ref presence — and
+the seed chain is the mechanism that is supposed to make that
+knowable. On `baf` it wasn't carrying the coverage it should have
+been; that is the thing to look at.
+
+## Superseded — what the prune did do
+
+**Directly attributable to the prune:**
+
+| | before | after |
+|---|---|---|
+| `offering N remote-tracking ref(s) as haves` | **40** | **2** |
+| preseed-sweep delete attempts | 38 → `HangupException` ×38 | none; nothing left to delete |
+
+**NOT attributable — corrected same evening.** `wan_unshared` 925 → 905
+and the topic tip moving `b3c1fb4f` → `0b0aa60d` both happened about
+half an hour BEFORE the 0.55.187 restart. First read here as evidence
+the prune worked; it wasn't. `baf` was never fully frozen — it was
+crawling at roughly **20 commits/hour**, which for 905 is ~two days of
+uninterrupted running it will not get.
+
+**The actual test is the RATE after 21:23**, not the count. Materially
+faster than 20/hour ⇒ the poisoned haves were the bottleneck.
+Still ~20/hour ⇒ they weren't, and the cost is elsewhere — most likely
+unconsolidated packs making every delta estimate crawl
+([[windows_repack_blocked_by_readers]]).
+
+Also still unobserved either way: whether `thin push REJECTED … unpack
+index-pack failed` still occurs now that only resolvable haves are
+offered. That line's absence or presence is the cleanest single answer.
+
+## The hypothesis this made (now supported)
 
 The push offers remote-tracking refs as `haves`:
 

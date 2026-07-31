@@ -73,6 +73,32 @@ def _load() -> dict:
 
 
 def _save(state: dict) -> None:
+    """Persist backoff state. **Never raises** (0.55.188).
+
+    This is bookkeeping. It used to re-raise, and because
+    ``mark_push_started`` is the first thing ``_attempt_push`` does, a
+    failure here killed the whole push before it reached the network:
+
+        Exception in thread wan-drain:
+          … _attempt_push → wan_backoff.mark_push_started → _save
+          PermissionError: [WinError 5] Accès refusé:
+            '.wan_state.blzrtbbk.tmp' -> 'wan_state.json'
+
+    Field 2026-07-31, Windows. `os.replace` over a file another handle
+    has open is refused there (the same rule that stops `git repack`
+    renaming a pack). Python's `open()` does not grant delete/rename
+    sharing, so **any concurrent reader is enough** — including this
+    daemon's own status polls, which read this state on every
+    `project_status`. So the more closely a machine is being watched,
+    the more often its pushes died.
+
+    Two changes: retry the replace briefly, since the contending
+    reader closes in milliseconds; and on final failure log and
+    return rather than raise. Losing a state update costs one
+    unnecessary push attempt later. Killing the thread costs the push,
+    and leaves `_wan_inflight` / the escalation counters describing a
+    push that is no longer running.
+    """
     path = _state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.wan_state.', suffix='.tmp',
@@ -80,13 +106,34 @@ def _save(state: dict) -> None:
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(state, f, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-    except Exception:
+    except Exception as ex:
         try:
             os.remove(tmp)
         except OSError:
             pass
-        raise
+        print(f'[wan_backoff] could not write state: {ex!r} — '
+              f'continuing without persisting it',
+              file=sys.stderr, flush=True)
+        return
+
+    import time as _t
+    last = None
+    for _attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as ex:
+            last = ex
+            _t.sleep(0.1 * (_attempt + 1))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print(f'[wan_backoff] could not replace {os.path.basename(path)} '
+          f'after 5 attempts ({last!r}) — state not persisted this '
+          f'time; the push continues. On Windows this means something '
+          f'held the file open, often a concurrent status read',
+          file=sys.stderr, flush=True)
 
 
 def _curve_seconds(consecutive_failures: int) -> float:
