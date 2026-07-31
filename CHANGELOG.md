@@ -9,6 +9,30 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.192 — restore the Windows daemon lock; the field already ran it
+
+0.55.191 withdrew 0.55.189's `msvcrt.locking` guard as untested. It turns out it
+had already been running for over an hour.
+
+The Cameroon machine was on **0.55.190**, which carried that code, and it booted
+normally all evening. The proof is in its own diagnostic snapshot:
+`server.lock (7 bytes)`, where it had been **0 bytes** every previous time. Seven
+is exactly the `lseek(fd, 1)` skip, a five-digit pid, and a newline — a byte only
+this branch writes. The lock was taken and the daemon carried on.
+
+So the failure the withdrawal was insurance against is the one outcome now
+demonstrated not to occur, and leaving the revert in place would have quietly
+removed a working guard the next time that machine pulled. Restored.
+
+It remains the **backstop**, not the fix: 0.55.190's client-side change is what
+took one UI from spawning fourteen daemons to one. This catches what a single
+process cannot see — a second, unrelated client spawning its own. Both are
+needed; neither covers the other.
+
+Still fails open on anything that isn't a clean "someone else holds it". Losing
+the daemon also loses the remote admin channel that needs it, so a misbehaving
+lock primitive must never be able to leave a field machine unreachable.
+
 ## 0.55.191 — withdraw the untested Windows daemon lock
 
 0.55.189's `msvcrt.locking` guard is reverted, without ever having been

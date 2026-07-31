@@ -44,7 +44,24 @@ contender:
 - `already in flight` six times in a millisecond — each process has
   its own `_wan_inflight` and cannot see the others.
 
-## Why 0.55.189 was withdrawn
+## RESOLVED for Windows — 0.55.192
+
+The `msvcrt.locking` guard is in and field-validated. NUBACA ran
+0.55.190 (which carried it) for over an hour and booted normally;
+`server.lock` went from 0 bytes to **7** — the `lseek(1)` skip, a
+five-digit pid, a newline. Only that branch writes it.
+
+Withdrawn in 0.55.191 out of caution, restored in 0.55.192 once the
+evidence arrived. Kent's point is why it could not be left withdrawn:
+the machine was already running it, so the revert would have silently
+removed a working guard at the next pull.
+
+What remains of this item is the **port from azt's single-instance
+module** — still worth doing, because azt's version handles the
+restart-after-update hand-off ([[restart_trips_duplicate_guard]])
+that this one has not been tested against. Lower priority now.
+
+## Why 0.55.189 was withdrawn (superseded)
 
 It added `msvcrt.locking`, which is the right primitive. It was
 withdrawn in 0.55.191 without ever being deployed, for two reasons:
@@ -71,8 +88,83 @@ and on Windows nothing stops both surviving. That residue is the
 measured size of the problem this item has to solve — not 14, but 1
 per concurrent client.
 
-Also visible in that sample: **2 UI processes** where one was launched.
+Also visible in that sample: **2 UI processes where Kent launched one**
+— his observation, repeated after I offered an explanation for it.
 Separate leak, see plan item 4.
+
+**CONFIRMED A LEAK.** `wmic` showed **no `--peer` on either** — two
+identical `python -m azt_collabd ui` processes from one launch. So it
+is not the deliberate second window for driving a peer
+(`"start a second window rather than retargeting a running one"`),
+which was the benign reading offered twice and wrong both times.
+
+`__main__.py` does not spawn a second UI: `ui` calls `ui_main()`
+in-process. So the duplicate originates elsewhere.
+
+**PIDs say they didn't start together.** UIs at ~18k and ~22k;
+daemons at ~4k and ~6k. Windows allocates roughly ascending, so:
+
+- the daemons started **well before** the UIs and were therefore not
+  spawned by them — they are older survivors;
+- the two UIs are ~4000 PIDs apart, i.e. a lot of process creation
+  between them, so they started at **different times**.
+
+That reads less like "one launch spawns two" and more like **an older
+UI process that never exited** — which is
+[[update_via_admin_double_restart]]: the window dies, the process
+does not. 2026-07-31 involved many update/restart cycles on that
+machine, which would accumulate exactly this. Suggestive, not proof:
+Windows reuses PIDs.
+
+If that is right, the fix is "make the UI process exit when its window
+closes", not "stop double-spawning" — and the two stale daemons are
+independently explained by the pre-0.55.191 spawn storm rather than by
+anything the UIs did.
+
+**Our code has no path that produces a `--peer`-less duplicate.**
+Both places checked 2026-07-31:
+
+- `__main__.py` — `ui` calls `ui_main()` in-process; no spawn.
+- `ui/app.py:1878` — the only `Popen` of a UI, and it **always**
+  passes `--peer`.
+
+Neither observed process carries `--peer`, so neither came from us.
+That points at the launcher (shortcut / `.bat` / alias) firing twice,
+or something else outside this repo.
+
+Also ruled out by Kent, in order, each after I proposed it: the
+deliberate `--peer` second window; an older UI surviving an update
+cycle; Git Bash failing to kill a Ctrl-C'd child. He had shut
+everything down via Task Manager multiple times and launched once.
+
+**It is not specific to the collab UI.** Kent, same evening: the same
+`wmic` count shows **4 processes on azt load as well**. Combined with
+"no path in this repo produces a `--peer`-less duplicate", the common
+factor is the launch environment both apps share on that Windows
+machine, not azt-collab.
+
+Where the thread continues (deliberately not chased from this repo):
+azt re-execs itself into its venv (`ensure_venv` / `sysrestart`),
+which produces a parent and a child by design — and
+[[restart_trips_duplicate_guard]] is already about that hand-off
+misbehaving on Windows.
+
+**Next datum, uncollected:** parent PID. It separates "the UI spawns a
+copy of itself" from "the launcher fires twice", which have completely
+different fixes:
+
+```
+wmic process where "name='python.exe'" get processid,parentprocessid,commandline /format:list
+```
+
+If one UI's parent is the other UI → self-spawn, look inside the app's
+startup (bootstrap / self-update / `open_server_ui`). If both share a
+shell/explorer parent → the shortcut or launcher script is starting two.
+
+**This reorders the item.** If one launch reliably yields two clients,
+then "only run one client" is not an available discipline, and the
+daemon-side single-instance guard stops being a backstop and becomes
+the load-bearing fix.
 
 ## Plans
 

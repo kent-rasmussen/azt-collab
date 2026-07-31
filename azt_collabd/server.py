@@ -255,24 +255,52 @@ def _acquire_server_lock(lock_path):
         # topic ref, each with its own ``_wan_inflight`` so none of
         # them could see the others.
         #
-        # WITHDRAWN BEFORE SHIPPING (0.55.191). 0.55.189 added an
-        # ``msvcrt.locking`` guard here. It is very likely correct, and
-        # it is untested on the one platform it affects — and the
-        # failure mode of a wrong lock primitive is a daemon that never
-        # starts, on machines nobody can reach. That is a worse outcome
-        # than the duplicates it prevents.
+        # ``msvcrt.locking`` is the real primitive on Windows:
+        # mandatory, per-byte-range, released on close or process exit.
         #
-        # It is also not the fix that matters. The 14 duplicate daemons
-        # observed 2026-07-31 all came from ONE process's spawn storm
-        # (per-instance spawn lock + cooldown, reset on every
-        # ``transports.reset()`` — fixed client-side in 0.55.190).
-        # A daemon-side lock is the backstop for spawns this one
-        # process cannot see; it is worth having, but it should be
-        # ported from azt's proven single-instance module rather than
-        # invented here, and landed with someone watching the daemon
-        # come up.
+        # Added 0.55.189, withdrawn unshipped in 0.55.191 as untested,
+        # RESTORED in 0.55.192 once the field disproved the caution.
+        # A Cameroon machine ran 0.55.190 — which carried this code —
+        # and booted normally, with ``server.lock`` going from 0 bytes
+        # to **7**: the ``lseek(1)`` skip plus a five-digit pid plus a
+        # newline. Only this branch writes that byte, so the lock was
+        # taken and the daemon continued. The failure I withdrew it
+        # for is the one thing now shown not to happen.
         #
-        # See agenda/daemon_needs_real_single_instance_guard.md.
+        # DELIBERATELY FAILS OPEN on anything that isn't a clean
+        # "someone else holds it". A daemon that refuses to start
+        # because its lock primitive misbehaved is worse than the
+        # duplicate it was preventing — these are field machines with
+        # no one to diagnose them, and losing the daemon also loses the
+        # remote admin channel, which needs it.
+        #
+        # This is the BACKSTOP. The 14 duplicate daemons of 2026-07-31
+        # came from one process's spawn storm (per-instance spawn lock
+        # + cooldown, reset on every ``transports.reset()``), fixed
+        # client-side in 0.55.190. This catches what that process
+        # cannot see: a second, unrelated client spawning its own.
+        # Both are needed; neither covers the other.
+        try:
+            import msvcrt as _msvcrt
+        except Exception:
+            return fd
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+        except Exception as ex:
+            print(f'[azt_collabd] single-instance lock unavailable on '
+                  f'this platform ({ex!r}) — continuing WITHOUT it; a '
+                  f'second daemon on this $AZT_HOME is possible',
+                  file=sys.stderr, flush=True)
+            return fd
+        try:
+            os.lseek(fd, 1, os.SEEK_SET)
+            os.write(fd, f'{os.getpid()}\n'.encode())
+        except OSError:
+            pass
         return fd
     try:
         _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
