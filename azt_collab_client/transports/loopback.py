@@ -32,6 +32,25 @@ _MAX_ATTEMPTS = 3
 # minutes until the wedged daemon was SIGTERMed).
 _SPAWN_COOLDOWN_S = 60.0
 
+# Cap on $AZT_HOME/spawn_boot_trace.txt before it rolls to .1 (one
+# generation kept). Small: this holds only what a daemon says before
+# its own log tee takes over, which is a handful of lines per spawn.
+_BOOT_TRACE_MAX = 512 * 1024
+
+
+def _spawn_exit_reason(rc):
+    """Plain-language meaning of a daemon's immediate exit code.
+    Mirrors the exits in ``azt_collabd.server.run``; keep in step."""
+    if rc == 1:
+        return ('another instance already holds server.lock, or '
+                '$AZT_HOME is unusable')
+    if rc == 3:
+        return ('the $AZT_HOME/server_crippled test marker is present '
+                '— delete it to allow the daemon to start')
+    if rc and rc < 0:
+        return f'killed by signal {-rc}'
+    return 'reason unknown; the boot trace is the only record'
+
 
 class LoopbackTransport(Transport):
     name = 'loopback'
@@ -157,17 +176,95 @@ class LoopbackTransport(Transport):
 
     @staticmethod
     def _pid_alive(pid):
+        """Is the daemon recorded in ``server.json`` still running?
+
+        A False answer lets the caller clear ``server.json`` and spawn;
+        a True answer makes it refuse both and report SERVICE_WEDGED.
+        **A wrong True is unrecoverable** — nothing retries, nothing
+        expires, and the machine has no daemon until a human
+        intervenes. A wrong False costs a spawn that the single-
+        instance flock kills immediately. The failure modes are
+        wildly asymmetric, so every uncertain branch below now
+        answers False. Pre-0.55.177 they all answered True, on the
+        reasoning that refusing to disturb a possibly-live daemon is
+        conservative; that is backwards once the flock exists.
+
+        WINDOWS DOES NOT HAVE A ``kill(pid, 0)`` PROBE (0.55.177).
+        ``os.kill`` is not merely non-portable here, it is actively
+        dangerous, and it broke this function in both directions:
+
+        - **Dead pid → reported ALIVE.** ``OpenProcess`` on a pid that
+          no longer exists fails with ``ERROR_INVALID_PARAMETER``,
+          which maps to ``EINVAL`` — not ``ESRCH`` — so Python raises
+          plain ``OSError`` rather than ``ProcessLookupError``. The old
+          blanket ``except OSError: return True`` then declared a dead
+          daemon alive. On Windows this function could essentially
+          never return False, so a ``server.json`` left behind by a
+          daemon that exited wedged the client permanently and
+          silently. Field 2026-07-31: a Windows desktop with
+          ``server.json`` from 19:28 the previous evening and no
+          daemon, no log, and no message all of the following day.
+        - **Live pid → KILLED.** Per the Python docs for ``os.kill``:
+          on Windows, any signal other than ``CTRL_C_EVENT`` /
+          ``CTRL_BREAK_EVENT`` "will cause the process to be
+          unconditionally killed by the TerminateProcess API". Signal
+          0 is not special-cased. So the probe terminated the very
+          daemon it was asking about. Reached only when health had
+          already failed, which is why it read as "the daemon keeps
+          dying" rather than "the client is killing it".
+
+        The Windows path below asks the question without answering it
+        destructively: open a handle with the minimum right needed to
+        query, then use ``WaitForSingleObject(h, 0)`` — ``WAIT_TIMEOUT``
+        means still running. ``GetExitCodeProcess`` is avoided because
+        its ``STILL_ACTIVE`` sentinel (259) is indistinguishable from a
+        process that genuinely exited with code 259.
+        """
         if not pid or not isinstance(pid, int):
-            return True   # older server.json without pid → trust it
+            # A server.json with no usable pid is from a daemon old
+            # enough that it is not running now. The pre-0.55.177
+            # "trust it" shim made this file un-clearable.
+            return False
+        if sys.platform == 'win32':
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x00000102
+            ERROR_ACCESS_DENIED = 5
+            try:
+                k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                k32.OpenProcess.restype = wintypes.HANDLE
+                k32.OpenProcess.argtypes = (wintypes.DWORD,
+                                            wintypes.BOOL,
+                                            wintypes.DWORD)
+                handle = k32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                    False, pid)
+                if not handle:
+                    # Access denied means the pid exists but belongs to
+                    # another user — never our daemon, which runs as us.
+                    # Anything else means it is gone.
+                    return False
+                try:
+                    return k32.WaitForSingleObject(
+                        handle, 0) == WAIT_TIMEOUT
+                finally:
+                    k32.CloseHandle(handle)
+            except Exception:
+                return False
         try:
             os.kill(pid, 0)
             return True
         except ProcessLookupError:
             return False
         except PermissionError:
+            # POSIX: the pid exists, owned by another user. Not ours,
+            # but something holds the number — don't spawn a rival that
+            # would just die on the flock.
             return True
         except OSError:
-            return True
+            return False
 
     # A daemon rewrites ``server.json`` as it comes up, so a very recent
     # mtime means a restart just happened. Wide enough to cover a desktop
@@ -205,6 +302,30 @@ class LoopbackTransport(Transport):
             return True
         except (urllib.error.URLError, OSError):
             return False
+
+    def _boot_trace_path(self):
+        return os.path.join(os.path.dirname(server_info_path()),
+                            'spawn_boot_trace.txt')
+
+    def _open_boot_trace(self):
+        """Append-mode capture file for a spawned daemon's pre-log
+        output. Returns None if it can't be opened, in which case the
+        caller falls back to DEVNULL — a spawn must never fail because
+        its diagnostics couldn't be captured."""
+        path = self._boot_trace_path()
+        try:
+            try:
+                if os.path.getsize(path) > _BOOT_TRACE_MAX:
+                    os.replace(path, path + '.1')
+            except OSError:
+                pass
+            f = open(path, 'a', encoding='utf-8', errors='replace')
+            f.write('\n=== spawn attempt {} (parent pid {}) ===\n'.format(
+                time.strftime('%Y-%m-%d %H:%M:%S'), os.getpid()))
+            f.flush()
+            return f
+        except OSError:
+            return None
 
     @staticmethod
     def _autospawn_enabled():
@@ -294,10 +415,21 @@ class LoopbackTransport(Transport):
                 os.remove(server_info_path())
             except OSError:
                 pass
+            # E1 (0.55.177): the child's early output goes to a FILE,
+            # not DEVNULL. Everything the daemon says before
+            # ``install_stdio_tee`` runs — a failed import, a missing
+            # dependency, an unwritable $AZT_HOME, the flock refusal,
+            # a traceback from the interpreter itself — used to be
+            # destroyed at birth. That is most of the ways a spawn can
+            # fail, and it is why "no daemon and no log anywhere" was
+            # a diagnosable-only-by-guessing state.
+            trace = self._open_boot_trace()
             try:
                 kwargs = {
-                    'stdout': subprocess.DEVNULL,
-                    'stderr': subprocess.DEVNULL,
+                    'stdout': trace if trace is not None
+                              else subprocess.DEVNULL,
+                    'stderr': subprocess.STDOUT if trace is not None
+                              else subprocess.DEVNULL,
                     'stdin': subprocess.DEVNULL,
                     'close_fds': True,
                     'env': build_spawn_env(),
@@ -314,11 +446,18 @@ class LoopbackTransport(Transport):
                     kwargs['creationflags'] = (
                         subprocess.CREATE_NO_WINDOW
                         | subprocess.CREATE_NEW_PROCESS_GROUP)
-                subprocess.Popen(
+                proc = subprocess.Popen(
                     [sys.executable, '-m', 'azt_collabd'], **kwargs)
             except OSError as ex:
                 print(f'[azt_collab_client] spawn failed: {ex}')
                 return ''
+            finally:
+                # The child dup'd it; the parent must not hold it open.
+                if trace is not None:
+                    try:
+                        trace.close()
+                    except Exception:
+                        pass
             deadline = time.time() + _SPAWN_WAIT
             while time.time() < deadline:
                 try:
@@ -327,8 +466,29 @@ class LoopbackTransport(Transport):
                         return 'spawned'
                 except ServerUnavailable:
                     pass
+                # E2 (0.55.177): notice a child that has already died.
+                # Previously this loop only ever asked "has server.json
+                # appeared yet", so a daemon that exited in the first
+                # 50 ms was indistinguishable from one still starting,
+                # and the caller waited out the full timeout to report
+                # nothing. The exit code is the most specific fact
+                # available about the failure, and it was being thrown
+                # away.
+                rc = proc.poll()
+                if rc is not None:
+                    print(f'[azt_collab_client] spawned daemon exited '
+                          f'immediately with code {rc}'
+                          f' — {_spawn_exit_reason(rc)}. See '
+                          f'{self._boot_trace_path()!r} for its output.',
+                          file=sys.stderr, flush=True)
+                    self._last_failed_spawn = time.time()
+                    return ''
                 time.sleep(0.1)
             self._last_failed_spawn = time.time()
+            print(f'[azt_collab_client] spawned daemon did not bind '
+                  f'within {_SPAWN_WAIT}s (still running, pid '
+                  f'{proc.pid}) — see {self._boot_trace_path()!r}',
+                  file=sys.stderr, flush=True)
             return ''
 
     @staticmethod

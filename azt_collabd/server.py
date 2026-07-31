@@ -276,6 +276,13 @@ _CRIPPLE_MARKER = 'server_crippled'
 # process exit status alone.
 _EXIT_CRIPPLED = 3
 
+# Bounds on the ``lan_debug`` ancestry walk (0.55.176). Well above any
+# real project's history, so a healthy repo still reports an exact
+# count; the point is that a pathological one can't turn a log line
+# into an unbounded job. See ``_h_lan_debug``.
+_ANCESTOR_WALK_MAX = 20000
+_ANCESTOR_WALK_DEADLINE_S = 5.0
+
 
 def _h_health(_body):
     # Test hook: if ``$AZT_HOME/_debug_force_503`` exists, return
@@ -2437,13 +2444,48 @@ def _h_lan_debug(langcode, _body):
             pass
         out['head_branch'] = head_branch
         out['head_sha'] = head_sha
-        # Ancestor count
+        # Ancestor count — BOUNDED BY BOTH COUNT AND WALL CLOCK
+        # (0.55.176). This was ``sum(1 for _ in walker)``: a full
+        # history walk, reading every commit object, computed in
+        # order to print one diagnostic number. On the boot path it
+        # was the whole outage of 2026-07-31 — the start-of-day
+        # snapshot calls this per project before the socket binds.
+        #
+        # Two bounds, not one. A count cap alone bounds the number of
+        # objects but not the time to read them: loose objects on a
+        # slow or contended disk make each step expensive, which is
+        # exactly the condition where this matters. The deadline is
+        # the honest bound; the count cap keeps a healthy repo from
+        # paying for a clock check per commit.
+        #
+        # When either bound trips, the number is reported as a floor,
+        # never as a total — asserting a complete count we didn't
+        # finish computing is the invariant-#15 mistake in numeric
+        # form. Callers comparing two devices' ancestry (the original
+        # 0.50.45 use) must check ``ancestor_count_capped`` before
+        # concluding two counts differ.
         ancestor_count = 0
         if head_sha:
             try:
+                started = _time.monotonic()
+                deadline = started + _ANCESTOR_WALK_DEADLINE_S
+                capped = ''
                 walker = repo_obj.get_walker(
                     include=[head_sha.encode('ascii')])
-                ancestor_count = sum(1 for _ in walker)
+                for ancestor_count, _entry in enumerate(walker, 1):
+                    if ancestor_count >= _ANCESTOR_WALK_MAX:
+                        capped = 'max'
+                        break
+                    # Clock check amortised: once per 512 commits is
+                    # far finer than the deadline it enforces.
+                    if (ancestor_count % 512 == 0
+                            and _time.monotonic() > deadline):
+                        capped = 'deadline'
+                        break
+                took = _time.monotonic() - started
+                out['ancestor_walk_s'] = round(took, 3)
+                if capped:
+                    out['ancestor_count_capped'] = capped
             except Exception as ex:
                 out['ancestor_count_error'] = repr(ex)
         out['ancestor_count_from_head'] = ancestor_count

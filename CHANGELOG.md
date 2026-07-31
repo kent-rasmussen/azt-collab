@@ -9,6 +9,76 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.177 — on Windows, `_pid_alive` could not report a dead daemon
+
+Field 2026-07-31, Windows desktop: `server.json` stamped 19:28 the previous
+evening, newest daemon log 07-30, no daemon and no log all day. No process, so
+no log — the question was why the client never spawned one.
+
+`_pid_alive` is `os.kill(pid, 0)`, which is not a probe on Windows. It was wrong
+in **both** directions:
+
+- **Dead pid → reported alive.** `OpenProcess` on a vanished pid fails with
+  `ERROR_INVALID_PARAMETER` → `EINVAL`, not `ESRCH`, so Python raises plain
+  `OSError` and not `ProcessLookupError`. The blanket `except OSError: return
+  True` then called it alive. On Windows this function could essentially never
+  return False, so any `server.json` left by an exited daemon wedged the client
+  permanently and silently: no respawn, no file cleanup, no message, no expiry.
+- **Live pid → killed.** Per the `os.kill` docs, on Windows any signal other
+  than `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` "will cause the process to be
+  unconditionally killed by the TerminateProcess API". Signal 0 is not special-
+  cased. The probe terminated the daemon it was asking about — reached only
+  once health had already failed, which is why it looked like the daemon dying
+  rather than the client killing it.
+
+Windows now opens a query-only handle and uses `WaitForSingleObject(h, 0)`;
+`WAIT_TIMEOUT` means running. `GetExitCodeProcess` is avoided because
+`STILL_ACTIVE` (259) is indistinguishable from a real exit code of 259.
+
+Every uncertain branch now answers **False**, reversing the old default. A wrong
+True is unrecoverable — nothing retries and nothing expires. A wrong False costs
+one spawn that the flock kills instantly. Refusing to disturb a possibly-live
+daemon stopped being the conservative choice the moment the flock existed.
+
+Two diagnosability fixes alongside, from the spawn-failure audit:
+
+- **The spawned child's output goes to `$AZT_HOME/spawn_boot_trace.txt`**, not
+  `DEVNULL`. Failed imports, missing dependencies, an unwritable `$AZT_HOME`,
+  the flock refusal, interpreter tracebacks — everything a daemon says before
+  its own log tee exists was previously destroyed at birth, which is most of the
+  ways a spawn can fail. Appended per attempt with a timestamped header, rolled
+  at 512 KB.
+- **The child's exit code is read.** The wait loop only ever asked whether
+  `server.json` had appeared, so a daemon that died in 50 ms was
+  indistinguishable from one still starting and the caller waited out the full
+  timeout to report nothing. `poll()` now names the code and its meaning — exit
+  1 is the flock, exit 3 is the `server_crippled` marker — and a daemon still
+  running at timeout is reported as such rather than as absent.
+
+**None of this is what broke on 2026-07-30.** All three are long-standing; they
+explain why the machine stayed dead and why it was invisible, not what stopped
+the daemon that evening.
+
+## 0.55.176 — the ancestry walk behind a log line is bounded
+
+`_h_lan_debug` computed `ancestor_count = sum(1 for _ in walker)` — a full
+history walk, reading every commit object, to print one diagnostic number. The
+start-of-day snapshot calls it once per project, and on 2026-07-31 that was the
+entire outage.
+
+Bounded by **both** count (20 000) and wall clock (5 s). Two bounds because a
+count cap limits objects but not the time to read them, and loose objects on a
+slow or contended disk are exactly the condition where this bites; the deadline
+is the honest bound, the count cap keeps a healthy repo from paying a clock
+check per commit (amortised to one per 512 either way).
+
+When either bound trips, the response carries `ancestor_count_capped:
+"max"|"deadline"` and the number is a floor, never a total — reporting a
+complete count that wasn't finished is invariant #15 in numeric form. Anything
+comparing two devices' ancestry (the original 0.50.45 use) must check that flag
+before concluding the counts differ. `ancestor_walk_s` is always reported, so a
+walk that is merely slow is visible before it becomes a hang.
+
 ## 0.55.175 — `$AZT_HOME/server_crippled`: reproduce "no daemon" on demand
 
 Testing affordance, by request. If that file exists, the daemon logs a refusal
