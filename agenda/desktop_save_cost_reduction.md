@@ -21,8 +21,44 @@
   growing queue of unsaved work. Whole-file interchange semantics
   preserved (the working-tree .lift stays one valid document).
 - **Deadline:** none
-- **Waiting on:** Nothing (Phase 0 needs the spurious-prompts fixes
-  deployed on the slow machine first)
+- **Waiting on:** Nothing. The daemon-side timing
+  (`agenda/daemon_submit_timing.md`, handed over 2026-07-30) shipped the
+  same day in 0.55.170 and reported — see PHASE 0 VERDICT below. What
+  remains is one measurement pass on a real repo, tracked as
+  `azt/agenda/timing_on_real_repos.md` (2026-07-31).
+
+## PHASE 0 VERDICT (2026-07-30, both halves instrumented)
+
+`Demo_en`, 5.6 MB, azt + daemon lines paired:
+
+```
+save cost:    5.6 MB | indent 0.09s + serialize 0.28s + submit 0.39s = 0.76s | ok
+[submit cost] Demo_en | land 0.01s + stage[1 files] 0.16s + commit 0.21s = 0.38s
+```
+
+**Both premises this item was built on are dead:**
+
+- NOT tree-proportional in the way assumed. `_stage_all` stages **0 or 1** paths per
+  save, not ~3050. Its ~0.2 s is `porcelain.status()` walking the tree to DISCOVER
+  that, not per-file staging. Logging the file count is what killed the assumption.
+- NOT payload-proportional. `land` is 0.00 s (an `os.replace` of an already-staged
+  file), and `commit` is 0.14–0.21 s for a 5.6 MB blob.
+- The two logs agree to ~0.1 s, so no queueing and negligible transport.
+
+**What the daemon's 0.4 s actually is: a floor of two whole-tree scans** — the status
+scan inside `_stage_all`, and the index work inside the commit.
+
+Consequences:
+
+- **Phase 1 (stage only the submitted path)** is the only phase with anything to win
+  — roughly the 0.2 s status scan.
+- **Phase 3 (surgical per-entry submit)** is NOT justified. It is a contract change
+  that would shrink a payload that isn't the cost. Do not build it on these numbers.
+- Total ~0.76 s per save on a fast box. **The item's own premise — slow machines
+  can't keep up — now needs re-establishing before either phase is built**, on the
+  real repo (`nml`: 16 MB LIFT, 1868 audio files, both scans larger) and on a slow
+  CPU. That is what `timing_on_real_repos.md` is for; it may close this item as
+  measured-and-fine.
 
 ## RE-WEIGHTED 2026-07-30 (Kent) — Phase 2's premise was WRONG
 
@@ -114,11 +150,12 @@ save to O(1). Care: keep the auto-init/recovery paths (which DO want
 whole-tree absorption) on `_stage_all`.
 
 ### Phase 2 — azt-side cheap wins, no contract change
-- **Dirty-flag skip:** azt autosaves unchanged content routinely
-  (NOTHING_TO_COMMIT is documented as routine) — each no-op save
-  still pays full serialize + submit + daemon hash. Track a dirty
-  bit (or dirty-entry count) and skip serialize+submit entirely when
-  clean. Likely the single biggest win on slow machines.
+- **Dirty-flag skip — DEMOTED, see the re-weighting above.** The premise
+  ("azt autosaves unchanged content routinely") was a misreading:
+  `maybewrite` IS the autosave, fired per change, so the content
+  genuinely differs on nearly every save and there is little to skip.
+  Keep only as a cheap guard against the few genuinely-clean saves;
+  do NOT budget it as the win.
 - **Serializer cost:** measure azt's DOM→bytes serialize; if it
   dominates, optimize in place (azt repo) before any contract change.
 
@@ -162,3 +199,64 @@ Adds daemon endpoint + client wrapper + status codes per the
   justify it.
 
 ## Research
+
+### First Phase-0 numbers, 2026-07-30 (Kent's box, NO daemon, 5.6 MB file)
+
+```
+17:39:49  5.6 MB | indent 0.05s + serialize 1.62s + submit 0.00s            = 1.67s   | (no daemon)
+18:12:16  5.6 MB | indent 0.09s + serialize 0.28s + submit 0.00s + replace 0.00s = 0.37s (thread) | (no daemon)
+18:36:35  5.6 MB | indent 0.08s + serialize 0.24s + submit 0.00s + replace 0.00s = 0.32s (thread) | (no daemon)
+```
+
+(The 17:39 line predates the `replace`/`(thread)` fields, so an update landed
+between it and 18:12.)
+
+**Settled: `indent` is not the cost.** The full-tree reindent — one of the four
+O(file) passes the re-weighting names — is 0.05–0.09 s, i.e. 5–25% of azt-side time
+and ~2% of the earlier worst case. Optimising `xmlfns.indent` is not worth doing.
+
+**azt-side cost is serialize, and it is ~0.045 s/MB** on this machine (0.24–0.28 s
+for 5.6 MB). Extrapolating linearly to the 16 MB field file: ~0.7 s serialize +
+~0.25 s indent ≈ **1 s of azt-side work per save on a FAST box** — so on a field CPU
+several times slower this is plausibly 3–5 s per save on its own, before the daemon
+does anything. That is consistent with "slow machines can't keep up" having an
+azt-side component, which Phase 3 (smaller payload) would cut and Phase 1 would not.
+
+**Unexplained: the 1.62 s serialize at 17:39, ~6× the other two for the same file.**
+First-save-of-session cold cost, a different build, or something real about that
+save. Do not average it away — if it recurs it matters more than the median.
+
+**These numbers CANNOT decide Phase 2 vs Phase 3**, and the reason is NOT that the
+daemon was down. Kent 2026-07-30: the daemon was up. `(no daemon)` was a bad label
+of mine — `lift.py:1287` set it as the initial value and it survived for two
+unrelated reasons: `collab_submit` not attached, OR `filename != self.filename`,
+i.e. **a backup/template write, which by design never goes through the daemon**
+(`writebackup()` → `self.write(self.backupfilename)`). A daemon that IS asked and
+fails logs `fallback`, so neither case ever meant "the server broke".
+
+**Consequence: these three lines may not describe the hot path at all.** If they are
+`writebackup` saves, their serialize cost is real but their `submit 0.00s` is by
+design, and no conclusion about save cadence follows from them. The label now
+distinguishes `(collab not attached)` from
+`(backup/other file — not the hot path)`, so the next capture is self-describing.
+
+Still needed, in priority order:
+
+1. A capture whose outcome is `ok` — i.e. the real collab save path — on any
+   machine. That alone gives `submit` wall-clock and settles decision (1) below.
+2. Daemon-side timing inside `_submit_file_locked` to split that number
+   (→ handed to the daemon team, `agenda/daemon_submit_timing.md`).
+3. The slow field machine, 16 MB file, on 1.13.3+ (the reload-prompt fixes are the
+   stated prerequisite — without them the stale-base loop makes every save a full
+   merge and swamps the measurement).
+
+### What each measurement decides
+- **(1) Is daemon cost significant?** If `submit` ≲ serialize (~0.25 s at 5.6 MB),
+  the item collapses to azt-side serialize + Phase 1 as a freebie; no contract change.
+- **(2) Payload-proportional or tree-proportional?** Tree (`_stage_all`'s ~3050-file
+  walk, commit overhead) → Phase 1 suffices, Phase 3 buys almost nothing. Payload
+  (parse/splice/write 16 MB) → Phase 3 is the main event.
+- **(3) Irreducible floor?** Writing a coherent 16 MB file and hashing a 16 MB blob
+  cost the same for a 2 KB payload. If that floor dominates, NEITHER phase helps and
+  the lever is storage granularity (parked entry-per-file) — the same reasoning the
+  per-field precision decision used, one level up.

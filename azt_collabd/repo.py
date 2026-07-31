@@ -2904,6 +2904,69 @@ def _stage_all(repo, project_dir):
 
     if paths:
         porcelain.add(repo, paths=paths)
+    # Report into the current submit's phase record, if one is open
+    # (0.55.170). The file COUNT is the point as much as the seconds: it is
+    # what makes "~3050 files per save" checkable instead of folklore, and it
+    # is the number that decides whether staging is worth narrowing.
+    _phase_note('stage', files=len(paths))
+
+
+# Per-thread phase record for the submit path (0.55.170).
+#
+# `submit_file` has been one opaque number on both sides: azt's ``save cost:``
+# line reports the whole round trip, and the daemon reported nothing. Three
+# very different findings are indistinguishable that way —
+# tree-proportional (stage the whole tree every save), payload-proportional
+# (write + hash a 16 MB file), or an irreducible floor — and they point at
+# three different fixes, only one of which is worth a contract change.
+#
+# Thread-local because submits are per-request and may overlap; a module dict
+# would attribute one request's staging to another's line.
+_submit_phases = threading.local()
+
+
+def _phase_open():
+    _submit_phases.rec = {'t0': time.perf_counter(), 'marks': [], 'extra': {}}
+
+
+def _phase_note(name, **extra):
+    """Record elapsed-since-last-mark under *name*. No-op outside a submit."""
+    rec = getattr(_submit_phases, 'rec', None)
+    if rec is None:
+        return
+    now = time.perf_counter()
+    prev = rec['marks'][-1][1] if rec['marks'] else rec['t0']
+    rec['marks'].append((name, now, now - prev))
+    if extra:
+        rec['extra'].setdefault(name, {}).update(extra)
+
+
+def _phase_close(label, project_dir):
+    """Emit one greppable line and clear the record.
+
+    Shaped after azt's ``save cost:`` line on purpose — same ``+``-separated
+    terms summing to a total — so the two halves of one save can be read side
+    by side and grepped the same way. Never raises: a measurement must not be
+    able to break a save."""
+    rec = getattr(_submit_phases, 'rec', None)
+    _submit_phases.rec = None
+    if rec is None:
+        return
+    try:
+        total = time.perf_counter() - rec['t0']
+        parts = []
+        for name, _at, dur in rec['marks']:
+            note = rec['extra'].get(name) or {}
+            suffix = ''
+            if 'files' in note:
+                suffix = f'[{note["files"]} files]'
+            parts.append(f'{name}{suffix} {dur:.2f}s')
+        print(f'[submit cost] {os.path.basename(project_dir)} | '
+              f'{" + ".join(parts) or "no phases"} = {total:.2f}s '
+              f'| {label}', file=sys.stderr, flush=True)
+    except Exception as ex:
+        print(f'[submit cost] line failed: {ex!r}',
+              file=sys.stderr, flush=True)
 
 
 def _safe_email_segment(s):
@@ -4444,6 +4507,14 @@ def _commit_repo_locked(project_dir, contributor_name):
     return result
 
 
+# A lock already held this long will not clear inside a save, so stop waiting
+# on it (0.55.172). Deliberately small: the operations that finish quickly —
+# a commit, a status walk — are done well inside this, while the ones that
+# don't are network pushes measured in minutes. Chosen so a normal contended
+# save still waits, and a hopeless one doesn't.
+_BUSY_FAIL_FAST_AGE_S = 3.0
+
+
 def submit_file(project_dir, rel_path, staged_path, base_sha,
                 contributor_name, message=None):
     """Base-aware whole-file write + commit — the desktop A-Z+T save
@@ -4485,8 +4556,41 @@ def submit_file(project_dir, rel_path, staged_path, base_sha,
     the submitted content on disk; the next successful commit
     stages it (same containment as a power cut)."""
     _ensure_ssl()
+    # FAIL FAST WHEN WAITING CANNOT HELP (0.55.172).
+    #
+    # Field 2026-07-30: a save cost the user **42.1 seconds** and still fell
+    # back to a plain write — 4 lock waits of 10 s plus azt's 3 × 0.7 s
+    # retries — while the lock was held for 125 s by a github push blocked in
+    # ``ssl.sendall``. Every one of those waits was doomed the moment it
+    # started, and the UI was unresponsive throughout.
+    #
+    # We already know enough to answer instantly: ``held_snapshot`` carries
+    # who holds the lock and for how long. A holder that has been in there
+    # for seconds is not about to finish, so waiting the full timeout buys
+    # nothing. A lock that is free or freshly taken still gets the normal
+    # wait, because that one usually clears — shortening it unconditionally
+    # would turn saves that would have succeeded into fallbacks.
+    _timeout = None
     try:
-        with project_lock(project_dir):
+        from .locks import held_snapshot
+        _key = os.path.basename(os.path.abspath(project_dir))
+        for _row in held_snapshot():
+            if _row.get('key') != _key:
+                continue
+            _age = float(_row.get('held_s') or 0.0)
+            if _age >= _BUSY_FAIL_FAST_AGE_S:
+                _timeout = 0.25
+                print(f'[submit_file] {os.path.basename(project_dir)!r}: '
+                      f'lock held {_age:.0f}s by '
+                      f'{_row.get("holder", "?")!r} — answering BUSY now '
+                      f'instead of waiting; a holder that old will not clear '
+                      f'inside a save',
+                      file=sys.stderr, flush=True)
+            break
+    except Exception:
+        _timeout = None
+    try:
+        with project_lock(project_dir, timeout=_timeout):
             with _track_opened_repos():
                 return _submit_file_locked(
                     project_dir, rel_path, staged_path, base_sha,
@@ -4498,6 +4602,7 @@ def submit_file(project_dir, rel_path, staged_path, base_sha,
 def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
                         contributor_name, message):
     from dulwich import porcelain
+    _phase_open()
     result = Result()
     target = os.path.join(project_dir, rel_path)
     repo = _get_repo(project_dir)
@@ -4525,6 +4630,7 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
     if head is None or (base_str and base_str == head_str):
         # Fast path — nothing landed since the caller's base.
         os.replace(staged_path, target)
+        _phase_note('land')
     else:
         # Divergent path — HEAD moved past the caller's base.
         theirs_bytes = None
@@ -4614,6 +4720,10 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
         # from your team" over the user's own content. The caller can
         # adopt ``head_sha`` as its new base and skip the reload
         # prompt when this is True.
+        # The divergent path, timed separately (0.55.170). It parses and
+        # three-way-merges the whole LIFT, so if it shows up per-save it
+        # swamps every other phase — and that would itself be the finding.
+        _phase_note('merge')
         merged_identical = (merged == theirs_bytes)
         result.add(S.MERGED_WITH_LOCAL,
                    n_conflicts=n_conflicts, base_sha=base_str,
@@ -4629,11 +4739,18 @@ def _submit_file_locked(project_dir, rel_path, staged_path, base_sha,
         # the other commit-issuing endpoints use, so the peer's
         # routing (→ set-your-name screen) is uniform.
         result.add(S.CONTRIBUTOR_UNSET)
+        _phase_close('no contributor — bytes landed, no commit', project_dir)
         return result, head_str
     _commit_step_locked(
         repo, project_dir, contributor_name, result,
         message=message or f'A-Z+T edit by {contributor_name}')
-    return result, head_sha_of(project_dir)
+    # ``_commit_step_locked`` runs ``_stage_all`` (which notes its own phase
+    # and file count) and then the commit; this mark captures hashing + commit
+    # as the remainder, which is the floor the other two are measured against.
+    _phase_note('commit')
+    _out_sha = head_sha_of(project_dir)
+    _phase_close(f'codes={result.codes()}', project_dir)
+    return result, _out_sha
 
 
 def _deterministic_merge_commit(repo, msg, bot, local_sha, remote_sha):
@@ -5820,16 +5937,9 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
         # path → blob sha, from the trees of the commits the REMOTE has.
         # Built by walking those trees, so membership here IS proof the
         # server holds the object.
-        base_by_path = {}
-        for hsha in (have or []):
-            try:
-                tree = getattr(store[hsha], 'tree', None)
-                if tree is None:
-                    continue
-                for entry in iter_tree_contents(store, tree):
-                    base_by_path.setdefault(entry.path, entry.sha)
-            except Exception:
-                continue
+        # Shared with the estimator (0.55.169) so the two cannot disagree
+        # about what counts as a safe base.
+        base_by_path = _base_map_from_haves(repo, have)
 
         def _emit():
             for unpacked in reused:
@@ -5851,11 +5961,14 @@ def _push_thin(repo, remote_url, refspec, username, token, errstream=None):
                     base_sha = base_by_path.get(path) if path else None
                     if base_sha and base_sha != sha:
                         try:
-                            target_raw = obj.as_raw_string()
-                            base_raw = store[base_sha].as_raw_string()
-                            delta = b''.join(
-                                create_delta(base_raw, target_raw))
-                            if len(delta) < len(target_raw) * 0.9:
+                            # Through the SHARED cache (0.55.169) — the
+                            # estimator has usually just computed this exact
+                            # delta to size the chunk, and recomputing a 16 MB
+                            # diff to send what was already measured is the
+                            # duplication the planner was meant to remove.
+                            delta = _thin_delta(repo, base_sha, sha)
+                            if delta is not None:
+                                target_raw = obj.as_raw_string()
                                 stats['computed'] += 1
                                 stats['saved'] += len(target_raw) - len(delta)
                                 # This version becomes the base for the NEXT
@@ -6064,6 +6177,85 @@ def _check_large_files_in_commit(repo, commit_sha, threshold_bytes):
 # behaviour — an overestimate, never an underestimate.
 _DELTA_ESTIMATE_MAX_OBJECTS = 5000
 
+# How far above the budget a chunk's RAW size may go while still being sized on
+# its wire (delta) size (0.55.169). This is the fallback-survivability bound: a
+# thin push that fails retries with the whole pack, so a chunk sized purely on
+# deltas could otherwise drop hundreds of MB onto a weak link. 20 × the 3 MB
+# default ≈ 60 MB — minutes on a bad connection, not hours.
+_FALLBACK_RAW_CEILING_MULT = 20
+
+
+# Shared push-time delta cache (0.55.169).
+#
+# The estimator and the pusher ask the same question — "how many bytes does
+# this blob become against that base" — and the chunk loop makes the estimator
+# ask repeatedly as it shrinks. Computing a 16 MB delta more than once per
+# (base, target) is waste; computing it in the estimator and AGAIN in the
+# pusher is exactly the duplication the plan set out to remove.
+#
+# Caches the delta BYTES, not just the size, so ``_push_thin`` sends what the
+# estimate was based on. ``None`` is cached too: "not worth deltifying" is an
+# answer worth remembering.
+_delta_cache = {}
+_delta_cache_bytes = 0
+_DELTA_CACHE_BYTE_CAP = 32 * 1024 * 1024
+_delta_cache_lock = threading.Lock()
+
+
+def _thin_delta(repo, base_sha, target_sha):
+    """Delta bytes taking *base_sha* → *target_sha*, or None to send whole.
+
+    None covers both "couldn't compute" and "saved less than 10%" — below that
+    a delta costs CPU on both ends and lengthens the chain for nothing.
+    """
+    global _delta_cache_bytes
+    if not base_sha or not target_sha or base_sha == target_sha:
+        return None
+    key = (bytes(base_sha), bytes(target_sha))
+    with _delta_cache_lock:
+        if key in _delta_cache:
+            return _delta_cache[key]
+    try:
+        from dulwich.pack import create_delta
+        target_raw = repo.object_store[target_sha].as_raw_string()
+        base_raw = repo.object_store[base_sha].as_raw_string()
+        delta = b''.join(create_delta(base_raw, target_raw))
+        if len(delta) >= len(target_raw) * 0.9:
+            delta = None
+    except Exception:
+        delta = None
+    with _delta_cache_lock:
+        # Coarse eviction: the cache exists to span one push cycle, not to be
+        # a long-lived store. Clearing wholesale is cheaper to reason about
+        # than an LRU, and the worst case is recomputing.
+        if _delta_cache_bytes > _DELTA_CACHE_BYTE_CAP:
+            _delta_cache.clear()
+            _delta_cache_bytes = 0
+        _delta_cache[key] = delta
+        if delta:
+            _delta_cache_bytes += len(delta)
+    return delta
+
+
+def _base_map_from_haves(repo, haves):
+    """``{path: blob_sha}`` from the trees of commits the remote holds.
+
+    Membership is itself the proof the server has the object, so a delta
+    against one of these is safe to send thin. Shared by the estimator and
+    ``_push_thin`` so the two can't disagree about what a base is."""
+    from dulwich.object_store import iter_tree_contents
+    out = {}
+    for hsha in (haves or []):
+        try:
+            tree = getattr(repo.object_store[hsha], 'tree', None)
+            if tree is None:
+                continue
+            for entry in iter_tree_contents(repo.object_store, tree):
+                out.setdefault(entry.path, entry.sha)
+        except Exception:
+            continue
+    return out
+
 
 def _reusable_delta_sizes(repo, shas, remote_has):
     """``{sha: delta_bytes}`` for objects that will ship as reused deltas.
@@ -6172,7 +6364,7 @@ def _estimate_delta_size(repo, have_sha, want_sha):
     tracking ref pointing at something we don't have can't make the
     whole estimate raise (which would silently disable the gate)."""
     if not want_sha:
-        return (0, 0)
+        return (0, 0, 0)
     try:
         from dulwich.object_store import MissingObjectFinder
         haves = [have_sha] if have_sha else []
@@ -6235,39 +6427,73 @@ def _estimate_delta_size(repo, have_sha, want_sha):
         except Exception:
             remote_has = set()
         wanted = []
+        hints = {}
         skipped = 0
         for sha, _hint in finder:
             if sha in seeded:
                 skipped += 1
                 continue
             wanted.append(sha)
+            hints[sha] = _hint
         if skipped:
             lift_merge.trace(
                 f'[sync-trace] pack-size estimate: {skipped} object(s) '
                 f'excluded as already seeded on the server')
         delta_bytes = _reusable_delta_sizes(repo, wanted, remote_has)
+        # PRICE PUSH-TIME DELTAS, NOT JUST STORED ONES (0.55.169).
+        #
+        # 0.55.147 taught this to count deltas already sitting in local packs.
+        # But almost none exist — field 2026-07-30 showed `0 reused from local
+        # packs` on nearly every push, because `git repack` points its chains
+        # the wrong way for incremental pushes. The deltas that actually get
+        # sent are computed at push time, and those were still being priced at
+        # whole-blob size: `pre-shrink chunk_n 50→1 (est 1,240,081,629 >
+        # budget 3,145,728)` for fifty commits of six-line edits.
+        #
+        # So ask the same question the pusher will, through the same cache, and
+        # chain within the estimate exactly as the pack does — otherwise a
+        # multi-commit chunk is priced as N whole blobs when only the first
+        # needs one.
+        base_by_path = _base_map_from_haves(repo, haves)
         count = 0
-        total_bytes = 0
+        wire_bytes = 0
+        raw_bytes = 0
+        computed = 0
         for sha in wanted:
             count += 1
+            try:
+                obj = repo.object_store[sha]
+                obj_raw = obj.raw_length()
+            except Exception:
+                continue
+            raw_bytes += obj_raw
             hit = delta_bytes.get(sha)
             if hit is not None:
-                total_bytes += hit
+                wire_bytes += hit
                 continue
-            try:
-                total_bytes += repo.object_store[sha].raw_length()
-            except Exception:
-                pass
-        if delta_bytes:
+            path = None
+            _hint = hints.get(sha)
+            if isinstance(_hint, tuple) and len(_hint) > 1:
+                path = _hint[1]
+            if path and obj.type_name == b'blob':
+                delta = _thin_delta(repo, base_by_path.get(path), sha)
+                if delta is not None:
+                    computed += 1
+                    wire_bytes += len(delta)
+                    base_by_path[path] = sha
+                    continue
+                base_by_path[path] = sha
+            wire_bytes += obj_raw
+        if delta_bytes or computed:
             lift_merge.trace(
-                f'[sync-trace] pack-size estimate: {len(delta_bytes)} of '
-                f'{count} object(s) will ship as reusable deltas, counted '
-                f'at delta size rather than whole-object size')
-        return (count, total_bytes)
+                f'[sync-trace] pack-size estimate: {computed} push-time '
+                f'delta(s) + {len(delta_bytes)} reusable, of {count} '
+                f'object(s) — wire {wire_bytes:,} vs raw {raw_bytes:,} bytes')
+        return (count, wire_bytes, raw_bytes)
     except Exception as exc:
         lift_merge.trace(
             f'[sync-trace] pack-size estimate failed: {exc!r}')
-        return (0, 0)
+        return (0, 0, 0)
 
 
 # Per-daemon-lifetime memo of (project_dir,) we've already swept
@@ -7138,9 +7364,16 @@ def _sweep_orphan_preseed_refs(
     from dulwich import porcelain
     from dulwich.object_store import iter_tree_contents
 
+    # ``azt-side-*`` TOO, not only ``azt-blob-seed-*`` (0.55.170). The local
+    # candidate list matched the seed prefix alone, so the side refs that
+    # chunked-push banking creates were invisible to the sweep unless the
+    # server-ref listing (0.55.151) happened to find them. They are the
+    # refs actually accumulating: four AZT branches on github after nml had
+    # converged, three of them ``azt-side-*``.
+    _side_track = b'refs/remotes/origin/azt-side-'
     candidates = [
         r for r in list(repo.refs.allkeys())
-        if r.startswith(_PRESEED_TRACK_PREFIX)
+        if r.startswith(_PRESEED_TRACK_PREFIX) or r.startswith(_side_track)
     ]
     if not candidates:
         return
@@ -7243,6 +7476,22 @@ def _sweep_orphan_preseed_refs(
             continue
         try:
             side_commit_sha = repo.refs[tracking_ref]
+            # ANCESTRY BEATS THE BLOB CHECK (0.55.170).
+            #
+            # ``azt-side-*`` refs are real commits on main's history, not
+            # orphans, so if main descends from one then everything it holds is
+            # reachable from main by definition — no blob comparison needed.
+            #
+            # And the blob comparison was WRONG for them: ``main_blobs`` comes
+            # from main's HEAD tree only, justified by "audio blobs are
+            # additive." That holds for audio and fails for the LIFT, which is
+            # rewritten every commit — so a side ref's tree always contains an
+            # older LIFT that HEAD's tree doesn't, ``all_in_main`` was never
+            # true, and nothing was ever swept. Field 2026-07-30: four AZT
+            # branches on github after nml had fully converged.
+            if main_sha and _is_ancestor(repo, side_commit_sha, main_sha):
+                deletable.append(tracking_ref)
+                continue
             side_commit = repo.object_store[side_commit_sha]
             side_tree = side_commit.tree
             all_in_main = True
@@ -7882,11 +8131,11 @@ def _push_chunked_to_ref(
         # the wire pack will be smaller, but raw_bytes is the right
         # gauge for 'fits in the receive-pack timeout window.' Used
         # below for the chunk_n=1 budget-bail diagnosis.
-        obj_count, raw_bytes = _estimate_delta_size(
+        obj_count, wire_bytes, raw_bytes = _estimate_delta_size(
             repo, chunk_base, intermediate)
         lift_merge.trace(
             f'[sync-trace] topic-push pack-size: {obj_count} objects, '
-            f'{raw_bytes:,} bytes (uncompressed upper bound)')
+            f'wire {wire_bytes:,} bytes (raw {raw_bytes:,})')
 
         # Pre-shrink from the estimate instead of attempting a doomed
         # oversize push. Only while we've never had a success at this
@@ -7897,14 +8146,34 @@ def _push_chunked_to_ref(
         # handle it). Skips burning a multi-minute 408 on
         # chunk_n=50/25/… every daemon lifetime (field: nml, ~194 MB at
         # chunk_n=50 shrinks straight to chunk_n=1).
-        if (working_n is None and chunk_n > 1 and budget > 0
-                and raw_bytes > budget):
-            shrunk = max(1, int(chunk_n * budget / raw_bytes))
+        # SHRINK ON THE WIRE ESTIMATE, WITH A RAW CEILING (0.55.169).
+        #
+        # The budget is about what fits in the server's receive-pack window, so
+        # the number to compare is what actually goes over the wire — now that
+        # thin push makes that a delta rather than a whole blob. Pricing on raw
+        # size pinned chunk_n at 1 and made us pay one full round trip per
+        # commit: ~10 s each, unchanged whether the push carried 15.7 MB or
+        # nothing.
+        #
+        # The raw ceiling is the safety half. If a thin push ever fails, the
+        # fallback sends the pack WHOLE — so a chunk sized purely on deltas
+        # could put hundreds of MB on the link at the worst moment. Allowing a
+        # multi-commit chunk only while its raw size stays inside a bounded
+        # multiple of the budget keeps the fallback survivable.
+        _raw_ceiling = budget * _FALLBACK_RAW_CEILING_MULT
+        _over = (wire_bytes > budget if budget > 0 else False)
+        _too_raw = (budget > 0 and raw_bytes > _raw_ceiling)
+        if working_n is None and chunk_n > 1 and (_over or _too_raw):
+            _basis = raw_bytes if _too_raw else wire_bytes
+            _limit = _raw_ceiling if _too_raw else budget
+            shrunk = max(1, int(chunk_n * _limit / max(1, _basis)))
             if shrunk < chunk_n:
                 lift_merge.trace(
                     f'[sync-trace] topic-push pre-shrink chunk_n '
-                    f'{chunk_n}→{shrunk} (est {raw_bytes:,} > '
-                    f'budget {budget:,})')
+                    f'{chunk_n}→{shrunk} '
+                    f'({"raw" if _too_raw else "wire"} {_basis:,} > '
+                    f'{"fallback ceiling" if _too_raw else "budget"} '
+                    f'{_limit:,})')
                 chunk_n = shrunk
                 continue
 

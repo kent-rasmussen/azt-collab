@@ -7079,8 +7079,11 @@ def run(host='127.0.0.1', port=0):
         print(f'[azt_collabd] lan_listener startup apply failed: '
               f'{ex!r}', file=sys.stderr, flush=True)
 
+    _signalled = {'yes': False}
+
     def _graceful(signum, frame):
         print(f'[azt_collabd] signal {signum}, shutting down', flush=True)
+        _signalled['yes'] = True
         threading.Thread(target=httpd.shutdown, daemon=True,
                          name='httpd-shutdown').start()
 
@@ -7096,8 +7099,37 @@ def run(host='127.0.0.1', port=0):
         print('[azt_collabd] interrupted', flush=True)
     finally:
         scheduler.stop_watcher()
+        # STOP DISCOVERY, THEN ACTUALLY EXIT (0.55.172).
+        #
+        # ``pkill`` appeared not to work at all: field 2026-07-30, repeated
+        # SIGTERMs and the daemon kept answering, reporting the same version
+        # each time — which reads as "the new code won't load" when in fact
+        # the old PROCESS had never died.
+        #
+        # python-zeroconf runs its event loop on a NON-daemon thread
+        # (``Thread-1 (_run_loop)`` in the watchdog's dump), so the
+        # interpreter waits for it at exit no matter how cleanly the HTTP
+        # server shut down. Nothing here stopped discovery.
+        try:
+            from . import lan_discovery as _lan_disc
+            _lan_disc.stop_browse()
+            _lan_disc.stop_advertise()
+        except Exception as ex:
+            print(f'[azt_collabd] discovery stop on shutdown raised: {ex!r}',
+                  file=sys.stderr, flush=True)
         try:
             os.remove(info_path)
         except OSError:
             pass
         httpd.server_close()
+        if _signalled['yes']:
+            # Everything durable is flushed by this point: the watcher is
+            # stopped, server.json is gone, the socket is closed. A signalled
+            # shutdown must END, and waiting on whatever third-party thread
+            # forgot to mark itself daemon is how a "graceful" stop becomes a
+            # process that will not die. Kent's recovery was ``pkill -9``,
+            # which is the outcome this exists to prevent.
+            print('[azt_collabd] shutdown complete; exiting',
+                  file=sys.stderr, flush=True)
+            sys.stderr.flush()
+            os._exit(0)

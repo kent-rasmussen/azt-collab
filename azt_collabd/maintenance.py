@@ -94,6 +94,48 @@ _no_git_logged = False
 # settled and require real growth ON TOP of that before going again.
 _post_repack_floor = {}
 
+# The floor is PERSISTED, not just in-memory (0.55.170). It was a module dict,
+# so every daemon restart reset it to zero and the same unreachable residue
+# tripped the trigger again: field 2026-07-30, `2458 → 2433 object(s), 6.3 →
+# 6.1 MB` in 11 s, on a fresh start, having done exactly this on the previous
+# start. A dozen restarts in a day meant a dozen 11-second no-ops.
+#
+# Stored beside the repo it describes rather than in a central state file:
+# it is a fact about that git directory, it travels with it, and a lost or
+# corrupt marker simply means one extra repack.
+_FLOOR_FILE = 'azt-repack-floor'
+
+
+def _floor_path(working_dir):
+    return os.path.join(working_dir, '.git', _FLOOR_FILE)
+
+
+def _read_floor(working_dir):
+    """``(count, bytes)`` the last repack settled at, or ``(0, 0)``."""
+    key = os.path.abspath(working_dir)
+    hit = _post_repack_floor.get(key)
+    if hit is not None:
+        return hit
+    try:
+        with open(_floor_path(working_dir)) as fh:
+            parts = fh.read().split()
+        value = (int(parts[0]), int(parts[1]))
+    except Exception:
+        value = (0, 0)
+    _post_repack_floor[key] = value
+    return value
+
+
+def _write_floor(working_dir, count, total):
+    _post_repack_floor[os.path.abspath(working_dir)] = (count, total)
+    try:
+        with open(_floor_path(working_dir), 'w') as fh:
+            fh.write(f'{int(count)} {int(total)}\n')
+    except OSError as ex:
+        print(f'[maintenance] could not persist the repack floor '
+              f'({ex!r}) — the next daemon start will repack once needlessly',
+              file=sys.stderr, flush=True)
+
 
 def _loose_object_stats(git_dir):
     """``(count, bytes)`` of loose objects under ``<git_dir>/objects``.
@@ -230,8 +272,7 @@ def repack_project(working_dir, langcode=''):
         os.path.join(working_dir, '.git'))
     # Remember where it settled, so the next trigger needs real growth on
     # top of this rather than re-firing on residue we cannot pack.
-    _post_repack_floor[os.path.abspath(working_dir)] = (
-        after_count, after_total)
+    _write_floor(working_dir, after_count, after_total)
     # SAY WHAT CHANGED, NOT JUST THAT IT RAN. A repack that packed nothing
     # and one that packed 700 MB are the same line otherwise, and the whole
     # point of the operation is the size of the difference.
@@ -264,13 +305,12 @@ def _needs_repack(working_dir):
     if not os.path.isdir(git_dir):
         return False, 0, 0
     count, total = _loose_object_stats(git_dir)
-    floor_count, floor_total = _post_repack_floor.get(
-        os.path.abspath(working_dir), (0, 0))
+    floor_count, floor_total = _read_floor(working_dir)
     # A shrinking count means something else pruned or the repo was replaced;
     # drop the floor so we don't sit above a stale high-water mark.
     if count < floor_count or total < floor_total:
         floor_count, floor_total = 0, 0
-        _post_repack_floor.pop(os.path.abspath(working_dir), None)
+        _write_floor(working_dir, 0, 0)
     return ((count - floor_count) >= _LOOSE_COUNT_TRIGGER
             or (total - floor_total) >= _LOOSE_BYTES_TRIGGER), count, total
 
@@ -324,18 +364,26 @@ def sweep(force=False):
             needed, count, total = _needs_repack(working_dir)
             if not needed:
                 continue
-            # Hold the project lock so a repack can't run against a tree
-            # that a commit / merge / push is mutating. Bounded: a project
-            # mid-push defers to the next sweep rather than blocking the
-            # watcher loop behind a multi-hour upload.
+            # NO project_lock (0.55.171).
+            #
+            # Taking it was over-caution and it starved the user: field
+            # 2026-07-30, `repack 'en': done in 49s` while every save came
+            # back ``BUSY`` and azt fell back to writing the file with no
+            # commit. A maintenance task must never be able to do that.
+            #
+            # Safe without it. ``git repack`` takes git's own locks and is
+            # designed to run against a live repository; deleting a pack on
+            # POSIX leaves open descriptors valid, and dulwich already
+            # rescans when a pack vanishes between snapshot and open (its
+            # own comment cites concurrent repack as the reason). Worst case
+            # is a reader retrying, not a corrupted tree.
             try:
-                from .locks import project_lock
-                with project_lock(working_dir, timeout=_LOCK_TIMEOUT_S):
-                    if repack_project(working_dir, langcode):
-                        repacked += 1
-            except Exception:
+                if repack_project(working_dir, langcode):
+                    repacked += 1
+            except Exception as ex:
                 skipped_busy.append(f'{langcode}({count} loose, '
-                                    f'{total / (1024 * 1024):.0f} MB)')
+                                    f'{total / (1024 * 1024):.0f} MB: '
+                                    f'{type(ex).__name__})')
                 continue
         # ALWAYS EMIT A SUMMARY, including the nothing-to-do case — a silent
         # function is indistinguishable from one that never ran.

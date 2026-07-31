@@ -9,6 +9,196 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.172 — a "graceful" shutdown that never exited
+
+Field 2026-07-30: repeated `pkill -f 'python -m azt_collabd'` and the daemon kept
+answering, reporting **the same version every time**. That reads as "the new code
+won't load" — the real state was that the old *process* had never died, and every
+restart attempt was talking to it.
+
+SIGTERM was handled correctly as far as it went: `httpd.shutdown()`, watcher
+stopped, `server.json` removed, socket closed. But python-zeroconf runs its event
+loop on a **non-daemon** thread (`Thread-1 (_run_loop)` in the watchdog's stack
+dump), so the interpreter waits for it at exit — and nothing in the shutdown path
+stopped discovery.
+
+- Shutdown now stops advertise + browse.
+- A **signalled** shutdown ends with `os._exit(0)` after the durable work is
+  flushed. Everything that matters is already done by then; waiting on whichever
+  third-party thread forgot to mark itself daemon is how a graceful stop becomes
+  a process that cannot be stopped. Only on the signal path — a normal return
+  still unwinds normally.
+
+Worth stating because it distorted a whole evening of diagnosis: several
+"restart into the new version" instructions in this session silently did nothing,
+and the versions I read back as evidence were the old process describing itself.
+
+## 0.55.172 — stop charging the user 42 s for a foregone conclusion
+
+The 42.12 s in every fallback save decomposes exactly:
+
+```
+Save hit a held project lock (BUSY); retrying 1/3 in 0.7s.   ← ×3
+submit 42.12s | outcome fallback
+```
+
+Four lock waits of 10 s plus three 0.7 s sleeps. Meanwhile the lock was held
+**125 s** by a github push parked in `ssl.sendall`. Every one of those waits was
+doomed when it started, the UI was unresponsive throughout, and the outcome was
+identical to the one available at second one.
+
+`submit_file` now consults `held_snapshot()` — which already carries the holder
+and its age — and if the lock has been held **≥ 3 s** it answers `BUSY`
+immediately, naming the holder and its age in the log. A free or freshly-taken
+lock still gets the normal wait, because that one usually clears; shortening it
+unconditionally would convert saves that would have succeeded into fallbacks.
+
+The threshold is small on purpose: the operations that finish quickly — a commit,
+a status walk — are done well inside 3 s, while the ones that don't are network
+pushes measured in minutes.
+
+This does not fix the cause, which is
+`daemon_lock_across_network_io.md` holding `project_lock` across a socket write.
+It stops the user paying 42 seconds and a frozen window to be told so. Two
+follow-ups it makes obvious, both peer-side: azt's 3 × 0.7 s retry is now nearly
+free but still pointless against a minutes-long holder — the daemon could return
+the holder age so the peer can skip retrying — and the save still runs on the UI
+thread, which is the `busy_is_not_unavailable` no-UI half.
+
+## 0.55.171 — maintenance must never starve a save
+
+Field 2026-07-30, project `en`, and the harm is user-visible: every save came
+back `submit_file 'en' done: codes=['BUSY']`, azt retried to ~42 s and logged
+`outcome fallback` — the file written straight to disk with **no commit** —
+while `n_changes` climbed 1 → 2 → 3 and stayed. Two things were holding
+`project_lock`:
+
+- `wan-drain`, for **125 s**, with the watchdog's stack inside `_push_thin` →
+  `send_pack` → `ssl.sendall`. That is agenda `daemon_lock_across_network_io.md`
+  with exactly the evidence it asked for — the lock held across a socket write
+  to github — and it is not fixed here.
+- **the maintenance repack, for 49 s**, which is mine and is fixed here.
+
+The repack no longer takes `project_lock`. Taking it was over-caution: `git
+repack` uses git's own locking and is built to run against a live repository,
+deleting a pack on POSIX leaves open descriptors valid, and dulwich already
+rescans when a pack disappears between snapshot and open — its own comment cites
+concurrent repack as the reason. Worst case is a reader retrying, not a corrupt
+tree. A background housekeeping task being able to block the user's save for 49 s
+is the worse trade by a wide margin.
+
+Same log, the sweep's own good news: `repack 'en': done in 49s — loose 3090 → 8
+object(s), 445.7 → 0.0 MB`. Four hundred and forty-five megabytes of loose
+objects folded away on a project that had never been repacked.
+
+## 0.55.170 — submit-phase timing; three sweep/maintenance defects
+
+### `[submit cost]` — the agenda item
+
+`submit_file` was one opaque number on both sides: azt's `save cost:` reports the
+whole round trip, the daemon reported nothing. Three findings are
+indistinguishable that way — tree-proportional (staging the whole tree every
+save), payload-proportional (write + hash 16 MB), or an irreducible floor — and
+they point at three different fixes, only one of which justifies a contract
+change.
+
+One greppable line per submit, shaped after azt's so the halves read side by
+side:
+
+```
+[submit cost] nml | land 0.31s + stage[3050 files] 1.84s + commit 0.42s = 2.57s | codes=['COMMITTED']
+```
+
+Phases: `land` (bytes into the working tree), `stage` **with the file count it
+walked** — the number that makes "~3050 files per save" checkable rather than
+folklore — `merge` (the divergent parse + three-way, which should be rare and, if
+it appears per-save, is itself the finding), and `commit` as the remainder.
+Thread-local record, since submits overlap and a module dict would bill one
+request's staging to another's line. Wrapped so a measurement failure can never
+break a save. Staging behaviour deliberately unchanged: measuring first is the
+whole point.
+
+### Repack fired on every daemon restart
+
+`2458 → 2433 object(s), 6.3 → 6.1 MB` in 11 s, on a fresh start, having done the
+same on the previous one. 0.55.150's floor was a module dict, so a restart reset
+it to zero and the 2433 unreachable objects tripped the trigger again — a dozen
+restarts, a dozen 11-second no-ops. Now persisted beside the repo it describes
+(`.git/azt-repack-floor`): a fact about that git directory, travelling with it,
+and a lost marker costs one extra repack.
+
+### Side refs could never be swept, for a wrong reason
+
+Four AZT branches on github after nml had fully converged. The sweep's safety
+check builds `main_blobs` from **main's HEAD tree only**, justified in a comment
+by "audio blobs are additive, so HEAD's tree proves reachability." True of audio,
+and false of `nml.lift`, which is rewritten every commit — so every side ref's
+tree contains an older LIFT that HEAD's tree lacks, `all_in_main` was never true,
+and nothing was ever deletable.
+
+For `azt-side-*` the blob check is the wrong instrument anyway: those are real
+commits on main's history, so `_is_ancestor(side, main)` settles it exactly and
+cheaply. And they weren't even in the local candidate list, which matched only
+the `azt-blob-seed-` prefix — they were reachable only via 0.55.151's server-ref
+listing. Both fixed.
+
+The chain itself still won't retire, for the same HEAD-tree reason applied to
+orphan refs; it is one ref rather than a thousand, so it waits.
+
+## 0.55.169 — size the chunk by what goes over the wire
+
+Agenda item *delta-aware chunk sizing*. Thin push made payload nearly free, but
+`chunk_n` stayed pinned at 1, so every commit still cost a full round trip —
+~10 s each, **identical whether the push carried 15.7 MB or nothing**. The gate
+was still pricing blobs at `raw_length()`:
+
+```
+topic-push pre-shrink chunk_n 50→1 (est 1,240,081,629 > budget 3,145,728)
+```
+
+Fifty commits of six-line edits, sized as 1.24 GB.
+
+- `_thin_delta(repo, base, target)` is now the single place a push-time delta is
+  computed, behind a **shared cache** keyed on `(base, target)`. The estimator
+  asks as the chunk loop shrinks, and `_push_thin` asks again to send — the plan
+  was explicit that computing a 16 MB diff twice was the thing to avoid. Caches
+  `None` too: "not worth deltifying" is an answer worth remembering.
+- `_base_map_from_haves` is shared by both, so the estimator and the pusher can't
+  disagree about what a safe base is. Bases come only from the trees of commits
+  the remote holds, so membership is the proof.
+- `_estimate_delta_size` returns `(count, wire_bytes, raw_bytes)` and chains
+  within the estimate exactly as the pack does — otherwise an N-commit chunk is
+  priced as N whole blobs when only the first needs one.
+- The shrink gate compares **wire** bytes to the budget, since the budget is
+  about what fits in the server's receive-pack window.
+
+**The raw ceiling is the safety half.** A failed thin push retries with the pack
+whole, so a chunk sized purely on deltas could drop hundreds of MB onto a weak
+link at the worst possible moment. A multi-commit chunk is allowed only while its
+raw size stays within `_FALLBACK_RAW_CEILING_MULT` (20×, ≈60 MB at the 3 MB
+default) — minutes on a bad connection rather than hours. The pre-seed decision
+at `chunk_n == 1` deliberately still uses **raw** size: a genuinely large new
+blob with no base must still be pre-seeded, because that path exists for when
+deltas can't help.
+
+**VERIFIED live the same evening**, on a 69-commit backlog:
+
+```
+21:47:24  push attempt target=18519066 chunk_n=69 consecutive_failures=0
+21:47:49  thin push: 7 blob(s) delta'd at push time, 159 reused from local
+          packs, 69 sent whole — 31.1 MB not transferred
+21:47:49  push done (advanced 69 commits)
+```
+
+No pre-shrink. **Twenty-five seconds for sixty-nine commits**, against the ~10 s
+per-commit floor those would have cost before — about 11½ minutes. `159 reused
+from local packs` is also the first time repacking has paid at scale: at
+`chunk_n=1` there was rarely a base in the pack to reuse.
+
+`chain_max` from 0.55.167 becomes more load-bearing here — longer chunks mean
+longer same-path chains — so watch it if `unpack index-pack failed` starts
+recurring.
+
 ## 0.55.168 — 0.55.164 broke Share diagnostics on every platform
 
 `_h_prepare_share_bundle(_body)` — underscore-prefixed, because nothing used the
