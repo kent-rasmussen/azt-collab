@@ -9,6 +9,70 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.173 — a once-a-day diagnostic stopped the daemon from ever binding
+
+Field 2026-07-31, **both** of Kent's machines dead at once, on the first boot of
+the day. azt said `collab server unavailable or project baf not registered:
+legacy this session` and nothing to the user; one box reported `WinError 10061`,
+the other `SERVICE_WEDGED (pid 24280 running but not answering)`; there was no
+daemon log for the day worth reading.
+
+Nothing had been committed that broke it. **The trigger was the day rollover.**
+
+`run()` calls `maybe_install_stdio_tee()` before the single-instance flock and
+before the socket bind. Inside it:
+
+```python
+if pre_size == 0:          # first daemon start after a fresh per-day log file
+    _dump_lan_debug_snapshot()
+```
+
+`_dump_lan_debug_snapshot` walks **every project's full ancestry** to log a
+start-of-day baseline. On a repo whose history had grown far enough, that walk
+stops being a log line and becomes the whole boot. The console's last word was
+`[lan-debug] snapshot start: 1 project(s)`. Because it happens *before* the bind,
+nothing listens — hence 10061 on one machine, and on the other a stale
+`server.json` naming a pid that is alive but never bound, which is precisely the
+`_pid_alive` branch in `loopback.py` that prints `SERVICE_WEDGED` and then, **by
+correct design**, refuses to respawn or delete the file. The protection that
+stops us killing a busy daemon is what made this permanent.
+
+It fires once per day, which is why yesterday was fine and why two machines
+failed within hours of each other.
+
+- **The snapshot runs on a thread.** A diagnostic must never be able to stop the
+  daemon serving. Both entry paths get this, since it lives in
+  `install_stdio_tee`.
+- **`serve_forever()` no longer waits on boot work.** `reconcile_on_startup`,
+  `consume_pending_merges`, `reconcile_publish_state_on_startup`,
+  `diagnose_and_repair_registry_on_startup`, `start_watcher`, `watchdog.start`
+  and `lan_listener.apply_toggle` move to a `boot-tasks` thread, in the same
+  order. They ran *after* the bind, so they never refused a connection — they
+  accepted it and went silent, which is the same indistinguishable-from-wedged
+  state. A peer polling a stale `job_id` in the first moments may now see it
+  before it flips to `JOB_INTERRUPTED`: a typed retryable answer, strictly
+  better than an unreachable daemon.
+- **`reconcile_on_startup` is wrapped.** It was the only startup step with no
+  handler, so an exception there killed the daemon where every other step logged
+  and continued.
+- **Traceback colour no longer lands in the log.** Python 3.13 colourises
+  tracebacks and the daemon's stderr is mirrored to the per-day file, so the log
+  read as `dulwich.file:<esc>[35m145` — the escape codes ate the exception type
+  and message, which is the one thing the log existed to carry. `build_spawn_env`
+  now sets `PYTHON_COLORS=0` and `NO_COLOR=1`.
+- **Invariant #15 on the bind line.** `listening on …` was printed at bind, ~100
+  lines before `serve_forever()`. It now says `bound to … — not serving yet`, and
+  a `serving on …` line is printed where serving actually begins.
+
+Still open, and deliberately not done here: the dulwich stack in the corrupted
+log (`objects.py:718` → `file.py:145`, the bare `open()` under
+`max_size=self.loose_object_size_limit`) is unexplained. It is consistent with
+the loose-object reads that ancestry walk performs, but the exception type was
+unreadable. Chase it with a legible trace rather than guessing. Also: the
+ancestor count itself is unbounded work inside a log line and should be capped or
+dropped, and the Android path (`server_apk/service.py`) still runs its boot steps
+inline — it gets the snapshot fix but not the `boot-tasks` split.
+
 ## 0.55.172 — a "graceful" shutdown that never exited
 
 Field 2026-07-30: repeated `pkill -f 'python -m azt_collabd'` and the daemon kept

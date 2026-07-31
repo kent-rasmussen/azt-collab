@@ -52,9 +52,21 @@ def build_spawn_env(extra_path=''):
     (field 2026-07-17: change-project picker "flash"). Console runs
     were immune (Windows console I/O is UTF-8 in Python 3.6+), which
     is why ``python -m azt_collabd`` by hand never showed it. Every
-    reader of these pipes already decodes UTF-8."""
+    reader of these pipes already decodes UTF-8.
+
+    Also disables Python's traceback colouring. Python 3.13 colourises
+    tracebacks, and the daemon's stderr is mirrored into the per-day log
+    file — so the escape sequences land ON DISK. Field 2026-07-31: a
+    boot-hang traceback in the daemon log read as
+    ``dulwich.file:<esc>[35m145``, and the exception TYPE AND MESSAGE
+    were unreadable inside the corruption. That is the one thing a log
+    exists to carry. Both variables are set because they are honoured by
+    different things: ``PYTHON_COLORS`` is Python's own, ``NO_COLOR`` is
+    the cross-tool convention any subprocess we shell out to will read."""
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
+    env['PYTHON_COLORS'] = '0'
+    env['NO_COLOR'] = '1'
     parent = extra_path or _locate_azt_collabd_parent()
     if parent:
         existing = env.get('PYTHONPATH', '')

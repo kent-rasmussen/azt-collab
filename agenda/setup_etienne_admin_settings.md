@@ -14,7 +14,7 @@
   read that daemon's log, and change one of its settings — with Etienne
   doing nothing. Confirmed by actually changing something innocuous and
   seeing it take on Etienne's machine, not Kent's.
-- **Deadline:** none
+- **Deadline:** 2026-07-31 (today)
 - **Waiting on:** Etienne's availability (must be in person, with his
   device, on the same LAN).
 

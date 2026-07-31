@@ -21,14 +21,23 @@
 - **Deadline:** none
 - **Waiting on:** Nothing
 
-## Status — legs 1–4 SHIPPED 0.54.74 (2026-07-25), awaiting field verify
+## Status — DONE 2026-07-31, both halves confirmed
 
-Daemon + client + UI all landed; needs a daemon restart on the
-operator's machine and an APK rebuild for the phone side. Verify:
-plug in, open Manage paired device, "Get diagnostics from this
-device" → bundle lands + share sheet offers it. Then repeat against
-a deliberately wedged/stopped peer daemon to exercise the restart
-escape hatch.
+Legs 1–4 shipped 0.54.74 (2026-07-25); both verification asks are now
+closed:
+
+- **Diagnostic pull-through — CONFIRMED WORKING 2026-07-29.** Plug in,
+  Manage paired device, "Get diagnostics from this device" → bundle
+  lands on the puller and the share sheet offers it.
+- **Wedge recovery — CONFIRMED 2026-07-31 (Kent): present and working
+  in peer settings.** The remote-restart escape hatch (leg 3) is
+  reachable from the puller's own device, which was the last thing
+  the item was holding for.
+
+Done-criteria met: a tech pulls diagnostics, and can restart a wedged
+peer daemon, without the owner's UI ever being opened. The DEAD-daemon
+case remains out of scope by design (no listener, nothing to answer —
+see leg 3's honest limits below).
 
 ## Decisions (Kent, 2026-07-25)
 

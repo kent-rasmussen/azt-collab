@@ -1,24 +1,56 @@
-# Daemon-side: time the phases of submit_file
+# Save/submit timing: paired azt + daemon capture on real repos
 
-- **Scope & relationships:** azt-collab (`azt_collabd/repo.py`) only — no client or
-  contract change. Split off from `desktop_save_cost_reduction.md` (Kent 2026-07-30:
-  "give it to the daemon team"), which is BLOCKED on the numbers this produces: it
-  cannot choose between Phase 1 (stage only the submitted path) and Phase 3
-  (surgical per-entry submit, a contract change) without knowing which phase of the
-  daemon's work the time goes to. Same split pattern as the client-timeout half of
-  `busy_is_not_unavailable`.
-- **Vision / done-criteria:** one greppable log line per `submit_file`, breaking the
-  daemon's wall-clock into its phases, so that a single field capture answers
-  "payload-proportional or tree-proportional?". Done when a save on a real project
-  produces a line that attributes the time, and `desktop_save_cost_reduction.md` can
-  be un-blocked.
+> **Merged 2026-07-31.** This item absorbed
+> `azt/agenda/timing_on_real_repos.md` (the azt half of the same capture). The two
+> described one grep on one machine: that doc's "is there a gap between azt's
+> `submit` and the daemon's total?" was this doc's step 1, and its "does
+> `stage[...]` grow with the tree?" was this doc's step 2. One item now owns both
+> sides; the surviving azt-side content is folded in below.
+
+- **Scope & relationships:** azt-collab (`azt_collabd/repo.py`, `[submit cost]`,
+  shipped 0.55.170) **and** azt (`io_put/lift.py::_log_save_cost`, `save cost:`).
+  Both halves are instrumented; no client or contract change is in scope — this is
+  a measurement, not a build. Split off from `desktop_save_cost_reduction.md` (Kent
+  2026-07-30: "give it to the daemon team"), which is BLOCKED on the numbers this
+  produces: it cannot choose between Phase 1 (stage only the submitted path) and
+  Phase 3 (surgical per-entry submit, a contract change) without knowing which phase
+  of the daemon's work the time goes to. Same split pattern as the client-timeout
+  half of `busy_is_not_unavailable`. A large azt-vs-daemon gap hands the problem to
+  `daemon_lock_across_network_io.md` instead.
+- **Vision / done-criteria:** paired `save cost:` + `[submit cost]` lines captured
+  from at least one working machine on a REAL project (`nml`: 16 MB LIFT, 1868 audio
+  files), with the daemon version recorded alongside, while somebody is actually
+  sorting. Done when `desktop_save_cost_reduction.md` can say "build Phase 1 / build
+  Phase 3 / neither, the premise doesn't reproduce" from evidence rather than
+  extrapolation.
 - **Deadline:** 2026-07-31 — instrumentation SHIPPED and verified 2026-07-30
   (0.55.170); what remains is capturing it where it matters
 - **Waiting on:** Nothing — needs a bigger repo and an older machine, which is
   tomorrow's plan (Kent 2026-07-30: "I'll do those tomorrow, on bigger repos on
   older machines")
 
-## Tomorrow (2026-07-31) — capture on real hardware
+## What to grep
+
+Both logs, same machine, overlapping time window:
+
+```
+grep -E "(submit|save) cost|daemon_version" <azt log> <daemon log>
+```
+
+`daemon_version` is in there deliberately: a capture is worthless if the daemon
+predates 0.55.170 (no `[submit cost]` line at all) or azt predates the 2026-07-30
+label fix (`(no daemon)` conflated "not attached" with "backup write").
+
+**Only lines whose outcome is `ok` count.** `(collab not attached)` and
+`(backup/other file — not the hot path)` are not the save path under study — that
+distinction is the whole reason the labels were split on 2026-07-30.
+
+```
+save cost: 5.6 MB | indent 0.09s + serialize 0.28s + submit 0.39s + replace — = 0.76s (thread) | outcome ok
+[submit cost] Demo_en | land 0.01s + stage[1 files] 0.16s + commit 0.21s = 0.38s | codes=['COMMITTED_LOCAL']
+```
+
+## The capture (2026-07-31) — on real hardware
 
 Everything below is a measurement, not a build. All of it is unverified as of
 2026-07-30 night.
@@ -41,6 +73,16 @@ hash are larger. The shape should hold; the constant probably won't.
 scan everywhere and Phase 1 is cheap and sufficient. If large on `nml`, the
 "~3050 files" folklore was right about *that* project and wrong about `Demo_en` —
 worth knowing before narrowing staging.
+
+**2b. Does `commit` scale with the 16 MB blob?** (from the merged azt-side item.)
+`commit` was 0.14–0.21 s for `Demo_en`'s 5.6 MB. If it dominates on `nml`, that is
+the irreducible floor neither planned phase removes, and the lever is storage
+granularity (the parked entry-per-file option) — not Phase 1 and not Phase 3.
+
+Alongside it, the constant question: ~0.6 s per save is not a problem. If `nml` on
+a slow machine lands at several seconds per save, the premise reproduces and Phase 1
+is worth doing; if it doesn't, close `desktop_save_cost_reduction.md` as
+measured-and-fine rather than building speculatively.
 
 **3. The `submit_file` fail-fast (0.55.172), never yet exercised.** It needs a
 push holding `project_lock`, so `work_offline` must be **off**. Turning it off
@@ -111,6 +153,11 @@ side and grepped the same way:
 
 ## Notes
 
+- **Capture while somebody is actually sorting** (from the merged azt-side item) —
+  the cadence matters as much as the per-save cost, and the failure mode reported in
+  the field is "can't keep up", i.e. saves arriving faster than they complete.
+- **Record which machine and which project on every capture.** The 2026-07-30
+  numbers lost time precisely because it wasn't obvious what they were measuring.
 - Correlating the two logs: azt's `submit` should ≈ the daemon's total plus transport.
   A large gap is itself a finding (queueing behind the daemon lock — see
   `daemon_lock_across_network_io.md`).

@@ -6903,11 +6903,34 @@ def install_stdio_tee(truncate=False):
         # 0.52.7 this fired only from the (now-removed) toggle-on
         # gesture; with always-on logging the equivalent moment
         # is "we just opened a fresh per-day file."
+        # ON A THREAD, NEVER INLINE (0.55.173). This runs from
+        # ``run()`` BEFORE the single-instance flock and BEFORE the
+        # socket binds, and ``_dump_lan_debug_snapshot`` walks every
+        # project's full ancestry. Field 2026-07-31: both of Kent's
+        # machines dead on the first boot of the day — console stopped
+        # at ``[lan-debug] snapshot start: 1 project(s)`` and never
+        # bound, so one box reported WinError 10061 (nothing listening)
+        # and the other SERVICE_WEDGED against a stale server.json.
+        # The trigger is the DAY ROLLOVER (``pre_size == 0`` is true
+        # only for the first daemon start after a fresh per-day log
+        # file), which is why nothing in the code had changed and why
+        # it hit two machines at once.
+        #
+        # A diagnostic must never be able to stop the daemon serving.
+        def _snapshot_off_the_boot_path():
+            try:
+                _dump_lan_debug_snapshot()
+            except Exception as ex:
+                print(f'[lan-debug-dump] snapshot raised: {ex!r}',
+                      file=sys.stderr, flush=True)
+
         try:
-            _dump_lan_debug_snapshot()
+            threading.Thread(target=_snapshot_off_the_boot_path,
+                             name='lan-debug-snapshot',
+                             daemon=True).start()
         except Exception as ex:
-            print(f'[lan-debug-dump] snapshot raised: {ex!r}',
-                  file=sys.stderr, flush=True)
+            print(f'[lan-debug-dump] snapshot thread failed to '
+                  f'start: {ex!r}', file=sys.stderr, flush=True)
     return True
 
 
@@ -6986,8 +7009,11 @@ def run(host='127.0.0.1', port=0):
     fd = os.open(info_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as f:
         json.dump(info, f)
-    print(f'[azt_collabd] listening on {host}:{bound_port} '
-          f'(home={home})', flush=True)
+    # Invariant #15: the socket is BOUND here, not served — serving
+    # starts at ``serve_forever()`` below. Saying "listening" at this
+    # point is what made a daemon stalled in boot read as healthy.
+    print(f'[azt_collabd] bound to {host}:{bound_port} '
+          f'(home={home}) — not serving yet', flush=True)
     _record_started()
 
     # Crash hook for any unhandled exception that escapes a request handler
@@ -6999,85 +7025,124 @@ def run(host='127.0.0.1', port=0):
             sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
-    # Mark any in-flight jobs left over from a previous daemon process
-    # (kill -9, OOM, container restart) as JOB_INTERRUPTED so peers
-    # polling on stale job_ids get a typed transient-failure result.
-    # Must run BEFORE start_watcher so the watcher sees a consistent
-    # job table.
-    scheduler.reconcile_on_startup()
+    # EVERYTHING BELOW RUNS OFF THE SERVING PATH (0.55.173).
+    #
+    # These steps used to run inline between the bind and
+    # ``serve_forever()``. The socket is already listening by then, so a
+    # slow step doesn't refuse connections — it accepts them and never
+    # answers, which is indistinguishable from a wedge and drives
+    # ``loopback.py:253`` to print SERVICE_WEDGED and then (correctly)
+    # refuse to respawn or delete ``server.json``. The protection that
+    # keeps a busy daemon from being killed is exactly what makes that
+    # state permanent, so the daemon must never enter it.
+    #
+    # ``reconcile_on_startup`` still runs first, and still before
+    # ``start_watcher``, so the watcher sees a consistent job table.
+    # What changed is that a request arriving mid-boot now gets an
+    # answer instead of silence. The window is real: a peer polling a
+    # stale ``job_id`` in the first moments can see it before it flips
+    # to JOB_INTERRUPTED. That is a typed, retryable answer — strictly
+    # better than an unreachable daemon.
+    #
+    # Sequential inside the thread: the ordering constraints between
+    # these steps are unchanged, only their relationship to serving is.
+    def _boot_tasks():
+        # Mark any in-flight jobs left over from a previous daemon
+        # process (kill -9, OOM, container restart) as JOB_INTERRUPTED
+        # so peers polling on stale job_ids get a typed
+        # transient-failure result. Must run BEFORE start_watcher so
+        # the watcher sees a consistent job table.
+        #
+        # Wrapped since 0.55.173: this was the one startup step with no
+        # handler, so an exception here killed the daemon outright
+        # where every other step below merely logged.
+        try:
+            scheduler.reconcile_on_startup()
+        except Exception as ex:
+            print(f'[azt_collabd] reconcile_on_startup raised: {ex!r}',
+                  file=sys.stderr, flush=True)
 
-    # One-shot hand-requested merges: any project carrying a
-    # ``sha_to_merge`` key in projects.json gets that ref merged into
-    # it via the convergence engine (commit-only; drain pushes when
-    # online), then the key is cleared. Behind-the-scenes recovery
-    # gesture — see docs/merge_ref_recovery.md. Mirrored in the Android
-    # startup path (server_apk/service.py) per the "startup hooks live
-    # in both" rule.
-    try:
-        repo_mod.consume_pending_merges()
-    except Exception as ex:
-        print(f'[merge-ref] consume_pending_merges raised: {ex!r}',
-              file=sys.stderr, flush=True)
+        # One-shot hand-requested merges: any project carrying a
+        # ``sha_to_merge`` key in projects.json gets that ref merged
+        # into it via the convergence engine (commit-only; drain pushes
+        # when online), then the key is cleared. Behind-the-scenes
+        # recovery gesture — see docs/merge_ref_recovery.md. Mirrored
+        # in the Android startup path (server_apk/service.py) per the
+        # "startup hooks live in both" rule.
+        try:
+            repo_mod.consume_pending_merges()
+        except Exception as ex:
+            print(f'[merge-ref] consume_pending_merges raised: {ex!r}',
+                  file=sys.stderr, flush=True)
 
-    # One-shot retroactive cleanup for the pre-0.50.52 Publish bug.
-    # Strips ``.git/config`` origin when the registry has no URL — a
-    # mismatch fingerprint that's unreachable from any post-0.50.52
-    # code path, so it can only be left over from an older daemon's
-    # silent publish failure. After this runs, the picker's
-    # publish-row gate sees both sides empty and shows the Publish
-    # button so the user can re-click. See
-    # ``docs/Publish_errors.md``.
-    try:
-        from . import repo as _repo
-        _repo.reconcile_publish_state_on_startup()
-    except Exception as ex:
-        print(f'[azt_collabd] reconcile_publish_state failed: '
-              f'{ex!r}', file=sys.stderr, flush=True)
+        # One-shot retroactive cleanup for the pre-0.50.52 Publish bug.
+        # Strips ``.git/config`` origin when the registry has no URL — a
+        # mismatch fingerprint that's unreachable from any post-0.50.52
+        # code path, so it can only be left over from an older daemon's
+        # silent publish failure. After this runs, the picker's
+        # publish-row gate sees both sides empty and shows the Publish
+        # button so the user can re-click. See
+        # ``docs/Publish_errors.md``.
+        try:
+            from . import repo as _repo
+            _repo.reconcile_publish_state_on_startup()
+        except Exception as ex:
+            print(f'[azt_collabd] reconcile_publish_state failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
 
-    # Boot-time diagnostic snapshot + orphan-working-dir auto-repair.
-    # Logs the picker's Share-diagnostics text into the daemon log
-    # (so every startup leaves a snapshot trail) and re-registers
-    # any subdir of $AZT_HOME that looks like a project (has .git
-    # + LIFT) but isn't keyed in projects.json. Repair is one-way:
-    # never removes entries, never alters working-tree contents.
-    # Belongs after reconcile so the post-reconcile registry state
-    # is what gets snapshotted.
-    try:
-        from . import repo as _repo
-        _repo.diagnose_and_repair_registry_on_startup()
-    except Exception as ex:
-        print(f'[azt_collabd] diagnose_and_repair_registry failed: '
-              f'{ex!r}', file=sys.stderr, flush=True)
+        # Boot-time diagnostic snapshot + orphan-working-dir auto-repair.
+        # Logs the picker's Share-diagnostics text into the daemon log
+        # (so every startup leaves a snapshot trail) and re-registers
+        # any subdir of $AZT_HOME that looks like a project (has .git
+        # + LIFT) but isn't keyed in projects.json. Repair is one-way:
+        # never removes entries, never alters working-tree contents.
+        # Belongs after reconcile so the post-reconcile registry state
+        # is what gets snapshotted.
+        try:
+            from . import repo as _repo
+            _repo.diagnose_and_repair_registry_on_startup()
+        except Exception as ex:
+            print(f'[azt_collabd] diagnose_and_repair_registry failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
 
-    # Start the connectivity watcher so projects with pending_push get
-    # drained on offline→online transitions.
-    scheduler.start_watcher()
+        # Start the connectivity watcher so projects with pending_push
+        # get drained on offline→online transitions.
+        try:
+            scheduler.start_watcher()
+        except Exception as ex:
+            print(f'[azt_collabd] start_watcher raised: {ex!r}',
+                  file=sys.stderr, flush=True)
 
-    # Self-monitor: dump all thread stacks when a loop or a project
-    # lock stalls, and restart out of a persistent wedge (0.54.90).
-    # Started AFTER the watcher so its heartbeats exist. Mirrored in
-    # the Android path (server_apk/service.py) per the "startup hooks
-    # live in both" rule.
-    try:
-        from . import watchdog as _watchdog
-        _watchdog.start()
-    except Exception as ex:
-        print(f'[watchdog] start raised: {ex!r}',
-              file=sys.stderr, flush=True)
+        # Self-monitor: dump all thread stacks when a loop or a project
+        # lock stalls, and restart out of a persistent wedge (0.54.90).
+        # Started AFTER the watcher so its heartbeats exist. Mirrored in
+        # the Android path (server_apk/service.py) per the "startup hooks
+        # live in both" rule.
+        try:
+            from . import watchdog as _watchdog
+            _watchdog.start()
+        except Exception as ex:
+            print(f'[watchdog] start raised: {ex!r}',
+                  file=sys.stderr, flush=True)
 
-    # Auto-start the LAN listener if the persisted toggle is on.
-    # ``lan.allow_sync`` survives a daemon restart in config.json
-    # but the listener thread / WifiLock / FGS state don't, so
-    # without this reconciliation a daemon respawn would leave us
-    # in the "toggle says yes, listener says no" split-brain state
-    # — paired peers' fan-out would silently fail with no endpoint
-    # to bind to. Idempotent: ``apply_toggle`` is a no-op when the
-    # listener's already running.
-    try:
-        _lan_listener.apply_toggle()
-    except Exception as ex:
-        print(f'[azt_collabd] lan_listener startup apply failed: '
-              f'{ex!r}', file=sys.stderr, flush=True)
+        # Auto-start the LAN listener if the persisted toggle is on.
+        # ``lan.allow_sync`` survives a daemon restart in config.json
+        # but the listener thread / WifiLock / FGS state don't, so
+        # without this reconciliation a daemon respawn would leave us
+        # in the "toggle says yes, listener says no" split-brain state
+        # — paired peers' fan-out would silently fail with no endpoint
+        # to bind to. Idempotent: ``apply_toggle`` is a no-op when the
+        # listener's already running.
+        try:
+            _lan_listener.apply_toggle()
+        except Exception as ex:
+            print(f'[azt_collabd] lan_listener startup apply failed: '
+                  f'{ex!r}', file=sys.stderr, flush=True)
+
+        print('[azt_collabd] boot tasks complete', flush=True)
+
+    threading.Thread(target=_boot_tasks, name='boot-tasks',
+                     daemon=True).start()
 
     _signalled = {'yes': False}
 
@@ -7093,6 +7158,9 @@ def run(host='127.0.0.1', port=0):
         except (ValueError, OSError):
             pass
 
+    # Invariant #15: this is the point at which the daemon can actually
+    # answer, so this is where it is allowed to say so.
+    print(f'[azt_collabd] serving on {host}:{bound_port}', flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
