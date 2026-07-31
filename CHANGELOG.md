@@ -9,6 +9,38 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.186 — 38 connections to delete 38 refs, all refused, every sweep
+
+Field 2026-07-31, `baf` on NUBACA. Between `topic-push` being scheduled and it
+actually beginning, 77 seconds of this:
+
+```
+preseed-sweep: delete b'refs/remotes/origin/azt-blob-seed-…' failed
+  (non-fatal, will retry next sweep): HangupException(…)
+```
+
+38 of them, one every ~2 s. The sweep opened a **separate HTTPS connection per
+ref**, and github hung up on every one — 38 rapid push connections being itself
+a plausible reason why. The refspec was correct; the shape was not.
+
+And it could never stop: the local tracking ref is dropped only after a
+*successful* delete, so a failed sweep left its inputs exactly as it found them
+and the identical 38 ran on the next sweep, and the next. A cleanup nobody could
+see was costing more than the work it was clearing the way for, permanently, in
+front of every push.
+
+- **One push, one connection.** Deleting refs takes a refspec list; git and
+  dulwich both accept many in one exchange.
+- **One log line, not one per ref.** The flood buried the push it was delaying.
+- **A 30 min cooldown after a wholesale failure**, in memory so a restart clears
+  it. Orphaned side refs cost only ref-advertisement bandwidth on later pushes —
+  cheap to defer, expensive to retry. The skip says how long it is deferred for,
+  because a silent one would read as "no orphans", the opposite of the truth.
+
+Same defect class as 0.55.185's repack loop, found the same evening: a
+maintenance step that cannot succeed, whose failure path leaves its own trigger
+condition intact, retried at full cost forever.
+
 ## 0.55.185 — a repack that can't succeed, retried all day
 
 Field 2026-07-31, Windows:

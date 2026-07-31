@@ -7377,6 +7377,15 @@ def _sweep_orphan_preseed_refs(
     ]
     if not candidates:
         return
+    _cooling, _left = _preseed_sweep_cooling(repo.path)
+    if _cooling:
+        # Say it — a silent skip reads as "no orphans", which is the
+        # opposite of the truth.
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: {len(candidates)} candidate '
+            f'ref(s), but the last batched delete failed — not '
+            f'retrying for another {_left // 60}m')
+        return
 
     main_ref = _enc(f'refs/remotes/origin/{branch}')
     try:
@@ -7554,29 +7563,79 @@ def _sweep_orphan_preseed_refs(
     if not deletable:
         return
 
-    lift_merge.trace(
-        f'[sync-trace] preseed-sweep: {len(deletable)}/'
-        f'{len(candidates)} side ref(s) orphaned by main; deleting')
+    # ONE PUSH, NOT ONE PER REF (0.55.186).
+    #
+    # This was a loop of individual ``porcelain.push`` calls — a separate
+    # HTTPS connection to github per ref. Field 2026-07-31, `baf`: 38
+    # orphaned side refs, every delete answered with
+    # ``HangupException``, ~2 s each, 77 s burned before the real push
+    # could even begin — and since the local tracking ref is only
+    # dropped after a SUCCESSFUL delete, the identical 38 ran again on
+    # the next sweep, and the next. A cleanup nobody could see was
+    # costing more than the work it preceded.
+    #
+    # Deleting refs is a refspec list; git and dulwich both take many in
+    # one exchange. That is 1 connection instead of 38, and 38 rapid
+    # connections is itself a plausible reason github was hanging up.
+    _by_refspec = {}
     for tracking_ref in deletable:
         suffix = tracking_ref[len(b'refs/remotes/origin/'):]
-        server_ref = b'refs/heads/' + suffix
-        refspec = b':' + server_ref
+        _by_refspec[b':' + b'refs/heads/' + suffix] = tracking_ref
+    lift_merge.trace(
+        f'[sync-trace] preseed-sweep: {len(deletable)}/'
+        f'{len(candidates)} side ref(s) orphaned by main; deleting in '
+        f'one push')
+    try:
+        with _socket_timeout(_PUSH_TIMEOUT_S):
+            porcelain.push(
+                repo, remote_url, list(_by_refspec.keys()),
+                username=username, password=token,
+                errstream=io.BytesIO(),
+            )
+    except Exception as exc:
+        # ONE LINE, NOT ONE PER REF, AND DON'T RETRY IMMEDIATELY. The
+        # per-ref flood buried the push it was delaying; and retrying a
+        # cleanup that just failed wholesale, every sweep, is how 77 s
+        # became permanent. Orphaned side refs cost only ref-
+        # advertisement bandwidth, so deferring is cheap and the sweep
+        # will try again once the cooldown lapses.
+        _note_preseed_sweep_failure(repo.path)
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: batched delete of '
+            f'{len(_by_refspec)} orphaned side ref(s) failed '
+            f'(non-fatal; not retried for '
+            f'{int(_PRESEED_SWEEP_COOLDOWN_S / 60)} min): {exc!r}')
+        return
+    for tracking_ref in _by_refspec.values():
         try:
-            with _socket_timeout(_PUSH_TIMEOUT_S):
-                porcelain.push(
-                    repo, remote_url, refspec,
-                    username=username, password=token,
-                    errstream=io.BytesIO(),
-                )
-            try:
-                del repo.refs[tracking_ref]
-            except Exception:
-                pass
-        except Exception as exc:
-            lift_merge.trace(
-                f'[sync-trace] preseed-sweep: delete '
-                f'{tracking_ref!r} failed (non-fatal, will retry '
-                f'next sweep): {exc!r}')
+            del repo.refs[tracking_ref]
+        except Exception:
+            pass
+    lift_merge.trace(
+        f'[sync-trace] preseed-sweep: deleted {len(_by_refspec)} '
+        f'orphaned side ref(s) from github')
+
+
+# A wholesale preseed-sweep failure isn't retried for this long
+# (0.55.186). In memory, so a daemon restart clears it. Orphaned side
+# refs cost only ref-advertisement bandwidth on later pushes, so this
+# is cheap to defer and expensive to retry — the failing form cost 77 s
+# in front of every push.
+_PRESEED_SWEEP_COOLDOWN_S = 30 * 60
+_preseed_sweep_failed_at = {}
+
+
+def _note_preseed_sweep_failure(repo_path):
+    _preseed_sweep_failed_at[str(repo_path)] = time.monotonic()
+
+
+def _preseed_sweep_cooling(repo_path):
+    """``(cooling, seconds_left)`` after a wholesale sweep failure."""
+    at = _preseed_sweep_failed_at.get(str(repo_path))
+    if at is None:
+        return False, 0
+    left = _PRESEED_SWEEP_COOLDOWN_S - (time.monotonic() - at)
+    return (left > 0), max(0, int(left))
 
 
 def _topic_branch_name(langcode, device_name):
