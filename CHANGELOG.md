@@ -9,6 +9,49 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.184 — the log you open to diagnose must not be drowned by opening it
+
+Two faults, one cause: reading a peer's log was made harder by the act of
+reading it.
+
+**`[lan-admin]` read floods.** One open remote-settings window polls ~7
+endpoints every few seconds — status, pending, peer_sync, toggle, last_project,
+work_offline — and each printed its own line. Field 2026-07-31: diagnosing a
+stuck push on a peer meant scrolling through a screenful per second, generated
+by the window being used to do the scrolling.
+
+Reads (`GET`) are now rolled up per peer, one summary line per 60 s naming the
+count and the top paths. Writes and privileged calls still get an individual
+line every time — those are the audit trail. Refusals (bad nonce, bad
+signature, not paired, no grant) are untouched and unconditional: a rolled-up
+read must never hide a rejected one.
+
+The old wording was also false for a read — `it is changing THIS device: GET
+'/v1/lan/pending'` changes nothing (invariant #15). Only the write path makes
+that claim now.
+
+**View diagnostics no longer scrolls on refresh.** Following means "keep
+fetching", not "drag the reader to the bottom". Kent, mid-diagnosis: *"updates
+kick it to the bottom, when I'm trying to scroll. I'll check the bottom when I
+need to."* Only the initial open jumps to the end.
+
+## 0.55.183 — View diagnostics follows, and its text can be selected
+
+Two things the first cut got wrong for the job it exists to do.
+
+- **Selectable.** The body is a readonly `TextInput` rather than a `Label`. A log
+  you cannot select is a log you cannot paste into a message to whoever is
+  standing next to the machine.
+- **Follows.** Re-tails every 3 s with a Following / Paused toggle. Deliberately
+  slower than a local `tail -f`: over the LAN admin transport each tick is a
+  nonce challenge plus a signed request against a peer that may be mid-push.
+
+Details that matter in use: the widget is only reassigned when the text actually
+changed, because replacing it drops whatever the reader has selected; a failed
+refresh says so in the popup instead of quietly freezing, since a follow that
+stopped working must not look like a log that stopped changing; and the timer is
+cancelled on dismiss. Pausing stops the RPCs entirely.
+
 ## 0.55.182 — `keep` was accepted on the wire and dropped on arrival
 
 `Share diagnostics` / `View diagnostics` now sit side by side on one row,

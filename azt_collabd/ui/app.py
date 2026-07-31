@@ -68,10 +68,16 @@ from azt_collab_client import (
 from azt_collab_client._debug import first_try_log
 
 # Tail shown by the "View diagnostics" popup. The daemon already caps
-# its reply at ~256 KB; a single Kivy Label given that much text locks
-# the UI while it lays out, and a diagnostic must not become the next
-# hang. The full file stays on the daemon's disk, named in the title.
+# its reply at ~256 KB; handing that much text to one widget locks the
+# UI while it lays out, and a diagnostic must not become the next hang.
+# The full file stays on the daemon's disk, named in the popup title.
 _LOG_VIEW_LINES = 400
+# Follow cadence. Each tick is a full RPC — over the LAN admin
+# transport that is a nonce challenge plus a signed request — so this
+# is deliberately slower than a local ``tail -f``. Following is also
+# pausable, because a reader who is selecting text does not want the
+# ground moving under them.
+_LOG_VIEW_REFRESH_S = 3.0
 
 
 _tr = _client_i18n._
@@ -3748,7 +3754,7 @@ class SettingsScreen(Screen):
         from kivy.uix.boxlayout import BoxLayout
         from kivy.uix.label import Label
         from kivy.uix.popup import Popup
-        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.textinput import TextInput
         from azt_collab_client import get_daemon_log
         from azt_collab_client.translate import tr as _tr
 
@@ -3756,69 +3762,136 @@ class SettingsScreen(Screen):
         if status is not None:
             status.text = _tr('Reading the log…')
 
-        def _say(msg):
-            if status is not None:
-                status.text = msg
+        st = {'follow': True, 'busy': False, 'event': None, 'text': ''}
 
-        def _show(res):
-            _say('')
-            res = res or {}
+        def _tail(text):
+            """Last ``_LOG_VIEW_LINES`` lines, with the count of what is
+            hidden stated rather than silently dropped."""
+            lines = text.splitlines()
+            shown = lines[-_LOG_VIEW_LINES:]
+            clipped = len(lines) - len(shown)
+            out = '\n'.join(shown)
+            if clipped > 0:
+                out = (_tr('… {n} earlier lines not shown …').format(
+                    n=clipped) + '\n\n' + out)
+            return out
+
+        def _fetch(then):
+            """One RPC on a worker, landing ``then(res)`` on the Kivy
+            thread. ``busy`` keeps a slow round trip from stacking up
+            behind the follow timer."""
+            if st['busy']:
+                return
+            st['busy'] = True
+
+            def _work():
+                try:
+                    res = get_daemon_log()
+                except Exception as ex:      # never raise off a worker
+                    res = {'error': repr(ex)}
+
+                def _land(_dt):
+                    st['busy'] = False
+                    then(res or {})
+                Clock.schedule_once(_land, 0)
+            threading.Thread(target=_work, daemon=True,
+                             name='view-diagnostics').start()
+
+        def _open(body_text, path):
+            # READONLY TextInput, not Label: a log you cannot select is
+            # a log you cannot paste into a bug report or a message to
+            # whoever is standing next to the machine.
+            view = TextInput(text=body_text, readonly=True,
+                             font_size=sp(11))
+            note = Label(text='', size_hint_y=None, height=dp(20),
+                         font_size=sp(11))
+            follow_btn = Button(size_hint_x=0.5)
+            close_btn = Button(text=_tr('Close'), size_hint_x=0.5)
+            row = BoxLayout(size_hint_y=None, height=dp(44),
+                            spacing=dp(8))
+            row.add_widget(follow_btn)
+            row.add_widget(close_btn)
+            box = BoxLayout(orientation='vertical', spacing=dp(6),
+                            padding=dp(8))
+            box.add_widget(view)
+            box.add_widget(note)
+            box.add_widget(row)
+            popup = Popup(title=path or _tr('Daemon log'), content=box,
+                          size_hint=(0.95, 0.95))
+            st['text'] = body_text
+
+            def _to_end():
+                view.do_cursor_movement('cursor_end', control=True)
+
+            def _label():
+                follow_btn.text = (
+                    _tr('Following — tap to pause') if st['follow']
+                    else _tr('Paused — tap to follow'))
+
+            def _toggle(_btn):
+                st['follow'] = not st['follow']
+                _label()
+
+            def _refresh(res):
+                if res.get('error'):
+                    # Say it here rather than closing: a follow that
+                    # stops working must not look like a log that
+                    # stopped changing.
+                    note.text = _tr('Refresh failed: {error}').format(
+                        error=res['error'])
+                    return
+                note.text = ''
+                new = _tail(res.get('log') or '')
+                # Only touch the widget when the text actually changed —
+                # reassigning it drops whatever the reader has selected.
+                # NEVER SCROLL ON REFRESH (0.55.184). Following means
+                # "keep fetching", not "drag the reader to the bottom".
+                # Kent, mid-diagnosis: *"updates kick it to the bottom,
+                # when I'm trying to scroll. I'll check the bottom when
+                # I need to."* Only the initial open jumps to the end.
+                if new != st['text']:
+                    st['text'] = new
+                    view.text = new
+
+            def _tick(_dt):
+                if st['follow']:
+                    _fetch(_refresh)
+
+            def _stop(*_a):
+                if st['event'] is not None:
+                    st['event'].cancel()
+                    st['event'] = None
+
+            follow_btn.bind(on_release=_toggle)
+            close_btn.bind(on_release=popup.dismiss)
+            popup.bind(on_dismiss=_stop)
+            _label()
+            popup.open()
+            Clock.schedule_once(lambda _dt: _to_end(), 0)
+            st['event'] = Clock.schedule_interval(
+                _tick, _LOG_VIEW_REFRESH_S)
+
+        def _first(res):
             err = res.get('error')
             if err:
-                _say(_tr('Could not read the log: {error}').format(
-                    error=err))
+                if status is not None:
+                    status.text = _tr(
+                        'Could not read the log: {error}').format(
+                            error=err)
                 return
             text = res.get('log') or ''
             path = res.get('log_path') or ''
             if not text.strip():
-                _say(_tr('The log is empty ({path}).').format(
-                    path=path or '?'))
+                if status is not None:
+                    status.text = _tr(
+                        'The log is empty ({path}).').format(
+                            path=path or '?')
                 return
-            # Only the tail is rendered. The daemon already caps its
-            # reply at ~256 KB, but handing that to a single Kivy
-            # Label locks the UI while it lays out — a diagnostic must
-            # not become the next hang. The full file stays on the
-            # daemon's disk and the popup title names it.
-            lines = text.splitlines()
-            shown = lines[-_LOG_VIEW_LINES:]
-            clipped = len(lines) - len(shown)
-            body_text = '\n'.join(shown)
-            if clipped > 0:
-                body_text = (
-                    _tr('… {n} earlier lines not shown …').format(
-                        n=clipped) + '\n\n' + body_text)
-            body = Label(text=body_text, size_hint_y=None,
-                         halign='left', valign='top', font_size=sp(11))
-            body.bind(width=lambda w, val: setattr(
-                w, 'text_size', (val, None)))
-            body.bind(texture_size=lambda w, val: setattr(
-                w, 'height', val[1]))
-            scroller = ScrollView()
-            scroller.add_widget(body)
-            root_box = BoxLayout(orientation='vertical', spacing=dp(8),
-                                 padding=dp(8))
-            root_box.add_widget(scroller)
-            closer = Button(text=_tr('Close'), size_hint_y=None,
-                            height=dp(44))
-            root_box.add_widget(closer)
-            popup = Popup(title=path or _tr('Daemon log'),
-                          content=root_box,
-                          size_hint=(0.95, 0.95))
-            closer.bind(on_release=popup.dismiss)
-            popup.open()
-            # Newest output is what a diagnosis needs first.
-            Clock.schedule_once(
-                lambda _dt: setattr(scroller, 'scroll_y', 0), 0)
+            if status is not None:
+                status.text = ''
+            _open(_tail(text), path)
 
-        def _work():
-            try:
-                res = get_daemon_log()
-            except Exception as ex:      # never raise off a worker
-                res = {'error': repr(ex)}
-            Clock.schedule_once(lambda _dt: _show(res), 0)
-
-        threading.Thread(target=_work, daemon=True,
-                         name='view-diagnostics').start()
+        _fetch(_first)
 
     def restart_server(self):
         """Ask the daemon to restart itself. The settings UI lives in
