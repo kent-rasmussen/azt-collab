@@ -76,4 +76,39 @@ Sketch only; not designed yet.
 
 Created 2026-07-29 out of the `staged_rejected` discussion (0.55.116).
 
+## Two field cases, 2026-07-31 — and a third reason it's needed
+
+**Case 1 — the guard prevented recovery.** NUBACA: `STALL DETECTED:
+loop 'watcher' last ticked 563s ago`. The watchdog saw it and did not
+restart, because `sync_flight` reported a push in flight and a
+`wan-drain` thread was holding it. The real wedge was in zeroconf
+(`get_service_info` parked past its own 2000 ms timeout, holding the
+discovery lock; `browser.cancel()` also would not return). So the
+protection that stops us killing a genuine push is what kept a wedged
+daemon wedged. Only a manual restart cleared it.
+
+**Case 2 — the guard was right.** Same machine, after restart: another
+stall, but the stack showed `wan-drain` inside
+`_estimate_delta_size → object_store.get_raw → _lookup_in_packs`. Real
+work, just slow. Restarting would have destroyed progress.
+
+Those two are **indistinguishable from outside today**, which is
+exactly this item. A counter says "someone is pushing"; it cannot say
+"and they moved bytes in the last 30 s".
+
+**Third reason: a push has no overall deadline.** `_socket_timeout`
+uses `socket.setdefaulttimeout`, which bounds each individual socket
+operation, not the operation as a whole — a connection that trickles
+resets that timer forever. And the value is sized from RAW bytes, not
+wire bytes: 2026-07-31 logged `socket timeout raised 180s → 3600s for
+289,078,627 bytes` for a push whose wire size was 201 KB. Deliberate
+(it keeps a whole-pack fallback survivable), but combined with
+`sync_flight` suppressing the watchdog it makes an hour-long blind
+window the single longest in the system.
+
+A progress timestamp instead of a counter resolves all three: the
+watchdog restarts on stalled progress, the UI can say what it is
+waiting on, and a push that has moved nothing in N minutes becomes
+detectable without guessing at timeouts.
+
 ## Research

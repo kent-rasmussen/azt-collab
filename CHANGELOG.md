@@ -9,6 +9,41 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.187 — prune the refs github doesn't have, instead of asking it to delete them
+
+0.55.186 made the failing sweep cheap. This makes it stop failing.
+
+The sweep already fetches the server's ref advertisement (`_server_refs`), and
+already uses it — but only for the *reverse* case: a ref github still has that
+we stopped mirroring. The local candidates were never checked against it. So a
+tracking ref whose branch is already gone from github went to the push-delete
+path, which asked github to remove something that isn't there, got
+`HangupException`, and left the tracking ref in place to try again next sweep.
+It could never succeed and never stopped.
+
+Field 2026-07-31: github held only `main` + `azt-blob-seed-chain` (plus topic
+and side refs) for both `baf` and `nml`, while NUBACA carried 38
+`azt-blob-seed-<hex>` tracking refs — every one of them stale.
+
+Candidates the advertisement doesn't list are now deleted **locally, with no
+push**. That is ordinary `fetch --prune` hygiene: dropping a tracking ref for a
+branch the server doesn't advertise is definitionally correct, and it's the only
+operation in this path that can't fail against the remote.
+
+Guarded on a *successful* advertisement. `_server_refs` is `{}` both when the
+listing failed and when the server genuinely has no refs; pruning on that would
+delete every mirror because the network hiccuped.
+
+The cooldown now guards only the push. Gating the local prune behind a push
+failure would be backwards — the prune is the part worth running.
+
+**This may matter well beyond the wasted seconds.** Stale tracking refs are
+offered as `haves`, and a `have` the server can't resolve is a plausible cause
+of the `unpack index-pack failed` thin-push rejections that force whole-pack
+fallbacks — 289 MB instead of 201 KB on `baf`. Unconfirmed; the check is whether
+thin pushes start being accepted once the stale refs are gone. See
+`agenda/stale_seed_refs_poison_haves.md`.
+
 ## 0.55.186 — 38 connections to delete 38 refs, all refused, every sweep
 
 Field 2026-07-31, `baf` on NUBACA. Between `topic-push` being scheduled and it

@@ -151,6 +151,128 @@ side and grepped the same way:
 - wrapped so a measurement failure can never break a save (`_log_save_cost` catches
   broadly and logs "save cost line failed").
 
+## THE PAIRED CAPTURE LANDED — 2026-07-31 17:02–17:47, NUBACA, `baf`
+
+Real field machine, real repo (6.8 MB LIFT, 1703 audio files), somebody
+actually working, both halves in one window. 16 paired saves.
+
+azt: `indent 0.19 + serialize ~0.78 + submit N = TOTAL`
+daemon: `land 0.00 + stage[N files] X + commit Y = TOTAL`
+
+| time | azt total | azt submit | daemon total | stage | commit |
+|---|---|---|---|---|---|
+| 17:02:16 | 6.56 | 5.58 | 5.56 | 3.09 [5f] | 2.45 |
+| 17:03:54 | 4.44 | 4.01 | 4.00 | 2.69 [2f] | 1.30 |
+| 17:05:39 | 11.00 | 10.05 | 10.03 | 5.82 [2f] | 4.18 |
+| 17:10:26 | 8.93 | 8.00 | 7.98 | 3.63 [2f] | 4.32 |
+| 17:17:26 | 10.05 | 9.05 | 9.02 | 5.56 [2f] | 3.44 |
+| 17:21:18 | 7.54 | 6.55 | 6.54 | 3.38 [2f] | 3.13 |
+| 17:43:43 | — | — | **21.88** | 10.71 [4f] | 11.15 |
+
+### What it settles
+
+1. **The slow-CPU premise is re-established, and then some.** Typical
+   save 6.5–11 s against **0.76 s** on the fast box — 10–15×. Worst
+   observed 21.88 s. Roughly one save every 60–90 s, so ~10 % of a
+   working session is spent saving, with visible multi-second stalls.
+
+2. **There is no azt-vs-daemon gap, so it is NOT lock contention.**
+   azt's `submit` and the daemon's total agree to ~0.02 s on every row
+   (5.58/5.56, 10.05/10.03, 9.05/9.02, 6.55/6.54). The item flagged a
+   large gap as the lock-contention signature; it isn't there. Every
+   second is real work inside the daemon. **Close that hypothesis.**
+
+3. **Phase 1 is now clearly justified — the fast-box estimate was
+   wrong by an order of magnitude.** `stage[2 files]` costs 3–6 s.
+   Two files. The cost is the whole-tree scan, not the payload, and it
+   is ~half of every save here versus the ~0.2 s Phase 0 measured on
+   Demo_en. Staging only the submitted path is worth 3–6 s per save on
+   the hardware that actually hurts.
+
+4. **`commit` is the other half, and Phase 1 does not touch it.**
+   2.5–4.3 s consistently, sometimes exceeding stage. Whatever tree
+   work `porcelain.commit` repeats needs its own look; fixing stage
+   alone roughly halves the cost, it does not remove it.
+
+5. **`land` stays 0.00–0.01 s.** Phase 3's contract change remains
+   unjustified — payload size is not the cost, on slow hardware either.
+   Confirmed, not merely inherited from Phase 0.
+
+6. **The 17:43:43 outlier (21.88 s) is contention with something
+   else** — WAN push or repack were both live that evening. Worth
+   isolating: a save that takes 22 s because maintenance is running is
+   a scheduling bug, not a cost.
+
+## NDEMLI / `nml` (15.7 MB LIFT, 1868 audio) — unpaired, 07-30 + 07-31
+
+Not a paired window (azt log is 07-30, daemon log 07-31), but each half
+settles something the paired capture could not.
+
+### 1. `stage[0 files]` costs 4.80–7.45 s — the scan is FIXED cost
+
+```
+14:50:15  land 0.01 + stage[0 files] 5.32 + commit 3.18 =  8.52  NOTHING_TO_COMMIT
+14:56:18  land 0.01 + stage[0 files] 7.45 + commit 2.94 = 10.40  NOTHING_TO_COMMIT
+14:30:14  merge 16.42 + stage[0 files] 4.80 + commit 4.74 = 25.96
+```
+
+Staging **zero files** takes five to seven seconds. That is the whole
+argument for Phase 1, with no inference left in it: the cost is a
+whole-tree walk and has nothing to do with what is being staged.
+Anything that scopes the scan to the submitted path removes essentially
+all of it.
+
+### 2. Saves that change nothing still pay full price
+
+`NOTHING_TO_COMMIT` rows cost **3.43 – 10.40 s** each (14:50:15 8.52,
+14:55:26 4.00, 14:59:04 4.81, 15:05:24 3.43, 14:56:18 10.40). The
+daemon walks the tree, hashes, and reaches `porcelain.commit` before
+discovering there was nothing to do. On a 60–90 s save cadence these
+are pure loss, and they are cheap to eliminate — the emptiness is
+knowable before the scan, not after it.
+
+### 3. The divergent-merge path is NOT rare — nine saves in a row
+
+Plans item 4 said: *"if it shows up per-save, that is the finding, and
+it swamps everything else."* 14:26:08 → 14:30:14, every save:
+
+```
+merge 14.36 + stage[4] 4.70 + commit 2.24 = 21.31
+merge 17.79 + stage[4] 5.30 + commit 4.97 = 28.07
+merge 18.45 + stage[2] 5.85 + commit 3.16 = 27.47
+merge 19.61 + stage[2] 5.37 + commit 6.36 = 31.36
+merge 19.49 + stage[2] 5.65 + commit 6.19 = 31.35   MERGED_WITH_LOCAL + NOTHING_TO_COMMIT
+…9 consecutive, 21.31–31.36 s each, merge alone 14.36–19.61 s
+```
+
+Four minutes where every save took half a minute, merge being the
+largest single term — larger than stage and commit combined. The last
+one merged and then had **nothing to commit**: 25.96 s to discover the
+save was a no-op. Why HEAD moved on nine consecutive saves is the
+question (LAN deliveries arriving mid-session is the obvious
+candidate); this predates the reload-prompt work being verified.
+
+### 4. With daemon vs without, same machine, same 15.7 MB file
+
+07-30, azt side. `(no daemon)` rows are the backup write, not the hot
+path — but they bound what the file itself costs:
+
+| | total |
+|---|---|
+| `outcome (no daemon)` ×16 | **0.75 – 2.04 s** (submit 0.00) |
+| `outcome ok` ×25 | **4.15 – 14.02 s** (submit 3.21 – 12.80) |
+
+Writing the 15.7 MB document costs about a second. Everything above
+that is the daemon round trip.
+
+### Next
+
+Phase 1 (stage only the submitted path), then measure again on this
+same machine. Then: the `NOTHING_TO_COMMIT` early-out, which is
+independent and probably cheaper. `commit`'s own 1.3–7.4 s is the
+remaining term after both. Merge frequency is a separate item — it is
+not a cost problem, it is a "why is HEAD moving" problem.
+
 ## Notes
 
 - **Capture while somebody is actually sorting** (from the merged azt-side item) —

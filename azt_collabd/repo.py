@@ -7377,15 +7377,6 @@ def _sweep_orphan_preseed_refs(
     ]
     if not candidates:
         return
-    _cooling, _left = _preseed_sweep_cooling(repo.path)
-    if _cooling:
-        # Say it — a silent skip reads as "no orphans", which is the
-        # opposite of the truth.
-        lift_merge.trace(
-            f'[sync-trace] preseed-sweep: {len(candidates)} candidate '
-            f'ref(s), but the last batched delete failed — not '
-            f'retrying for another {_left // 60}m')
-        return
 
     main_ref = _enc(f'refs/remotes/origin/{branch}')
     try:
@@ -7560,7 +7551,75 @@ def _sweep_orphan_preseed_refs(
         except Exception:
             continue
 
+    # PRUNE WHAT THE SERVER NO LONGER HAS — LOCALLY, NO PUSH (0.55.187).
+    #
+    # ``_server_refs`` above is the advertisement, and until now it was
+    # consulted only for the REVERSE case (server has a ref we stopped
+    # mirroring). The local candidates were never checked against it —
+    # so a tracking ref whose branch is already gone from github was
+    # handed to the push-delete path, which asked github to delete
+    # something that is not there, got ``HangupException``, and left
+    # the tracking ref in place to try again on the next sweep. It can
+    # never succeed and never stops.
+    #
+    # Field 2026-07-31: github held only ``main`` +
+    # ``azt-blob-seed-chain`` (+ topic/side) for both `baf` and `nml`,
+    # while NUBACA carried 38 ``azt-blob-seed-<hex>`` tracking refs.
+    #
+    # This is ordinary ``fetch --prune`` hygiene and needs no network of
+    # its own: deleting a tracking ref for a branch the server does not
+    # advertise is definitionally correct, and it is the only operation
+    # here that cannot fail against the remote.
+    #
+    # It may also matter far beyond the wasted seconds: stale tracking
+    # refs are offered as ``haves``, and a ``have`` the server cannot
+    # resolve is a plausible cause of the ``unpack index-pack failed``
+    # thin-push rejections that force whole-pack fallbacks. See
+    # agenda/stale_seed_refs_poison_haves.md.
+    #
+    # GUARDED ON A SUCCESSFUL ADVERTISEMENT. ``_server_refs`` is ``{}``
+    # when the listing FAILED, which is indistinguishable from "the
+    # server has no refs" — pruning on that would delete every mirror
+    # we have because the network hiccuped.
+    _pruned = []
+    if _server_refs:
+        _still_there = {
+            r[len(b'refs/heads/'):] for r in _server_refs
+            if r.startswith(b'refs/heads/')
+        }
+        _remaining = []
+        for _tracking in deletable:
+            _suffix = _tracking[len(b'refs/remotes/origin/'):]
+            if _suffix in _still_there:
+                _remaining.append(_tracking)
+                continue
+            try:
+                del repo.refs[_tracking]
+                _pruned.append(_tracking)
+            except Exception:
+                _remaining.append(_tracking)
+        deletable = _remaining
+        if _pruned:
+            lift_merge.trace(
+                f'[sync-trace] preseed-sweep: pruned {len(_pruned)} '
+                f'tracking ref(s) whose branch github no longer has — '
+                f'local only, no push. These were being offered as '
+                f'haves')
+
     if not deletable:
+        return
+
+    # The cooldown guards only the PUSH. The prune above is local,
+    # cannot fail against the remote, and is the thing most worth
+    # running — gating it behind a push failure would be backwards.
+    _cooling, _left = _preseed_sweep_cooling(repo.path)
+    if _cooling:
+        # Say it — a silent skip reads as "no orphans", which is the
+        # opposite of the truth.
+        lift_merge.trace(
+            f'[sync-trace] preseed-sweep: {len(deletable)} ref(s) still '
+            f'need a server-side delete, but the last batched attempt '
+            f'failed — not retrying for another {_left // 60}m')
         return
 
     # ONE PUSH, NOT ONE PER REF (0.55.186).

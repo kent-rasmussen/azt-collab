@@ -87,6 +87,37 @@
   needs ranking.
 - **Waiting on:** Nothing.
 
+## The watchdog dump the item asked for — 2026-07-31, NDEMLI
+
+This item said to deploy and read the watchdog's stack dumps first,
+because they name the actual lock holder. They now have:
+
+```
+[watchdog] STALL DETECTED: project lock '9a6971668a565870.lock'
+           held 131s by thread 'wan-drain'
+
+_drain_pending_push → _attempt_push → _push_repo
+  → repo.py:5405 push_repo → _push_repo_locked
+  → repo.py:5501 _push_step_locked
+  → repo.py:9406 porcelain.push → client.send_pack
+  → urllib3 → http.client.send → ssl.write
+```
+
+So: **`_push_step_locked`, holding `project_lock` for the entire TLS
+upload** — 131 s on that occasion, and only that short because `nml`
+was 169 commits rather than 925. The lock is released when the upload
+finishes, not when the local work does.
+
+Note the contrast in the same log: `phase-A begins WITHOUT the project
+lock (0.55.84) — local work stays responsive while this uploads`. The
+topic-push path already got the phase split. **`_push_step_locked` —
+the direct-push route — did not.** That narrows the work: the pattern
+exists and is proven, it just was not applied here.
+
+Also confirms the cost is real rather than theoretical: any save
+arriving in that 131 s window blocks or returns BUSY, which is the
+"azt clients freeze when wifi internet is on" report.
+
 ## Field wedge with a silent log (2026-07-27)
 
 Four Android devices tethered to the dev desktop. Symptoms, in the

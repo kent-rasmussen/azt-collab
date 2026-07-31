@@ -114,6 +114,34 @@ daemon. Otherwise it next fires at the 2026-08-01 rollover.
 Remaining: 2 (bound the ancestor walk), 7 (the dulwich `open()`), the
 Android divergence below, and the new suspect immediately below.
 
+**Shipped from the audit, 2026-07-31 evening.** E1, E2 and A3–A5 are
+done, in 0.55.177:
+
+- `_pid_alive` was broken **in both directions on Windows**.
+  `os.kill(pid, 0)` is not a probe there: a dead pid raises
+  `OSError(EINVAL)` rather than `ProcessLookupError`, so the blanket
+  `except OSError: return True` called dead daemons alive — meaning it
+  could essentially never return False, and any leftover
+  `server.json` wedged the client permanently and silently. And per
+  the `os.kill` docs, a *live* pid gets `TerminateProcess`: the probe
+  killed what it was asking about. Now a query-only handle plus
+  `WaitForSingleObject`; every uncertain branch answers False, since a
+  wrong True is unrecoverable and a wrong False costs one spawn the
+  flock kills. **This is the likely reason the Windows desktop had no
+  daemon all day** — not the boot wedge itself.
+- **E1**: the spawned child's output goes to
+  `$AZT_HOME/spawn_boot_trace.txt` instead of `DEVNULL`.
+- **E2**: the child's exit code is read and named (1 = flock,
+  3 = cripple marker) instead of a silent timeout.
+
+Also shipped: `$AZT_HOME/server_crippled` (0.55.175) for reproducing
+"no daemon" on demand, and the ancestry-walk bounds (0.55.176).
+
+**Upstream cause found the same evening.** The slow ancestry walk is
+downstream of [[windows_repack_blocked_by_readers]] — packs never
+consolidate on Windows, so every object lookup searches every pack.
+Fixing the walk's bounds treats the symptom; the repack is the cause.
+
 **New suspect (2026-07-31, late).** Kent confirms there was **no log at
 all** from the hung run — not a corrupted one, none. Since the tee installs
 before the bind, a hung daemon should always leave a file. That points at

@@ -54,4 +54,42 @@ written to fix the third instance; 0.55.54's hardcoded "5s" was written
 in the same pass that made the timeout a parameter). Re-read each edit
 against the rule before moving on.
 
+## New instances found 2026-07-31 (field day)
+
+Six more, all the same shape. Three are fixed; three are open.
+
+**Fixed in 0.55.173–0.55.186:**
+
+1. `[azt_collabd] listening on <host>:<port>` was printed at bind,
+   ~100 lines before `serve_forever()`. A daemon stalled in boot
+   therefore read as healthy. Now `bound to … — not serving yet`, with
+   a separate `serving on …` where serving actually starts.
+2. `[maintenance] repack …` carried a comment asserting "lock held" as
+   an already-settled precondition — 0.55.171 had removed the lock and
+   left the claim. A comment can violate this invariant too.
+3. `[lan-admin] … it is changing THIS device: GET '/v1/lan/pending'`.
+   A GET changes nothing. Reads are now rolled up and only writes make
+   that claim.
+
+**Open:**
+
+4. `[sync-trace] push done (advanced 169 commits)` printed **twice**,
+   20:11:42 and 20:12:02, `codes=['PUSHED']` both times — the second
+   after `wan_unshared` already read 0. Run-to-completion's second
+   attempt advanced nothing and said it advanced 169.
+5. `prepare_share_bundle` returned bare `None` for both "unreachable"
+   and "the daemon answered and refused", so a live session reported
+   "Could not reach the AZT Collab daemon". Fixed in the client
+   (0.55.179/180), but the shape — one value standing for two answers
+   with opposite remedies — is the same defect in return-value form,
+   and `get_daemon_log` had it too.
+6. `Sharing is only available on Android` shown on a desktop
+   diagnostics share: `share_text`'s platform refusal replacing the
+   message it was handed. Fixed 0.55.178.
+
+The pattern across all six: the line is written where the *intent*
+lives, not where the *outcome* is known. Items 5 and 6 extend it —
+a return value or a substituted string can assert something false
+just as a log line can.
+
 ## Research
