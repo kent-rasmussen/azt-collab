@@ -9,6 +9,45 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.185 — a repack that can't succeed, retried all day
+
+Field 2026-07-31, Windows:
+
+```
+[maintenance] repack 'baf': git exited 128 after 524s — fatal: renaming pack
+to '.git/objects/pack/pack-9c1d….pack' failed: Permission denied
+```
+
+Two faults, and the second is why it mattered all day.
+
+**The rename fails because Windows is not POSIX.** 0.55.171 removed
+`project_lock` from the sweep — correctly, it was starving saves — and justified
+it in POSIX terms: *"deleting a pack on POSIX leaves open descriptors valid, and
+dulwich already rescans when a pack vanishes."* True there. On Windows a rename
+over a file another handle holds open is refused, and `repack -a -d` must do
+exactly that. The daemon mmaps packs through dulwich on every status poll, so
+anything watching the project — an open settings window is enough — keeps a
+reader alive across the entire repack. That failure now says so in the log
+instead of leaving "Permission denied" to be read as a filesystem ACL.
+
+**It retried forever.** `_write_floor` is only reached on success, so a failed
+repack left the thresholds exactly as it found them and the next sweep ran the
+identical doomed command — 524 s each time, indefinitely. And because the repack
+never landed, loose objects kept accumulating, which is what makes the
+`lan_debug` ancestry walk slow enough to have wedged boot this morning. The
+maintenance meant to prevent that condition was manufacturing it.
+
+A failed repack now enters a 6 h per-project cooldown, in memory so a daemon
+restart clears it — a restart is also when the readers holding packs open go
+away, which is exactly when a retry is worth making. The sweep summary names
+what is cooling down; a silent skip would read as "nothing needed doing", the
+opposite of the truth.
+
+Not fixed here: Windows still cannot repack while anything polls the project.
+Taking `project_lock` again would restore the save starvation 0.55.171 removed,
+so the real answer is a per-project idle signal — the same one the
+*daemon activity signal* item needs. Recorded rather than guessed at.
+
 ## 0.55.184 — the log you open to diagnose must not be drowned by opening it
 
 Two faults, one cause: reading a peer's log was made harder by the act of

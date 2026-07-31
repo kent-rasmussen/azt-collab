@@ -218,6 +218,30 @@ def _git_binary():
     return None
 
 
+# A repack that failed is not retried for this long (0.55.185). Long
+# enough that a 500 s attempt isn't repeated all day; short enough that
+# a machine left overnight still gets its chance once conditions change
+# (the settings window closed, the push finished). In memory only, so a
+# daemon restart clears it — a restart is also when the readers holding
+# packs open go away, which is exactly when a retry is worth making.
+_REPACK_FAILURE_COOLDOWN_S = 6 * 3600
+_repack_failed_at = {}
+
+
+def _note_repack_failure(working_dir):
+    _repack_failed_at[os.path.abspath(working_dir)] = time.monotonic()
+
+
+def _repack_in_cooldown(working_dir):
+    """``(in_cooldown, seconds_remaining)`` for a project whose last
+    repack failed."""
+    at = _repack_failed_at.get(os.path.abspath(working_dir))
+    if at is None:
+        return False, 0
+    left = _REPACK_FAILURE_COOLDOWN_S - (time.monotonic() - at)
+    return (left > 0), max(0, int(left))
+
+
 def repack_project(working_dir, langcode=''):
     """Repack one project. Returns True if git ran and succeeded.
 
@@ -234,8 +258,11 @@ def repack_project(working_dir, langcode=''):
     count, total = _loose_object_stats(os.path.join(working_dir, '.git'))
     started = time.monotonic()
     # ANNOUNCE AT THE POINT OF ACTION (invariant #15): everything that
-    # decides whether this happens — git present, lock held, thresholds — is
-    # already settled above, and the subprocess call is the next statement.
+    # decides whether this happens — git present, thresholds, the failure
+    # cooldown — is already settled above, and the subprocess call is the
+    # next statement. ("lock held" was listed here until 0.55.185; 0.55.171
+    # removed the lock and left the comment asserting it, which is the same
+    # defect the invariant is about.)
     print(f'[maintenance] repacking {label!r}: {count} loose object(s), '
           f'{total / (1024 * 1024):.1f} MB — this is what lets pushes ship '
           f'deltas instead of whole files', file=sys.stderr, flush=True)
@@ -267,6 +294,23 @@ def repack_project(working_dir, langcode=''):
         print(f'[maintenance] repack {label!r}: git exited '
               f'{proc.returncode} after {took:.0f}s — {tail}',
               file=sys.stderr, flush=True)
+        # DON'T RETRY THIS EVERY SWEEP (0.55.185). ``_write_floor`` is
+        # only reached on success, so a failing repack left the
+        # thresholds exactly as it found them and the next sweep ran the
+        # identical doomed command. Field 2026-07-31, Windows: `baf`
+        # burned 524s per attempt, indefinitely, and because the repack
+        # never landed the loose objects kept growing — which is what
+        # makes the ancestry walk slow enough to wedge boot.
+        _note_repack_failure(working_dir)
+        if os.name == 'nt' and 'Permission denied' in tail:
+            print(f'[maintenance] repack {label!r}: on Windows this is '
+                  f'a file-lock, not a permissions setting — a pack is '
+                  f'open in this process (dulwich mmaps them) and '
+                  f'Windows refuses to rename over an open file, where '
+                  f'POSIX allows it. Anything polling this project '
+                  f'(an open settings window is enough) keeps a reader '
+                  f'alive across the whole repack',
+                  file=sys.stderr, flush=True)
         return False
     after_count, after_total = _loose_object_stats(
         os.path.join(working_dir, '.git'))
@@ -355,6 +399,7 @@ def sweep(force=False):
         considered = 0
         repacked = 0
         skipped_busy = []
+        cooling = []
         for project in (entries or []):
             langcode = getattr(project, 'langcode', '') or ''
             working_dir = getattr(project, 'working_dir', '') or ''
@@ -363,6 +408,10 @@ def sweep(force=False):
             considered += 1
             needed, count, total = _needs_repack(working_dir)
             if not needed:
+                continue
+            _cooling, _left = _repack_in_cooldown(working_dir)
+            if _cooling:
+                cooling.append(f'{langcode}({_left // 60}m left)')
                 continue
             # NO project_lock (0.55.171).
             #
@@ -389,8 +438,15 @@ def sweep(force=False):
         # function is indistinguishable from one that never ran.
         _busy = (f'; deferred (busy): {", ".join(skipped_busy)}'
                  if skipped_busy else '')
+        # NAME WHAT WAS SKIPPED. A cooldown that is invisible reads as
+        # "maintenance decided nothing needed doing", which is the
+        # opposite of the truth — it needs doing and we are declining
+        # to try again yet.
+        _cool = (f'; in failure cooldown: {", ".join(cooling)}'
+                 if cooling else '')
         print(f'[maintenance] sweep: {considered} project(s) checked, '
-              f'{repacked} repacked{_busy}', file=sys.stderr, flush=True)
+              f'{repacked} repacked{_busy}{_cool}',
+              file=sys.stderr, flush=True)
         if repacked:
             lift_merge.trace(
                 f'[sync-trace] maintenance: repacked {repacked} project(s); '
