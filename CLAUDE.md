@@ -190,6 +190,29 @@ python ../azt-collab/examples/sister_app.py
 | dir override | `AZT_HOME` | platform default |
 | disable auto-spawn | `AZT_CLIENT_AUTOSPAWN=0` | enabled |
 
+### `$AZT_HOME/server_crippled` — the daemon refuses to boot (testing only)
+
+If this file exists, `azt_collabd` logs a refusal and exits
+`3` instead of starting. Checked after the log tee (so the refusal is
+always recorded) and before the single-instance flock (so it never
+holds the lock, and a healthy daemon starts the instant the file is
+gone). Any text in the file is echoed into the log line, so you can
+label what a given marker is for.
+
+**Create and delete it by hand — there is deliberately no UI, and
+nothing in the product ever writes it.** It exists so "this machine has
+no daemon" can be reproduced on demand, which is otherwise only
+reachable by breaking something for real; the client-side response to a
+missing daemon needs a repeatable way to get there.
+
+This is the one persistent stay-down flag in the system, and it is a
+deliberate exception to the rule that auto-spawn must always be able to
+recover a machine (`AZT_CLIENT_AUTOSPAWN=0` is the env-scoped, non-
+persistent way to do the same thing). **If a machine mysteriously has
+no daemon and no other explanation fits, look for this file** — the
+refusal line in the daemon log names its full path and says to delete
+it. Desktop `run()` only; the Android service path does not check it.
+
 ## Android specifics
 
 - Suite signature permission is `org.atoznback.AZT_COLLAB_ACCESS` (`protectionLevel="signature"`). The standalone server APK (`org.atoznback.aztcollab`) is the **only** app that declares the `<permission>` (in `server_apk/manifest_extras.xml`) and exports the `<provider>` at authority `org.atoznback.aztcollab` (injected post-render by `p4a_hook.py:_inject_aztcollab_provider`, gated on `dist_name == 'aztcollab'`). Peer apps consume it via `<uses-permission>` (from `android.permissions` in their spec) plus a `<queries><package .../></queries>` block (from `android/manifest_extras_peer.xml`, symlinked into each peer as `manifest_extras.xml`).

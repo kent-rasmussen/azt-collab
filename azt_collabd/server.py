@@ -263,6 +263,19 @@ def _acquire_server_lock(lock_path):
 
 UNAUTHENTICATED_PATHS = ('/v1/health',)
 
+# Hand-created file under $AZT_HOME that makes the daemon refuse to
+# boot. TESTING ONLY — nothing in the product ever writes it, and
+# there is deliberately no UI to set or clear it. Its purpose is to
+# reproduce "this machine has no daemon" on demand so the CLIENT side
+# of that state can be developed against something repeatable.
+# Documented in CLAUDE.md § Runtime config. See ``run()``.
+_CRIPPLE_MARKER = 'server_crippled'
+
+# Distinct from the flock guard's exit(1) so "another instance is
+# running" and "deliberately crippled" are tellable apart from a
+# process exit status alone.
+_EXIT_CRIPPLED = 3
+
 
 def _h_health(_body):
     # Test hook: if ``$AZT_HOME/_debug_force_503`` exists, return
@@ -5401,7 +5414,17 @@ def _dump_lan_debug_snapshot():
         try:
             _, resp = _h_lan_debug(langcode, {})
         except Exception as ex:
-            print(f'[lan-debug] {langcode!r} raised: {ex!r}',
+            # FULL TRACEBACK, not ``{ex!r}`` (0.55.174). This walk is
+            # the one that reads every loose object in a project's
+            # ancestry, so it is where a corrupt / missing / locked
+            # object surfaces — and the repr alone names neither the
+            # failing path nor the frame. Field 2026-07-31: an OSError
+            # from ``dulwich.file:145`` reached the log with no way to
+            # tell WHICH object it was, which is the only fact that
+            # makes it actionable.
+            import traceback as _traceback
+            print(f'[lan-debug] {langcode!r} raised: {ex!r}\n'
+                  + _traceback.format_exc(),
                   file=sys.stderr, flush=True)
             continue
         print(f'[lan-debug] {langcode!r} '
@@ -6784,6 +6807,14 @@ def _format_log_stamp():
 _log_session = _LogSession()
 
 
+# CSI sequences (colour, cursor moves) and OSC strings. Applied only
+# to the log-file half of the tee — see ``_StdioTee.write``.
+_ANSI_RE = re.compile(
+    r'\x1b\[[0-9;:?]*[ -/]*[@-~]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+    r'|\x1b[@-Z\\-_]')
+
+
 class _StdioTee:
     """File-like that mirrors writes to the original stream (logcat /
     terminal) AND to the shared ``_LogSession`` (since 0.52.5;
@@ -6810,7 +6841,24 @@ class _StdioTee:
         except Exception:
             pass
         try:
-            self._session.write(data)
+            # STRIPPED ON THE WAY TO THE FILE (0.55.174). The terminal
+            # gets the bytes as-is; the log file must not. Python 3.13
+            # colourises tracebacks, and ``__getattr__`` below passes
+            # ``isatty`` through to the real stream — so a daemon
+            # launched from a terminal (by hand, or ``-um`` from the
+            # UI) reports a TTY, gets colour, and writes the escape
+            # sequences into the per-day log. Field 2026-07-31: a
+            # boot-hang traceback logged as ``dulwich.file:<esc>[35m145``
+            # with the exception TYPE AND MESSAGE unreadable inside the
+            # corruption — the one thing the log existed to carry.
+            #
+            # Stripping here rather than setting PYTHON_COLORS in the
+            # spawn env because the env only covers daemons the client
+            # spawns; this covers every launch path, including the
+            # hand-run that a person does precisely when they are
+            # trying to capture a failure.
+            self._session.write(_ANSI_RE.sub('', data)
+                                if isinstance(data, str) else data)
         except Exception:
             pass
         return len(data) if isinstance(data, str) else 0
@@ -6977,7 +7025,9 @@ def maybe_install_stdio_tee():
 def run(host='127.0.0.1', port=0):
     """Start the server. Blocks until interrupted. Writes server.json on
     bind and removes it on shutdown. Exits non-zero if another
-    azt_collabd is already running against the same $AZT_HOME."""
+    azt_collabd is already running against the same $AZT_HOME, or if
+    the ``server_crippled`` test marker is present (see
+    ``_CRIPPLE_MARKER``)."""
     global _server_lock_fd
     home = azt_home()
     os.makedirs(home, exist_ok=True)
@@ -6986,6 +7036,40 @@ def run(host='127.0.0.1', port=0):
     # we capture the boot trace. Idempotent and silent when the
     # toggle is off.
     maybe_install_stdio_tee()
+
+    # TEST CRIPPLE MARKER (0.55.175). Deliberately has NO UI to set or
+    # clear it — it exists so a developer can reproduce "no daemon on
+    # this machine" on demand and work on the CLIENTS' response to that
+    # state, which is otherwise only reachable by breaking something
+    # for real.
+    #
+    # Checked AFTER the log tee (so the refusal is recorded) and BEFORE
+    # the flock (so a crippled daemon never holds the single-instance
+    # lock, and a healthy one can start the moment the marker is gone).
+    #
+    # This is a persistent stay-down flag, which the daemon otherwise
+    # does not allow: auto-spawn must always be able to recover a
+    # machine. It is tolerable ONLY because it is a hand-created file
+    # that nothing in the product writes, and because the refusal names
+    # the file and the remedy every single time. If you are reading
+    # this because a machine mysteriously has no daemon: delete the
+    # file named in the log line below.
+    cripple = os.path.join(home, _CRIPPLE_MARKER)
+    if os.path.exists(cripple):
+        note = ''
+        try:
+            with open(cripple, encoding='utf-8', errors='replace') as f:
+                note = f.read().strip()[:200]
+        except OSError:
+            pass
+        print(f'[azt_collabd] REFUSING TO BOOT — test cripple marker '
+              f'present: {cripple!r}'
+              + (f' ({note})' if note else '')
+              + '. This is a hand-created TEST file; nothing in the '
+                'product writes it. DELETE IT to restore normal '
+                'operation.',
+              file=sys.stderr, flush=True)
+        sys.exit(_EXIT_CRIPPLED)
 
     # Single-instance guard — flock on $AZT_HOME/server.lock
     lock_path = os.path.join(home, 'server.lock')

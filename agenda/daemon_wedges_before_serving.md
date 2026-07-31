@@ -96,9 +96,33 @@ echo x >> <$AZT_HOME>/daemon-<peer>-2026-07-31_log.txt
 
 ## Plans
 
-**Status 2026-07-31: 1, 3, 4, 5, 6 shipped in 0.55.173 — NOT compiled, NOT
-tested, NOT deployed (no Bash this session). 2 and 7 remain, plus the
-Android divergence noted below.**
+**Status 2026-07-31.** Shipped: 1, 4, 5, 6 in 0.55.173; 3 in 0.55.173 and
+then properly in 0.55.174 (env var only covered client-spawned daemons —
+the ANSI strip in `_StdioTee.write` covers every launch path). 0.55.175
+added `$AZT_HOME/server_crippled`, a hand-created boot refusal for
+reproducing "no daemon" on demand while working the client side.
+
+**Live-verified 13:27:58** on a desktop restart: `serving on` at `,875`,
+first boot task (`publish-reconcile`) at `,895` — serving is up 20 ms
+before boot work begins, which is the whole point of the change.
+
+**NOT yet verified: the actual outage path.** `pre_size == 0` was false on
+that run, so the start-of-day snapshot never fired and neither did the
+dulwich failure. Forcing it = stop daemon, move today's log aside, start
+daemon. Otherwise it next fires at the 2026-08-01 rollover.
+
+Remaining: 2 (bound the ancestor walk), 7 (the dulwich `open()`), the
+Android divergence below, and the new suspect immediately below.
+
+**New suspect (2026-07-31, late).** Kent confirms there was **no log at
+all** from the hung run — not a corrupted one, none. Since the tee installs
+before the bind, a hung daemon should always leave a file. That points at
+`maybe_install_stdio_tee` swallowing its own failure: if `install_stdio_tee`
+raises (permissions, disk, bad `$AZT_HOME`), the error goes to
+`sys.__stderr__`, which is `DEVNULL` for a client-autospawned child. Result:
+a running daemon with no on-disk capture and no indication anywhere. Same
+"silent exactly when it matters" class as the wedge itself. Worth checking
+before trusting any future boot log.
 
 1. **Get the snapshot off the boot path.** It is a diagnostic; it must
    never gate serving. Run it on a background thread after

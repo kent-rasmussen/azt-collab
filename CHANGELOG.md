@@ -9,6 +9,56 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.175 — `$AZT_HOME/server_crippled`: reproduce "no daemon" on demand
+
+Testing affordance, by request. If that file exists, the daemon logs a refusal
+naming its full path and exits `3` instead of booting. Checked after the log tee
+(the refusal is always recorded) and before the single-instance flock (it never
+holds the lock, and a healthy daemon starts the moment the file is gone). Any
+text inside is echoed into the log line, so a marker can say what it is for.
+
+Created and deleted by hand; **no UI, and nothing in the product writes it.** The
+point is to make "this machine has no daemon" reachable on demand, so the client
+side of that state can be developed against something repeatable instead of
+against a real breakage. `AZT_CLIENT_AUTOSPAWN=0` already does this per-
+environment, but it can't defeat a spawn that a launcher performs in its own
+env — the marker works regardless of who starts what.
+
+This is the one persistent stay-down flag in the system, and a deliberate
+exception to the rule that auto-spawn must always be able to recover a machine.
+It is tolerable because it is hand-created, because nothing writes it
+accidentally, and because the refusal names the file and the remedy every time
+it fires. Documented in CLAUDE.md § Runtime config for the day someone finds a
+machine with no daemon and no other explanation. Desktop `run()` only; the
+Android service path does not check it.
+
+## 0.55.174 — the log has to catch it, or there is nothing to chase
+
+0.55.173 left the dulwich failure "to be chased with a legible trace", without
+saying how anyone would ever obtain one. Kent, correctly: *"how will I get this?
+the first attempt resulted in no log. I'm not going to just randomly start the
+server in a terminal, to see if it hangs."* Two gaps made that trace
+un-gettable, and both are the log's fault, not the user's.
+
+- **ANSI is stripped on the way to the log file.** 0.55.173 set
+  `PYTHON_COLORS=0` in `build_spawn_env`, which only covers daemons the *client*
+  spawns. `_StdioTee.__getattr__` passes `isatty` through to the real stream, so
+  a daemon started from a terminal — by hand, or `-um` from the UI — reports a
+  TTY, gets colourised tracebacks, and writes the escape codes into the per-day
+  file. That is the exact run a person makes when trying to capture a failure.
+  The terminal still gets colour; the file half is now stripped, on every launch
+  path including Android.
+- **The lan-debug snapshot logs a full traceback.** It logged `{ex!r}`, which
+  names neither the failing path nor the frame. That walk reads every loose
+  object in a project's ancestry, so it is precisely where a corrupt, missing or
+  locked object surfaces — and "which object" is the only fact that makes it
+  actionable.
+
+Net effect: the next time this fires, the daemon log contains a readable
+traceback naming the object, and it is already inside what the
+share-diagnostics bundle collects. No terminal, no reproduction attempt, no
+timing.
+
 ## 0.55.173 — a once-a-day diagnostic stopped the daemon from ever binding
 
 Field 2026-07-31, **both** of Kent's machines dead at once, on the first boot of
