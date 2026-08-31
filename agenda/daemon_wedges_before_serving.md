@@ -94,6 +94,44 @@ byte to it before starting the daemon skips the whole path:
 echo x >> <$AZT_HOME>/daemon-<peer>-2026-07-31_log.txt
 ```
 
+## Third face, and the client-side bounds now in place (2026-08-24)
+
+Hit again on Kent's machine, this time on azt's STARTUP attach. Faulthandler stack:
+`socket.readinto` ← `urlopen` ← `loopback._call_once` ← `rpc.call` ←
+`client.open_project` ← `azt/backend/core/collab.py::attach` ← `main.py::_run_setup`
+← `run` — i.e. on the main thread BEFORE `mainloop`. Not a frozen UI: a startup that
+never completes, and therefore can never tell the user why.
+
+The client had already diagnosed it correctly on stderr:
+
+```
+SERVICE_WEDGED (pid 296572 is running but not answering /v1/health)
+ — not respawning, not touching server.json; restart that process
+```
+
+That refusal is right — a live pid holding the flock must not be papered over — and it
+even names the remedy. **The defect is that nothing could surface it**, because the host
+app was blocked before it had a UI. `pkill` then produced `Connection reset by peer` and
+the client logged `SERVICE_RESTARTED` and recovered on its own.
+
+Bounded on the client side, since the daemon fix is the slower half:
+
+- `azt_collab_client.open_project(langcode, timeout=…)` — `rpc.call` always accepted a
+  timeout; the wrapper simply never exposed it. Timeout returns None, which is what peers
+  already handle for an unreachable daemon. Canonical, so recorder and viewer get it too.
+- `azt collab.attach` passes `ATTACH_TIMEOUT_S = 20`, falling into the existing NO_SERVER
+  decline. `TypeError` fallback for an older client.
+
+That makes THREE separately-bounded call sites for one daemon defect — save (`submit_file`
+still unbounded, `submit_file_needs_a_timeout.md`), the status poll
+(`busy_is_not_unavailable.md`, threaded 08-21), and now attach. Each needed its own fix
+because each had its own unbounded call. Worth asking whether `rpc.call`'s 300 s default
+is the real bug: nothing a UI thread calls should ever be able to wait that long.
+
+Retired hypothesis, recorded so it isn't re-derived: that an inherited file descriptor in
+a forked child was holding the accepted connection open after the parent was killed. The
+`Connection reset by peer` shows the kill did close it.
+
 ## Plans
 
 **Status 2026-07-31.** Shipped: 1, 4, 5, 6 in 0.55.173; 3 in 0.55.173 and

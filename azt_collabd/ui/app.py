@@ -5803,8 +5803,11 @@ class CollabUIApp(App):
             # wrong-machine bug this change exists to remove.
             if code == 'FAILED':
                 try:
-                    from azt_collab_client import transports as _tr
-                    _remote = bool(_tr.is_remote())
+                    # NOT `as _tr` — that shadowed the module-level
+                    # translator (line 83) for the whole of _work,
+                    # which killed the window on every real update.
+                    from azt_collab_client import transports as _transports
+                    _remote = bool(_transports.is_remote())
                 except Exception:
                     _remote = False
                 if not _remote:

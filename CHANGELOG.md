@@ -9,6 +9,33 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.193 — the Update button killed its own window: a module import shadowed `_tr`
+
+`_desktop_git_update._work` did `from azt_collab_client import transports as _tr`
+(`ui/app.py:5806`). `_tr` is the module-level translator (`ui/app.py:83`), so that
+single assignment made `_tr` **local to the whole function**.
+
+On the success path — `code == 'UPDATED'`, which is every real update — the `FAILED`
+branch never runs, so the local `_tr` is never bound. The Clock callback scheduled at
+:5828 then evaluates `_tr('Updated — restarting the service…')` on the Kivy main
+thread and raises, and Kivy's default `ExceptionManager` policy takes the app down.
+That is the window death. Worse, `_work` runs on a `daemon=True` thread, so the dying
+process can take `restart_server()` at :5832 with it — which is why the daemon was
+still on the old version when the window was reopened, and why the restart then had
+to be done by hand.
+
+On `FAILED` the name *is* bound — to the module — so `:5854` would have raised
+`TypeError: 'module' object is not callable` instead of reporting why the update
+failed.
+
+Renamed the import to `_transports`; nothing else changed. `:3759` shadows `_tr` the
+same way but binds a callable translator at the top of its function before any use,
+so it is benign — left alone.
+
+Invisible to `py_compile` and there is no UI test; `pyflakes` over `ui/app.py` catches
+this class of bug. **Not yet reproduced against the field sequence** — the repro this
+needs is written up in `agenda/update_via_admin_double_restart.md`.
+
 ## 0.55.192 — restore the Windows daemon lock; the field already ran it
 
 0.55.191 withdrew 0.55.189's `msvcrt.locking` guard as untested. It turns out it

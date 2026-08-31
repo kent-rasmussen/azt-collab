@@ -7,7 +7,7 @@ display. ``Result.has(S.PUSHED)`` etc. is the way to drive business
 logic — no more substring matching on log strings.
 """
 
-__version__ = "0.55.192"
+__version__ = "0.55.195"
 # Floor on the azt_collabd version this client is willing to talk
 # to. ``check_server_compat()`` returns ``server_too_old`` when the
 # running daemon is below this; peer apps surface that to the user
@@ -2278,11 +2278,25 @@ def list_projects():
     return [Project.from_dict(p) for p in resp.get('projects', [])]
 
 
-def open_project(langcode):
-    """Return the registered Project for *langcode*, or None."""
+def open_project(langcode, timeout=None):
+    """Return the registered Project for *langcode*, or None.
+
+    *timeout* seconds for the RPC; None keeps ``rpc.call``'s default of
+    300. A caller that cannot afford to block — attach during a host
+    app's STARTUP, before it has a UI to say anything with — should pass
+    a small one: a daemon that is listening but not yet serving answers
+    nothing, and 300 s of that is indistinguishable from a hang (field
+    repro 2026-08-24, azt frozen in ``_run_setup`` before ``mainloop``).
+    Returning None on timeout is the same answer the peer already
+    handles for an unreachable daemon."""
     try:
-        resp = call('GET', f'/v1/projects/{langcode}')
+        kw = {} if timeout is None else {'timeout': timeout}
+        resp = call('GET', f'/v1/projects/{langcode}', **kw)
     except ServerUnavailable:
+        return None
+    except OSError:
+        # socket.timeout is an OSError; a bounded caller asked for this,
+        # so it is "no answer", not an error to propagate into startup.
         return None
     if not resp.get('ok'):
         return None

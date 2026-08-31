@@ -81,7 +81,7 @@ source.include_patterns = main.py,service.py
 # index seed assets, copied into $AZT_HOME/cawl/ on first
 # daemon access for that repo if no cache file exists yet.
 # Closes install-day-no-network for index lookup.
-source.include_exts = py,xml,gz,png,po,mo,json
+source.include_exts = py,xml,gz,png,po,mo,json,properties
 
 # Maintainer / desktop-only scripts that get swept up by the
 # include_exts glob but have no business living in the on-device
@@ -142,6 +142,7 @@ android.archs = arm64-v8a, armeabi-v7a
 android.ndk = 29
 #p4a.master:
 #android.ndk = 27
+
 
 # Custom suite signature permission. Same name and signature as
 # every peer APK. Without that match, install-time grant is denied
