@@ -331,7 +331,7 @@ CONTRIBUTOR_UNSET = 'CONTRIBUTOR_UNSET'
 
 # ── LAN sync transport (parked spec, phases 1-8) ───────────────────────────
 # Status codes for the device-to-device LAN sync transport
-# (``docs/local_lan_sync_stub.md``). Each code is mirrored in
+# (the LAN-sync design spec). Each code is mirrored in
 # ``azt_collab_client/status.py``.
 #
 # LAN_PAIRED:           Peer entry written to peers.json on a successful

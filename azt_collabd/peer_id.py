@@ -1,6 +1,6 @@
 """
-Per-device identity for the LAN sync transport (parked design in
-``docs/local_lan_sync_stub.md``, phase 1).
+Per-device identity for the LAN sync transport (the parked
+LAN-sync design spec, phase 1).
 
 On first use, generates an ed25519 keypair and a self-signed X.509
 cert with the ed25519 pubkey as the subject public key and a 100-year

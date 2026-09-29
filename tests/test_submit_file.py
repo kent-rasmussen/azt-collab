@@ -1,6 +1,6 @@
 """Tests for the ``submit_file`` RPC (0.53.0) and its sibling
 desktop-adopt hardening — the daemon half of the AZT persistence
-contract (azt-collab/agenda/azt_persistence_server_sync.md, G1–G4).
+contract (the AZT-persistence / server-sync design, G1–G4).
 
 What's covered:
 

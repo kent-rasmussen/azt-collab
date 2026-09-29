@@ -786,7 +786,7 @@ class UnrelatedHistoriesError(Exception):
     meant to stay separate) DO share an ancestor, so this guard
     does not fire for them — keeping forks apart requires a project
     identity distinct from the langcode (tracked in
-    agenda/project_identity_beyond_langcode.md); until that ships,
+    the project-identity-beyond-langcode item); until that ships,
     the only protection for forks is not sharing them to the same
     peers."""
 
@@ -1178,7 +1178,7 @@ def _merge_diverged(repo, project_dir, branch, local_sha, remote_sha):
 # emailed-backup variant, report, and PDF. Appended (idempotently) to
 # the project's ``.gitignore`` at registration — see
 # ``ensure_ignore_patterns`` and the AZT persistence contract
-# (azt-collab/agenda/azt_persistence_server_sync.md, G3/D5/D6).
+# (the AZT-persistence / server-sync design, G3/D5/D6).
 AZT_DESKTOP_IGNORES = (
     '*.lift*txt',            # daily crash-safety backups (kept, emailed)
     '*.gz',                  # writegzip variants
@@ -1277,7 +1277,7 @@ def _worktree_has_files(directory):
 # A dulwich ``Repo`` holds open file descriptors (pack files, index)
 # until ``.close()`` — and reference cycles inside dulwich mean GC
 # does NOT reliably release them. Field incident 2026-07-10 (karlap
-# desktop, agenda/daemon_fd_leak_emfile_hardening.md): un-closed
+# desktop, the daemon fd-leak (EMFILE) hardening item): un-closed
 # Repos from the ~10 s status poll + per-gesture commit paths
 # exhausted the process fd table (EMFILE) in under a day, wedging
 # the LAN listener, the drain loop, and even ``/v1/health``.
@@ -3299,7 +3299,7 @@ def repo_status_summary(project_dir):
         # left the project's pack/index fds open until GC got
         # around to it, which on the 2026-07-10 karlap desktop
         # exhausted the fd table in under a day (EMFILE incident —
-        # see agenda/daemon_fd_leak_emfile_hardening.md).
+        # see the daemon fd-leak (EMFILE) hardening item).
         if repo is not None:
             try:
                 repo.close()
@@ -4010,7 +4010,7 @@ def init_repo(project_dir, remote_url, username, token,
     the user already committed to. State changes only on a
     successful ``PUSHED``; otherwise the working tree is left
     exactly as the user last saw it, and the next daemon
-    startup retries silently. See ``docs/Publish_errors.md`` for
+    startup retries silently. See the publish-errors notes for
     the rationale."""
     _ensure_ssl()
     try:
@@ -4519,7 +4519,7 @@ def submit_file(project_dir, rel_path, staged_path, base_sha,
                 contributor_name, message=None):
     """Base-aware whole-file write + commit — the desktop A-Z+T save
     primitive (0.53.0; contract in
-    azt-collab/agenda/azt_persistence_server_sync.md → to land in
+    the AZT-persistence / server-sync design → to land in
     CLIENT_INTEGRATION.md).
 
     The caller has serialized the full file to *staged_path* (a
@@ -5375,7 +5375,7 @@ def push_repo(project_dir, username, token):
     # ``project_lock`` held 125–625 s repeatedly, which is what made LAN
     # post-receive resets time out at 5 s (received peer data sat
     # unabsorbed all day) and AZT saves return BUSY. It is the WAN half
-    # of agenda/daemon_lock_across_network_io.md.
+    # of the project-lock-across-network-I/O item.
     #
     # Safe to hoist because Phase A only:
     #   - READS local objects, which are content-addressed — two readers
@@ -5812,8 +5812,8 @@ def _pick_intermediate_sha(repo, base_sha, tip_sha, n):
     # objects — quadratic in the delta size. Field 2026-07-28: 134–145 s
     # per call on an 816-commit delta, with ``project_lock`` held
     # throughout, which is what made LAN post-receive resets time out at
-    # 5 s and AZT saves return BUSY (agenda:
-    # daemon_lock_across_network_io). The watchdog also read it as a
+    # 5 s and AZT saves return BUSY (the
+    # project-lock-across-network-I/O item). The watchdog also read it as a
     # stall and, before 0.55.73, restarted the daemon over it.
     #
     # Same answer, computed once: build a parent→children map over the
@@ -7575,7 +7575,7 @@ def _sweep_orphan_preseed_refs(
     # refs are offered as ``haves``, and a ``have`` the server cannot
     # resolve is a plausible cause of the ``unpack index-pack failed``
     # thin-push rejections that force whole-pack fallbacks. See
-    # agenda/stale_seed_refs_poison_haves.md.
+    # the stale-seed-refs item.
     #
     # GUARDED ON A SUCCESSFUL ADVERTISEMENT. ``_server_refs`` is ``{}``
     # when the listing FAILED, which is indistinguishable from "the

@@ -884,7 +884,7 @@ def _normalize_entry(entry, path='', audio_recency=None):
             #    the merge will need per-gloss IDENTITY (base-match /
             #    id, like _pair_same_key) to tell them apart. Until
             #    then, treat all same-lang gloss multiplicity as valid.
-            #    See agenda/lift_merge_robustness.md (2026-07-22).
+            #    See the LIFT merge robustness item (2026-07-22).
             if tag == 'gloss':
                 stripped = 0
                 for f in survivors:
@@ -913,7 +913,7 @@ def _normalize_entry(entry, path='', audio_recency=None):
             #    still-None case (resolver absent, e.g. a caller that
             #    passes nothing) falls through to annotate. See
             #    three_way_merge ``audio_recency`` +
-            #    agenda/lift_merge_robustness.md.
+            #    the LIFT merge robustness item.
             if (tag == 'form' and audio_recency is not None
                     and lang.endswith(_AUDIO_LANG_SUFFIX)):
                 best = None

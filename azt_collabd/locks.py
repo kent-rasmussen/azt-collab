@@ -119,7 +119,7 @@ _locks: dict = {}
 # incident cost an evening of inference over a silent log. Anything
 # holding a project lock for tens of seconds is either doing network
 # I/O under it (the regression tracked in
-# agenda/daemon_lock_across_network_io.md) or deadlocked.
+# the project-lock-across-network-I/O item) or deadlocked.
 _held_lock = threading.Lock()
 _held: dict = {}
 

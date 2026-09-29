@@ -622,8 +622,8 @@ KV_TEMPLATE = '''
                         text: _('no')
                         on_press: root.set_work_offline_mode(False)
                 # LAN sync (0.45.0). Daemon-wide toggle for the
-                # device-to-device fan-out transport (parked design
-                # in ``docs/local_lan_sync_stub.md``). When on, the
+                # device-to-device fan-out transport (the parked
+                # LAN-sync design spec). When on, the
                 # listener thread runs + (Android) the :provider
                 # service is promoted to a foreground service of
                 # type specialUse. Hot-applied — flipping does NOT

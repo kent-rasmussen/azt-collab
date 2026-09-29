@@ -6,7 +6,7 @@
 #
 #   baseline   — normal cold start
 #   doze       — device forced into doze (Q2 in
-#                  docs/daemon_boot_plan.md)
+#                  the daemon boot plan)
 #   prewarm    — peer expected to call prewarm() in App.build()
 #                  (Q3)
 #   doze+prewarm — combination (sanity check of the worst case)

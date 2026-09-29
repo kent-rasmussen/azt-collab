@@ -47,7 +47,7 @@ import android.util.Log;
  * peers signed with the wrong key fail the bind at install-grant
  * time and the connector silently logs the SecurityException.
  *
- * <p>Shipped per Phase B2 of <code>docs/daemon_boot_plan.md</code>
+ * <p>Shipped per Phase B2 of the daemon boot plan
  * (azt_collab_client 0.33.0). The server APK side (this same Service
  * class file) needed no change — its {@code onBind} has returned a
  * stub Binder + tracked <code>sBoundCount</code> since the original

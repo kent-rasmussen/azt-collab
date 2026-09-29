@@ -1,5 +1,5 @@
 """Regression tests for the 2026-07-10 fd-exhaustion incident
-(agenda/daemon_fd_leak_emfile_hardening.md).
+(the daemon fd-leak (EMFILE) hardening item).
 
 A dulwich ``Repo`` holds open pack/index fds until ``.close()``, and
 reference cycles inside dulwich mean GC does not reliably release

@@ -71,7 +71,7 @@ def build_canonical_merge_message(branch, commits_a, commits_b,
     same merge produced different messages, hence different commit
     SHAs, hence neither peer could fast-forward to the other and both
     re-merged forever (the ping-pong in
-    agenda/daemon_lock_across_network_io.md). This renders both sides
+    the project-lock-across-network-I/O item). This renders both sides
     as one set, ordered by SHA, so peer A and peer B produce byte-
     identical text for the same pair of parents.
 

@@ -982,7 +982,7 @@ def set_device_name(name):
 # ── LAN sync identity + paired list (phase 1) ──────────────────────────────
 #
 # Daemon-owned per-device identity for the parked LAN-sync transport
-# (``docs/local_lan_sync_stub.md`` in the canonical repo). These
+# (the LAN-sync design spec). These
 # getters are query-shaped and follow the standard rule: never raise
 # from a query wrapper; on transport failure return the empty
 # equivalent so a peer offline can still render its settings UI.

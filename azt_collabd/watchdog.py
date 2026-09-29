@@ -32,7 +32,7 @@ Signals watched:
   minutes old means that loop is not running.
 - **Held project locks** (``locks.held_snapshot()``). A lock held for
   minutes is network I/O under the lock (the regression tracked in
-  ``agenda/daemon_lock_across_network_io.md``) or a deadlock.
+  the project-lock-across-network-I/O item) or a deadlock.
 
 What this deliberately does NOT do: restart because a single RPC was
 slow, or because a merge is taking a while. Thresholds are minutes,

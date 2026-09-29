@@ -756,7 +756,7 @@ def main():
     # registry remote_url empty) mismatch, and re-fires the
     # publish the user already committed to. See
     # ``azt_collabd/repo.py::reconcile_publish_state_on_startup``
-    # and ``docs/Publish_errors.md`` for the rationale. Wired here
+    # and the publish-errors notes for the rationale. Wired here
     # in the Android entry path because the desktop entry point
     # (``azt_collabd.server.serve``) has its own copy; both daemon
     # startups need this call. (Missed in 0.50.53–0.50.54 — only

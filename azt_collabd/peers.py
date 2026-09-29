@@ -1,6 +1,6 @@
 """
-Paired-peers registry for the LAN sync transport (parked design in
-``docs/local_lan_sync_stub.md``, phase 1).
+Paired-peers registry for the LAN sync transport (the parked
+LAN-sync design spec, phase 1).
 
 Persists ``$AZT_HOME/peers.json``:
 

@@ -130,7 +130,7 @@ _jobs: "OrderedDict[str, Job]" = OrderedDict()
 # tick (0.54.89). Surfaced by ``/v1/health`` so a wedge is detectable
 # programmatically: HTTP answering while a heartbeat goes stale means
 # the daemon is up but its working loops are not. See
-# agenda/daemon_lock_across_network_io.md.
+# the project-lock-across-network-I/O item.
 _heartbeats: dict = {}
 
 
@@ -1507,7 +1507,7 @@ def _drain_pending_push(ignore_backoff=False):
     # can therefore stall every local operation on that project for
     # minutes — the "azt clients freeze when wifi internet is on"
     # symptom (Kent 2026-07-28). The lock phase-split is the real fix
-    # (``agenda/daemon_lock_across_network_io.md``); this restores the
+    # (the project-lock-across-network-I/O item); this restores the
     # user's ability to say "not now" and have it mean something.
     #
     # LAN sync is deliberately unaffected: ``lan_push`` never consults

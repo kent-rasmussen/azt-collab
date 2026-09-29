@@ -645,7 +645,7 @@ def _push_to_peer_inner(project, peer_entry, pid, expected_fp):
         # not ECONNREFUSED — pre-0.54.3 that skipped this whole
         # block, so the stale address was never invalidated OR
         # demoted and got re-dialed every fan-out (field repro
-        # 2026-07-11, agenda/lan_stale_peer_address.md). Matching is
+        # 2026-07-11, the LAN stale-peer-address item). Matching is
         # deliberately connect-phase only ('connect timeout' /
         # ConnectTimeoutError) — a READ timeout mid-transfer means
         # the address was fine.
@@ -2341,7 +2341,7 @@ def fetch_diagnostics_from_peer(peer_id, read_timeout_s=180):
 def send_restart_request(peer_id):
     """Ask a paired peer's daemon to restart itself (0.54.74) — the
     remote leg of wedge recovery
-    (agenda/pull_diagnostics_over_peer_link.md). Cooperative only:
+    (the pull-diagnostics-over-peer-link item). Cooperative only:
     reaches the wedged-ALIVE class, where the peer's listener
     thread still serves while its scheduler threads are stuck on
     ``project_lock``/network — the common field wedge. A fully

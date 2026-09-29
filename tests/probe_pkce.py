@@ -7,7 +7,7 @@ Not a pytest test (filename intentionally lacks the ``test_`` prefix
 so it isn't auto-collected). Run it by hand from a desktop venv —
 needs a real browser, a real GitHub login, and the App's
 ``client_id`` (and, for cases 3 and 4, the ``client_secret``). See
-``docs/web_flow_migration_plan.md`` Phase 1 for the four test cases.
+the web-flow migration plan Phase 1 for the four test cases.
 
 Usage:
 
@@ -292,7 +292,7 @@ def main():
         sys.exit('Set AZT_GITHUB_APP_CLIENT_ID before running.')
     client_secret = os.environ.get('AZT_GITHUB_APP_CLIENT_SECRET', '').strip()
 
-    print('PKCE probe — see docs/web_flow_migration_plan.md Phase 1.')
+    print('PKCE probe — see the web-flow migration plan Phase 1.')
     print()
     print(f'  client_id    = {client_id}')
     print(f'  redirect_uri = {REDIRECT_URI}')

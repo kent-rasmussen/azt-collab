@@ -7,7 +7,7 @@ pushing the result to both sides.
 Known limit (documented on the exception): projects FORKED from one
 another share an ancestor, so this guard does not fire for them —
 that case needs project identity beyond the langcode
-(agenda/project_identity_beyond_langcode.md).
+(the project-identity-beyond-langcode item).
 """
 
 import pytest

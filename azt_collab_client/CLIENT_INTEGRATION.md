@@ -468,7 +468,7 @@ value the daemon owns as the project's langcode.
 
 The contract for a peer that serializes and saves the **entire LIFT**
 per edit (desktop A-Z+T) instead of using § 9a's surgical writes.
-Design + rationale: `azt-collab/agenda/azt_persistence_server_sync.md`.
+Design + rationale: the AZT-persistence / server-sync design.
 
 A whole-file editor MUST NOT plain-overwrite the working-tree LIFT: the
 daemon merges peer changes into that file (WAN sync, LAN receive), and

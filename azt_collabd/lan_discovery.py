@@ -320,7 +320,7 @@ def _clear_unreachable_on_announcement(peer_id_hex):
     phone side the gate stayed set while the desktop announced its
     post-restart port the whole time, and every sweep fast-fail
     skipped it (`lan_unshared` climbed 11 → 12+; field repro
-    2026-07-11 ~17:19, agenda/lan_stale_peer_address.md). Worst
+    2026-07-11 ~17:19, the LAN stale-peer-address item). Worst
     case of clearing on every announcement: a peer whose daemon
     announces but whose listener is wedged costs one real connect
     attempt per fan-out instead of a microsecond skip — bounded,
@@ -516,7 +516,7 @@ def _zc_listener_class():
             # (field repro 2026-07-11: pushed to hotspot ghost
             # 10.42.0.100:40425 while the phone was announcing
             # 192.168.10.23:39391 — see
-            # agenda/lan_stale_peer_address.md).
+            # the LAN stale-peer-address item).
             try:
                 _persist_resolved_endpoint(
                     peer_id, host, int(info.port))

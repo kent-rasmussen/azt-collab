@@ -22,7 +22,7 @@ Why this exists: the daemon's remote handling is intended to be
 host-agnostic. The github-mediated path is what's exercised in
 the field, but a team can equally point ``Project.remote_url``
 at a gitea / forgejo / gogs / git-daemon on the office LAN. The
-parked LAN-sync spec (``docs/local_lan_sync_stub.md``) builds
+parked LAN-sync design spec builds
 on dulwich.web as the in-process listener, so exercising
 dulwich.web as a git server in CI today gives the spec a
 foundation that won't quietly rot. A future github-ism

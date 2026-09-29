@@ -25,7 +25,7 @@ source of truth for what shipped when) before each release pass.
   3-step indicator, state-aware primary button, pre-flight
   explanation, "Verify setup" relabel, create-account link,
   Connect/Settings button gating. See
-  `github_connect_ux_audit.md` for the audit trail.
+  the GitHub-connect UX audit for the audit trail.
 - **Grant-collaborator UI** — peer can invite GitHub
   collaborators per-project via reusable popup
   (`grant_collaborator_popup`). See
@@ -48,11 +48,11 @@ source of truth for what shipped when) before each release pass.
 
 ## Cleanup history
 
-- 2026-05-09: `daemon_boot_plan.md` pruned to status-first form.
-  `github_connect_ux_audit.md` implementation-order list
+- 2026-05-09: the daemon boot plan pruned to status-first form.
+  The GitHub-connect UX audit implementation-order list
   refreshed (1–7 done). `p4a_hook_picker_intent.md` reduced to
   a redirect stub (work shipped in v0.28.x). This file
   created.
 - 2026-06-29: open-work section removed (now tracked in the
-  agenda); file moved to `agenda/` and reframed as a
+  agenda); moved to the agenda and reframed as a
   status + doc-index page.

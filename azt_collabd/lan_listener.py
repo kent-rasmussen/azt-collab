@@ -1,6 +1,6 @@
 """
-LAN sync HTTPS listener (parked design in
-``docs/local_lan_sync_stub.md``, phase 4).
+LAN sync HTTPS listener (the parked
+LAN-sync design spec, phase 4).
 
 When the daemon-wide ``lan.allow_sync`` toggle is on, ``apply_toggle()``
 spins up a threaded ``dulwich.web``-backed HTTPS server bound to
@@ -3824,7 +3824,7 @@ def _outward_ip_guess():
     platforms keep the old '0.0.0.0' fallback. (A multi-homed host
     whose default route is NOT the drill network still advertises the
     wrong IP — the real fix is advertising all addresses in the QR,
-    tracked in agenda/local_lan_sync_stub.md § Pairing.)"""
+    tracked in the LAN-sync design spec § Pairing.)"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:

@@ -52,7 +52,7 @@ returns** (`ui/decisions.py::_open_share_offer_popup`, `_accept`
   a no-op, the popup stays, and every later tap (including
   Decline) queues behind the wedged main thread. This composes
   with the confirmed hold-`project_lock`-across-network-I/O
-  regression (agenda/daemon_lock_across_network_io.md): a
+  regression (the project-lock-across-network-I/O item): a
   daemon wedged on network I/O under the lock blocks even the
   quick `lan_decline_offer` round-trip indefinitely.
 - Neither helper can raise (both swallow `ServerUnavailable`),

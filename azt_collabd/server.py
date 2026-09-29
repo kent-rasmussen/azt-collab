@@ -436,7 +436,7 @@ def _health_liveness():
       incident.
     - ``locks_held`` — which project lock is held, by which thread,
       for how long. Tens of seconds means network I/O under the lock
-      (agenda/daemon_lock_across_network_io.md) or a deadlock. This is
+      (the project-lock-across-network-I/O item) or a deadlock. This is
       the field that NAMES the stuck operation.
     - ``heartbeats`` — seconds since each daemon loop last ticked. A
       stale heartbeat beside a live HTTP thread IS the wedge.
@@ -565,7 +565,7 @@ def _h_set_device_name(body):
 
 def _h_lan_peer_id(_body):
     """Return this daemon's LAN peer identity. Phase 1 of the LAN
-    sync transport (parked design in ``docs/local_lan_sync_stub.md``).
+    sync transport (the parked LAN-sync design spec).
 
     Response: ``{ok: True, peer_id, fp, device_name}``. Lazy-creates
     the ed25519 keypair + self-signed X.509 cert on first call. If
@@ -7297,7 +7297,7 @@ def run(host='127.0.0.1', port=0):
         # silent publish failure. After this runs, the picker's
         # publish-row gate sees both sides empty and shows the Publish
         # button so the user can re-click. See
-        # ``docs/Publish_errors.md``.
+        # the publish-errors notes.
         try:
             from . import repo as _repo
             _repo.reconcile_publish_state_on_startup()

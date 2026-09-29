@@ -34,7 +34,7 @@ so it is benign — left alone.
 
 Invisible to `py_compile` and there is no UI test; `pyflakes` over `ui/app.py` catches
 this class of bug. **Not yet reproduced against the field sequence** — the repro this
-needs is written up in `agenda/update_via_admin_double_restart.md`.
+needs is written up in the update-via-admin double-restart item.
 
 ## 0.55.192 — restore the Windows daemon lock; the field already ran it
 
@@ -75,7 +75,7 @@ storm, which is 0.55.190 — client-side, and unable to prevent a daemon startin
 The daemon-side guard is still worth having as a backstop, and should be ported
 from azt's existing single-instance module rather than invented here: Kent wrote
 that one because this is hard on Windows, and its failure modes are already
-known. Recorded in `agenda/daemon_needs_real_single_instance_guard.md`.
+known. Recorded in the daemon single-instance-guard item.
 
 **0.55.191 is the deployable version.** It contains 0.55.190's spawn fix and
 nothing that can stop a daemon from coming up.
@@ -225,7 +225,7 @@ offered as `haves`, and a `have` the server can't resolve is a plausible cause
 of the `unpack index-pack failed` thin-push rejections that force whole-pack
 fallbacks — 289 MB instead of 201 KB on `baf`. Unconfirmed; the check is whether
 thin pushes start being accepted once the stale refs are gone. See
-`agenda/stale_seed_refs_poison_haves.md`.
+the stale-seed-refs item.
 
 ## 0.55.186 — 38 connections to delete 38 refs, all refused, every sweep
 
@@ -683,12 +683,12 @@ a status walk — are done well inside 3 s, while the ones that don't are networ
 pushes measured in minutes.
 
 This does not fix the cause, which is
-`daemon_lock_across_network_io.md` holding `project_lock` across a socket write.
+the project-lock-across-network-I/O item — holding `project_lock` across a socket write.
 It stops the user paying 42 seconds and a frozen window to be told so. Two
 follow-ups it makes obvious, both peer-side: azt's 3 × 0.7 s retry is now nearly
 free but still pointless against a minutes-long holder — the daemon could return
 the holder age so the peer can skip retrying — and the save still runs on the UI
-thread, which is the `busy_is_not_unavailable` no-UI half.
+thread, which is the no-UI half of the azt "BUSY is not unavailable" item.
 
 ## 0.55.171 — maintenance must never starve a save
 
@@ -699,7 +699,7 @@ while `n_changes` climbed 1 → 2 → 3 and stayed. Two things were holding
 `project_lock`:
 
 - `wan-drain`, for **125 s**, with the watchdog's stack inside `_push_thin` →
-  `send_pack` → `ssl.sendall`. That is agenda `daemon_lock_across_network_io.md`
+  `send_pack` → `ssl.sendall`. That is the project-lock-across-network-I/O item
   with exactly the evidence it asked for — the lock held across a socket write
   to github — and it is not fixed here.
 - **the maintenance repack, for 49 s**, which is mine and is fixed here.
@@ -1909,7 +1909,7 @@ translation uses them: `Busy: commit_repo baf (94s). Try again in a moment.`
 Best-effort — a missing snapshot degrades to the old sentence rather than
 turning a lock timeout into an error.
 
-The peer half is `azt/agenda/busy_is_not_unavailable.md`: retry brief holds
+The peer half is the azt "BUSY is not unavailable" item: retry brief holds
 instead of switching to legacy mode, never word `BUSY` as "unavailable", and —
 the priority — **never leave the user with no UI**, which is what it actually
 did in the field. A save that can't reach the daemon must still hand control
@@ -2332,7 +2332,7 @@ refused. Visible after the fact beats unavailable by policy.
 
 ## 0.55.117 — settings at a distance: the grant, the transport, the launch
 
-Completes phases 2–4 of `agenda/remote_settings_over_lan.md` on top of
+Completes phases 2–4 of the remote-settings-over-LAN item on top of
 0.55.101 (crypto) and 0.55.102 (the `/v1/lan/admin` endpoint).
 
 **The grant.** `peers.json` entries gain `admin`, default False, set only by
@@ -2876,7 +2876,7 @@ the client-side LAN transport, `--peer` launch, and the peer-row button.
 ## 0.55.101 — LAN identity can be proved, not just asserted (phase 1)
 
 First phase of remote-settings-over-LAN
-(`agenda/remote_settings_over_lan.md`), and a security fix that stands on
+(the remote-settings-over-LAN item), and a security fix that stands on
 its own.
 
 **LAN identity was forgeable.** A caller stated its `peer_id` in the request
@@ -3394,7 +3394,7 @@ the entire push, and Phase A is the part that takes hours — field
 2026-07-28: held **125–625 s** repeatedly, which is what made LAN
 post-receive resets time out at 5 s (peer data sat unabsorbed all day) and
 AZT saves return `BUSY`. This is the WAN half of
-`agenda/daemon_lock_across_network_io.md`; 0.55.83 fixed the other half
+the project-lock-across-network-I/O item; 0.55.83 fixed the other half
 (the quadratic `_pick_intermediate_sha` inside the same hold).
 
 Safe to hoist because Phase A only **reads** local objects — content
@@ -3429,7 +3429,7 @@ restart the daemon over it).
 Same answer, computed once: build a parent→children map over the delta and
 BFS out from base. Everything reached descends from base, which is exactly
 what the per-candidate test established. This is the second half of
-`agenda/daemon_lock_across_network_io.md` — the half that isn't about
+the project-lock-across-network-I/O item — the half that isn't about
 network I/O at all.
 
 **Push liveness (`push_progress`).** `wan_unshared` already counts down as
@@ -3590,7 +3590,7 @@ Which means the 8.9 GB is **genuine**: ~2,330 objects averaging 3.8 MB is
 audio the merge introduces that github does not have. No estimate fix and no
 walk reordering makes it smaller; it is data that has to travel. The goal is
 therefore **resumability, not shrinkage** — see
-`agenda/merge_aware_chunk_ordering.md`, which now carries the worked design.
+the merge-aware chunk-ordering item, which now carries the worked design.
 
 ## 0.55.79 — pre-seed before a push we've already measured as hopeless; show push progress
 
@@ -4816,7 +4816,7 @@ that have been freezing when wifi internet is on."*
 - Both stale docstrings corrected.
 
 The lock phase-split remains the real fix
-(`agenda/daemon_lock_across_network_io.md`, #11 — LAN half shipped
+(the project-lock-across-network-I/O item, #11 — LAN half shipped
 0.55.24, WAN half open). This restores the user's ability to say "not
 now" and have it mean something.
 
@@ -5227,7 +5227,7 @@ serious half: a focused-but-unnoticed field takes keystrokes, so text can
 land in the contributor input, and anything that commits on blur or Enter
 would change the contributor silently. Tracked with the swipe /
 touch_down audit in
-`agenda/presplash_hold_until_responsive.md`.
+the presplash-hold item.
 
 ## 0.55.27 — "couldn't ask" stops masquerading as "nothing configured"
 
@@ -5352,7 +5352,7 @@ is the first one to name culprits rather than describe symptoms.
   ssl.py:1167 read              ← parked here
 ```
 
-This is `agenda/daemon_lock_across_network_io.md` (#9) with evidence at
+This is the project-lock-across-network-I/O item (#9) with evidence at
 last, and the direct cause of `post-receive reset 'nml': lock busy (5s
 timeout)` repeating every 20–40 s for minutes on every device: inbound
 data landed and could never be absorbed, because an **outbound** merge
@@ -5422,7 +5422,7 @@ Remaining, in order of expected size: `refresh()` still calls both RPCs
 **on the UI thread** (bounded now, ~12 s worst case, was 77 s) and should
 go through `_rpc_then`; and the presplash's own 45 s watchdog did not cut
 in at 45 s on either device. Both in
-`agenda/presplash_hold_until_responsive.md`.
+the presplash-hold item.
 
 ## 0.55.22 — two UI-thread RPCs had a 300-second timeout
 
@@ -5462,7 +5462,7 @@ refactor touches the presplash-release path, where a mistake means a
 permanently stuck splash, so it is not something to do at the tail of a
 long session. Worst case after this change is ~12 s per refresh instead
 of 77; the remaining work is tracked in
-`agenda/presplash_hold_until_responsive.md`.
+the presplash-hold item.
 
 Also unexplained and worth its own look: the presplash's own 45 s
 watchdog did not cut in at 45 s on either device.
@@ -5588,7 +5588,7 @@ else serves slightly-stale rows rather than queueing behind a walk.
 `update_working_tree` → object unpacking for over 120 s, which is why
 `post-receive reset 'nml': lock busy (5s timeout)` repeated every 20–40 s
 from 14:31:20 to 14:38:20 — received data kept arriving and never landed.
-This is exactly the evidence `agenda/daemon_lock_across_network_io.md`
+This is exactly the evidence that the project-lock-across-network-I/O item
 (#9) was waiting for; recorded there, not fixed here.
 
 **Regression fixed: my own 0.55.13 cap was starving reverse delivery.**
@@ -5751,7 +5751,7 @@ served from jnius's per-class cache.
 Consequence worth re-timing: while this bind never happened,
 `:provider` never got bind-priority protection, leaving Android 15's
 freezer free to suspend the daemon. That is on the suspect list for the
-44 s startup silence in `agenda/presplash_hold_until_responsive.md` —
+44 s startup silence in the presplash-hold item —
 re-time a cold launch before doing more work there.
 
 ## 0.55.13 — reverse delivery was a mutual amplifier (regression, 0.55.10)
@@ -5840,7 +5840,7 @@ built for and came back empty-handed.
 
 Still unexplained from that log: what the `watcher` loop was blocked on
 for 120 s. The next stall on a build with this fix will say — which is
-the input `agenda/daemon_lock_across_network_io.md` (#9, dated
+the input that the project-lock-across-network-I/O item (#9, dated
 2026-07-28) has been waiting for.
 
 ## 0.55.11 — "up to date" no longer covers for a question never asked
@@ -6216,7 +6216,7 @@ after it consumes `status`/`online` for button state, and both the
 daemon-answered retry ladder and the presplash release hang off its
 result — so it needs the whole downstream block moved into an applier
 in one careful pass, not a partial conversion. Scoped in
-`agenda/presplash_hold_until_responsive.md`.
+the presplash-hold item.
 
 ## 0.55.0 — one long string trimmed; 0.54.x patch space exhausted
 
@@ -6303,7 +6303,7 @@ on every inbound POST, so a decline survived only while we could reach
 the sender to nack it — and one-way reachability (they reach us, we
 can't reach them) is exactly the case that keeps re-offering, so the
 offer returned forever (the open bug in
-`agenda/sync_status_board.md`). Declining now records the refusal in
+the sync status board item). Declining now records the refusal in
 `peers.json` (`declined_shares`), re-arriving offers are dropped
 locally and the nack re-attempted, and the sender rolls its own
 allowlist back when that lands. Superseded by a later accept, or by us
@@ -6533,7 +6533,7 @@ Spec from the AZT team, 2026-07-27: *"project_status would have to
 report the commits between azt's base and HEAD — count plus distinct
 author names — since azt in collab mode never touches .git itself and
 has no other way to know."* Exactly right, and it's the missing
-justification half of `agenda/spurious_team_update_prompts.md`:
+justification half of the spurious team-update prompts item:
 suppression removes prompts that shouldn't exist; this explains the
 ones that should.
 
@@ -6779,7 +6779,7 @@ own log went silent after 08:24:57 while the UI kept polling and
 timing out — a wedged-but-health-answering daemon, its zeroconf
 advertise/browse threads stuck in the same process, which is why the
 phones stopped listing the computer despite live USB links. Belongs to
-`agenda/daemon_lock_across_network_io.md`.
+the project-lock-across-network-I/O item.
 
 Client transport → relaunch the UI / restart peer processes.
 
@@ -7154,7 +7154,7 @@ the phone, take the log, and move on."* Collecting a log from someone
 else's working machine required opening THEIR collaboration UI —
 which in the field usually isn't even running. Now the operator plugs
 in, taps once on their own device, and walks away.
-Item: `agenda/pull_diagnostics_over_peer_link.md`.
+Tracked in the pull-diagnostics-over-peer-link item.
 
 **Pull (not push).** Pairing — a prior QR gesture on the owner's
 device — is the consent boundary; the pull needs zero interaction on
@@ -7234,7 +7234,7 @@ later committed those bytes (reconcile / debounced commit / next
 save's whole-tree staging); every subsequent save then declares a
 stale `base_sha` and takes the divergent `submit_file` path — a merge
 of the user's content with the user's content. Tracked at
-`agenda/spurious_team_update_prompts.md` (reopens the F4(c) tail of
+the spurious team-update prompts item (reopens the F4(c) tail of
 the 2026-07-09 arc, per its "reopen if the window returns" clause).
 
 - **`_submit_file_locked` now reports whether the divergent path
@@ -7581,7 +7581,7 @@ Daemon + settings UI → rebuild server APK / restart desktop daemon.
 ## 0.54.56 — clone/offer papercuts 1, 3, 4, 5
 
 Kent 2026-07-24. The remaining papercuts from the 2026-07-23 evening
-list (agenda/sync_status_board.md § Clone/offer completion papercuts;
+list (the sync status board item § Clone/offer completion papercuts;
 #2 shipped as 0.54.55).
 
 - **(1) Adopt-origin confirm now surfaces IN-FLOW** after an
@@ -7689,7 +7689,7 @@ surface there too.
 ## 0.54.52 — stale share-offer: sensible "not connected" message (offer surfacing, stage 1)
 
 Kent 2026-07-23, in the field. Stage 1 of the "surface offers, don't
-nag" redesign (agenda/sync_status_board.md § Pending offers).
+nag" redesign (the sync status board item § Pending offers).
 
 - Field: an accepted clone offer for `nml` from a phone that's no
   longer around kept surfacing, its clone failing against a dead
@@ -7828,7 +7828,7 @@ Kent 2026-07-23. Three related LAN/UX improvements.
   now a cheap cached read, no git work unless something changed. This is
   the "changes arrive with the changes" model and undoes the 2.5 s
   walk-storm that ANR'd the daemon (0.54.45). (#2b, real push via
-  Android ContentObserver, is deferred — see sync_status_board.md.)
+  Android ContentObserver, is deferred — see the sync status board item.)
 - **Fast USB-link watcher.** Interface-change detection moved out of the
   connectivity watcher (which backs off to ~15 s) into a dedicated ~3 s
   local watcher (`_iface_watcher_loop`) — cheap (`/sys/class/net` +
@@ -7860,7 +7860,7 @@ blocking"): two settings-screen polls introduced/aggravated the freeze.
   split into `_render_cawl_status`.
 
 Both are the acute triggers on top of the systemic root already tracked
-in `daemon_lock_across_network_io.md` (the daemon holds `project_lock`
+in the project-lock-across-network-I/O item (the daemon holds `project_lock`
 across network I/O, so a busy/slow daemon blocks UI RPCs). This makes
 the settings screen survivable now; the durable cure is that lock work.
 
@@ -8102,7 +8102,7 @@ names + best-effort default-route IP) and, on a change while LAN sync
 is on, calls `lan_discovery.restart_browse()` + `lan_burst.start_burst()`
 — re-arming discovery on the new interface and firing a burst so the
 peer is found and synced with no user action. mDNS crossing the tether
-link + arrival-fires-sweep were already proven (usb_cable_transport.md
+link + arrival-fires-sweep were already proven (the USB-cable transport item
 Phase 0); this closes the "who re-scans when the cable appears" gap.
 
 Also: while LAN sync is on, the adaptive connectivity poll is capped at
@@ -8152,7 +8152,7 @@ Behaviorally identical to before (it's the same resolution the non-LIFT
 paths already used — just reached in the right order); purely a cost
 cut, and the highest-frequency one since merges run constantly during
 an active session. First of the "cheap merge" wins from
-`daemon_lock_across_network_io.md`; per-entry incremental (for the
+the project-lock-across-network-I/O item; per-entry incremental (for the
 both-sides-changed case) remains the larger follow-on.
 
 ## 0.54.31 — audio-recency resolver: one walk, not one-per-file; forget shows why
@@ -8345,7 +8345,7 @@ dulwich — no git CLI, so it works on Android) and hands it to
 `lift_merge.three_way_merge(audio_recency=…)`. `_normalize_entry`'s new
 audio branch keeps the newest take, drops the older, strips the marker.
 
-Design decisions (all in agenda/lift_merge_robustness.md):
+Design decisions (all in the LIFT merge robustness item):
 - **Per-file commit, not branch-tip** — branch-tip is wrong for the
   normal field pattern (a month-dark phone's tip is "today", so its
   month-old files would beat another phone's yesterday work).
@@ -8446,7 +8446,7 @@ glosses are read-only (no edit UI). When gloss editing ships it must
 be revisited: two divergent same-lang glosses then become ambiguous
 (new synonym vs. edited-to-conflict) and the merge will need
 per-gloss identity to tell them apart. Tracked in
-agenda/lift_merge_robustness.md.
+the LIFT merge robustness item.
 
 Not shipped in the package (recovery tools, in scratchpad): a
 one-shot `strip_false_gloss_conflicts.py` (minimal-diff, gloss-scoped
@@ -8471,8 +8471,8 @@ DOCUMENTED LIMIT (the 2026-07-22 nml incident is NOT covered by
 this guard): projects forked from one another share an ancestor,
 so keeping intentional forks apart requires project identity
 beyond the langcode — design tracked in
-agenda/project_identity_beyond_langcode.md; the incident's
-recovery in agenda/disentangle_nml_repositories.md. The share
+the project-identity-beyond-langcode item; the incident's
+recovery in the disentangle-nml-repositories item. The share
 mis-bind that started it (a bare `nml` label silently pointing at
 a test directory) is the provenance-display work in the same item.
 
@@ -8633,7 +8633,7 @@ dial-time line (`dialing <peer> at <host>:<port> for <lang>`) so a
 sweep's attempts are visible when they START, not only when they
 fail minutes later.
 
-Session findings register: agenda/lan_field_robustness_audit.md
+Session findings register: the LAN field-robustness audit
 (F1–F8; this release closes F1's lan_push paths and the retry half
 of F5; F5's client-abort trigger + F2/F3/F4/F8 remain open there).
 
@@ -8890,7 +8890,7 @@ delivery. No wire-format change.
 ## 0.54.4 — merge: shared pollution counts as repairs, not conflicts
 
 Field repro (A3 drill rounds, 2026-07-11, →
-`agenda/lift_merge_robustness.md` § second round): ~290 Demo_en
+the LIFT merge robustness item § second round): ~290 Demo_en
 entries carry legacy duplicate same-lang glosses that are IDENTICAL
 on both devices. The 0.54.0 invariant sweep annotates them (correct
 — the pollution is real and should be visible), but the per-entry
@@ -8915,7 +8915,7 @@ merge.)
 ## 0.54.3 — LAN fan-out no longer dials stale peer addresses; listener keeps its port across restarts
 
 Field repro (karlap desktop, 2026-07-11, →
-`agenda/lan_stale_peer_address.md`): fan-out pushed to
+the LAN stale-peer-address item): fan-out pushed to
 `10.42.0.100:40425` — the phone's address from an earlier
 HOTSPOT pairing (NetworkManager sharing subnet) — and hung to
 ConnectTimeout, while the phone was right there announcing
@@ -9004,7 +9004,7 @@ is newer (`i18n.py` msgfmt-lite), so no build step changes.
 ## 0.54.1 — daemon fd leak fixed (EMFILE after ~1 day); health/spawn/allowlist hardening
 
 Field incident (karlap desktop, 2026-07-10, →
-`agenda/daemon_fd_leak_emfile_hardening.md`): after ~1 day of uptime
+the daemon fd-leak (EMFILE) hardening item): after ~1 day of uptime
 the daemon hit `OSError(24, 'Too many open files')`. Cascade: the LAN
 listener rejected paired phones (unreadable `peers.json` read as an
 EMPTY allowlist), LAN pushes failed (`SSLError(EMFILE)`), repo opens
@@ -9207,7 +9207,7 @@ Daemon-only; no wire-format or client change (no `MIN_*_VERSION` bump). Phase C'
 push was already bounded and was never where the log stopped, so it is unchanged.
 The still-open belt-and-suspenders items (stall-watchdog on transfers; keep the
 whole promote off the idle-stop path) are deferred — no longer required now that
-the promote is fast, tracked in `agenda/deblock_sync_unknown_bug.md`.
+the promote is fast, tracked in the deblock-sync-unknown item.
 
 ## 0.53.8 — daemon: LAN merge no longer mints empty ping-pong merge commits
 
@@ -9250,12 +9250,12 @@ Daemon-only; no wire-format or client change (no `MIN_*_VERSION` bump). The
 desktop-app companion (classify reload-worthiness by LIFT blob SHA so a stray
 empty merge from an un-updated peer never pops the dialog) is implemented as
 `lift_blob_sha` below (was tracked as A3 in
-`agenda/azt_persistence_server_sync.md`).
+the AZT-persistence / server-sync design).
 
 ### Also in 0.53.8 — desktop persistence hardening (submit_file / diagnosability)
 
 Follow-on fixes from the same "Team changes available" investigation
-(`agenda/azt_persistence_server_sync.md` F3/F4/F7/F8/post-commit/Kivy):
+(the AZT-persistence / server-sync design F3/F4/F7/F8/post-commit/Kivy):
 
 - **submit_file post-commit hooks moved off the request thread.** The
   `COMMITTED_LOCAL` side effects (`_set_pending_push` + `after_committed_local`)
@@ -9319,7 +9319,7 @@ route at all on a hotspot host and fell back to '0.0.0.0', so the QR
 advertised nowhere. Now a failed/loopback guess falls through to a
 SIOCGIFCONF interface enumeration (Linux ioctl, guarded; private RFC-1918
 addresses preferred) — a hotspot host advertises its 10.42.0.1-style address.
-Known remaining gap (tracked in agenda/local_lan_sync_stub.md § Pairing): a
+Known remaining gap (tracked in the LAN-sync design spec § Pairing): a
 multi-homed desktop whose default route is NOT the drill network still
 advertises the wrong single IP; the real fix is advertising all local
 addresses in the QR and letting the scanner try each.
@@ -9428,8 +9428,8 @@ harmless import instead of a dead app. No wire change; no version-floor bumps.
 ## 0.53.0 — desktop AZT persistence: base-aware `submit_file` + adopt-in-place hardening (G1–G4)
 
 The daemon half of the AZT persistence contract
-(`agenda/azt_persistence_server_sync.md`; azt-side wiring is the sibling
-`azt/agenda/azt_run_with_server.md` item). Desktop A-Z+T autosaves the whole
+(the AZT-persistence / server-sync design; azt-side wiring is the sibling
+azt "run with server" item). Desktop A-Z+T autosaves the whole
 LIFT on nearly every edit and never re-reads; without a base-aware write, its
 first save after a daemon-side merge would content-clobber peer work. New
 capability set:
@@ -11090,7 +11090,7 @@ only.
 Field log nml 2026-06-18 (devices ``7aeb3fac`` aztobt1-sudo and
 ``db033cd4`` aztobt2-ui, both LAN-converged at SHA
 ``fcd30318c03b``) exposed the
-[masking sync-indicator follow-up](docs/Publish_errors.md) that
+masking sync-indicator follow-up (in the publish-errors notes) that
 was deferred out of the 0.50.x sync rebuild. ``7aeb3fac``'s
 GitHub App is installed on ``aztobt1-sudo``, not ``aztobt2-ui``,
 so every fetch against the ``aztobt2-ui/nml.git`` origin returns
@@ -11135,7 +11135,7 @@ contract that already worked for LAN-only projects now also
 works for github-configured-but-unreachable projects.
 
 Resolves the not-yet-shipped follow-up tracked in
-[``docs/Publish_errors.md``](docs/Publish_errors.md) §
+the publish-errors notes §
 "Related follow-ups" and the deferred fix noted in the 0.50.x
 CHANGELOG under "The masking sync-indicator
 (OK-on-uncertainty firing on NotGitRepository) is a separate
@@ -11573,7 +11573,7 @@ whatever `AZT_GITHUB_COLLABORATOR` / `configure(collaborator=…)`
 overrides). The log line is the only proof in the daemon trail
 that this happened.
 
-**`docs/Publish_errors.md` — Lessons section.** Captures three
+**The publish-errors notes — Lessons section.** Captures three
 patterns from this journey for future reference:
 
 1. Always emit a summary line, even on no-op paths
@@ -18073,7 +18073,7 @@ it); fixed now for the LAN listener.
 Field linguists in the same office today have one sync path: github.
 When the internet is down or restricted, two phones a metre apart
 are isolated. The parked LAN sync design
-(``docs/local_lan_sync_stub.md``, 2026-05-19) was un-parked this
+(the LAN-sync design spec, 2026-05-19) was un-parked this
 release to land the RPC layer + listener foundation so subsequent
 peer rebuilds can pair, share, and fan-out commits across the local
 network without burning metered data.
@@ -20242,7 +20242,7 @@ principle — `Project.remote_url` accepts any HTTP/HTTPS git
 URL — but the only host exercised in the field is github.com.
 A team running gitea / forgejo / gogs / git-daemon on a laptop
 on the office LAN is a perfectly valid convergence point, and
-the parked LAN-sync spec in `docs/local_lan_sync_stub.md`
+the parked LAN-sync design spec
 builds on dulwich.web as its in-process listener (same library,
 same WSGI shape). Without a CI test, a github-ism (substring
 matching on a github-specific error string, host-header
@@ -20404,7 +20404,7 @@ LAN-sync session.
 
 ### Why
 
-`docs/local_lan_sync_stub.md` was a sketch; expanding it to a real
+The LAN-sync design spec was a sketch; expanding it to a real
 spec after researching mDNS-on-Android (Android 17 will gate raw
 mDNS sockets behind a new runtime permission — `NsdManager` with
 `FLAG_SHOW_PICKER` is the escape hatch), Android 14+ foreground-
@@ -20417,7 +20417,7 @@ offline-first peer-to-peer git patterns (Syncthing-style identity
 
 ### Changes
 
-- `docs/local_lan_sync_stub.md` rewritten as a design spec with
+- The LAN-sync design spec rewritten as a full design spec with
   eight load-bearing decisions locked, concrete touchpoints
   enumerated, and a short list of items deferred to
   prototyping. Still parked — no implementation in this bump.
@@ -24824,14 +24824,14 @@ again:
   when the explicit name returns no match.
 
 ### azt_collab_client 0.33.7 — docs/ cleanup: prune shipped plans, organise residual work
-- **``docs/daemon_boot_plan.md``** rewritten as status-first.
+- **The daemon boot plan** rewritten as status-first.
   Phase A and Phase B2 marked SHIPPED with measured outcomes;
   Phase B1 + Phase C trimmed to "not shipped / not worth
   shipping unless …" notes with the trigger conditions
   spelled out. Cost-model speculation replaced with measured
   numbers from R500-class slow tablet (2026-05-09 harness
   run).
-- **``docs/github_connect_ux_audit.md``** —
+- **The GitHub-connect UX audit** —
   recommended-implementation-order list at the bottom
   refreshed: items #1–#7 are done/declined (audit-trail
   strikethroughs preserved per the doc's own rule); items
@@ -24865,7 +24865,7 @@ again:
   "optional, measure first"). Cost of always calling it is
   essentially zero on devices where it doesn't help, and
   it's a 10× UX improvement on slow tablets.
-- ``docs/daemon_boot_plan.md`` Q2 + Q3 marked answered with
+- The daemon boot plan Q2 + Q3 marked answered with
   the measured numbers; remaining content kept for context.
 
 ### azt_collabd 0.33.0 + azt_collab_client 0.33.5 — bindService alone bootstraps Python (Service.onCreate self-delivers onStartCommand)
@@ -25024,7 +25024,7 @@ again:
   onBind`` was already returning a stub ``Binder`` and tracking
   ``sBoundCount`` from the original sticky-bound design;
   peers were just never binding. Server APK can stay at 0.32.1.
-- **Plan-doc** (``docs/daemon_boot_plan.md``) updated to mark
+- **Plan-doc** (the daemon boot plan) updated to mark
   B2 shipped + record the verification commands.
 
 ### azt_collab_client 0.32.2 — document prewarm + boot-trace harness in CLIENT_INTEGRATION.md
@@ -25084,7 +25084,7 @@ again:
   the sentinel file (peer must be debuggable for ``run-as``).
   README at ``tests/integration/README.md`` documents
   prerequisites + scenario semantics.
-- **Plan-doc updated** (``docs/daemon_boot_plan.md``):
+- **Plan-doc updated** (the daemon boot plan):
   open-questions Q2 (doze) and Q3 (prewarm) now have explicit
   measurement plans pointing at the harness; Q1 (loopback
   ``kind``) remains as a deferred Phase A loose end.
@@ -25124,7 +25124,7 @@ again:
   read ``ex.kind`` for fail-fast vs keep-retrying decisions.
   ``check_server_compat`` threads it into the result dict
   (``compat['kind']``).
-- **Phase B + C planned** in ``docs/daemon_boot_plan.md``:
+- **Phase B + C planned** in the daemon boot plan:
   provider-state in 503 body, ``bindService`` for OOM priority,
   optional daemon-side lazy imports if the new diagnostics show
   ``import azt_collabd`` is the dominant cost on slow tablets.
@@ -26129,8 +26129,8 @@ again:
   ``disconnect_gitlab``. The KV buttons call ``app.go(...)``
   directly; the disconnect helpers live on each respective
   screen instead.
-- **Web-flow migration plan** drafted at
-  ``docs/web_flow_migration_plan.md``. Research finding: GitHub
+- **Web-flow migration plan** drafted
+  (tracked as the web-flow migration plan). Research finding: GitHub
   Apps' OAuth web flow accepts PKCE but still requires
   ``client_secret`` on the token exchange (per
   github.blog/changelog 2025-07-14 + community/discussions
@@ -26173,7 +26173,7 @@ again:
   is now defensive only: use ``verification_uri_complete`` if a
   future GitHub change starts returning it, otherwise the bare
   ``verification_uri``. No more constructed query strings.
-- ``docs/github_connect_ux_audit.md`` #1 updated with the
+- The GitHub-connect UX audit #1 updated with the
   research finding and links to the canonical references so the
   next person doesn't rediscover the false premise.
 - The user-visible flow against the current GitHub: the user

@@ -1,5 +1,5 @@
 """Regression tests for the stale-peer-address family
-(agenda/lan_stale_peer_address.md, incidents 2026-07-10/11).
+(the LAN stale-peer-address item, incidents 2026-07-10/11).
 
 Shape of the bug: fan-out dialed an address from a previous network
 life (hotspot ghost ``10.42.0.100:40425``) while the peer was
