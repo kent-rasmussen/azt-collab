@@ -9,6 +9,43 @@ both); patch-level bumps in one without the other are fine.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely.
 
+## 0.55.196 — desktop settings UI: "ok" means the window is up, not that a process started
+
+Field 2026-10-19 (Windows 11, azt on OneDrive): Collaboration settings never
+appeared; the host logged `settings UI spawned` and nothing else. The launcher
+put the UI's stderr on a PIPE it never read (a Windows pipe holds a few KB;
+Kivy's startup logging fills it and the child blocks before drawing), and
+called the launch ok if the child hadn't exited within 0.25 s.
+
+- New `azt_collab_client/_settings_ui.py`. The UI child's stdout + stderr go
+  to `$AZT_HOME/settings-ui-<date>_log.txt` (pruned by
+  `logging.retention_days`; included in the diagnostics bundle).
+- `python -m azt_collabd ui --ready-token <id>`: the local desktop window
+  writes `<id>` to `$AZT_HOME/settings_ui.json` on the frame after
+  `on_start`. Matched by token, not pid — a Windows venv `python.exe` is a
+  redirector whose pid isn't the interpreter's.
+- `open_server_ui()` desktop returns `ok` only when the window has reported
+  ready (≤15 s), or `ok` + `raised` when one was already open; otherwise
+  `spawn_failed` / `spawn_exited` (+`returncode`) / `ui_not_ready` (child
+  left running), each with `detail` (UI log tail) and `log` (path).
+- New `on_result=` parameter: returns `{'ok': None, 'pending': True}` at
+  once and calls back on a worker thread, so a host's UI thread doesn't
+  wait out the startup.
+- One window at a time: a second open asks the running one to raise itself
+  (`settings_ui_raise`, polled every 0.5 s); no acknowledgement within 3 s ⇒
+  the marker is stale and a new window is launched.
+- Windows: `pythonw.exe` beside `python.exe` when present;
+  `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`; a 0.5 s always-on-top when
+  the window appears, against the foreground lock.
+- `--peer` (remote) windows are unchanged: they neither write the marker nor
+  take raise requests, and their launchers already drain their pipes.
+- Caveat: a UI from a checkout older than this never reports ready, so the
+  launcher says `ui_not_ready` after 15 s while its window is showing.
+
+`tests/test_settings_ui_launch.py` passes (Linux). **Fix awaiting
+verification on Windows**; the azt consumer (`open_settings`) still needs to
+pass `on_result` and stop logging "spawned".
+
 ## 0.55.193 — the Update button killed its own window: a module import shadowed `_tr`
 
 `_desktop_git_update._work` did `from azt_collab_client import transports as _tr`

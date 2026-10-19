@@ -1365,7 +1365,7 @@ The user lands on the SettingsScreen with the right
 project's langcode + remote URL already on display — no
 peer-side disambiguation needed.
 
-**Desktop: report the result, not the call.** On
+**Desktop: report the result, not the call (0.55.196).** On
 desktop ``open_server_ui`` returns ``ok: True`` only once the
 window has said it is up (or an already-open one was raised —
 ``raised: True``); it can take seconds, so a host on a UI thread
