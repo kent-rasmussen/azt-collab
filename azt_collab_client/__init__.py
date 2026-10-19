@@ -237,11 +237,27 @@ def configure(app_id: str):
     return None
 
 
-def open_server_ui(on_status=None, python_exe=None):
+def open_server_ui(on_status=None, python_exe=None, on_result=None):
     """Open the daemon settings UI on whichever platform we're on.
 
-    Desktop: spawns ``python -m azt_collabd ui`` detached and returns
-    ``{'ok': True, 'pid': <int>}``. ``python_exe`` (0.53.4) overrides
+    Desktop: brings an already-open settings window to the front, or
+    spawns ``python -m azt_collabd ui`` detached and waits (up to 15 s)
+    for the new window to say it is up. ``{'ok': True, 'pid': <int>}``
+    means a window IS showing — never merely that a process started.
+    Failures: ``spawn_failed``, ``spawn_exited`` (with ``returncode``),
+    ``ui_not_ready`` (still starting or stuck; left running) — each with
+    ``detail`` (tail of the UI's own log) and ``log`` (its path). The
+    UI's output goes to ``$AZT_HOME/settings-ui-<date>_log.txt``; see
+    ``_settings_ui.py``.
+
+    That wait would freeze a host's UI thread, so pass ``on_result``:
+    the call returns ``{'ok': None, 'pending': True}`` at once and
+    ``on_result(result)`` runs later ON A WORKER THREAD — marshal to
+    your UI thread yourself. (Android doesn't wait — launching an intent
+    is immediate — so there ``on_result`` is called before returning,
+    on the caller's thread, and the result is also returned.)
+
+    ``python_exe`` (0.53.4) overrides
     the interpreter for the spawn — the settings UI needs Kivy, and a
     non-Kivy host (desktop A-Z+T, tkinter) may be running a venv
     without it; such hosts pass a Kivy-capable python here while
@@ -271,37 +287,27 @@ def open_server_ui(on_status=None, python_exe=None):
     from ._platform import platform as _plat
     platform = _plat()
     if platform == 'android':
-        return _open_server_ui_android(on_status)
-    import os
-    import subprocess
+        result = _open_server_ui_android(on_status)
+        if on_result is not None:
+            on_result(result)
+        return result
     import sys as _sys
-    import time as _time
     from ._spawn import build_spawn_env
-    try:
-        proc = subprocess.Popen(
-            [python_exe or _sys.executable, '-m', 'azt_collabd', 'ui'],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=hasattr(os, 'setsid'),
-            env=build_spawn_env(),
-        )
-    except OSError as ex:
-        return {'ok': False, 'error': f'spawn_failed: {ex}'}
-    deadline = _time.time() + 0.25
-    while _time.time() < deadline:
-        rc = proc.poll()
-        if rc is not None:
-            try:
-                err = proc.stderr.read() if proc.stderr else b''
-            except Exception:
-                err = b''
-            detail = err.decode('utf-8', 'replace').strip()[:200]
-            return {'ok': False, 'error': 'spawn_exited',
-                    'returncode': rc, 'detail': detail}
-        _time.sleep(0.02)
-    return {'ok': True, 'pid': proc.pid}
+    from ._settings_ui import open_desktop
+    argv = [python_exe or _sys.executable, '-m', 'azt_collabd', 'ui']
+
+    def _run():
+        try:
+            return open_desktop(argv, env=build_spawn_env())
+        except Exception as ex:
+            return {'ok': False, 'error': 'spawn_failed',
+                    'detail': f'{type(ex).__name__}: {ex}'}
+    if on_result is None:
+        return _run()
+    import threading
+    threading.Thread(target=lambda: on_result(_run()),
+                     daemon=True).start()
+    return {'ok': None, 'pending': True}
 
 
 def _open_server_ui_android(on_status):

@@ -5598,6 +5598,8 @@ class CollabUIApp(App):
     version_string = StringProperty(
         f'client {azt_collab_client.__version__}  ·  server ?'
     )
+    # Per-launch id from ``ui --ready-token``; see _announce_ready.
+    ready_token = ''
 
     def build(self):
         # NAME THE MACHINE IN THE TITLE BAR when this process is driving
@@ -5680,6 +5682,75 @@ class CollabUIApp(App):
         except Exception as ex:
             print(f'[collab-ui] decision watcher install failed: '
                   f'{ex!r}', file=sys.stderr, flush=True)
+        # Tell the launcher the window is up, and come to the front.
+        # Local desktop window only: a ``--peer`` window is a deliberate
+        # second window, and Android launches by intent, not by us.
+        from azt_collab_client._platform import on_android
+        try:
+            from azt_collab_client import transports as _t
+            remote = bool(_t.is_remote())
+        except Exception:
+            remote = False
+        if not on_android() and not remote:
+            # Next frame, so the window has drawn once before we say so.
+            Clock.schedule_once(self._announce_ready, 0)
+
+    def _announce_ready(self, _dt):
+        from azt_collab_client import _settings_ui
+        try:
+            _settings_ui.mark_ready(self.ready_token)
+            print(f'[collab-ui] window up; marked ready in '
+                  f'{_settings_ui.marker_path()}', file=sys.stderr,
+                  flush=True)
+        except Exception as ex:
+            print(f'[collab-ui] could not mark ready ({ex!r}); the '
+                  f'launcher will report ui_not_ready', file=sys.stderr,
+                  flush=True)
+            return
+        self._raise_window()
+        Clock.schedule_interval(self._poll_raise_request, 0.5)
+
+    def _poll_raise_request(self, _dt):
+        from azt_collab_client import _settings_ui
+        try:
+            if _settings_ui.take_raise_request():
+                print('[collab-ui] raise requested by another launch',
+                      file=sys.stderr, flush=True)
+                self._raise_window()
+        except Exception as ex:
+            print(f'[collab-ui] raise request failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+
+    def _raise_window(self):
+        """Bring this window in front. Windows' foreground lock lets a
+        window launched from another app open BEHIND it; a brief
+        always-on-top is the reliable way past that from Kivy."""
+        from kivy.core.window import Window
+        try:
+            Window.restore()
+            Window.show()
+            Window.raise_window()
+        except Exception as ex:
+            print(f'[collab-ui] raise_window failed: {ex!r}',
+                  file=sys.stderr, flush=True)
+        if sys.platform == 'win32':
+            try:
+                Window.always_on_top = True
+                Clock.schedule_once(
+                    lambda _dt: setattr(Window, 'always_on_top', False),
+                    0.5)
+            except Exception as ex:
+                print(f'[collab-ui] always_on_top unavailable: {ex!r}',
+                      file=sys.stderr, flush=True)
+
+    def on_stop(self):
+        from azt_collab_client._platform import on_android
+        if not on_android():
+            try:
+                from azt_collab_client import _settings_ui
+                _settings_ui.clear_marker()
+            except Exception:
+                pass
 
     def _probe_server_version(self):
         """Ask the daemon what version it is via /v1/health (the
@@ -5887,9 +5958,11 @@ class CollabUIApp(App):
         ).open()
 
 
-def main():
+def main(ready_token=''):
     azt_collabd.configure()
-    CollabUIApp().run()
+    app = CollabUIApp()
+    app.ready_token = ready_token
+    app.run()
 
 
 if __name__ == '__main__':

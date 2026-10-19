@@ -5391,6 +5391,15 @@ def stage_diagnostics_bundle(exclude_slug='', keep=False):
     # already up (no USB mode switch, no internet).
     carried = _carried_bundle_items(exclude_slug=exclude_slug)
     log_files.extend(carried)
+    # The desktop settings window's own output (it isn't a daemon log:
+    # the UI is a separate process, and when it fails to appear this is
+    # the only record of why).
+    try:
+        from azt_collab_client._settings_ui import log_files as _ui_logs
+        ui_logs = [(os.path.basename(p), p) for p in _ui_logs()]
+    except Exception:
+        ui_logs = []
+    log_files.extend(ui_logs)
     content_items = (
         [(f'azt_snapshot_{stamp}.txt', snapshot)] if snapshot else [])
     try:
@@ -5402,7 +5411,7 @@ def stage_diagnostics_bundle(exclude_slug='', keep=False):
               file=sys.stderr, flush=True)
         raise
     log_entries = max(0, written - (1 if snapshot else 0)
-                      - len(carried))
+                      - len(carried) - len(ui_logs))
 
     items = [{
         'display_name': archive_name,

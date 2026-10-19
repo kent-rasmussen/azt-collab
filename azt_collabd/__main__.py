@@ -2,6 +2,12 @@
 
     python -m azt_collabd            — start the loopback server (daemon)
     python -m azt_collabd ui         — start the Kivy settings UI
+    python -m azt_collabd ui --ready-token <id>
+                                     — same; <id> is written to
+                                       $AZT_HOME/settings_ui.json when
+                                       the window is up (open_server_ui
+                                       passes it to know the launch
+                                       worked)
     python -m azt_collabd ui --peer <peer_id>
                                      — drive ANOTHER paired device's
                                        settings over the LAN. Requires
@@ -58,9 +64,16 @@ if __name__ == '__main__':
         # second window rather than retargeting a running one, so no
         # window is ever ambiguous about which machine it changes.
         peer = ''
+        # ``--ready-token`` is the launcher's per-launch id; the window
+        # echoes it into $AZT_HOME/settings_ui.json once it exists so
+        # ``open_server_ui`` can tell "up" from "spawned" (see
+        # azt_collab_client/_settings_ui.py).
+        ready_token = ''
         for i, a in enumerate(args):
             if a == '--peer' and i + 1 < len(args):
                 peer = args[i + 1]
+            if a == '--ready-token' and i + 1 < len(args):
+                ready_token = args[i + 1]
         if peer:
             from . import lan_admin_client
             from azt_collab_client import transports as _t
@@ -113,7 +126,7 @@ if __name__ == '__main__':
                   f'{tr.device_name or peer}, not this machine',
                   file=sys.stderr, flush=True)
         from .ui.app import main as ui_main
-        ui_main()
+        ui_main(ready_token=ready_token)
     elif args and args[0] == 'projects':
         from .ui.picker_app import main as picker_main
         picker_main()

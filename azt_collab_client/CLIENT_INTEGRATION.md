@@ -1365,6 +1365,17 @@ The user lands on the SettingsScreen with the right
 project's langcode + remote URL already on display — no
 peer-side disambiguation needed.
 
+**Desktop: report the result, not the call.** On
+desktop ``open_server_ui`` returns ``ok: True`` only once the
+window has said it is up (or an already-open one was raised —
+``raised: True``); it can take seconds, so a host on a UI thread
+MUST pass ``on_result=`` (called later on a worker thread) and
+get ``{'ok': None, 'pending': True}`` back at once. Never log or
+show "opened"/"spawned" before ``on_result`` says ``ok``. On
+``spawn_exited`` / ``ui_not_ready`` / ``spawn_failed``, show
+``detail`` and the ``log`` path — the UI's own output lives
+there (``$AZT_HOME/settings-ui-<date>_log.txt``), nowhere else.
+
 ### Phase 1 / Phase 3 sequencing constraint
 
 **Do NOT ship a peer release that strips its old per-project
