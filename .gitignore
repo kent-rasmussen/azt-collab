@@ -5,6 +5,7 @@ __pycache__/
 .buildozer/
 .DS_Store
 .pytest_cache/
+pytest_results.txt
 
 # Build outputs
 bin/

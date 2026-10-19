@@ -1,4 +1,0 @@
-# 2026-10-19 17:20:24 CDT
-$ python3 -m pytest -q
-/usr/bin/python3: No module named pytest
-(exited 1 — chain stopped)
